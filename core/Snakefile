@@ -1,0 +1,2689 @@
+import hashlib
+import functools
+import json
+import os
+import shlex
+import sys
+from collections.abc import Mapping
+from pathlib import Path
+
+src_path = Path(workflow.basedir)
+if str(src_path.resolve()) not in sys.path:
+    sys.path.insert(0, str(src_path.resolve()))
+
+from dna_pipeline import (
+    MANAGED_SPECIES,
+    TAPS_MIN_MAPQ, TAPS_MIN_BASEQ, TAPS_INCLUDE_FLAGS, TAPS_EXCLUDE_FLAGS,
+    BISMARK_CELL_RULE_RUNTIME_MIN,
+    MULTIQC_BISCUIT_SOURCE_SUFFIXES,
+    ProjectLayout,
+    STATIC_FUSED_RULES,
+    backend_active_index_paths,
+    backend_resource_request,
+    bismark_alignment_instance_count,
+    bismark_library_flag,
+    biscuit_library_mode,
+    combined_runtime_min,
+    controller_resource_request,
+    demux_manifest_index,
+    demux_resource_request,
+    disable_snakemake_output_mtime_gate,
+    discover_samples,
+    finalize_project_config,
+    get_backend,
+    get_protocol_policy,
+    get_raw_route,
+    load_run_snapshot,
+    map_discovered_samples_to_manifest,
+    manifest_raw_samples,
+    publish_delivery,
+    read_project_sample_manifest,
+    resolve_demux_fastq_from_manifest,
+    resolve_fai_contigs,
+    resolve_reference,
+    resource_request,
+    resource_threads,
+    scratch_mb,
+    validate_barcode_map_for_protocol,
+    write_multiqc_file_list,
+)
+
+disable_snakemake_output_mtime_gate()
+
+_workflow_pipeline_root = Path(workflow.basedir).parent.resolve()
+PIPELINE_ROOT = _workflow_pipeline_root
+
+def _internal_helper(relative_path):
+    helper = (PIPELINE_ROOT / relative_path).resolve()
+    if not helper.is_file():
+        raise FileNotFoundError(f"Pipeline helper is missing: {helper}")
+    return helper
+
+JOB_RUNTIME = _internal_helper("core/job_runtime.sh")
+BSCONV_MODULE_CODE = _internal_helper("core/dna_pipeline.py")
+config = finalize_project_config(config)
+PROTOCOL_POLICY = get_protocol_policy(config)
+BACKEND_POLICY = get_backend(config)
+METHYLATION_BACKEND = BACKEND_POLICY.name
+
+_RULE_ENVIRONMENT_PREFIX_RAW = str(
+    os.environ.get("DNA_PIPELINE_RULE_ENV", "") or ""
+).strip()
+if not _RULE_ENVIRONMENT_PREFIX_RAW:
+    raise ValueError("DNA_PIPELINE_RULE_ENV must name the selected solved Conda prefix")
+_RULE_ENVIRONMENT_PREFIX = Path(_RULE_ENVIRONMENT_PREFIX_RAW).expanduser().resolve()
+if not (_RULE_ENVIRONMENT_PREFIX / "conda-meta" / "history").is_file():
+    raise ValueError(
+        "DNA_PIPELINE_RULE_ENV is not a complete Conda prefix: "
+        f"{_RULE_ENVIRONMENT_PREFIX}"
+    )
+ENVIRONMENT_YAML = str(_RULE_ENVIRONMENT_PREFIX)
+
+def _rule_executable(name):
+    return str(_RULE_ENVIRONMENT_PREFIX / "bin" / name)
+
+CUTADAPT = _rule_executable("cutadapt")
+BISCUIT = _rule_executable("biscuit")
+DUPSIFTER_BINARY = _rule_executable("dupsifter")
+SAMTOOLS = _rule_executable("samtools")
+BGZIP = _rule_executable("bgzip")
+TABIX = _rule_executable("tabix")
+MULTIQC = _rule_executable("multiqc")
+ZSTD = _rule_executable("zstd")
+GZIP = _rule_executable("gzip")
+BISMARK = _rule_executable("bismark")
+BOWTIE2 = _rule_executable("bowtie2")
+BWA = _rule_executable("bwa")
+RASTAIR = _rule_executable("rastair")
+RASTAIR_PYTHON = _rule_executable("python")
+
+_active_config_env = str(os.environ.get("DNA_PIPELINE_CONFIG", "") or "").strip()
+if _active_config_env:
+    ACTIVE_CONFIG_PATH = Path(_active_config_env).expanduser().resolve()
+else:
+    _workflow_configfiles = list(getattr(workflow, "configfiles", []) or [])
+    if not _workflow_configfiles:
+        raise ValueError(
+            "Alopex requires --configfile <project>/00_config/config.yaml"
+        )
+    ACTIVE_CONFIG_PATH = Path(_workflow_configfiles[-1]).expanduser().resolve()
+
+if ACTIVE_CONFIG_PATH.name != "config.yaml" or ACTIVE_CONFIG_PATH.parent.name != "00_config":
+    raise ValueError(
+        f"Alopex only accepts <project>/00_config/config.yaml; found {ACTIVE_CONFIG_PATH}"
+    )
+PROJECT_DIR = ACTIVE_CONFIG_PATH.parent.parent.resolve()
+if not PROJECT_DIR.is_dir():
+    raise FileNotFoundError(f"Project directory does not exist: {PROJECT_DIR}")
+_launcher_project_root = str(os.environ.get("DNA_PIPELINE_PROJECT_DIR", "") or "").strip()
+if _launcher_project_root and Path(_launcher_project_root).expanduser().resolve() != PROJECT_DIR:
+    raise ValueError(
+        "Launcher project root and config-derived project root disagree: "
+        f"{_launcher_project_root} != {PROJECT_DIR}"
+    )
+
+CONFIG_DIR = PROJECT_DIR / "00_config"
+RAW_DATA_DIR = PROJECT_DIR / "01_raw"
+INTERMEDIATE_DIR = PROJECT_DIR / "02_work"
+LOGS_DIR = PROJECT_DIR / "04_logs"
+PROJECT_TMP_DIR = PROJECT_DIR / "05_tmp"
+PUBLIC_RESULTS_DIR = PROJECT_DIR / "03_results"
+_delivery_id = str(os.environ.get("DNA_PIPELINE_DELIVERY_ID", "development") or "development").strip()
+if not _delivery_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for char in _delivery_id):
+    raise ValueError(f"DNA_PIPELINE_DELIVERY_ID is invalid: {_delivery_id!r}")
+DELIVERY_ID = _delivery_id
+STAGED_RESULTS_DIR = INTERMEDIATE_DIR / "results_stage"
+DELIVERY_STAGE_ROOT = PROJECT_TMP_DIR / "finalize" / DELIVERY_ID
+DELIVERY_READY = DELIVERY_STAGE_ROOT / "delivery_ready.json"
+PROJECT_LAYOUT = ProjectLayout(INTERMEDIATE_DIR, STAGED_RESULTS_DIR, METHYLATION_BACKEND)
+CELL_PATH_PATTERN = PROJECT_LAYOUT.cell("{demux_sample}")
+SCRATCH_NAMESPACE = hashlib.sha256(str(PROJECT_DIR).encode("utf-8")).hexdigest()[:16]
+
+_snapshot_env = str(os.environ.get("DNA_PIPELINE_RUN_SNAPSHOT", "") or "").strip()
+PROVENANCE_SNAPSHOT_PATH = (
+    Path(_snapshot_env).expanduser().resolve() if _snapshot_env else None
+)
+RUN_SNAPSHOT = (
+    load_run_snapshot(PROVENANCE_SNAPSHOT_PATH)
+    if PROVENANCE_SNAPSHOT_PATH
+    else None
+)
+if RUN_SNAPSHOT:
+    _snapshot_inputs = RUN_SNAPSHOT["input_copies"]
+    _snapshot_inputs_root = PROVENANCE_SNAPSHOT_PATH.parent / "inputs"
+    SAMPLE_MANIFEST = (_snapshot_inputs_root / str(
+        _snapshot_inputs["sample_manifest"]["snapshot_path"]
+    )).resolve()
+    BARCODE_MAP = (_snapshot_inputs_root / str(
+        _snapshot_inputs["barcode_map"]["snapshot_path"]
+    )).resolve()
+    RUN_SNAPSHOT_DEP = [str(PROVENANCE_SNAPSHOT_PATH)]
+else:
+    SAMPLE_MANIFEST = CONFIG_DIR / "sample_manifest.tsv"
+    BARCODE_MAP = CONFIG_DIR / "Barcode_Map.csv"
+    RUN_SNAPSHOT_DEP = []
+DNA_OUT_DIR = INTERMEDIATE_DIR / "demux" / "DNA"
+RNA_OUT_DIR = INTERMEDIATE_DIR / "demux" / "RNA"
+DEMUX_STATE_DIR = INTERMEDIATE_DIR / "demux" / "state"
+DEMUX_COMPLETION_PATTERN = DEMUX_STATE_DIR / "{sample}" / "completion.json"
+RNA_COLLECT_DIR = INTERMEDIATE_DIR / "RNA" / ".collect"
+
+for required_path, label in (
+    (SAMPLE_MANIFEST, "sample manifest"),
+    (BARCODE_MAP, "Barcode Map"),
+):
+    if not required_path.is_file():
+        raise FileNotFoundError(f"Project {label} not found: {required_path}")
+
+PIPELINE_EXECUTOR = str(os.environ.get("DNA_PIPELINE_EXECUTOR", "local") or "local").strip().lower()
+if PIPELINE_EXECUTOR not in {"local", "slurm"}:
+    raise ValueError("DNA_PIPELINE_EXECUTOR must be 'local' or 'slurm'")
+try:
+    LOCAL_EXECUTOR_CORES = int(str(os.environ.get("DNA_PIPELINE_LOCAL_CORES", "0") or "0"))
+except ValueError:
+    LOCAL_EXECUTOR_CORES = 0
+if PIPELINE_EXECUTOR == "local":
+    NODE_TMPDIR = str(PROJECT_TMP_DIR.resolve())
+else:
+    configured_node_tmp = config["slurm"].get("node_tmpdir")
+    if configured_node_tmp is None:
+        NODE_TMPDIR = ""
+    else:
+        configured_node_tmp = Path(str(configured_node_tmp)).expanduser()
+        if not configured_node_tmp.is_absolute():
+            raise ValueError("slurm.node_tmpdir must be null or a non-root absolute path")
+        configured_node_tmp = configured_node_tmp.resolve()
+        if configured_node_tmp == Path("/"):
+            raise ValueError("slurm.node_tmpdir must not resolve to the filesystem root")
+        NODE_TMPDIR = str(configured_node_tmp)
+
+DEMUX_BINARY = PIPELINE_ROOT / "conda" / "rust" / "bin" / "demux_rs"
+
+SAMPLE_MANIFEST_ROWS = read_project_sample_manifest(
+    SAMPLE_MANIFEST,
+    species=str(config["species"]),
+    protocol=PROTOCOL_POLICY.name,
+)
+DISCOVERED_RAW_SAMPLES = discover_samples(
+    RAW_DATA_DIR,
+    selected_samples=manifest_raw_samples(SAMPLE_MANIFEST_ROWS, PROTOCOL_POLICY.name),
+)
+RAW_SAMPLES_MAP = map_discovered_samples_to_manifest(
+    DISCOVERED_RAW_SAMPLES,
+    SAMPLE_MANIFEST_ROWS,
+    protocol=PROTOCOL_POLICY.name,
+)
+DEMUX_RUN_IDS = sorted(RAW_SAMPLES_MAP)
+DEMUX_RUN_ROUTES = {
+    run_id: get_raw_route(info["route_id"], PROTOCOL_POLICY.name)
+    for run_id, info in RAW_SAMPLES_MAP.items()
+}
+
+CUTADAPT_ADAPTER_R1 = "CTGTCTCTTATACACATCT"
+CUTADAPT_ADAPTER_R2 = "N{9}CTGTCTCTTATACACATCT"
+CUTADAPT_R1_MIN_OVERLAP = 3
+CUTADAPT_R2_MIN_OVERLAP = 12
+CUTADAPT_ADAPTER_R1_SPEC = f"{CUTADAPT_ADAPTER_R1};min_overlap={CUTADAPT_R1_MIN_OVERLAP}"
+CUTADAPT_ADAPTER_R2_SPEC = f"{CUTADAPT_ADAPTER_R2};min_overlap={CUTADAPT_R2_MIN_OVERLAP}"
+CUTADAPT_QUALITY_CUTOFF = "20,20"
+CUTADAPT_MIN_LENGTH = 20
+
+DEMUX_CONFIG = config["demux"]
+HIGH_CPH_CONFIG = config["high_cph"]
+BISCUIT_CONFIG = config["biscuit"]
+
+DEMUX_MIN_MATCHED_READ_PAIRS = int(DEMUX_CONFIG["min_matched_read_pairs"])
+DNA_W_SPACER_LEN = int(DEMUX_CONFIG["dna_w_spacer_len"])
+
+PUBLISH_RNA_BAM = PROTOCOL_POLICY.publishes_rna_bam
+KEEP_FINAL_BAM = bool(config["retention"]["keep_final_bam"])
+
+BISCUIT_LIBRARY_MODE = biscuit_library_mode(config)
+BISCUIT_HIGH_CPH_RETENTION_THRESHOLD = float(
+    BISCUIT_CONFIG["high_cph_retention_threshold"]
+)
+GENERATE_SNP = BISCUIT_CONFIG["generate_snp"]
+
+BISMARK_LIBRARY_FLAG = bismark_library_flag(config)
+BISMARK_ALIGNMENT_INSTANCES = bismark_alignment_instance_count(config)
+BISMARK_LOCAL_ALIGNMENT = bool(config["bismark"]["local_alignment"])
+BISMARK_LOCAL_ALIGNMENT_FLAG = "--local" if BISMARK_LOCAL_ALIGNMENT else ""
+BISMARK_ALIGNMENT_FLAG = "" if BISMARK_LOCAL_ALIGNMENT else "--combined_index"
+BISMARK_SCORE_MIN = "G,20,8" if BISMARK_LOCAL_ALIGNMENT else "L,0,-0.2"
+BISMARK_SEED_MISMATCHES = 0
+BISMARK_SEED_LENGTH = 20
+BISMARK_EFFORT_D = 15
+BISMARK_RESEED_R = 2
+BISMARK_ANALYSIS_BAM = CELL_PATH_PATTERN.processed_bam
+BISMARK_NONCONVERSION_PERCENTAGE_CUTOFF = int(
+    config["bismark"]["non_conversion_percentage_cutoff"]
+)
+BISMARK_NONCONVERSION_MIN_COUNT = int(
+    config["bismark"]["non_conversion_minimum_count"]
+)
+
+validate_barcode_map_for_protocol(BARCODE_MAP, PROTOCOL_POLICY)
+SPECIES = str(config["species"])
+_CONFIGURED_REFERENCE_GENOME = resolve_reference(
+    config, SPECIES, PROJECT_DIR, pipeline_root=PIPELINE_ROOT
+)
+REFERENCE_GENOME = (
+    str(RUN_SNAPSHOT["basis"]["reference"]["resolved_path"])
+    if RUN_SNAPSHOT
+    else _CONFIGURED_REFERENCE_GENOME
+)
+REFERENCE_PATH = Path(REFERENCE_GENOME)
+REFERENCE_FAI = Path(f"{REFERENCE_GENOME}.fai")
+REFERENCE_SETUP_SCRIPT = PIPELINE_ROOT / "core" / "doctor.sh"
+if SPECIES in MANAGED_SPECIES:
+    REFERENCE_SETUP_HINT = (
+        "Standard hg38/mm10 reference setup: place hg38.fa, mm10.fa, lambda.fa "
+        "and pUC19.fa under resources/reference_source/, then run:\n"
+        f"  bash \"{REFERENCE_SETUP_SCRIPT}\" reference"
+    )
+else:
+    REFERENCE_SETUP_HINT = (
+        "Custom species are user-managed. Prepare the final FASTA and run:\n"
+        f"  samtools faidx {REFERENCE_PATH}\n"
+        f"  biscuit index {REFERENCE_PATH}\n"
+        f"Then create {REFERENCE_PATH}.bismark/genome.fa and run Bismark prepare "
+        "for that directory. For TAPS, create <FASTA>.bwa/ and run bwa index -p <FASTA>.bwa/genome <FASTA>."
+    )
+if not REFERENCE_PATH.is_file():
+    raise FileNotFoundError(f"Reference FASTA not found: {REFERENCE_PATH}\n{REFERENCE_SETUP_HINT}")
+if not REFERENCE_FAI.is_file():
+    raise FileNotFoundError(f"Reference FASTA index not found: {REFERENCE_FAI}\n{REFERENCE_SETUP_HINT}")
+HIGH_CPH_EXCLUDED_CONTIGS = [] if METHYLATION_BACKEND == "rastair" else resolve_fai_contigs(
+    HIGH_CPH_CONFIG["excluded_contigs"],
+    REFERENCE_FAI,
+)
+HIGH_CPH_EXCLUDED_CONTIGS_JSON = json.dumps(
+    HIGH_CPH_EXCLUDED_CONTIGS,
+    ensure_ascii=False,
+    separators=(",", ":"),
+)
+
+REFERENCE_BISCUIT_INDEX_PATHS = backend_active_index_paths(REFERENCE_PATH, "biscuit")
+REFERENCE_BISCUIT_INDEXES = [str(path) for path in REFERENCE_BISCUIT_INDEX_PATHS]
+REFERENCE_ALT_PATH = Path(f"{REFERENCE_GENOME}.alt")
+REFERENCE_ALT_DEP = [str(REFERENCE_ALT_PATH)] if REFERENCE_ALT_PATH.is_file() else []
+REFERENCE_BISMARK_DIR = Path(f"{REFERENCE_GENOME}.bismark")
+REFERENCE_BISMARK_GENOME = REFERENCE_BISMARK_DIR / "genome.fa"
+if METHYLATION_BACKEND == "biscuit":
+    missing_backend_indexes = [
+        path for path in REFERENCE_BISCUIT_INDEX_PATHS if not path.is_file()
+    ]
+    if missing_backend_indexes:
+        raise FileNotFoundError(
+            "BISCUIT reference index is incomplete. Missing: "
+            + ", ".join(str(path) for path in missing_backend_indexes)
+            + f"\n{REFERENCE_SETUP_HINT}"
+        )
+    REFERENCE_BACKEND_DEPENDENCIES = [
+        REFERENCE_PATH,
+        REFERENCE_FAI,
+        *REFERENCE_BISCUIT_INDEX_PATHS,
+    ]
+elif METHYLATION_BACKEND == "rastair":
+    REFERENCE_BACKEND_DEPENDENCIES = [REFERENCE_PATH, REFERENCE_FAI, *backend_active_index_paths(REFERENCE_PATH, "rastair")]
+    missing_backend_indexes = [p for p in REFERENCE_BACKEND_DEPENDENCIES if not p.is_file()]
+    if missing_backend_indexes:
+        raise FileNotFoundError(f"BWA reference index is incomplete: {missing_backend_indexes}. {REFERENCE_SETUP_HINT}")
+else:
+    if not REFERENCE_BISMARK_GENOME.is_file() or not REFERENCE_BISMARK_DIR.is_dir():
+        raise FileNotFoundError(
+            f"Bismark reference is incomplete: {REFERENCE_BISMARK_DIR}.\n"
+            f"{REFERENCE_SETUP_HINT}"
+        )
+    if BISMARK_LOCAL_ALIGNMENT:
+        index_dir = REFERENCE_BISMARK_DIR / "Bisulfite_Genome"
+        active_dirs = [index_dir / "CT_conversion", index_dir / "GA_conversion"]
+        missing_dirs = [path for path in active_dirs if not path.is_dir()]
+        if missing_dirs:
+            raise FileNotFoundError(
+                "Bismark faithful CT/GA index is missing. Missing: "
+                + ", ".join(str(path) for path in missing_dirs)
+            )
+    else:
+        combined_dir = REFERENCE_BISMARK_DIR / "Bisulfite_Genome" / "Combined"
+        if not combined_dir.is_dir():
+            raise FileNotFoundError(
+                "Bismark combined index is missing. Run core/doctor.sh reference "
+                "to build Bisulfite_Genome/Combined/."
+            )
+    REFERENCE_BISMARK_INDEX_PATHS = backend_active_index_paths(
+        REFERENCE_PATH, "bismark", bismark_local_alignment=BISMARK_LOCAL_ALIGNMENT
+    )
+    if not REFERENCE_BISMARK_INDEX_PATHS:
+        raise FileNotFoundError(
+            f"Bismark index directory is empty for the selected alignment mode: "
+            f"{REFERENCE_BISMARK_DIR}"
+        )
+    REFERENCE_BACKEND_DEPENDENCIES = [
+        REFERENCE_PATH,
+        REFERENCE_FAI,
+        REFERENCE_BISMARK_GENOME,
+        *REFERENCE_BISMARK_INDEX_PATHS,
+    ]
+
+
+def repeated_cli_flag(flag, values):
+    return " ".join(f"{flag} {shlex.quote(str(value))}" for value in values)
+
+@functools.lru_cache(maxsize=1)
+def current_demux_manifest_index():
+    for run_id in DEMUX_RUN_IDS:
+        checkpoints.demux.get(sample=run_id)
+    return demux_manifest_index(DEMUX_STATE_DIR, tuple(DEMUX_RUN_IDS))
+
+def current_demux_fastq(demux_sample, read_pair):
+    return resolve_demux_fastq_from_manifest(
+        INTERMEDIATE_DIR,
+        demux_sample,
+        read_pair,
+        manifest_index=current_demux_manifest_index(),
+    )
+
+@functools.lru_cache(maxsize=None)
+def current_demux_match(demux_sample):
+    if demux_sample is None:
+        return None
+    sample = Path(str(demux_sample)).name.strip()
+    if not sample:
+        return None
+    matches = [
+        (manifest, row)
+        for manifest, row in current_demux_manifest_index().get(sample, [])
+        if str(row.get("downstream_dna", "") or "").strip().lower() == "true"
+    ]
+    if len(matches) > 1:
+        locations = ", ".join(str(manifest) for manifest, _row in matches)
+        raise ValueError(
+            f"Cell {sample!r} occurs in more than one downstream-DNA demux manifest: {locations}"
+        )
+    if not matches:
+        return None
+    return matches[0]
+
+def current_demux_row(demux_sample):
+    match = current_demux_match(demux_sample)
+    return None if match is None else match[1]
+
+def current_demux_completion(wildcards):
+    sample = Path(str(wildcards.demux_sample)).name.strip()
+    match = current_demux_match(sample)
+    if match is None:
+        raise FileNotFoundError(
+            f"No committed downstream-DNA demux row for {sample!r}"
+        )
+    manifest, _row = match
+    if manifest.parent.parent != DEMUX_STATE_DIR:
+        raise ValueError(f"Unexpected demux manifest path: {manifest}")
+    run_id = manifest.parent.name
+    checkpoint_output = checkpoints.demux.get(sample=run_id).output
+    if Path(str(checkpoint_output.manifest)).resolve() != manifest.resolve():
+        raise ValueError(
+            f"Checkpoint {run_id!r} returned the wrong manifest: "
+            f"{checkpoint_output.manifest} != {manifest}"
+        )
+    return str(checkpoint_output.completion)
+
+def current_run_demux_manifest(wildcards):
+    checkpoint_job = checkpoints.demux.get(sample=wildcards.sample)
+    return str(checkpoint_job.output.manifest)
+
+
+def demux_sample_dna_reads(demux_sample):
+    row = current_demux_row(demux_sample)
+    if row is None:
+        return None
+    raw_value = str(row.get("dna_reads", "") or "").strip()
+    try:
+        dna_reads = int(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return dna_reads if dna_reads >= 0 else None
+
+def dupsifter_metadata_json(demux_sample):
+    row = current_demux_row(demux_sample)
+    if row is None:
+        raise FileNotFoundError(
+            f"No committed downstream-DNA demux row for {demux_sample!r}"
+        )
+    fields = (
+        "demux_sample", "raw_sample", "pipeline_mode", "route_id",
+        "plate_id", "cell_order", "dna_barcode", "downstream_dna", "dna_status",
+    )
+    return json.dumps(
+        {field: str(row.get(field, "") or "") for field in fields},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+def static_resource_request(rule_key, demux_sample=None, attempt=1):
+    return resource_request(
+        rule_key,
+        dna_reads=demux_sample_dna_reads(demux_sample),
+        attempt=int(attempt),
+    )
+
+def static_resource_mem_mb(rule_key, demux_sample=None, attempt=1):
+    return int(static_resource_request(rule_key, demux_sample, attempt).mem_mb)
+
+def static_resource_runtime_min(rule_key, demux_sample=None, attempt=1):
+    return int(static_resource_request(rule_key, demux_sample, attempt).runtime_min)
+
+@functools.lru_cache(maxsize=None)
+def demux_run_total_bytes(run_id):
+    if not RUN_SNAPSHOT:
+        return None
+    basis = RUN_SNAPSHOT.get("basis")
+    records = basis.get("raw_fastqs") if isinstance(basis, Mapping) else None
+    if not isinstance(records, list):
+        return None
+    target = str(run_id).strip()
+    total = 0
+    for record in records:
+        if str(record.get("raw_sample", "")) != target:
+            continue
+        for mate in ("r1", "r2"):
+            identity = record.get(mate)
+            if isinstance(identity, Mapping):
+                total += int(identity.get("size_bytes", 0) or 0)
+    return total
+
+def demux_resource_mem_mb(run_id, attempt=1):
+    request = demux_resource_request(demux_run_total_bytes(run_id), int(attempt))
+    return int(request.mem_mb)
+
+def demux_resource_runtime_min(run_id, attempt=1):
+    request = demux_resource_request(demux_run_total_bytes(run_id), int(attempt))
+    return int(request.runtime_min)
+
+def demux_resource_log(run_id):
+    request = demux_resource_request(demux_run_total_bytes(run_id), 1)
+    total = demux_run_total_bytes(run_id)
+    return (
+        f"policy={request.policy} rule=demux run={run_id} "
+        f"input_bytes={'NA' if total is None else total} tier={request.tier}"
+    )
+
+def combined_static_runtime_min(rule_keys, demux_sample=None, attempt=1):
+    return int(
+        combined_runtime_min(
+            tuple(rule_keys), demux_sample_dna_reads(demux_sample), int(attempt)
+        )
+    )
+
+def controller_resource_mem_mb(rule_key, attempt=1):
+    return int(controller_resource_request(rule_key, int(attempt)).mem_mb)
+
+def controller_resource_runtime_min(rule_key, attempt=1):
+    return int(controller_resource_request(rule_key, int(attempt)).runtime_min)
+
+def static_resource_log(rule_key, demux_sample=None):
+    request = static_resource_request(rule_key, demux_sample, 1)
+    cell = Path(str(demux_sample)).name.strip() if demux_sample is not None else "NA"
+    cell = cell or "NA"
+    dna_reads = "NA" if request.dna_reads is None else str(request.dna_reads)
+    return (
+        f"policy={request.policy} rule={request.rule_key} cell={cell} "
+        f"dna_reads={dna_reads} tier={request.tier}"
+    )
+
+def static_scratch_mb(scratch_group, demux_sample=None):
+    return int(
+        scratch_mb(
+            str(scratch_group), demux_sample_dna_reads(demux_sample)
+        )
+    )
+
+def backend_stage_request(backend, stage, demux_sample=None, attempt=1):
+    return backend_resource_request(
+        backend,
+        stage,
+        demux_sample_dna_reads(demux_sample),
+        attempt=int(attempt),
+        executor=PIPELINE_EXECUTOR,
+        local_cores=LOCAL_EXECUTOR_CORES,
+        bismark_local_alignment=(
+            BISMARK_LOCAL_ALIGNMENT
+            if str(backend) == "bismark" and str(stage) == "align"
+            else False
+        ),
+    )
+
+def backend_stage_resource_log(backend, stage, demux_sample=None):
+    request = backend_stage_request(backend, stage, demux_sample, 1)
+    return static_resource_log(request.rule_key, demux_sample)
+
+def backend_stage_threads(backend, stage, wildcards):
+    return int(
+        backend_stage_request(backend, stage, wildcards.demux_sample, 1).threads
+    )
+
+def backend_stage_mem_mb(backend, stage, demux_sample=None, attempt=1):
+    return int(backend_stage_request(backend, stage, demux_sample, attempt).mem_mb)
+
+def backend_stage_runtime_min(backend, stage, demux_sample=None, attempt=1):
+    return int(
+        backend_stage_request(backend, stage, demux_sample, attempt).runtime_min
+    )
+
+def backend_preprocess_runtime_min(backend, demux_sample=None, attempt=1):
+    return int(
+        static_resource_runtime_min("cutadapt", demux_sample, attempt)
+        + backend_stage_runtime_min(backend, "align", demux_sample, attempt)
+    )
+
+DEMUX_THREADS = resource_threads("demux")
+CUTADAPT_THREADS = resource_threads("cutadapt")
+ALIGN_THREADS = lambda wildcards: backend_stage_threads("biscuit", "align", wildcards)
+BISMARK_ALIGN_THREADS = lambda wildcards: backend_stage_threads("bismark", "align", wildcards)
+HIGH_CPH_READ_NAMES_THREADS = resource_threads("high_cph_read_names")
+BSCONV_DNA_THREADS = resource_threads("bsconv_dna")
+HIGH_CPH_BAM_THREADS = resource_threads("high_cph_bam")
+PILEUP_THREADS = resource_threads("pileup")
+CPG_THREADS = resource_threads("generate_cpg_input")
+BISMARK_EXTRACT_THREADS = lambda wildcards: backend_stage_threads("bismark", "extract", wildcards)
+SNP_THREADS = resource_threads("generate_snp_input")
+BISCUIT_QC_THREADS = resource_threads("biscuit_qc")
+MULTIQC_THREADS = resource_threads("multiqc")
+HIGH_CPH_FILTER_RULES = STATIC_FUSED_RULES["high_cph_filter"]
+
+def passing_dna_rows(checkpoints_obj, run_id, workflow_config):
+    policy = get_protocol_policy(workflow_config)
+    checkpoint_job = checkpoints_obj.demux.get(sample=run_id)
+    chk_output = checkpoint_job.output
+    expected_manifest = (DEMUX_STATE_DIR / run_id / "manifest.tsv").resolve()
+    if Path(chk_output.manifest).resolve() != expected_manifest:
+        raise ValueError(
+            f"Demux checkpoint {run_id!r} returned an unexpected manifest: "
+            f"{chk_output.manifest} != {expected_manifest}"
+        )
+    index = current_demux_manifest_index()
+    rows = [
+        row
+        for entries in index.values()
+        for _manifest, row in entries
+        if _manifest.resolve() == expected_manifest
+    ]
+    passing = []
+    for row in rows:
+        demux_sample = row.get("demux_sample", "")
+        manifest_protocol = (row.get("pipeline_mode") or "").strip().lower()
+        manifest_route = (row.get("route_id") or "").strip().lower()
+        manifest_demux_mode = (row.get("demux_mode") or "").strip().lower()
+        manifest_rna_role = (row.get("rna_output_role") or "").strip().lower()
+        manifest_high_cph_role = (row.get("high_cph_role") or "").strip().lower()
+        manifest_downstream = (row.get("downstream_dna") or "").strip().lower()
+        try:
+            route = get_raw_route(manifest_route, policy.name)
+        except Exception as exc:
+            raise ValueError(
+                f"Demux manifest contains an invalid route {manifest_route!r}: {expected_manifest}"
+            ) from exc
+        if (
+            manifest_protocol != policy.name
+            or manifest_demux_mode != route.demux_mode
+            or manifest_rna_role != route.rna_output_role
+            or manifest_high_cph_role != route.high_cph_role
+            or manifest_downstream != ("true" if route.downstream_dna else "false")
+        ):
+            raise ValueError(
+                "Demux manifest was produced under a different protocol/raw-route policy: "
+                f"manifest={expected_manifest}, protocol={manifest_protocol!r}, route={manifest_route!r}, "
+                f"demux_mode={manifest_demux_mode!r}, downstream_dna={manifest_downstream!r}; "
+                f"current policy={policy.name!r}/{route.route_id!r}/{route.demux_mode!r}/"
+                f"downstream_dna={route.downstream_dna}. Remove this run's demux outputs and rerun."
+            )
+        if not route.downstream_dna or row.get("dna_status") != "Pass":
+            continue
+        if not str(demux_sample or "").strip():
+            raise ValueError(
+                f"Demux manifest marks a DNA library as Pass without a sample id: {expected_manifest}"
+            )
+        passing.append(row)
+    return passing
+
+@functools.lru_cache(maxsize=1)
+def _cached_demuxed_samples(run_ids_key):
+    samples = []
+    for run_id in run_ids_key:
+        samples.extend(
+            row["demux_sample"]
+            for row in passing_dna_rows(checkpoints, run_id, config)
+        )
+    seen, duplicates = set(), set()
+    for sample in samples:
+        if sample in seen:
+            duplicates.add(sample)
+        seen.add(sample)
+    if duplicates:
+        raise ValueError(
+            "Canonical DNA cell(s) appear in more than one committed demux run: "
+            + ", ".join(sorted(duplicates))
+        )
+    return tuple(samples)
+
+def get_demuxed_samples():
+    return list(_cached_demuxed_samples(tuple(DEMUX_RUN_IDS)))
+
+def get_staged_delivery_targets():
+    samples = get_demuxed_samples()
+    biscuit = config["biscuit"]
+    backend = get_backend(config)
+    layout = ProjectLayout(INTERMEDIATE_DIR, STAGED_RESULTS_DIR, backend.name)
+    targets = [str(layout.cell(sample).cpg) for sample in samples]
+    if biscuit["generate_snp"]:
+        if not backend.supports_snp:
+            raise ValueError("generate_snp=true is currently supported only by the Biscuit backend")
+        for sample in samples:
+            paths = layout.cell(sample)
+            targets.extend([str(paths.snp), str(paths.snp_index)])
+    return targets
+rule all:
+    """聚合唯一交付边界 DELIVERY_READY 作为整个 workflow 的终点。"""
+    input:
+        DELIVERY_READY
+
+
+onsuccess:
+    if PROVENANCE_SNAPSHOT_PATH is not None and DELIVERY_READY.is_file():
+        marker = publish_delivery(DELIVERY_READY)
+        print(f"Published sealed delivery: {marker.parent}", flush=True)
+
+
+rule initial_cell_manifest:
+    """合并项目 sample manifest 与 Barcode Map，生成协议/物种感知的初始 cell manifest。"""
+    input:
+        project_manifest = SAMPLE_MANIFEST,
+        barcode_map = BARCODE_MAP
+    output:
+        manifest = INTERMEDIATE_DIR / "sample_manifest.tsv"
+    log:
+        LOGS_DIR / "rules/initial_cell_manifest.log"
+    conda: ENVIRONMENT_YAML
+    resources:
+        mem_mb = lambda wildcards, attempt: controller_resource_mem_mb(
+            "initial_cell_manifest", attempt
+        ),
+        runtime = lambda wildcards, attempt: controller_resource_runtime_min(
+            "initial_cell_manifest", attempt
+        )
+    params:
+        species = SPECIES,
+        protocol = PROTOCOL_POLICY.name
+    shell:
+        r"""
+        set -euo pipefail
+        export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+        mkdir -p "$(dirname {output.manifest:q})" "$(dirname {log:q})"
+        python -m dna_pipeline write-cell-manifest \
+            {input.project_manifest:q} \
+            {input.barcode_map:q} \
+            {output.manifest:q} \
+            --species {params.species:q} \
+            --protocol {params.protocol:q} > {log:q} 2>&1
+        """
+checkpoint demux:
+    """按 raw run 原子提交解复用 FASTQ、manifest、报告与 completion 边界。"""
+    input:
+        r1 = lambda wc: RAW_SAMPLES_MAP[wc.sample]["r1"],
+        r2 = lambda wc: RAW_SAMPLES_MAP[wc.sample]["r2"],
+        barcode_map = BARCODE_MAP,
+        cell_manifest = rules.initial_cell_manifest.output.manifest,
+        binary = str(DEMUX_BINARY),
+    output:
+        completion = update(DEMUX_COMPLETION_PATTERN),
+        json_report = update(DEMUX_STATE_DIR / "{sample}" / "report.json"),
+        json_mqc = update(DEMUX_STATE_DIR / "{sample}" / "demux_mqc.json"),
+        manifest = update(DEMUX_STATE_DIR / "{sample}" / "manifest.tsv"),
+    params:
+        sample_name = lambda wc: RAW_SAMPLES_MAP[wc.sample]["sample_id"],
+        raw_sample = lambda wc: RAW_SAMPLES_MAP[wc.sample]["raw_sample"],
+        r1_args = lambda wc: repeated_cli_flag("--r1", RAW_SAMPLES_MAP[wc.sample]["r1"]),
+        r2_args = lambda wc: repeated_cli_flag("--r2", RAW_SAMPLES_MAP[wc.sample]["r2"]),
+        input_fastq_pairs = lambda wc: len(RAW_SAMPLES_MAP[wc.sample]["r1"]),
+        min_matched_read_pairs = DEMUX_MIN_MATCHED_READ_PAIRS,
+        dna_w_spacer_len = DNA_W_SPACER_LEN,
+        demux_mode = lambda wc: DEMUX_RUN_ROUTES[wc.sample].demux_mode,
+        pipeline_mode = PROTOCOL_POLICY.name,
+        route_id = lambda wc: DEMUX_RUN_ROUTES[wc.sample].route_id,
+        downstream_dna = lambda wc: DEMUX_RUN_ROUTES[wc.sample].downstream_dna,
+        dna_dir = lambda wc: str(DNA_OUT_DIR / wc.sample),
+        rna_dir = lambda wc: str(RNA_OUT_DIR / wc.sample),
+        resource_log = lambda wc: demux_resource_log(wc.sample)
+    threads: DEMUX_THREADS
+    resources:
+        mem_mb = lambda wildcards, attempt: demux_resource_mem_mb(
+            wildcards.sample, attempt
+        ),
+        runtime = lambda wildcards, attempt: demux_resource_runtime_min(
+            wildcards.sample, attempt
+        ),
+        attempt_no = lambda wildcards, attempt: int(attempt)
+    conda: ENVIRONMENT_YAML
+    log:
+        LOGS_DIR / "rules/demux/{sample}.log"
+    shell:
+        r"""
+        set -euo pipefail
+        source {JOB_RUNTIME:q}
+        export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+        mkdir -p \
+            "$(dirname {output.json_report:q})" \
+            "$(dirname {output.json_mqc:q})" \
+            "$(dirname {output.manifest:q})" \
+            "$(dirname {output.completion:q})" \
+            "$(dirname {params.dna_dir:q})" \
+            "$(dirname {params.rna_dir:q})" \
+            "$(dirname {log:q})"
+        dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+        printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+            {params.resource_log:q} {resources.attempt_no} {threads} \
+            {resources.mem_mb} {resources.runtime} >> {log:q}
+
+        demux_tool={input.binary:q}
+        [ -x "$demux_tool" ] || {{
+            printf 'ERROR: demux_rs is missing or not executable: %s\n' "$demux_tool" >&2
+            exit 127
+        }}
+        {{
+            echo "protocol={params.pipeline_mode}"
+            echo "demux_mode={params.demux_mode}"
+            echo "route_id={params.route_id}"
+            echo "downstream_dna={params.downstream_dna}"
+            echo "min_matched_read_pairs={params.min_matched_read_pairs}"
+            echo "input_fastq_pairs={params.input_fastq_pairs}"
+            echo "allocated_cpus={threads}"
+            echo "worker_threads=$(({threads} > 2 ? {threads} - 2 : 1))"
+            "$demux_tool" --build-info
+        }} >> {log:q} 2>&1
+
+        dna_final={params.dna_dir:q}
+        rna_final={params.rna_dir:q}
+        dna_tmp="${{dna_final}}.tmp.$$"
+        rna_tmp="${{rna_final}}.tmp.$$"
+        report_tmp={output.json_report:q}.tmp.$$
+        mqc_tmp={output.json_mqc:q}.tmp.$$
+        manifest_tmp={output.manifest:q}.tmp.$$
+        completion_final={output.completion:q}
+        completion_tmp={output.completion:q}.tmp.$$
+        backup_suffix=".backup"
+        publish_in_progress=0
+
+        restore_demux_path() {{
+            target="$1"
+            backup="${{target}}${{backup_suffix}}"
+            absent="${{backup}}.absent"
+            if [[ -e "$backup" || -L "$backup" ]]; then
+                rm -rf -- "$target"
+                mv "$backup" "$target"
+            elif [[ -e "$absent" ]]; then
+                rm -rf -- "$target"
+                rm -f -- "$absent"
+            fi
+        }}
+
+        rollback_demux_publish() {{
+            restore_demux_path "$dna_final"
+            restore_demux_path "$rna_final"
+            restore_demux_path {output.json_report:q}
+            restore_demux_path {output.json_mqc:q}
+            restore_demux_path {output.manifest:q}
+            restore_demux_path "$completion_final"
+        }}
+
+        discard_demux_backup() {{
+            target="$1"
+            rm -rf -- "${{target}}${{backup_suffix}}"
+            rm -f -- "${{target}}${{backup_suffix}}.absent"
+        }}
+
+        if [[ -e "${{completion_final}}${{backup_suffix}}" || \
+              -e "${{completion_final}}${{backup_suffix}}.absent" ]]; then
+            if [[ -e "$completion_final" ]]; then
+                discard_demux_backup "$dna_final"
+                discard_demux_backup "$rna_final"
+                discard_demux_backup {output.json_report:q}
+                discard_demux_backup {output.json_mqc:q}
+                discard_demux_backup {output.manifest:q}
+                discard_demux_backup "$completion_final"
+            else
+                rollback_demux_publish
+            fi
+        fi
+
+        cleanup_demux_tmp() {{
+            exit_status=$?
+            if (( publish_in_progress == 1 )); then
+                rollback_demux_publish || true
+            fi
+            rm -rf -- "$dna_tmp" "$rna_tmp"
+            rm -f -- "$report_tmp" "$mqc_tmp" "$manifest_tmp" "$completion_tmp"
+            return "$exit_status"
+        }}
+        trap cleanup_demux_tmp EXIT
+
+        rm -rf -- "$dna_tmp" "$rna_tmp"
+        mkdir -p "$dna_tmp" "$rna_tmp"
+
+        worker_threads=$(({threads} > 2 ? {threads} - 2 : 1))
+
+        run_demux() {{
+            "$demux_tool" \
+              {params.r1_args} \
+              {params.r2_args} \
+              --barcode-map {input.barcode_map:q} \
+              --dna-out-dir "$dna_tmp" \
+              --rna-out-dir "$rna_tmp" \
+              --json-report "$report_tmp" \
+              --sample-name {params.sample_name:q} \
+              --min-matched-read-pairs {params.min_matched_read_pairs} \
+              --dna-w-spacer-len {params.dna_w_spacer_len} \
+              --mode {params.demux_mode:q} \
+              --threads "$worker_threads" \
+              "$@"
+        }}
+        run_demux >> {log:q} 2>&1
+
+        python -m dna_pipeline write-demux-metadata \
+            "$report_tmp" "$mqc_tmp" "$manifest_tmp" "$dna_final" "$rna_final" \
+            {params.pipeline_mode:q} {params.route_id:q} {params.downstream_dna:q} \
+            {params.raw_sample:q} {input.cell_manifest:q} >> {log:q} 2>&1
+
+        backup_demux_path() {{
+            target="$1"
+            backup="${{target}}${{backup_suffix}}"
+            absent="${{backup}}.absent"
+            rm -rf -- "$backup"
+            rm -f -- "$absent"
+            if [[ -e "$target" || -L "$target" ]]; then
+                mv "$target" "$backup"
+            else
+                : > "$absent"
+            fi
+        }}
+
+        publish_in_progress=1
+        backup_demux_path "$completion_final"
+        backup_demux_path "$dna_final"
+        backup_demux_path "$rna_final"
+        backup_demux_path {output.json_report:q}
+        backup_demux_path {output.json_mqc:q}
+        backup_demux_path {output.manifest:q}
+
+        mv "$dna_tmp" "$dna_final"
+        mv "$rna_tmp" "$rna_final"
+        mv "$report_tmp" {output.json_report:q}
+        mv "$mqc_tmp" {output.json_mqc:q}
+        mv "$manifest_tmp" {output.manifest:q}
+
+        python -m dna_pipeline write-demux-completion \
+            "$completion_tmp" \
+            --run-id {wildcards.sample:q} \
+            --project-sample-id {params.sample_name:q} \
+            --manifest {output.manifest:q} \
+            --report {output.json_report:q} \
+            --mqc {output.json_mqc:q} \
+            --dna-dir "$dna_final" \
+            --rna-dir "$rna_final" \
+            --cell-manifest {input.cell_manifest:q} >> {log:q} 2>&1
+        mv "$completion_tmp" "$completion_final"
+
+
+        publish_in_progress=0
+        discard_demux_backup "$dna_final"
+        discard_demux_backup "$rna_final"
+        discard_demux_backup {output.json_report:q}
+        discard_demux_backup {output.json_mqc:q}
+        discard_demux_backup {output.manifest:q}
+        discard_demux_backup "$completion_final"
+        trap - EXIT
+        """
+
+
+if PROTOCOL_POLICY.requires_rna_barcode:
+    localrules: rna_collect_fastq
+
+    rule rna_collect_fastq:
+        """把已提交 run 的 RNA FASTQ 硬链接收集到 02_work/RNA/FASTQ 保留区；demux scratch 回收后数据仍存续。"""
+        input:
+            manifest = current_run_demux_manifest,
+        output:
+            marker = RNA_COLLECT_DIR / "{sample}.json"
+        log:
+            LOGS_DIR / "rules/demux/{sample}_rna_collect.log"
+        params:
+            intermediate_dir = str(INTERMEDIATE_DIR),
+        shell:
+            r"""
+            set -euo pipefail
+            export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+            mkdir -p "$(dirname {output.marker:q})" "$(dirname {log:q})"
+            python -m dna_pipeline collect-rna-fastq \
+                --manifest {input.manifest:q} \
+                --intermediate-dir {params.intermediate_dir:q} \
+                --marker {output.marker:q} \
+                --run-id {wildcards.sample} > {log:q} 2>&1
+            """
+if METHYLATION_BACKEND == "biscuit":
+    rule align_sort_dedup:
+        """在单个节点 scratch 作业内完成一个细胞的 Cutadapt trimming、BISCUIT 比对、Dupsifter 去重与坐标排序。"""
+        input:
+            r1 = lambda wc: current_demux_fastq(wc.demux_sample, 1),
+            r2 = lambda wc: current_demux_fastq(wc.demux_sample, 2),
+            ref = REFERENCE_GENOME,
+            ref_fai = str(REFERENCE_FAI),
+            ref_indexes = REFERENCE_BISCUIT_INDEXES,
+            ref_alt = REFERENCE_ALT_DEP
+        output:
+            report = CELL_PATH_PATTERN.cutadapt_json,
+            bam = temp(CELL_PATH_PATTERN.post_alignment_bam),
+            bai = temp(CELL_PATH_PATTERN.post_alignment_bam_index),
+            mqc = CELL_PATH_PATTERN.dupsifter_multiqc
+        log:
+            main = LOGS_DIR / "rules/biscuit/{demux_sample}_align.log",
+            cutadapt = LOGS_DIR / "rules/cutadapt/{demux_sample}.log",
+            biscuit = LOGS_DIR / "rules/biscuit/{demux_sample}_biscuit.log",
+            dupsifter = LOGS_DIR / "rules/biscuit/{demux_sample}_dupsifter.log",
+            sort = LOGS_DIR / "rules/biscuit/{demux_sample}_sort.log"
+        threads: ALIGN_THREADS
+        resources:
+            mem_mb = lambda wildcards, attempt: backend_stage_mem_mb(
+                "biscuit", "align", wildcards.demux_sample, attempt
+            ),
+            runtime = lambda wildcards, attempt: backend_preprocess_runtime_min(
+                "biscuit", wildcards.demux_sample, attempt
+            ),
+            disk_mb = lambda wildcards: static_scratch_mb(
+                "preprocess_alignment", wildcards.demux_sample
+            ),
+            attempt_no = lambda wildcards, attempt: int(attempt)
+        params:
+            rg_header = lambda wc: "@RG\\tID:{0}\\tSM:{0}\\tPL:ILLUMINA".format(
+                wc.demux_sample.replace(os.sep, "_")
+            ),
+            cutadapt = CUTADAPT,
+            cutadapt_threads = CUTADAPT_THREADS,
+            cutadapt_quality = CUTADAPT_QUALITY_CUTOFF,
+            cutadapt_min_length = CUTADAPT_MIN_LENGTH,
+            adapter_r1_spec = lambda wc: CUTADAPT_ADAPTER_R1_SPEC,
+            adapter_r2_spec = lambda wc: CUTADAPT_ADAPTER_R2_SPEC,
+            biscuit = BISCUIT,
+            dupsifter_metadata = lambda wc: dupsifter_metadata_json(wc.demux_sample),
+            samtools = SAMTOOLS,
+            local_tmp = NODE_TMPDIR,
+            scratch_namespace = SCRATCH_NAMESPACE,
+            biscuit_library_mode = BISCUIT_LIBRARY_MODE,
+            dupsifter_extra = "--remove-dups",
+            resource_log = lambda wc: static_resource_log("align_sort_dedup", wc.demux_sample)
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+            ulimit -s unlimited 2>/dev/null || true
+
+            mkdir -p \
+                "$(dirname {output.report:q})" \
+                "$(dirname {output.bam:q})" \
+                "$(dirname {log.main:q})" \
+                "$(dirname {log.cutadapt:q})"
+
+            dna_pipeline_init_attempt_logs {resources.attempt_no} \
+                {log.main:q} {log.cutadapt:q} {log.biscuit:q} \
+                {log.dupsifter:q} {log.sort:q}
+            printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s\n' \
+                {params.resource_log:q} {resources.attempt_no} {threads} \
+                {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log.main:q}
+            printf 'stage=cutadapt attempt=%s threads=%s merged_runtime_min=%s\n' \
+                {resources.attempt_no} {params.cutadapt_threads} {resources.runtime} >> {log.cutadapt:q}
+
+            exec 2>> {log.main:q}
+
+            dna_pipeline_allocate_scratch \
+                {params.local_tmp:q} {params.scratch_namespace:q} \
+                preprocess_alignment \
+                {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
+            dna_pipeline_install_scratch_cleanup
+            tmpdir="$DNA_PIPELINE_SCRATCH_DIR"
+
+            tmp_r1="$tmpdir/trim.1.fastq.gz"
+            tmp_r2="$tmpdir/trim.2.fastq.gz"
+            tmp_report="$tmpdir/cutadapt.json"
+            tmp_unsorted="$tmpdir/dedup.unsorted.bam"
+            tmp_bam="$tmpdir/output.bam"
+            tmp_stat="$tmpdir/dupsifter.stat"
+            tmp_mqc="$tmpdir/dupsifter_mqc.json"
+
+            echo "INFO: sample={wildcards.demux_sample}" >&2
+            dna_pipeline_log_scratch >&2
+
+            echo "INFO: stage=cutadapt status=START" >&2
+            dna_pipeline_run_cutadapt \
+                {params.cutadapt:q} {GZIP:q} {params.cutadapt_threads} \
+                {params.cutadapt_quality:q} {params.cutadapt_min_length} \
+                {params.adapter_r1_spec:q} {params.adapter_r2_spec:q} \
+                {input.r1:q} {input.r2:q} "$tmp_r1" "$tmp_r2" "$tmp_report" {log.cutadapt:q}
+            echo "INFO: stage=cutadapt status=OK" >&2
+
+            biscuit_threads=$(({threads} - 1))
+            (( biscuit_threads > 15 )) && biscuit_threads=15
+            (( biscuit_threads >= 1 )) || biscuit_threads=1
+            echo "INFO: stage=align_dedup status=START biscuit_threads=$biscuit_threads" >&2
+            set +e
+            {params.biscuit:q} align \
+                -@ "$biscuit_threads" \
+                -b {params.biscuit_library_mode} \
+                -R {params.rg_header:q} \
+                {input.ref:q} "$tmp_r1" "$tmp_r2" \
+                2>> {log.biscuit:q} | \
+            {DUPSIFTER_BINARY:q} {params.dupsifter_extra} \
+                -O "$tmp_stat" \
+                -o "$tmp_unsorted" \
+                {input.ref:q} \
+                2>> {log.dupsifter:q}
+            stage_status=("${{PIPESTATUS[@]}}")
+            set -e
+            biscuit_status=${{stage_status[0]:-99}}
+            dupsifter_status=${{stage_status[1]:-99}}
+            if (( biscuit_status != 0 || dupsifter_status != 0 )); then
+                echo "ERROR: stage=align_dedup biscuit_exit=$biscuit_status dupsifter_exit=$dupsifter_status" >&2
+                tail -n 80 {log.biscuit:q} >&2 || true
+                tail -n 80 {log.dupsifter:q} >&2 || true
+                exit 1
+            fi
+
+            [[ -s "$tmp_unsorted" ]] || {{ echo "ERROR: dupsifter produced an empty BAM" >&2; exit 1; }}
+            [[ -s "$tmp_stat" ]] || {{ echo "ERROR: dupsifter produced no statistics" >&2; exit 1; }}
+            {params.samtools:q} quickcheck -v "$tmp_unsorted" >> {log.main:q} 2>&1
+            rm -f -- "$tmp_r1" "$tmp_r2"
+
+            sort_extra_threads=$(({threads} - 1))
+            (( sort_extra_threads > 15 )) && sort_extra_threads=15
+            (( sort_extra_threads >= 1 )) || sort_extra_threads=1
+            echo "INFO: stage=samtools_sort status=START extra_threads=$sort_extra_threads mem_per_thread=768M" >&2
+            set +e
+            {params.samtools:q} sort \
+                -@ "$sort_extra_threads" \
+                -m 768M \
+                -T "$tmpdir/sort" \
+                -O BAM \
+                -o "$tmp_bam" \
+                "$tmp_unsorted" \
+                2>> {log.sort:q}
+            sort_status=$?
+            set -e
+            if (( sort_status != 0 )); then
+                (( sort_status != 137 )) || echo "ERROR: component=SAMTOOLS_SORT reason=SIGKILL_or_OOM" >&2
+                tail -n 100 {log.sort:q} >&2 || true
+                exit 1
+            fi
+            rm -f -- "$tmp_unsorted"
+            {params.samtools:q} quickcheck -v "$tmp_bam" >> {log.main:q} 2>&1
+            {params.samtools:q} index -@ "$sort_extra_threads" "$tmp_bam" >> {log.sort:q} 2>&1
+
+            python -m dna_pipeline write-dupsifter-qc \
+                "$tmp_stat" "$tmp_mqc" \
+                --sample {wildcards.demux_sample:q} \
+                --metadata {params.dupsifter_metadata:q} >> {log.main:q} 2>&1
+
+            echo "INFO: stage=publish status=START" >&2
+            python -m dna_pipeline atomic-publish \
+                --samtools {params.samtools:q} \
+                --bam-destination {output.bam:q} \
+                --commit-last {output.bam:q} \
+                --file "$tmp_report" {output.report:q} \
+                --file "$tmp_bam.bai" {output.bai:q} \
+                --file "$tmp_mqc" {output.mqc:q} \
+                --file "$tmp_bam" {output.bam:q} \
+                >> {log.main:q} 2>&1
+
+
+            echo "INFO: stage=publish status=OK" >&2
+            dna_pipeline_release_scratch
+            """
+    MERGE_BSCONV_FILTER = not PUBLISH_RNA_BAM
+
+    DNA_BAM_OUTPUT = temp(CELL_PATH_PATTERN.dna_bam) if not KEEP_FINAL_BAM else CELL_PATH_PATTERN.dna_bam
+    DNA_BAI_OUTPUT = temp(CELL_PATH_PATTERN.dna_bam_index) if not KEEP_FINAL_BAM else CELL_PATH_PATTERN.dna_bam_index
+    RNA_BAM_OUTPUT = CELL_PATH_PATTERN.rna_bam
+    RNA_BAI_OUTPUT = CELL_PATH_PATTERN.rna_bam_index
+
+
+    def get_pileup_bam(wildcards):
+        return PROJECT_LAYOUT.cell(wildcards.demux_sample).dna_bam
+
+
+    def get_pileup_bai(wildcards):
+        return PROJECT_LAYOUT.cell(wildcards.demux_sample).dna_bam_index
+
+
+    if MERGE_BSCONV_FILTER:
+        rule bsconv_filter_dna:
+            """在同一 scratch 作业内识别 high-CpH reads 并发布过滤后的 DNA BAM。"""
+            input:
+                demux_completion = current_demux_completion,
+                bam = CELL_PATH_PATTERN.post_alignment_bam,
+                bai = CELL_PATH_PATTERN.post_alignment_bam_index,
+                ref = REFERENCE_GENOME,
+                helper = str(BSCONV_MODULE_CODE),
+            output:
+                summary = CELL_PATH_PATTERN.high_cph_summary,
+                mqc = temp(CELL_PATH_PATTERN.high_cph_multiqc),
+                dna = DNA_BAM_OUTPUT,
+                dna_bai = DNA_BAI_OUTPUT
+            log:
+                classify = LOGS_DIR / "rules/biscuit/{demux_sample}_high_cph_reads.log",
+                filter = LOGS_DIR / "rules/biscuit/{demux_sample}_bsconv_dna.log"
+            threads: BSCONV_DNA_THREADS
+            resources:
+                mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                    "high_cph_read_names", wildcards.demux_sample, attempt
+                ),
+                runtime = lambda wildcards, attempt: combined_static_runtime_min(
+                    HIGH_CPH_FILTER_RULES, wildcards.demux_sample, attempt
+                ),
+                disk_mb = lambda wildcards: static_scratch_mb(
+                    "high_cph_filter", wildcards.demux_sample
+                ),
+                attempt_no = lambda wildcards, attempt: int(attempt)
+            params:
+                biscuit = BISCUIT,
+                samtools = SAMTOOLS,
+                threshold = BISCUIT_HIGH_CPH_RETENTION_THRESHOLD,
+                excluded_contigs_json = HIGH_CPH_EXCLUDED_CONTIGS_JSON,
+                sample_name = lambda wc: wc.demux_sample.replace(os.sep, "_"),
+                protocol = PROTOCOL_POLICY.name,
+                high_cph_role = PROTOCOL_POLICY.high_cph_role,
+                local_tmp = NODE_TMPDIR,
+                scratch_namespace = SCRATCH_NAMESPACE,
+                resource_log = lambda wc: static_resource_log(
+                    "high_cph_read_names", wc.demux_sample
+                )
+            conda: ENVIRONMENT_YAML
+            shell:
+                r"""
+                set -euo pipefail
+                source {JOB_RUNTIME:q}
+                mkdir -p "$(dirname {output.dna:q})" "$(dirname {log.classify:q})"
+                dna_pipeline_init_attempt_logs {resources.attempt_no} \
+                    {log.classify:q} {log.filter:q}
+                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s merged=bsconv_filter\n' \
+                    {params.resource_log:q} {resources.attempt_no} {threads} \
+                    {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log.classify:q}
+                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s merged=bsconv_filter\n' \
+                    {params.resource_log:q} {resources.attempt_no} {threads} \
+                    {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log.filter:q}
+
+                dna_pipeline_allocate_scratch \
+                    {params.local_tmp:q} {params.scratch_namespace:q} \
+                    high_cph_filter \
+                    {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
+                dna_pipeline_install_scratch_cleanup
+                tmpdir="$DNA_PIPELINE_SCRATCH_DIR"
+
+                tmp_names="$tmpdir/high_cph_reads.txt"
+                tmp_summary="$tmpdir/bsconv_filter_summary.json"
+                tmp_mqc="$tmpdir/bsconv_filter_mqc.json"
+                tmp_bam="$tmpdir/dna.bam"
+
+                dna_pipeline_log_scratch >> {log.filter:q} 2>&1
+
+                common_extract_args=(
+                    --bsconv-tsv -
+                    --threshold {params.threshold}
+                    --high-read-names "$tmp_names"
+                    --summary-json "$tmp_summary"
+                    --multiqc-json "$tmp_mqc"
+                    --sample-name {params.sample_name:q}
+                    --excluded-contigs-json {params.excluded_contigs_json:q}
+                    --alignment-bam {input.bam:q}
+                    --samtools {params.samtools:q}
+                    --protocol {params.protocol:q}
+                    --high-cph-role {params.high_cph_role:q}
+                )
+
+                dna_pipeline_run_bsconv_classification \
+                    {params.samtools:q} {params.biscuit:q} {input.ref:q} {input.bam:q} \
+                    {log.classify:q} "${{common_extract_args[@]}}"
+
+                if [ ! -s "$tmp_names" ]; then
+                    echo "INFO: no high-CpH reads detected; copying complete aligned BAM." >> {log.filter:q}
+                    if cp --reflink=auto {input.bam:q} "$tmp_bam" 2>/dev/null; then
+                        :
+                    elif cp -c {input.bam:q} "$tmp_bam" 2>/dev/null; then
+                        :
+                    else
+                        cp {input.bam:q} "$tmp_bam"
+                    fi
+                else
+                    sam_extra=$(({threads} > 1 ? {threads} - 1 : 0))
+                    {params.samtools:q} view -@ "$sam_extra" -b \
+                        -N "^$tmp_names" \
+                        -o "$tmp_bam" \
+                        {input.bam:q} \
+                        >> {log.filter:q} 2>&1
+                fi
+                {params.samtools:q} quickcheck -v "$tmp_bam" >> {log.filter:q} 2>&1
+                {params.samtools:q} index "$tmp_bam" >> {log.filter:q} 2>&1
+
+                python -m dna_pipeline atomic-publish \
+                    --samtools {params.samtools:q} \
+                    --bam-destination {output.dna:q} \
+                    --commit-last {output.dna:q} \
+                    --file "$tmp_summary" {output.summary:q} \
+                    --file "$tmp_mqc" {output.mqc:q} \
+                    --file "$tmp_bam.bai" {output.dna_bai:q} \
+                    --file "$tmp_bam" {output.dna:q} \
+                    >> {log.filter:q} 2>&1
+                dna_pipeline_release_scratch
+                """
+
+
+    if not MERGE_BSCONV_FILTER:
+        rule high_cph_read_names:
+            """识别 high-CpH reads，写出 read names、守恒摘要与 MultiQC 输入。"""
+            input:
+                demux_completion = current_demux_completion,
+                bam = CELL_PATH_PATTERN.post_alignment_bam,
+                bai = CELL_PATH_PATTERN.post_alignment_bam_index,
+                ref = REFERENCE_GENOME,
+                helper = str(BSCONV_MODULE_CODE),
+            output:
+                names = temp(CELL_PATH_PATTERN.high_cph_read_names),
+                summary = CELL_PATH_PATTERN.high_cph_summary,
+                mqc = temp(CELL_PATH_PATTERN.high_cph_multiqc)
+            log:
+                LOGS_DIR / "rules/biscuit/{demux_sample}_high_cph_reads.log"
+            threads: HIGH_CPH_READ_NAMES_THREADS
+            resources:
+                mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                    "high_cph_read_names", wildcards.demux_sample, attempt
+                ),
+                runtime = lambda wildcards, attempt: static_resource_runtime_min(
+                    "high_cph_read_names", wildcards.demux_sample, attempt
+                ),
+                attempt_no = lambda wildcards, attempt: int(attempt)
+            params:
+                biscuit = BISCUIT,
+                samtools = SAMTOOLS,
+                threshold = BISCUIT_HIGH_CPH_RETENTION_THRESHOLD,
+                excluded_contigs_json = HIGH_CPH_EXCLUDED_CONTIGS_JSON,
+                sample_name = lambda wc: wc.demux_sample.replace(os.sep, "_"),
+                protocol = PROTOCOL_POLICY.name,
+                high_cph_role = PROTOCOL_POLICY.high_cph_role,
+                resource_log = lambda wc: static_resource_log("high_cph_read_names", wc.demux_sample)
+            conda: ENVIRONMENT_YAML
+            shell:
+                r"""
+                set -euo pipefail
+                source {JOB_RUNTIME:q}
+                mkdir -p "$(dirname {output.names:q})" "$(dirname {log:q})"
+                dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+                    {params.resource_log:q} {resources.attempt_no} {threads} \
+                    {resources.mem_mb} {resources.runtime} >> {log:q}
+
+                tmp_names={output.names:q}.tmp.$$
+                tmp_summary={output.summary:q}.tmp.$$
+                tmp_mqc={output.mqc:q}.tmp.$$
+                cleanup_bsconv_filter_tmp() {{
+                    rm -f -- "$tmp_names" "$tmp_summary" "$tmp_mqc"
+                }}
+                trap cleanup_bsconv_filter_tmp EXIT
+
+                common_extract_args=(
+                    --bsconv-tsv -
+                    --threshold {params.threshold}
+                    --high-read-names "$tmp_names"
+                    --summary-json "$tmp_summary"
+                    --multiqc-json "$tmp_mqc"
+                    --sample-name {params.sample_name:q}
+                    --excluded-contigs-json {params.excluded_contigs_json:q}
+                    --alignment-bam {input.bam:q}
+                    --samtools {params.samtools:q}
+                    --protocol {params.protocol:q}
+                    --high-cph-role {params.high_cph_role:q}
+                )
+
+                dna_pipeline_run_bsconv_classification \
+                    {params.samtools:q} {params.biscuit:q} {input.ref:q} {input.bam:q} \
+                    {log:q} "${{common_extract_args[@]}}"
+
+
+                mv "$tmp_names" {output.names:q}
+                mv "$tmp_summary" {output.summary:q}
+                mv "$tmp_mqc" {output.mqc:q}
+                trap - EXIT
+                """
+
+
+    if not MERGE_BSCONV_FILTER:
+        rule bsconv_dna:
+            """按 high-CpH read names 过滤并原子发布 DNA BAM。"""
+            input:
+                demux_completion = current_demux_completion,
+                bam = CELL_PATH_PATTERN.post_alignment_bam,
+                bai = CELL_PATH_PATTERN.post_alignment_bam_index,
+                high_names = rules.high_cph_read_names.output.names
+            output:
+                dna = DNA_BAM_OUTPUT,
+                dna_bai = DNA_BAI_OUTPUT
+            log:
+                LOGS_DIR / "rules/biscuit/{demux_sample}_bsconv_dna.log"
+            threads: BSCONV_DNA_THREADS
+            resources:
+                mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                    "bsconv_dna", wildcards.demux_sample, attempt
+                ),
+                runtime = lambda wildcards, attempt: static_resource_runtime_min(
+                    "bsconv_dna", wildcards.demux_sample, attempt
+                ),
+                attempt_no = lambda wildcards, attempt: int(attempt)
+            params:
+                samtools = SAMTOOLS,
+                resource_log = lambda wc: static_resource_log("bsconv_dna", wc.demux_sample)
+            conda: ENVIRONMENT_YAML
+            shell:
+                r"""
+                set -euo pipefail
+                source {JOB_RUNTIME:q}
+                mkdir -p "$(dirname {output.dna:q})" "$(dirname {log:q})"
+                dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+                    {params.resource_log:q} {resources.attempt_no} {threads} \
+                    {resources.mem_mb} {resources.runtime} >> {log:q}
+
+                tmp_bam={output.dna:q}.tmp.$$
+                tmp_bai="$tmp_bam.bai"
+                cleanup_dna_bam_tmp() {{ rm -f -- "$tmp_bam" "$tmp_bai"; }}
+                trap cleanup_dna_bam_tmp EXIT
+
+                copy_bam_independent() {{
+                    src="$1"
+                    dst="$2"
+                    if cp --reflink=auto "$src" "$dst" 2>/dev/null; then
+                        echo "INFO: BAM reused with reflink/copy-on-write when supported." >> {log:q}
+                    elif cp -c "$src" "$dst" 2>/dev/null; then
+                        echo "INFO: BAM reused with APFS clonefile." >> {log:q}
+                    else
+                        cp "$src" "$dst"
+                        echo "INFO: BAM reused with regular copy." >> {log:q}
+                    fi
+                }}
+
+                if [ ! -s {input.high_names:q} ]; then
+                    echo "INFO: no high-CpH reads detected; retaining the complete aligned BAM." >> {log:q}
+                    copy_bam_independent {input.bam:q} "$tmp_bam"
+                    cp {input.bai:q} "$tmp_bai"
+                else
+                    sam_extra=$(({threads} > 1 ? {threads} - 1 : 0))
+                    high_names={input.high_names:q}
+                    {params.samtools:q} view -@ "$sam_extra" -b \
+                        -N "^$high_names" \
+                        -o "$tmp_bam" \
+                        {input.bam:q} \
+                        >> {log:q} 2>&1
+                    {params.samtools:q} index "$tmp_bam" >> {log:q} 2>&1
+                fi
+
+                {params.samtools:q} quickcheck -v "$tmp_bam" >> {log:q} 2>&1
+                mv "$tmp_bam" {output.dna:q}
+                mv "$tmp_bai" {output.dna_bai:q}
+                trap - EXIT
+                """
+
+
+    if PUBLISH_RNA_BAM:
+        rule bsconv_rna_bam:
+            """SRD 恒定发布被 high-CpH 筛出的 BAM，作为 RNA 部分原始数据保留在 02_work/RNA。"""
+            input:
+                demux_completion = current_demux_completion,
+                bam = CELL_PATH_PATTERN.post_alignment_bam,
+                high_names = rules.high_cph_read_names.output.names
+            output:
+                rna_bam = RNA_BAM_OUTPUT,
+                rna_bai = RNA_BAI_OUTPUT
+            log:
+                LOGS_DIR / "rules/biscuit/{demux_sample}_rna_bam.log"
+            threads: HIGH_CPH_BAM_THREADS
+            resources:
+                mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                    "high_cph_bam", wildcards.demux_sample, attempt
+                ),
+                runtime = lambda wildcards, attempt: static_resource_runtime_min(
+                    "high_cph_bam", wildcards.demux_sample, attempt
+                ),
+                attempt_no = lambda wildcards, attempt: int(attempt)
+            params:
+                samtools = SAMTOOLS,
+                resource_log = lambda wc: static_resource_log("high_cph_bam", wc.demux_sample)
+            conda: ENVIRONMENT_YAML
+            shell:
+                r"""
+                set -euo pipefail
+                source {JOB_RUNTIME:q}
+                mkdir -p "$(dirname {output.rna_bam:q})" "$(dirname {log:q})"
+                dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+                    {params.resource_log:q} {resources.attempt_no} {threads} \
+                    {resources.mem_mb} {resources.runtime} >> {log:q}
+                tmp_bam={output.rna_bam:q}.tmp.$$
+                cleanup_rna_bam_tmp() {{ rm -f -- "$tmp_bam" "$tmp_bam.bai"; }}
+                trap cleanup_rna_bam_tmp EXIT
+
+                sam_extra=$(({threads} > 1 ? {threads} - 1 : 0))
+                high_names={input.high_names:q}
+                if [ -s "$high_names" ]; then
+                    {params.samtools:q} view -@ "$sam_extra" -b \
+                        -N "$high_names" \
+                        -o "$tmp_bam" {input.bam:q} \
+                        >> {log:q} 2>&1
+                else
+                    {params.samtools:q} view -H {input.bam:q} | \
+                        {params.samtools:q} view -@ "$sam_extra" -b -o "$tmp_bam" - \
+                        >> {log:q} 2>&1
+                fi
+                {params.samtools:q} quickcheck -v "$tmp_bam" >> {log:q} 2>&1
+                {params.samtools:q} index "$tmp_bam" >> {log:q} 2>&1
+                python -m dna_pipeline atomic-publish \
+                    --samtools {params.samtools:q} \
+                    --bam-destination {output.rna_bam:q} \
+                    --commit-last {output.rna_bam:q} \
+                    --file "$tmp_bam.bai" {output.rna_bai:q} \
+                    --file "$tmp_bam" {output.rna_bam:q} \
+                    >> {log:q} 2>&1
+                cleanup_rna_bam_tmp
+                trap - EXIT
+                """
+    rule pileup:
+        """对单个细胞的过滤后 BAM 执行 BISCUIT pileup，产出 bgzip VCF 与变体统计；零比对 cell 发布合法空 VCF。"""
+        input:
+            demux_completion = current_demux_completion,
+            bam = get_pileup_bam,
+            bai = get_pileup_bai,
+            ref = REFERENCE_GENOME
+        output:
+            vcf = INTERMEDIATE_DIR / "biscuit" / "{demux_sample}.pileup.vcf.gz",
+            stats = INTERMEDIATE_DIR / "biscuit" / "{demux_sample}.pileup_stats.json"
+        log:
+            LOGS_DIR / "rules/biscuit/{demux_sample}_pileup.log"
+        threads: PILEUP_THREADS
+        resources:
+            mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                "pileup", wildcards.demux_sample, attempt
+            ),
+            runtime = lambda wildcards, attempt: static_resource_runtime_min(
+                "pileup", wildcards.demux_sample, attempt
+            ),
+            attempt_no = lambda wildcards, attempt: int(attempt)
+        params:
+            biscuit = BISCUIT,
+            samtools = SAMTOOLS,
+            bgzip = BGZIP,
+            bgzip_threads = 1,
+            sample_name = lambda wc: wc.demux_sample.replace(os.sep, "_"),
+            resource_log = lambda wc: static_resource_log("pileup", wc.demux_sample)
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            ulimit -n 65535 2>/dev/null || true
+            ulimit -s unlimited 2>/dev/null || ulimit -s 65536 2>/dev/null || true
+            mkdir -p "$(dirname {output.vcf:q})" "$(dirname {log:q})"
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+            printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+                {params.resource_log:q} {resources.attempt_no} {threads} \
+                {resources.mem_mb} {resources.runtime} >> {log:q}
+
+            tmp_vcf={output.vcf:q}.tmp.$$.vcf.gz
+            tmp_stats={output.stats:q}.tmp.$$
+            tmp_count="${{tmp_stats}}.count"
+            cleanup_pileup_tmp() {{ rm -f -- "$tmp_vcf" "$tmp_stats" "$tmp_count"; }}
+            trap cleanup_pileup_tmp EXIT
+
+            mapped_reads=$({params.samtools:q} idxstats {input.bam:q} | awk '{{n += $3}} END {{print n + 0}}')
+            echo "INFO: mapped_reads=$mapped_reads" >> {log:q}
+            variant_rows=0
+            if [ "$mapped_reads" -eq 0 ]; then
+                echo "WARNING: BAM has zero mapped reads; publishing a valid empty VCF." >> {log:q}
+                printf '##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n' | \
+                    {params.bgzip:q} -@ {params.bgzip_threads} -c > "$tmp_vcf"
+            else
+                echo "INFO: stage=biscuit_pileup threads={threads}" >> {log:q}
+                {params.biscuit:q} pileup -@ {threads} -m 40 -a 40 -l 20 {input.ref:q} {input.bam:q} 2>> {log:q} | \
+                    awk -v count_file="$tmp_count" 'BEGIN{{n=0}} /^#/ {{print; next}} {{n++; print}} END{{print n > count_file}}' | \
+                    {params.bgzip:q} -@ {params.bgzip_threads} -c > "$tmp_vcf"
+                variant_rows="$(cat "$tmp_count")"
+            fi
+            dna_pipeline_write_pileup_stats "$tmp_stats" {params.sample_name:q} "$mapped_reads" "$variant_rows"
+            echo "INFO: variant_records=$variant_rows" >> {log:q}
+
+            {params.bgzip:q} -t "$tmp_vcf" >> {log:q} 2>&1
+            mv "$tmp_vcf" {output.vcf:q}
+            mv "$tmp_stats" {output.stats:q}
+            rm -f -- "$tmp_count"
+
+            trap - EXIT
+            """
+    rule generate_cpg_input:
+        """将 BISCUIT pileup VCF 的 CpG calls 直接转换为 SnapATAC2 import_values 四列格式；零变体 cell 发布合法空表。"""
+        input:
+            demux_completion = current_demux_completion,
+            vcf = rules.pileup.output.vcf,
+            stats = rules.pileup.output.stats
+        output:
+            cpg = CELL_PATH_PATTERN.cpg
+        log:
+            LOGS_DIR / "rules/biscuit/{demux_sample}_cpg.log"
+        threads: CPG_THREADS
+        resources:
+            mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                "generate_cpg_input", wildcards.demux_sample, attempt
+            ),
+            runtime = lambda wildcards, attempt: static_resource_runtime_min(
+                "generate_cpg_input", wildcards.demux_sample, attempt
+            ),
+            attempt_no = lambda wildcards, attempt: int(attempt)
+        params:
+            biscuit = BISCUIT,
+            zstd = ZSTD,
+            resource_log = lambda wc: static_resource_log("generate_cpg_input", wc.demux_sample)
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            ulimit -n 65535 2>/dev/null || true
+            ulimit -s unlimited 2>/dev/null || ulimit -s 65536 2>/dev/null || true
+            mkdir -p "$(dirname {output.cpg:q})" "$(dirname {log:q})"
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+            printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+                {params.resource_log:q} {resources.attempt_no} {threads} \
+                {resources.mem_mb} {resources.runtime} >> {log:q}
+
+            tmp_cpg={output.cpg:q}.tmp.$$.zst
+            cleanup_cpg_tmp() {{ rm -f -- "$tmp_cpg"; }}
+            trap cleanup_cpg_tmp EXIT
+            variant_rows=$(dna_pipeline_pileup_stat {input.stats:q} variant_records)
+            if [ "$variant_rows" -eq 0 ]; then
+                dna_pipeline_emit_canonical_cpg {params.zstd:q} 0 "$tmp_cpg" < /dev/null
+                echo "WARNING: pileup VCF has no records; publishing a header-only SnapATAC2 CpG table." >> {log:q}
+            else
+                {params.biscuit:q} vcf2bed -t cg -k 1 -c {input.vcf:q} 2>> {log:q} | \
+                    dna_pipeline_emit_canonical_cpg {params.zstd:q} 0 "$tmp_cpg"
+            fi
+            {params.zstd:q} -q -t "$tmp_cpg" >> {log:q} 2>&1
+            python -m dna_pipeline atomic-publish \
+                --commit-last {output.cpg:q} \
+                --file "$tmp_cpg" {output.cpg:q} \
+                >> {log:q} 2>&1
+
+            rm -f -- "$tmp_cpg"
+            trap - EXIT
+            """
+
+
+    if GENERATE_SNP:
+        rule generate_snp_input:
+            """把 BISCUIT pileup VCF 转换为可选公开 SNP BED 并建立 tabix 索引。"""
+            input:
+                demux_completion = current_demux_completion,
+                vcf = rules.pileup.output.vcf,
+                stats = rules.pileup.output.stats
+            output:
+                snp = CELL_PATH_PATTERN.snp,
+                tbi = CELL_PATH_PATTERN.snp_index
+            log:
+                LOGS_DIR / "rules/biscuit/{demux_sample}_snp.log"
+            threads: SNP_THREADS
+            resources:
+                mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                    "generate_snp_input", wildcards.demux_sample, attempt
+                ),
+                runtime = lambda wildcards, attempt: static_resource_runtime_min(
+                    "generate_snp_input", wildcards.demux_sample, attempt
+                ),
+                attempt_no = lambda wildcards, attempt: int(attempt)
+            params:
+                biscuit = BISCUIT,
+                bgzip = BGZIP,
+                tabix = TABIX,
+                bgzip_threads = 1,
+                resource_log = lambda wc: static_resource_log("generate_snp_input", wc.demux_sample)
+            conda: ENVIRONMENT_YAML
+            shell:
+                r"""
+                set -euo pipefail
+                source {JOB_RUNTIME:q}
+                mkdir -p "$(dirname {output.snp:q})" "$(dirname {log:q})"
+                dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+                    {params.resource_log:q} {resources.attempt_no} {threads} \
+                    {resources.mem_mb} {resources.runtime} >> {log:q}
+                tmp_snp={output.snp:q}.tmp.$$.bed.gz
+                tmp_tbi="$tmp_snp.tbi"
+                cleanup_snp_tmp() {{ rm -f -- "$tmp_snp" "$tmp_tbi"; }}
+                trap cleanup_snp_tmp EXIT
+
+                variant_rows=$(dna_pipeline_pileup_stat {input.stats:q} variant_records)
+                if [ "$variant_rows" -eq 0 ]; then
+                    echo "WARNING: pileup VCF has no records; publishing an empty SNP BED." >> {log:q}
+                    : | {params.bgzip:q} -@ {params.bgzip_threads} -c > "$tmp_snp"
+                else
+                    {params.biscuit:q} vcf2bed -t snp {input.vcf:q} 2>> {log:q} | \
+                        {params.bgzip:q} -@ {params.bgzip_threads} -c > "$tmp_snp"
+                fi
+                {params.bgzip:q} -t "$tmp_snp" >> {log:q} 2>&1
+                {params.tabix:q} -f -p bed "$tmp_snp" >> {log:q} 2>&1
+                mv "$tmp_snp" {output.snp:q}
+                mv "$tmp_tbi" {output.tbi:q}
+
+                trap - EXIT
+                """
+    rule biscuit_qc:
+        """对单个细胞的 post-dedup BAM 运行 biscuit qc，并基于 pileup VCF 补齐碱基平均 conversion 表；零比对 cell 发布合法空报告。"""
+        input:
+            demux_completion = current_demux_completion,
+            dna_bam = CELL_PATH_PATTERN.post_alignment_bam,
+            dna_bai = CELL_PATH_PATTERN.post_alignment_bam_index,
+            vcf = rules.pileup.output.vcf,
+            stats = rules.pileup.output.stats,
+            ref = REFERENCE_GENOME
+        output:
+            strand = update(CELL_PATH_PATTERN.biscuit_qc_source("strand_table.txt")),
+            read_conversion = update(CELL_PATH_PATTERN.biscuit_qc_source("totalReadConversionRate.txt")),
+            cpg_retention = update(CELL_PATH_PATTERN.biscuit_qc_source("CpGRetentionByReadPos.txt")),
+            mapq = update(CELL_PATH_PATTERN.biscuit_qc_source("mapq_table.txt")),
+            base_conversion = update(CELL_PATH_PATTERN.biscuit_qc_source("totalBaseConversionRate.txt")),
+            cph_retention = update(CELL_PATH_PATTERN.biscuit_qc_source("CpHRetentionByReadPos.txt")),
+            isize = update(CELL_PATH_PATTERN.biscuit_qc_source("isize_table.txt")),
+            dup_report = update(CELL_PATH_PATTERN.biscuit_qc_source("dup_report.txt"))
+        log:
+            LOGS_DIR / "rules/biscuit_qc/{demux_sample}.log"
+        threads: BISCUIT_QC_THREADS
+        resources:
+            mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                "biscuit_qc", wildcards.demux_sample, attempt
+            ),
+            runtime = lambda wildcards, attempt: static_resource_runtime_min(
+                "biscuit_qc", wildcards.demux_sample, attempt
+            ),
+            attempt_no = lambda wildcards, attempt: int(attempt)
+        conda: ENVIRONMENT_YAML
+        params:
+            sample_name = lambda wc: wc.demux_sample.replace(os.sep, "_"),
+            biscuit = BISCUIT,
+            samtools = SAMTOOLS,
+            abs_qc_dir = lambda wc: os.path.abspath(
+                str(PROJECT_LAYOUT.cell(wc.demux_sample).biscuit_qc_dir)
+            ),
+            abs_ref = lambda wc, input: os.path.abspath(str(input.ref)),
+            abs_bam = lambda wc, input: os.path.abspath(str(input.dna_bam)),
+            abs_vcf = lambda wc, input: os.path.abspath(str(input.vcf)),
+            resource_log = lambda wc: static_resource_log("biscuit_qc", wc.demux_sample)
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            ulimit -n 65535 2>/dev/null || true
+            ulimit -s unlimited 2>/dev/null || ulimit -s 65536 2>/dev/null || true
+            mkdir -p "$(dirname {params.abs_qc_dir:q})" "$(dirname {log:q})"
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+            printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+                {params.resource_log:q} {resources.attempt_no} {threads} \
+                {resources.mem_mb} {resources.runtime} >> {log:q}
+            [ -f {input.dna_bai:q} ] || (printf 'BAM index not found: %s\n' {input.dna_bai:q} >&2; exit 1)
+
+            qc_tmp={params.abs_qc_dir:q}.new
+            qc_backup={params.abs_qc_dir:q}.backup
+            qc_absent="${{qc_backup}}.absent"
+            publish_in_progress=0
+
+            restore_qc_generation() {{
+                if [ -d "$qc_backup" ]; then
+                    rm -rf -- {params.abs_qc_dir:q}
+                    mv "$qc_backup" {params.abs_qc_dir:q}
+                    rm -f -- "$qc_absent"
+                elif [ -f "$qc_absent" ]; then
+                    rm -rf -- {params.abs_qc_dir:q}
+                    rm -f -- "$qc_absent"
+                fi
+            }}
+
+            if [ -d "$qc_backup" ] || [ -f "$qc_absent" ]; then
+                restore_qc_generation
+            fi
+            rm -rf -- "$qc_tmp"
+            mkdir -m 700 "$qc_tmp"
+            cleanup_qc_tmp() {{
+                exit_status=$?
+                rm -rf -- "$qc_tmp"
+                if (( publish_in_progress == 1 )); then
+                    restore_qc_generation || true
+                fi
+                return "$exit_status"
+            }}
+            trap cleanup_qc_tmp EXIT
+            sample_name={params.sample_name:q}
+
+            read -r mapped_reads unmapped_reads <<EOF_STATS
+    $({params.samtools:q} idxstats {params.abs_bam:q} | awk '{{m += $3; u += $4}} END {{print m + 0, u + 0}}')
+EOF_STATS
+            total_reads=$((mapped_reads + unmapped_reads))
+            {{
+                echo "BISCUIT native QC"
+                echo "sample=$sample_name"
+                echo "total_reads=$total_reads"
+                echo "mapped_reads=$mapped_reads"
+                {params.biscuit:q} version || true
+            }} >> {log:q} 2>&1
+
+            if [ "$mapped_reads" -gt 0 ]; then
+                {params.biscuit:q} qc \
+                    {params.abs_ref:q} \
+                    {params.abs_bam:q} \
+                    "$qc_tmp/$sample_name" \
+                    >> {log:q} 2>&1
+            else
+                echo "WARNING: BAM contains zero mapped reads; skipping biscuit qc." >> {log:q}
+                cat > "$qc_tmp/${{sample_name}}_strand_table.txt" <<'EOF_STRAND'
+BISCUITqc Strand Table
+Strand Distribution:
+strand\BS      BSW (f)      BSC (r)
+     R1 (f):   0            0
+     R1 (r):   0            0
+EOF_STRAND
+                cat > "$qc_tmp/${{sample_name}}_totalReadConversionRate.txt" <<'EOF_READ_CONV'
+BISCUITqc Conversion Rate by Read Average Table
+CpA	CpC	CpG	CpT
+-1	-1	-1	-1
+EOF_READ_CONV
+                cat > "$qc_tmp/${{sample_name}}_CpGRetentionByReadPos.txt" <<'EOF_CPG'
+BISCUITqc CpG Retention by Read Position Table
+ReadInPair	Position	Conversion/Retention	Count
+EOF_CPG
+                cat > "$qc_tmp/${{sample_name}}_CpHRetentionByReadPos.txt" <<'EOF_CPH'
+BISCUITqc CpH Retention by Read Position Table
+ReadInPair	Position	Conversion/Retention	Count
+EOF_CPH
+                cat > "$qc_tmp/${{sample_name}}_mapq_table.txt" <<EOF_MAPQ
+BISCUITqc Mapping Quality Table
+MapQ	Count
+unmapped	$unmapped_reads
+EOF_MAPQ
+                cat > "$qc_tmp/${{sample_name}}_isize_table.txt" <<'EOF_ISIZE'
+BISCUITqc Insert Size Table
+InsertSize	Fraction	ReadCount
+EOF_ISIZE
+                cat > "$qc_tmp/${{sample_name}}_dup_report.txt" <<EOF_DUP
+BISCUITqc Read Duplication Table
+Number of duplicate reads:	0
+Number of reads:	$total_reads
+Number of duplicate q40-reads:	0
+Number of q40-reads:	0
+EOF_DUP
+            fi
+
+            base_conv="$qc_tmp/${{sample_name}}_totalBaseConversionRate.txt"
+            echo "BISCUITqc Conversion Rate by Base Average Table" > "$base_conv"
+            variant_rows=$(dna_pipeline_pileup_stat {input.stats:q} variant_records)
+            if [ "$variant_rows" -eq 0 ]; then
+                printf 'CA\tCC\tCG\tCT\n-1\t-1\t-1\t-1\n' >> "$base_conv"
+            else
+                {params.biscuit:q} vcf2bed -e -t c {params.abs_vcf:q} 2>> {log:q} | \
+                awk '{{ beta_sum[$6] += $8; beta_cnt[$6] += 1 }} END {{
+                    print "CA\tCC\tCG\tCT"
+                    ca = (beta_cnt["CA"] < 20) ? -1 : beta_sum["CA"] / beta_cnt["CA"]
+                    cc = (beta_cnt["CC"] < 20) ? -1 : beta_sum["CC"] / beta_cnt["CC"]
+                    cg = (beta_cnt["CG"] < 20) ? -1 : beta_sum["CG"] / beta_cnt["CG"]
+                    ct = (beta_cnt["CT"] < 20) ? -1 : beta_sum["CT"] / beta_cnt["CT"]
+                    print ca "\t" cc "\t" cg "\t" ct
+                }}' >> "$base_conv"
+            fi
+
+            for suffix in \
+                strand_table.txt \
+                totalReadConversionRate.txt \
+                CpGRetentionByReadPos.txt \
+                mapq_table.txt \
+                totalBaseConversionRate.txt \
+                CpHRetentionByReadPos.txt \
+                isize_table.txt \
+                dup_report.txt; do
+                test -s "$qc_tmp/${{sample_name}}_${{suffix}}" || {{
+                    echo "ERROR: BISCUIT QC did not produce ${{sample_name}}_${{suffix}}" >> {log:q}
+                    exit 1
+                }}
+            done
+
+            if [ -d {params.abs_qc_dir:q} ]; then
+                mv {params.abs_qc_dir:q} "$qc_backup"
+            else
+                : > "$qc_absent"
+            fi
+            publish_in_progress=1
+            if ! mv "$qc_tmp" {params.abs_qc_dir:q}; then
+                restore_qc_generation
+                publish_in_progress=0
+                exit 1
+            fi
+            publish_in_progress=0
+            rm -rf -- "$qc_backup"
+            rm -f -- "$qc_absent"
+            trap - EXIT
+            """
+elif METHYLATION_BACKEND == "rastair":
+    rule taps_align_mark:
+        """复用 Cabernet trimming，以 BWA 比对并标记重复，保留全部原始测得的比对记录。"""
+        input:
+            r1 = lambda wc: current_demux_fastq(wc.demux_sample, 1),
+            r2 = lambda wc: current_demux_fastq(wc.demux_sample, 2),
+            reference = REFERENCE_BACKEND_DEPENDENCIES,
+            helper = str(BSCONV_MODULE_CODE),
+        output:
+            report = CELL_PATH_PATTERN.cutadapt_json,
+            bam = CELL_PATH_PATTERN.marked_bam if KEEP_FINAL_BAM else temp(CELL_PATH_PATTERN.marked_bam),
+            bai = CELL_PATH_PATTERN.marked_bam_index if KEEP_FINAL_BAM else temp(CELL_PATH_PATTERN.marked_bam_index),
+            qc = INTERMEDIATE_DIR / "rastair/{demux_sample}.alignment_qc.json",
+        log:
+            main = LOGS_DIR / "rules/rastair/{demux_sample}_align.log",
+            cutadapt = LOGS_DIR / "rules/cutadapt/{demux_sample}.log",
+        threads: lambda wc: backend_stage_threads("rastair", "align", wc)
+        resources:
+            mem_mb = lambda wc, attempt: backend_stage_mem_mb("rastair", "align", wc.demux_sample, attempt),
+            runtime = lambda wc, attempt: backend_preprocess_runtime_min("rastair", wc.demux_sample, attempt),
+            disk_mb = lambda wc: static_scratch_mb("preprocess_alignment", wc.demux_sample),
+            attempt_no = lambda wc, attempt: int(attempt),
+        params:
+            bwa_prefix = f"{REFERENCE_GENOME}.bwa/genome",
+            rg = lambda wc: "@RG\\tID:{0}\\tSM:{0}\\tPL:ILLUMINA".format(wc.demux_sample),
+            trim_threads = CUTADAPT_THREADS,
+            quality = CUTADAPT_QUALITY_CUTOFF,
+            min_length = CUTADAPT_MIN_LENGTH,
+            adapter1 = lambda wc: CUTADAPT_ADAPTER_R1_SPEC,
+            adapter2 = lambda wc: CUTADAPT_ADAPTER_R2_SPEC,
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+            mkdir -p "$(dirname {output.bam:q})" "$(dirname {output.report:q})" "$(dirname {log.main:q})" "$(dirname {log.cutadapt:q})"
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log.main:q} {log.cutadapt:q}
+            exec >> {log.main:q} 2>&1
+            printf 'stage=taps_align_mark attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s\n' \
+                {resources.attempt_no} {threads} {resources.mem_mb} {resources.runtime} {resources.disk_mb}
+            dna_pipeline_allocate_scratch {NODE_TMPDIR:q} {SCRATCH_NAMESPACE:q} preprocess_alignment \
+                {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
+            dna_pipeline_install_scratch_cleanup
+            tmpdir="$DNA_PIPELINE_SCRATCH_DIR"
+            dna_pipeline_log_scratch
+            dna_pipeline_run_cutadapt {CUTADAPT:q} {GZIP:q} {params.trim_threads} \
+                {params.quality:q} {params.min_length} {params.adapter1:q} {params.adapter2:q} \
+                {input.r1:q} {input.r2:q} "$tmpdir/R1.fastq.gz" "$tmpdir/R2.fastq.gz" "$tmpdir/cutadapt.json" {log.cutadapt:q}
+            bwa_threads=$(({threads} > 1 ? {threads} - 1 : 1))
+            io_threads=$(({threads} - 1))
+            sort_mem=$(({resources.mem_mb} / ({threads} + 1)))
+            {BWA:q} mem -Y -t "$bwa_threads" -R {params.rg:q} {params.bwa_prefix:q} "$tmpdir/R1.fastq.gz" "$tmpdir/R2.fastq.gz" | \
+                {SAMTOOLS:q} view -u -o "$tmpdir/aligned.bam" -
+            rm -f -- "$tmpdir/R1.fastq.gz" "$tmpdir/R2.fastq.gz"
+            {SAMTOOLS:q} collate -@ "$io_threads" -o "$tmpdir/names.bam" -T "$tmpdir/collate" "$tmpdir/aligned.bam"
+            rm -f -- "$tmpdir/aligned.bam"
+            {SAMTOOLS:q} fixmate -m -@ "$io_threads" "$tmpdir/names.bam" "$tmpdir/fixmate.bam"
+            rm -f -- "$tmpdir/names.bam"
+            {SAMTOOLS:q} sort -@ "$io_threads" -m "${{sort_mem}}M" -T "$tmpdir/sort" -o "$tmpdir/sorted.bam" "$tmpdir/fixmate.bam"
+            rm -f -- "$tmpdir/fixmate.bam"
+            {SAMTOOLS:q} markdup -S -s -@ "$io_threads" -T "$tmpdir/markdup" "$tmpdir/sorted.bam" "$tmpdir/marked.bam"
+            rm -f -- "$tmpdir/sorted.bam"
+            {SAMTOOLS:q} index -@ "$io_threads" "$tmpdir/marked.bam"
+            {RASTAIR_PYTHON:q} -m dna_pipeline taps-alignment-qc --bam "$tmpdir/marked.bam" \
+                --samtools {SAMTOOLS:q} --scratch "$tmpdir" --sample {wildcards.demux_sample:q} --output "$tmpdir/qc.json"
+            python -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
+                --bam-destination {output.bam:q} --samtools {SAMTOOLS:q} \
+                --file "$tmpdir/cutadapt.json" {output.report:q} \
+                --file "$tmpdir/marked.bam" {output.bam:q} --file "$tmpdir/marked.bam.bai" {output.bai:q} \
+                --file "$tmpdir/qc.json" {output.qc:q}
+            """
+
+    rule taps_call_cpg:
+        """调用 TAPS 的 5mC＋5hmC，按参考基因型导出 canonical 整数 CpG 及对照 QC。"""
+        input:
+            bam = CELL_PATH_PATTERN.marked_bam,
+            bai = CELL_PATH_PATTERN.marked_bam_index,
+            qc = rules.taps_align_mark.output.qc,
+            reference = REFERENCE_GENOME,
+            helper = str(BSCONV_MODULE_CODE),
+            fai = str(REFERENCE_FAI),
+        output:
+            cpg = CELL_PATH_PATTERN.cpg,
+            qc = CELL_PATH_PATTERN.rastair_qc,
+        log:
+            LOGS_DIR / "rules/rastair/{demux_sample}_call.log"
+        threads: 1
+        resources:
+            mem_mb = lambda wc, attempt: static_resource_mem_mb("pileup", wc.demux_sample, attempt),
+            runtime = lambda wc, attempt: static_resource_runtime_min("pileup", wc.demux_sample, attempt),
+            disk_mb = lambda wc: static_scratch_mb("preprocess_alignment", wc.demux_sample),
+            attempt_no = lambda wc, attempt: int(attempt),
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+            mkdir -p "$(dirname {output.cpg:q})" "$(dirname {log:q})"
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+            exec >> {log:q} 2>&1
+            printf 'stage=taps_call_cpg attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+                {resources.attempt_no} {threads} {resources.mem_mb} {resources.runtime}
+            dna_pipeline_allocate_scratch {NODE_TMPDIR:q} {SCRATCH_NAMESPACE:q} preprocess_alignment \
+                {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
+            dna_pipeline_install_scratch_cleanup
+            tmpdir="$DNA_PIPELINE_SCRATCH_DIR"
+            {RASTAIR:q} call -@ {threads} -r {input.reference:q} --guess-read-orientation \
+                -q {TAPS_MIN_MAPQ} -Q {TAPS_MIN_BASEQ} -f {TAPS_INCLUDE_FLAGS} -F {TAPS_EXCLUDE_FLAGS} \
+                --cpgs-only --all --m-min-depth 1 --nOT 0,0,0,0 --nOB 0,0,0,0 \
+                --bed "$tmpdir/native.bed" {input.bam:q}
+            {RASTAIR_PYTHON:q} -m dna_pipeline rastair-cpg --bed "$tmpdir/native.bed" --reference {input.reference:q} \
+                --alignment-qc {input.qc:q} --output-qc "$tmpdir/qc.json" | \
+                dna_pipeline_emit_canonical_cpg {ZSTD:q} 0 "$tmpdir/cpg.tsv.zst"
+            {ZSTD:q} -q -t "$tmpdir/cpg.tsv.zst"
+            python -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
+                --file "$tmpdir/cpg.tsv.zst" {output.cpg:q} --file "$tmpdir/qc.json" {output.qc:q}
+            """
+
+else:
+    rule bismark_align_dedup:
+        """在单个 scratch 作业内完成 Cutadapt、Bismark 比对与 paired-end 去重。"""
+        group: "bismark_cell" if PROTOCOL_POLICY.name == "cabernet" else None
+        input:
+            r1 = lambda wc: current_demux_fastq(wc.demux_sample, 1),
+            r2 = lambda wc: current_demux_fastq(wc.demux_sample, 2),
+            ref = REFERENCE_GENOME,
+            ref_fai = str(REFERENCE_FAI),
+            bismark_genome = str(REFERENCE_BISMARK_GENOME),
+            bismark_indexes = [str(path) for path in REFERENCE_BISMARK_INDEX_PATHS]
+        output:
+            report = CELL_PATH_PATTERN.cutadapt_json,
+            bam = temp(CELL_PATH_PATTERN.post_alignment_bam),
+            align_report = CELL_PATH_PATTERN.bismark_align_report,
+            dedup_report = CELL_PATH_PATTERN.bismark_dedup_report
+        log:
+            LOGS_DIR / "rules/bismark/{demux_sample}_align.log"
+        threads: BISMARK_ALIGN_THREADS
+        resources:
+            mem_mb = lambda wildcards, attempt: backend_stage_mem_mb("bismark", "align", wildcards.demux_sample, attempt),
+            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name == "cabernet" else backend_preprocess_runtime_min("bismark", wildcards.demux_sample, attempt),
+            disk_mb = lambda wildcards: static_scratch_mb("preprocess_alignment", wildcards.demux_sample),
+            attempt_no = lambda wildcards, attempt: int(attempt)
+        params:
+            cutadapt = CUTADAPT,
+            cutadapt_threads = CUTADAPT_THREADS,
+            cutadapt_quality = CUTADAPT_QUALITY_CUTOFF,
+            cutadapt_min_length = CUTADAPT_MIN_LENGTH,
+            adapter_r1_spec = lambda wc: CUTADAPT_ADAPTER_R1_SPEC,
+            adapter_r2_spec = lambda wc: CUTADAPT_ADAPTER_R2_SPEC,
+            bismark = BISMARK,
+            bowtie2_dir = str(Path(BOWTIE2).parent),
+            alignment_instances = BISMARK_ALIGNMENT_INSTANCES,
+            library_flag = BISMARK_LIBRARY_FLAG,
+            alignment_flag = BISMARK_ALIGNMENT_FLAG,
+            score_min = BISMARK_SCORE_MIN,
+            local_alignment_flag = BISMARK_LOCAL_ALIGNMENT_FLAG,
+            seed_mismatches = BISMARK_SEED_MISMATCHES,
+            seed_length = BISMARK_SEED_LENGTH,
+            effort_d = BISMARK_EFFORT_D,
+            reseed_r = BISMARK_RESEED_R,
+            samtools = SAMTOOLS,
+            local_tmp = NODE_TMPDIR,
+            scratch_namespace = SCRATCH_NAMESPACE,
+            resource_log = lambda wc: backend_stage_resource_log(
+                "bismark", "align", wc.demux_sample
+            )
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            mkdir -p "$(dirname {output.bam:q})" "$(dirname {output.align_report:q})" "$(dirname {log:q})"
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+            printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s\n' \
+                {params.resource_log:q} {resources.attempt_no} {threads} \
+                {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log:q}
+            exec 2>> {log:q}
+            dna_pipeline_allocate_scratch {params.local_tmp:q} {params.scratch_namespace:q} preprocess_alignment {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
+            dna_pipeline_install_scratch_cleanup
+            dna_pipeline_log_scratch >> {log:q} 2>&1
+            tmpdir="$DNA_PIPELINE_SCRATCH_DIR"; out="$tmpdir/bismark"; mkdir -p "$out"
+            r1="$tmpdir/trim.1.fastq.gz"; r2="$tmpdir/trim.2.fastq.gz"; cj="$tmpdir/cutadapt.json"
+            dna_pipeline_run_cutadapt \
+                {params.cutadapt:q} {GZIP:q} {params.cutadapt_threads} \
+                {params.cutadapt_quality:q} {params.cutadapt_min_length} \
+                {params.adapter_r1_spec:q} {params.adapter_r2_spec:q} \
+                {input.r1:q} {input.r2:q} "$r1" "$r2" "$cj" {log:q}
+            bthreads=$(( {threads} / {params.alignment_instances} ))
+            (( bthreads >= 1 )) || bthreads=1
+            set --
+            if (( bthreads >= 2 )); then
+                set -- -p "$bthreads"
+            fi
+            echo "INFO: stage=bismark_align allocated_threads={threads} alignment_instances={params.alignment_instances} bowtie_threads_per_instance=$bthreads" >> {log:q}
+            {params.bismark:q} align \
+                --genome "$(dirname {input.bismark_genome:q})" \
+                --path_to_bowtie2 {params.bowtie2_dir:q} \
+                --basename {wildcards.demux_sample:q} \
+                --output_dir "$out" --temp_dir "$tmpdir" \
+                "$@" {params.alignment_flag} {params.library_flag} {params.local_alignment_flag} \
+                --score_min {params.score_min:q} \
+                --seedmms {params.seed_mismatches} --seedlen {params.seed_length} \
+                -D {params.effort_d} -R {params.reseed_r} \
+                -1 "$r1" -2 "$r2" >> {log:q} 2>&1
+            align_bam=$(dna_pipeline_find_single_output "$out" --exclude-glob '*deduplicated*' '*.bam')
+            align_report=$(dna_pipeline_find_single_output "$out" '*PE_report.txt' '*SE_report.txt')
+            {params.samtools:q} quickcheck -v "$align_bam" >> {log:q} 2>&1
+            test -s "$align_report"
+
+            dedup_threads=$(( {threads} < 4 ? {threads} : 4 ))
+            {params.bismark:q} dedup --bam -p --parallel "$dedup_threads" --output_dir "$out" -o {wildcards.demux_sample:q} "$align_bam" >> {log:q} 2>&1
+            final_bam=$(dna_pipeline_find_single_output "$out" '*.deduplicated.bam')
+            dedup_report=$(dna_pipeline_find_single_output "$out" '*deduplication_report.txt')
+            test -s "$dedup_report"
+            {params.samtools:q} quickcheck -v "$final_bam" >> {log:q} 2>&1
+            python -m dna_pipeline atomic-publish \
+                --samtools {params.samtools:q} \
+                --bam-destination {output.bam:q} \
+                --commit-last {output.bam:q} \
+                --file "$cj" {output.report:q} \
+                --file "$align_report" {output.align_report:q} \
+                --file "$dedup_report" {output.dedup_report:q} \
+                --file "$final_bam" {output.bam:q} \
+                >> {log:q} 2>&1
+            dna_pipeline_release_scratch
+            """
+    rule bismark_filter_nonconversion:
+        """执行 bismark filter 非 CG（non-CG）评估/过滤，并保持输出 BAM 中 read pair 相邻。"""
+        group: "bismark_cell" if PROTOCOL_POLICY.name == "cabernet" else None
+        input:
+            demux_completion = current_demux_completion,
+            bam = rules.bismark_align_dedup.output.bam
+        output:
+            bam = temp(CELL_PATH_PATTERN.processed_bam) if not KEEP_FINAL_BAM else CELL_PATH_PATTERN.processed_bam,
+            removed = temp(CELL_PATH_PATTERN.removed_bam) if PUBLISH_RNA_BAM else [],
+            summary = CELL_PATH_PATTERN.high_cph_summary,
+            mqc = temp(CELL_PATH_PATTERN.high_cph_multiqc),
+        log:
+            LOGS_DIR / "rules/bismark/{demux_sample}_filter.log"
+        threads: HIGH_CPH_READ_NAMES_THREADS
+        resources:
+            mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                "high_cph_read_names", wildcards.demux_sample, attempt
+            ),
+            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name == "cabernet" else combined_static_runtime_min(
+                HIGH_CPH_FILTER_RULES, wildcards.demux_sample, attempt
+            ),
+            disk_mb = lambda wildcards: static_scratch_mb(
+                "high_cph_filter", wildcards.demux_sample
+            ),
+            attempt_no = lambda wildcards, attempt: int(attempt)
+        params:
+            bismark = BISMARK,
+            samtools = SAMTOOLS,
+            excluded_contigs_json = HIGH_CPH_EXCLUDED_CONTIGS_JSON,
+            percentage = BISMARK_NONCONVERSION_PERCENTAGE_CUTOFF,
+            minimum = BISMARK_NONCONVERSION_MIN_COUNT,
+            publish_removed = "true" if PUBLISH_RNA_BAM else "false",
+            protocol = PROTOCOL_POLICY.name,
+            high_cph_role = PROTOCOL_POLICY.high_cph_role,
+            python = _rule_executable("python"),
+            local_tmp = NODE_TMPDIR,
+            scratch_namespace = SCRATCH_NAMESPACE,
+            resource_log = lambda wc: static_resource_log(
+                "high_cph_read_names", wc.demux_sample
+            )
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            mkdir -p "$(dirname {output.bam:q})" "$(dirname {log:q})"
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+            printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s\n' \
+                {params.resource_log:q} {resources.attempt_no} {threads} \
+                {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log:q}
+            exec 2>> {log:q}
+            dna_pipeline_allocate_scratch \
+                {params.local_tmp:q} {params.scratch_namespace:q} \
+                high_cph_filter \
+                {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
+            dna_pipeline_install_scratch_cleanup
+            tmp="$DNA_PIPELINE_SCRATCH_DIR"
+            dna_pipeline_log_scratch >> {log:q} 2>&1
+
+            filter_dir="$tmp/filter"
+            mkdir -p "$filter_dir"
+            {params.python:q} -m dna_pipeline split-bismark-pairs \
+                --input-bam {input.bam:q} \
+                --excluded-contigs-json {params.excluded_contigs_json:q} \
+                --bio "$filter_dir/input.bam" --excluded "$tmp/excluded.bam" \
+                > "$tmp/pair_counts.txt"
+            read -r candidate_pairs excluded_pairs < "$tmp/pair_counts.txt"
+            removed_pairs=0
+            filtered="$filter_dir/input.bam"
+            removed="$filtered"
+
+            if (( candidate_pairs > 0 )); then
+                (
+                    cd "$filter_dir"
+                    {params.bismark:q} filter -p \
+                        --percentage_cutoff {params.percentage} \
+                        --minimum_count {params.minimum} \
+                        input.bam
+                ) >> {log:q} 2>&1
+                filtered=$(dna_pipeline_find_single_output "$filter_dir" --recursive '*nonCG_filtered*.bam')
+                removed=$(dna_pipeline_find_single_output "$filter_dir" --recursive '*nonCG_removed*.bam')
+                removed_aln=$({params.samtools:q} view -c "$removed")
+                (( removed_aln % 2 == 0 )) || {{
+                    echo "ERROR: Bismark non-CG removed BAM contains an odd alignment count" >&2
+                    exit 1
+                }}
+                removed_pairs=$((removed_aln / 2))
+            fi
+            {params.samtools:q} quickcheck -v "$filtered" "$removed" >> {log:q} 2>&1
+
+            main_bio="$filtered"
+            if (( excluded_pairs > 0 )); then
+                {params.samtools:q} cat -o "$tmp/processed.bam" "$main_bio" "$tmp/excluded.bam" >> {log:q} 2>&1
+            elif (( candidate_pairs == 0 )) && {params.publish_removed}; then
+                cp "$main_bio" "$tmp/processed.bam"
+            else
+                mv "$main_bio" "$tmp/processed.bam"
+            fi
+            {params.samtools:q} quickcheck -v "$tmp/processed.bam" >> {log:q} 2>&1
+            export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+            python -m dna_pipeline write-filter-summary \
+                --sample {wildcards.demux_sample:q} \
+                --candidate-pairs "$candidate_pairs" --removed-pairs "$removed_pairs" \
+                --excluded-pairs "$excluded_pairs" \
+                --processed-bam "$tmp/processed.bam" --samtools {params.samtools:q} \
+                --percentage {params.percentage} --minimum-count {params.minimum} \
+                --protocol {params.protocol:q} --high-cph-role {params.high_cph_role:q} \
+                --summary-path "$tmp/summary.json" --multiqc-path "$tmp/mqc.json" >> {log:q} 2>&1
+
+            if {params.publish_removed}; then
+                python -m dna_pipeline atomic-publish \
+                    --samtools {params.samtools:q} \
+                    --bam-destination {output.bam:q} \
+                    --commit-last {output.bam:q} \
+                    --file "$tmp/summary.json" {output.summary:q} \
+                    --file "$tmp/mqc.json" {output.mqc:q} \
+                    --file "$removed" {output.removed:q} \
+                    --file "$tmp/processed.bam" {output.bam:q} \
+                    >> {log:q} 2>&1
+            else
+                python -m dna_pipeline atomic-publish \
+                    --samtools {params.samtools:q} \
+                    --bam-destination {output.bam:q} \
+                    --commit-last {output.bam:q} \
+                    --file "$tmp/summary.json" {output.summary:q} \
+                    --file "$tmp/mqc.json" {output.mqc:q} \
+                    --file "$tmp/processed.bam" {output.bam:q} \
+                    >> {log:q} 2>&1
+            fi
+            dna_pipeline_release_scratch
+            """
+
+
+    if PUBLISH_RNA_BAM:
+        rule bismark_publish_rna_bam:
+            """SRD 恒定把被 non-CG 筛出的 BAM 排序索引后保留到 02_work/RNA/BAM。"""
+            input:
+                bam = rules.bismark_filter_nonconversion.output.removed
+            output:
+                bam = CELL_PATH_PATTERN.rna_bam,
+                bai = CELL_PATH_PATTERN.rna_bam_index
+            log:
+                LOGS_DIR / "rules/bismark/{demux_sample}_rna_bam.log"
+            threads: HIGH_CPH_BAM_THREADS
+            resources:
+                mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                    "high_cph_bam", wildcards.demux_sample, attempt
+                ),
+                runtime = lambda wildcards, attempt: static_resource_runtime_min(
+                    "high_cph_bam", wildcards.demux_sample, attempt
+                ),
+                attempt_no = lambda wildcards, attempt: int(attempt)
+            params:
+                samtools = SAMTOOLS,
+                resource_log = lambda wc: static_resource_log("high_cph_bam", wc.demux_sample),
+            conda: ENVIRONMENT_YAML
+            shell:
+                r"""
+                set -euo pipefail
+                source {JOB_RUNTIME:q}
+                mkdir -p "$(dirname {log:q})"
+                dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+                    {params.resource_log:q} {resources.attempt_no} {threads} \
+                    {resources.mem_mb} {resources.runtime} >> {log:q}
+                tmp_bam={output.bam:q}.tmp.$$
+                tmp_bai="$tmp_bam.bai"
+                trap 'rm -f -- "$tmp_bam" "$tmp_bai"' EXIT
+                sam_extra=$(({threads} > 1 ? {threads} - 1 : 0))
+                dna_pipeline_coordinate_sort_and_stage \
+                    {params.samtools:q} "$sam_extra" {input.bam:q} \
+                    "$tmp_bam" "$tmp_bai" \
+                    {output.bam:q} {output.bai:q} >> {log:q} 2>&1
+                rm -f -- "$tmp_bam" "$tmp_bai"
+                trap - EXIT
+                """
+    rule bismark_extract:
+        """直接在 pair-adjacent 过滤 BAM 上运行 Bismark methylation extraction，产出合并 cov、M-bias 与报告。"""
+        group: "bismark_cell" if PROTOCOL_POLICY.name == "cabernet" else None
+        input:
+            demux_completion = current_demux_completion,
+            bam = BISMARK_ANALYSIS_BAM
+        output:
+            cov = temp(CELL_PATH_PATTERN.bismark_cov),
+            extract_report = CELL_PATH_PATTERN.bismark_extract_report,
+            mbias = CELL_PATH_PATTERN.bismark_mbias
+        log:
+            LOGS_DIR / "rules/bismark/{demux_sample}_extract.log"
+        threads: BISMARK_EXTRACT_THREADS
+        resources:
+            mem_mb = lambda wildcards, attempt: backend_stage_mem_mb(
+                "bismark", "extract", wildcards.demux_sample, attempt
+            ),
+            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name == "cabernet" else backend_stage_runtime_min(
+                "bismark", "extract", wildcards.demux_sample, attempt
+            ),
+            disk_mb = lambda wildcards: static_scratch_mb(
+                "bismark_extract", wildcards.demux_sample
+            ),
+            attempt_no = lambda wildcards, attempt: int(attempt)
+        params:
+            bismark = BISMARK,
+            samtools = SAMTOOLS,
+            local_tmp = NODE_TMPDIR,
+            scratch_namespace = SCRATCH_NAMESPACE,
+            resource_log = lambda wc: static_resource_log(
+                "bismark_extract", wc.demux_sample
+            )
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            mkdir -p "$(dirname {output.cov:q})" "$(dirname {log:q})"
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+            printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s\n' \
+                {params.resource_log:q} {resources.attempt_no} {threads} \
+                {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log:q}
+            exec 2>> {log:q}
+            dna_pipeline_allocate_scratch \
+                {params.local_tmp:q} {params.scratch_namespace:q} \
+                bismark_extract \
+                {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
+            dna_pipeline_install_scratch_cleanup
+            tmp="$DNA_PIPELINE_SCRATCH_DIR"
+            out="$tmp/out"
+            mkdir -p "$out"
+            dna_pipeline_log_scratch >> {log:q} 2>&1
+
+            {params.samtools:q} quickcheck -v {input.bam:q} >> {log:q} 2>&1
+
+            echo "INFO: stage=bismark_extract allocated_threads={threads} parallel=1" >> {log:q}
+
+            {params.bismark:q} extract \
+                --gzip --bedGraph --comprehensive --parallel 1 \
+                --output_dir "$out" \
+                {input.bam:q} >> {log:q} 2>&1
+            cov=$(dna_pipeline_find_single_output "$out" '*.bismark.cov.gz')
+            extract_report=$(dna_pipeline_find_single_output "$out" '*splitting_report.txt')
+            mbias=$(dna_pipeline_find_single_output "$out" '*M-bias.txt')
+            {GZIP:q} -t "$cov" >> {log:q} 2>&1
+            test -s "$extract_report"
+            test -s "$mbias"
+
+            python -m dna_pipeline atomic-publish \
+                --commit-last {output.cov:q} \
+                --file "$extract_report" {output.extract_report:q} \
+                --file "$mbias" {output.mbias:q} \
+                --file "$cov" {output.cov:q} \
+                >> {log:q} 2>&1
+            dna_pipeline_release_scratch
+            """
+    rule bismark_cpg:
+        """将 Bismark observed coverage 直接流式转换为 SnapATAC2 import_values 四列 CpG 格式。"""
+        group: "bismark_cell" if PROTOCOL_POLICY.name == "cabernet" else None
+        input:
+            demux_completion = current_demux_completion,
+            cov = rules.bismark_extract.output.cov
+        output:
+            cpg = CELL_PATH_PATTERN.cpg
+        log:
+            LOGS_DIR / "rules/bismark/{demux_sample}_cpg.log"
+        threads: CPG_THREADS
+        resources:
+            mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                "generate_cpg_input", wildcards.demux_sample, attempt
+            ),
+            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name == "cabernet" else static_resource_runtime_min(
+                "generate_cpg_input", wildcards.demux_sample, attempt
+            ),
+            attempt_no = lambda wildcards, attempt: int(attempt)
+        params:
+            zstd = ZSTD,
+            gzip = GZIP,
+            resource_log = lambda wc: static_resource_log(
+                "generate_cpg_input", wc.demux_sample
+            )
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            mkdir -p "$(dirname {output.cpg:q})" "$(dirname {log:q})"
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+            printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+                {params.resource_log:q} {resources.attempt_no} {threads} {resources.mem_mb} {resources.runtime} \
+                >> {log:q}
+            exec 2>> {log:q}
+
+            tmp_cpg={output.cpg:q}.tmp.$$.zst
+            cleanup_cpg_tmp() {{ rm -f -- "$tmp_cpg"; }}
+            trap cleanup_cpg_tmp EXIT
+            {params.gzip:q} -t {input.cov:q}
+            {params.gzip:q} -dc {input.cov:q} | \
+                dna_pipeline_emit_canonical_cpg {params.zstd:q} -1 "$tmp_cpg"
+            {params.zstd:q} -q -t "$tmp_cpg"
+            python -m dna_pipeline atomic-publish \
+                --commit-last {output.cpg:q} \
+                --file "$tmp_cpg" {output.cpg:q} \
+                >> {log:q} 2>&1
+            rm -f -- "$tmp_cpg"
+            trap - EXIT
+            """
+localrules: initial_cell_manifest, demux_completion_barrier, multiqc, final_sample_manifest, delivery_ready
+
+DEMUX_COMPLETION_TARGETS = expand(
+    [str(path) for path in rules.demux.output],
+    sample=DEMUX_RUN_IDS,
+)
+DEMUX_COMPLETION_BARRIER = INTERMEDIATE_DIR / "markers" / "demux_completions.done"
+
+
+def current_pipeline_output_targets(wildcards):
+    for run_id in DEMUX_RUN_IDS:
+        checkpoints.demux.get(sample=run_id)
+    return get_staged_delivery_targets()
+
+
+FINAL_SAMPLE_PAIR_QC = INTERMEDIATE_DIR / "multiqc" / "pair_level_qc_mqc.json"
+FINAL_SAMPLE_CUTADAPT_QC = (
+    INTERMEDIATE_DIR / "multiqc" / "cutadapt_r1r2_qc_mqc.json"
+)
+
+
+def current_multiqc_source_inputs(wildcards):
+    sources = []
+    for run_id in DEMUX_RUN_IDS:
+        checkpoint_output = checkpoints.demux.get(sample=run_id).output
+        sources.append(str(checkpoint_output.json_mqc))
+
+    active_samples = get_demuxed_samples()
+    for sample in active_samples:
+        paths = PROJECT_LAYOUT.cell(sample)
+        sources.append(str(paths.cutadapt_json))
+        if METHYLATION_BACKEND == "biscuit":
+            sources.append(str(paths.dupsifter_multiqc))
+            sources.append(str(paths.high_cph_multiqc))
+            sources.extend(
+                str(path)
+                for path in paths.biscuit_qc_sources(
+                    MULTIQC_BISCUIT_SOURCE_SUFFIXES
+                )
+            )
+        elif METHYLATION_BACKEND == "bismark":
+            sources.extend(
+                [
+                    str(paths.bismark_align_report),
+                    str(paths.bismark_extract_report),
+                    str(paths.bismark_mbias),
+                ]
+            )
+            sources.append(str(paths.high_cph_multiqc))
+            sources.append(str(paths.bismark_dedup_report))
+    sources.extend([
+        str(FINAL_SAMPLE_PAIR_QC),
+        str(FINAL_SAMPLE_CUTADAPT_QC),
+    ])
+    return sources
+
+
+def current_final_manifest_qc_inputs(wildcards):
+    for run_id in DEMUX_RUN_IDS:
+        checkpoints.demux.get(sample=run_id)
+    active_samples = get_demuxed_samples()
+    inputs = []
+    for sample in active_samples:
+        paths = PROJECT_LAYOUT.cell(sample)
+        inputs.append(str(paths.cutadapt_json))
+        if METHYLATION_BACKEND == "rastair":
+            inputs.append(str(paths.rastair_qc))
+            if KEEP_FINAL_BAM:
+                inputs.extend([str(paths.marked_bam), str(paths.marked_bam_index)])
+            continue
+        inputs.append(str(paths.high_cph_summary))
+        if METHYLATION_BACKEND == "biscuit":
+            inputs.extend(
+                [
+                    str(paths.dupsifter_multiqc),
+                    str(paths.biscuit_qc_source("CpHRetentionByReadPos.txt")),
+                ]
+            )
+        else:
+            inputs.extend(
+                [
+                    str(paths.bismark_dedup_report),
+                    str(paths.bismark_align_report),
+                    str(paths.bismark_extract_report),
+                    str(paths.bismark_mbias),
+                ]
+            )
+    return inputs
+
+
+def current_rna_bam_inputs(wildcards):
+    if not PUBLISH_RNA_BAM:
+        return []
+    inputs = []
+    for sample in get_demuxed_samples():
+        paths = PROJECT_LAYOUT.cell(sample)
+        inputs.extend([str(paths.rna_bam), str(paths.rna_bam_index)])
+    return inputs
+
+
+def current_rna_fastq_inputs(wildcards):
+    if not PROTOCOL_POLICY.requires_rna_barcode:
+        return []
+    return [
+        str(RNA_COLLECT_DIR / f"{run_id}.json")
+        for run_id in DEMUX_RUN_IDS
+    ]
+
+
+rule multiqc:
+    """生成 MultiQC 文件清单，并基于 --file-list 运行 MultiQC，把 HTML 报告以同文件系统原子 rename 发布到 staged QC 目录。"""
+    input:
+        sources = current_multiqc_source_inputs,
+        pair_qc = FINAL_SAMPLE_PAIR_QC,
+        cutadapt_qc = FINAL_SAMPLE_CUTADAPT_QC,
+    output:
+        report = STAGED_RESULTS_DIR / "QC_Results" / "multiqc_report.html",
+        file_list = temp(INTERMEDIATE_DIR / "multiqc" / "multiqc_sources.txt"),
+    log:
+        LOGS_DIR / "rules/multiqc.log"
+    threads: MULTIQC_THREADS
+    conda: ENVIRONMENT_YAML
+    resources:
+        mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+            "multiqc", None, attempt
+        ),
+        runtime = lambda wildcards, attempt: static_resource_runtime_min(
+            "multiqc", None, attempt
+        ),
+        attempt_no = lambda wildcards, attempt: int(attempt)
+    params:
+        outdir = STAGED_RESULTS_DIR / "QC_Results",
+        tmpout = INTERMEDIATE_DIR / "multiqc" / "output_tmp",
+        multiqc = MULTIQC,
+        resource_log = lambda wc: static_resource_log("multiqc")
+    run:
+        shell("source {JOB_RUNTIME:q}; dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}")
+        count, skipped = write_multiqc_file_list(
+            list(input.sources) + [str(input.pair_qc), str(input.cutadapt_qc)],
+            str(output.file_list),
+        )
+        with open(str(log), "a", encoding="utf-8") as handle:
+            handle.write(f"INFO: multiqc_sources={count}\n")
+            for item in skipped:
+                handle.write(f"WARNING: skipped_multiqc_source={item}\n")
+        shell(
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            mkdir -p {params.outdir:q} "$(dirname {log:q})" "$(dirname {params.tmpout:q})"
+            printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
+                {params.resource_log:q} {resources.attempt_no} {threads} \
+                {resources.mem_mb} {resources.runtime} >> {log:q}
+
+            tmpout={params.tmpout:q}.attempt{resources.attempt_no}.$$
+            report_partial={output.report:q}.partial.$$
+            cleanup_multiqc_tmp() {{
+                rm -rf -- "$tmpout"
+                rm -f -- "$report_partial"
+            }}
+            trap cleanup_multiqc_tmp EXIT
+            mkdir -p "$tmpout"
+
+            {params.multiqc:q} -f \
+                -o "$tmpout" \
+                -n multiqc_report.html \
+                --file-list {output.file_list:q} \
+                >> {log:q} 2>&1
+
+            test -s "$tmpout/multiqc_report.html"
+            cp "$tmpout/multiqc_report.html" "$report_partial"
+            test -s "$report_partial"
+
+            mv "$report_partial" {output.report:q}
+            rm -rf -- "$tmpout"
+            trap - EXIT
+            """
+        )
+
+
+rule final_sample_manifest:
+    """汇总全部 staged deliverable 与逐细胞 QC 工件，生成公开 sample manifest 及配套 presentation-only QC JSON。"""
+    input:
+        trigger = DEMUX_COMPLETION_BARRIER,
+        deliverables = current_pipeline_output_targets,
+        qc_artifacts = current_final_manifest_qc_inputs,
+        rna_bams = current_rna_bam_inputs,
+        rna_fastq_markers = current_rna_fastq_inputs,
+        initial_manifest = rules.initial_cell_manifest.output.manifest
+    output:
+        manifest = STAGED_RESULTS_DIR / "QC_Results" / "sample_manifest.tsv",
+        pair_qc = temp(FINAL_SAMPLE_PAIR_QC),
+        cutadapt_qc = temp(FINAL_SAMPLE_CUTADAPT_QC)
+    log:
+        LOGS_DIR / "rules/final_sample_manifest.log"
+    conda: ENVIRONMENT_YAML
+    resources:
+        mem_mb = lambda wildcards, attempt: controller_resource_mem_mb(
+            "final_sample_manifest", attempt
+        ),
+        runtime = lambda wildcards, attempt: controller_resource_runtime_min(
+            "final_sample_manifest", attempt
+        )
+    params:
+        bismark = BISMARK,
+        initial_manifest = lambda wc, input: str(input.initial_manifest),
+        intermediate = str(INTERMEDIATE_DIR),
+        staged_results = str(STAGED_RESULTS_DIR),
+        published_results = str(PUBLIC_RESULTS_DIR),
+        options_json = json.dumps(
+            {
+                "methylation_backend": METHYLATION_BACKEND,
+                "generate_snp": GENERATE_SNP,
+                "keep_final_bam": KEEP_FINAL_BAM,
+                "publish_rna_bam": PUBLISH_RNA_BAM,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    shell:
+        r"""
+        set -euo pipefail
+        export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+        mkdir -p "$(dirname {output.manifest:q})" "$(dirname {log:q})"
+        python -m dna_pipeline write-sample-manifest \
+            {params.initial_manifest:q} \
+            {params.intermediate:q} \
+            {params.staged_results:q} \
+            {params.published_results:q} \
+            {output.manifest:q} \
+            {output.pair_qc:q} \
+            {output.cutadapt_qc:q} \
+            --bismark {params.bismark:q} \
+            --options-json {params.options_json:q} > {log:q} 2>&1
+        """
+
+
+rule delivery_ready:
+    """按最终 manifest 声明的产物记录一次 inventory，拒绝缺失文件并写入 delivery_ready 发布边界。"""
+    input:
+        multiqc_report = rules.multiqc.output.report,
+        sample_manifest = rules.final_sample_manifest.output.manifest,
+        deliverables = current_pipeline_output_targets,
+        run_snapshot = RUN_SNAPSHOT_DEP
+    output:
+        ready = DELIVERY_READY
+    log:
+        LOGS_DIR / "rules/delivery_ready.log"
+    conda: ENVIRONMENT_YAML
+    resources:
+        mem_mb = lambda wildcards, attempt: controller_resource_mem_mb(
+            "delivery_ready", attempt
+        ),
+        runtime = lambda wildcards, attempt: controller_resource_runtime_min(
+            "delivery_ready", attempt
+        )
+    params:
+        staged_results = str(STAGED_RESULTS_DIR),
+        run_snapshot = str(PROVENANCE_SNAPSHOT_PATH or ""),
+    shell:
+        r"""
+        set -euo pipefail
+        export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+        mkdir -p "$(dirname {output.ready:q})" "$(dirname {log:q})"
+        python -m dna_pipeline delivery-ready \
+            --ready {output.ready:q} \
+            --staged-results {params.staged_results:q} \
+            --run-snapshot {params.run_snapshot:q} > {log:q} 2>&1
+        """
+
+
+rule demux_completion_barrier:
+    """等待全部 raw run 的 manifest、report、展示 JSON 与 completion 完整后落 marker，缺一项即重跑该 demux。"""
+    input:
+        DEMUX_COMPLETION_TARGETS
+    output:
+        touch(DEMUX_COMPLETION_BARRIER)

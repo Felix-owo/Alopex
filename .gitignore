@@ -1,0 +1,105 @@
+# macOS、编辑器与临时备份
+.DS_Store
+._*
+.AppleDouble
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.bak
+*.bak.*
+*.bkp
+*.orig
+*.rej
+*~
+.#*
+.~lock.*#
+~$*
+
+# 本机环境变量与凭据；可提交脱敏模板
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Python、Notebook、测试与覆盖率产物
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
+.venv/
+venv/
+__pypackages__/
+*.egg-info/
+
+# Snakemake 运行状态
+.snakemake/
+
+# Pipeline 本地部署、日志与临时状态
+/conda/
+/logs/
+/tmp/
+/run_pipeline.sh
+/quick-benchmark.json
+
+# Rust 生成目录；Cargo.toml、Cargo.lock 与 src/ 必须保留
+/core/demux_rs/target/
+/core/demux_rs/vendor/
+/core/demux_rs/.cargo/
+
+# Reference bundle；配置、Barcode Map 与 Doctor fixture 保留
+/resources/.locks/
+/resources/.build/
+/resources/reference_source/
+/resources/*_reference/
+
+# 项目运行目录；避免在 Pipeline 仓库内初始化项目后误提交
+**/00_config/
+**/01_raw/
+**/02_work/
+**/03_results/
+**/04_logs/
+**/05_tmp/
+
+# 测序与比对大文件
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.sam
+*.bam
+*.bai
+*.cram
+*.crai
+
+# Doctor 自带的小型端到端测试数据属于版本化 fixture
+!/resources/doctor_benchmark/*.fastq.gz
+
+# 容器与大型二进制产物
+*.sif
+*.sif.sha256
+*.sif.receipt.json
+*.sif.build.json
+*.sif.build.log
+
+# Slurm、HPC 与构建产物
+slurm-*.out
+slurm-*.err
+nohup.out
+.nfs*
+/build/
+/dist/
+
+# ZCode 会话产物不入库
+.zcode/

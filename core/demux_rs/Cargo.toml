@@ -1,0 +1,26 @@
+[package]
+name = "demux_rs"
+version = "2.0.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
+flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
+libdeflate = { package = "libdeflater", version = "1.25" }
+needletail = { version = "0.6", default-features = false, features = ["flate2"] }
+rayon = "1.11"
+triple_accel = "0.4"
+ahash = "0.8"
+log = "0.4"
+env_logger = "0.11"
+csv = "1.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3

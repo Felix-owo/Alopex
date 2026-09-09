@@ -1,0 +1,98 @@
+control:
+  name: dna_pipeline_control
+  channels:
+  - https://conda.anaconda.org/conda-forge
+  - https://conda.anaconda.org/bioconda
+  - nodefaults
+  dependencies:
+  - python>=3.14,<3.15
+  - conda>=26,<27
+  - conda-libmamba-solver>=26,<27
+  - pyyaml>=6,<7
+  - jsonschema>=4.26,<5
+  - snakemake>=9.25,<10
+  - snakemake-executor-plugin-slurm>=2.7,<3
+  - rust>=1.97,<1.98
+biscuit:
+  name: dna_pipeline_biscuit
+  channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+  dependencies:
+  - python>=3.13,<3.14
+  - pyyaml>=6,<7
+  - biscuit>=1.10,<1.11
+  - dupsifter>=1.4,<1.5
+  - cutadapt>=5.2,<6
+  - samtools>=1.24,<1.25
+  - htslib>=1.24,<1.25
+  - gawk>=5.4,<6
+  - coreutils>=9.5,<10
+  - multiqc>=1.35,<2
+  - zstd>=1.5.7,<2
+  - gzip>=1.14,<2
+bismark:
+  name: dna_pipeline_bismark
+  channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+  dependencies:
+  - python>=3.13,<3.14
+  - pyyaml>=6,<7
+  - pysam>=0.23,<0.24
+  - bismark>=3.1,<4
+  - bowtie2>=2.5,<3
+  - cutadapt>=5.2,<6
+  - samtools>=1.24,<1.25
+  - htslib>=1.24,<1.25
+  - gawk>=5.4,<6
+  - coreutils>=9.5,<10
+  - multiqc>=1.35,<2
+  - zstd>=1.5.7,<2
+  - gzip>=1.14,<2
+rastair:
+  name: dna_pipeline_rastair
+  channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+  dependencies:
+  - python>=3.13,<3.14
+  - pyyaml>=6,<7
+  - pysam>=0.23,<0.24
+  - bwa>=0.7.19,<0.8
+  - rastair=2.2.0
+  - cutadapt>=5.2,<6
+  - samtools>=1.24,<1.25
+  - htslib>=1.24,<1.25
+  - gawk>=5.4,<6
+  - coreutils>=9.5,<10
+  - multiqc>=1.35,<2
+  - zstd>=1.5.7,<2
+  - gzip>=1.14,<2
+notebook:
+  name: notebook
+  channels:
+  - conda-forge
+  - nodefaults
+  dependencies:
+  - python=3.13
+  - pip
+  - anndata>=0.10,<0.11
+  - ipykernel
+  - jupyterlab
+  - matplotlib-base>=3.9,<4
+  - numba>=0.61,<0.63
+  - numpy>=2,<3
+  - packaging>=24,<26
+  - pandas>=2.2,<3
+  - polars>=1,<2
+  - pyyaml>=6,<7
+  - scikit-learn>=1.5,<2
+  - seaborn>=0.13,<0.14
+  - tqdm>=4.66,<5
+  - zstd>=1.5,<2
+  - pip:
+    - snapatac2==2.9.0
