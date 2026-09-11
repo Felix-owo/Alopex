@@ -244,7 +244,7 @@ dna_pipeline_run_cutadapt() {
     local r1_out="${10}" r2_out="${11}" json_out="${12}" log_file="${13}"
     "$cutadapt" \
         -a "$adapter_r1" -A "$adapter_r2" \
-        --error-rate 0.2 \
+        --error-rate 0.25 \
         -q "$quality" -m "$min_length" -j "$threads" \
         -o "$r1_out" -p "$r2_out" --json "$json_out" \
         "$r1_in" "$r2_in" >> "$log_file" 2>&1

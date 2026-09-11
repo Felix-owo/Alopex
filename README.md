@@ -1,4 +1,4 @@
-# Alopex v13.6
+# Alopex v13.7
 
 Alopex 是面向 Cabernet、SRD 和 Cabernet–TAPS+ 单细胞 DNA 甲基化数据的 Snakemake Pipeline。它将原始 paired FASTQ 转为单细胞 CpG 结果、质量报告和可追溯的交付清单：
 
@@ -11,7 +11,7 @@ Alopex 是面向 Cabernet、SRD 和 Cabernet–TAPS+ 单细胞 DNA 甲基化数�
 - BISCUIT 路线的可选 SNP 输出；
 - cell QC、MultiQC 汇总与运行结果清单。
 
-三个 backend 共用固定 Cutadapt `--error-rate 0.2`，R1/R2 overlap 为 3/12，
+三个 backend 共用固定 Cutadapt `--error-rate 0.25`，R1/R2 overlap 为 3/12，
 R2 同时剪除 9 bp 技术序列。各参数的含义与默认值见初始化项目生成的 `00_config/config.yaml` 模板行内注释；
 参数依据与生物学表现验证所属的内部 benchmark 归档不随公开仓库分发。
 
@@ -52,7 +52,7 @@ core/run_pipeline.sh  创建项目、检查输入并运行分析
 获取代码：
 
 ```bash
-git clone --branch v13.6 https://github.com/Felix-owo/Alopex.git
+git clone --branch v13.7 https://github.com/Felix-owo/Alopex.git
 cd Alopex
 ```
 
