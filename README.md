@@ -1,4 +1,4 @@
-# Alopex v13.7
+# Alopex v13.8
 
 Alopex 是面向 Cabernet、SRD 和 Cabernet–TAPS+ 单细胞 DNA 甲基化数据的 Snakemake Pipeline。它将原始 paired FASTQ 转为单细胞 CpG 结果、质量报告和可追溯的交付清单：
 
@@ -52,7 +52,7 @@ core/run_pipeline.sh  创建项目、检查输入并运行分析
 获取代码：
 
 ```bash
-git clone --branch v13.7 https://github.com/Felix-owo/Alopex.git
+git clone --branch v13.8 https://github.com/Felix-owo/Alopex.git
 cd Alopex
 ```
 
@@ -221,7 +221,7 @@ cd /path/to/Patient001
 ### config.yaml
 
 模板显式列出全部参数及其默认值（`high_cph` 在 Cabernet/SRD 中固定为「统计并剔除」，TAPS 不适用，无开关；
-其唯一参数 `excluded_contigs` 默认内置，模板未列出，需要时按下表添加），
+模板列出其唯一参数 `excluded_contigs` 及默认对照列表），
 通常只需要修改物种、实验协议和甲基化后端：
 
 ```yaml
@@ -262,7 +262,7 @@ analysis:
 
 > 参数解释与默认值见 `00_config/config.yaml` 模板行内注释；内部固定的参数不放入 `config.yaml`。
 
-> Bismark alignment mode 由 `bismark.local_alignment` 选择，只有当前模式使用的 index 是 runtime 依赖；过滤后的 paired-end BAM 保持 read-pair 相邻直达 methylation extraction，避免重复排序 I/O。extraction 所有档位固定申请 8 CPU + 16 GiB，attempt 2 内存为 24 GiB。
+> Bismark alignment mode 由 `bismark.local_alignment` 选择，只有当前模式使用的 index 是 runtime 依赖；过滤后的 paired-end BAM 保持 read-pair 相邻直达 methylation extraction，避免重复排序 I/O。extraction 所有档位固定申请 8 CPU + 16 GiB，attempt 2/3 内存分别为 24/32 GiB。
 
 重要组合限制：
 
@@ -312,7 +312,7 @@ SampleA.R1.fq.gz             SampleA.R2.fq.gz
 样本_SampleA_L1_1.fq.gz      样本_SampleA_L1_2.fq.gz
 ```
 
-同一样本可以包含多个 lane/chunk（lane 号 1-3 位，3 位 chunk 段可省略）。mate 可为 `R1/R2` 或 `1/2`，分隔符支持下划线、点和连字符；lane 按数值配对排序，`L1/L01/L001` 表示同一个 lane，缺省 chunk 等于 `001`。每个 R1 segment 必须有对应 R2，同一 segment 的重复 mate 仍会报错。
+同一样本可以包含多个 lane/chunk（lane 号 1-3 位且为 1-999，3 位 chunk 段可省略）。mate 可为 `R1/R2` 或 `1/2`，分隔符支持下划线、点和连字符；lane 按数值配对排序，`L1/L01/L001` 表示同一个 lane，缺省 chunk 等于 `001`。每个 R1 segment 必须有对应 R2，同一 segment 的重复 mate 仍会报错。
 
 识别时保留原文件名，只去掉内部样本名开头的 `样本_`；例如 `样本_PT_Mon_1_FKDL123_L1_1.fq.gz` 对应 raw sample `PT_Mon_1_FKDL123`，`Mon_1` 和批次编号不会被删除。其余内部样本名只接受英文字母、数字、点、下划线和连字符，不能是单独的 `.` 或 `..`。有前缀与无前缀的两种基名若映射到同一 raw sample，即使 lane 不同也拒绝隐式合并。manifest、snapshot 和 workflow 使用同一识别结果，无需手工改名或增加 config 参数。
 
@@ -380,20 +380,20 @@ macOS 使用 local executor。Linux/HPC 的当前 shell 承载 Snakemake control
 
 Cabernet/Bismark 的每个 cell 独立组成一个 Slurm 作业，依次执行比对去重（含 Cutadapt）、过滤、extraction 和 CpG 转换。全部 S/M/L/XL 档位均分组，SRD 与 BISCUIT 按规则独立调度。
 
-| Alignment mode | S/M/L/XL CPU | 首次内存 | 重试内存 |
-| --- | --- | --- | --- |
-| combined-index end-to-end（默认） | 8/12/12/16 | 均为 16 GiB | 均为 24 GiB |
-| faithful CT/GA local | 12/12/16/16 | 24/24/32/32 GiB | 36/36/48/48 GiB |
+| Alignment mode | S/M/L/XL CPU | 首次内存 | 第一次重试 | 第二次重试 |
+| --- | --- | --- | --- | --- |
+| combined-index end-to-end（默认） | 8/12/12/16 | 均为 16 GiB | 均为 24 GiB | 均为 32 GiB |
+| faithful CT/GA local | 12/12/16/16 | 24/24/32/32 GiB | 36/36/48/48 GiB | 48/48/64/64 GiB |
 
-**完整 cell 作业每次申请 10 小时，四个阶段共享这段时间。** 每阶段的 150 分钟仅用于 Snakemake 累加组资源，阶段没有独立 timeout；alignment 可以使用超过 150 分钟。部分阶段重跑申请不超过 10 小时。最多尝试两次，重试只增加内存；排队和多次尝试的累计耗时不计入单次时限。
+**完整 cell 作业每次申请 10 小时，四个阶段共享这段时间。** 每阶段的 150 分钟仅用于 Snakemake 累加组资源，阶段没有独立 timeout；alignment 可以使用超过 150 分钟。部分阶段重跑申请不超过 10 小时。最多尝试三次，重试只增加内存；排队和多次尝试的累计耗时不计入单次时限。
 
 ### 失败恢复
 
-修正问题后重新执行 `./run_pipeline.sh`。Snakemake 根据依赖与有效输出决定重算范围；失败作业的成员输出会清理，Cabernet/Bismark 组可能需要整组重跑。资源规则首次运行即建立 `.attempt1` 日志硬链接，自动重试清理主日志后仍保留首次证据，第二次使用新的主日志。共享文件系统的时钟偏差不作为作业失败依据，命令退出码、输出完整性与科学守恒仍会检查。
+修正问题后重新执行 `./run_pipeline.sh`。Snakemake 根据依赖与有效输出决定重算范围；失败作业的成员输出会清理，Cabernet/Bismark 组可能需要整组重跑。调用日志初始化 helper 的资源规则每次尝试均建立 `.attempt1/.attempt2/.attempt3` 对应日志硬链接，自动重试清理主日志后仍保留本轮各次证据；新一轮首次尝试会清理上一轮陈旧归档。共享文件系统的时钟偏差不作为作业失败依据，命令退出码、输出完整性与科学守恒仍会检查。
 
 同一项目从 workflow 执行到发布均由 Snakemake 项目锁保护。遇到残留锁时，先确认没有运行中的 launcher，再删除项目的 `.snakemake/locks` 后重试。保留 `02_work/` 与 `.snakemake/` 可支持恢复；各规则会回收自身独占的临时 scratch。scratch 不允许 `.`/`..` 路径组件或符号链接父目录。
 
-Snakemake 的 `onsuccess` 在释放项目锁前将结果以硬链接逐文件原子安装到 `03_results/`，完整验证后最后写入 `run_manifest.json`。`02_work/results_stage/` 与 `03_results/` 必须位于同一文件系统，公开结果的父目录必须是真实目录；链接失败不回退复制。发布中断时完成清单缺失，重新运行 launcher 可从稳定结果阶段完成发布。
+Snakemake 的 `onsuccess` 在释放项目锁前将结果以硬链接逐文件原子安装到 `03_results/`，完整验证后最后写入 `run_manifest.json`。`02_work/results_stage/` 与 `03_results/` 必须位于同一文件系统，公开结果的父目录必须是真实目录；链接失败不回退复制。发布中断时完成清单缺失，重新运行 launcher 可从稳定结果阶段完成发布。开启 `retention.keep_final_bam` 后，缺失的最终 BAM/索引会进入 DAG 恢复，不能由“交付已完成”提前退出。
 
 发布清单只收录本次最终 sample manifest 声明的 CpG、SNP（含 index）和固定 QC 文件。移除样本或关闭 SNP 后，stage 中的旧文件保留供 Snakemake 复用，`03_results/` 中的对应旧文件会清理。
 若全部 cell 都低于 demux 保留阈值，仍发布含 demux 统计的 MultiQC 和最终 manifest，便于检查筛除原因。
@@ -434,7 +434,7 @@ CpG 文件固定为 SnapATAC2 `pp.import_values` 可直接读取的四列：`chr
 
 正式运行成功时，controller log 会记录 `Published sealed delivery`。发布函数自动回收 `02_work/demux/`（先删 `state/` 提交边界，再删整棵 scratch）；state 删除失败则保留 FASTQ 并告警，下次启动可幂等补收。发布之前该目录始终完整保留以支持断点续跑。之后可执行 `./run_pipeline.sh --dry-run` 检查当前 DAG；需要重算哪些规则由 Snakemake 当前 dependency/rerun trigger 决定。
 
-任何依赖 demux 输出的修改都会重新执行 demux checkpoint 并重新生成其 FASTQ scratch；该策略在发布后释放 demux 磁盘空间。不要手动只删除其中 FASTQ 而保留 completion。也不要单独删除 `02_work/results_stage/`：它与公开结果共享 hardlink 内容（不额外占用磁盘），同时也是 Snakemake 增量重算的稳定 biological output stage 与重发布来源。
+任何依赖 demux 输出的修改都会重新执行 demux checkpoint 并重新生成其 FASTQ scratch；该策略在发布后释放 demux 磁盘空间。重建时间戳本身不触发比对/CpG 重算；这些规则直接跟踪真实 raw 输入、Barcode Map、样本声明、demux binary 和分析参数。不要手动只删除其中 FASTQ 而保留 completion。也不要单独删除 `02_work/results_stage/`：它与公开结果共享 hardlink 内容（不额外占用磁盘），同时也是 Snakemake 增量重算的稳定 biological output stage 与重发布来源。
 
 通过 demux 阈值的 cell 即使全未比对或 trim 后全空，也保留合法空 CpG 和 QC，不阻断整批交付；零 primary reads 的 mapping 为 0%，无 CpH 观测为缺失值。
 
@@ -446,6 +446,9 @@ CpG 文件固定为 SnapATAC2 `pp.import_values` 可直接读取的四列：`chr
 03_results/run_manifest.json
 ```
 
+交付清单的 `pipeline.name` 固定为 `Alopex`；`delivery-ready` 由内部 CLI 生成，
+正式发布由 Snakemake 持锁的 `onsuccess` 调用 `publish_delivery` 完成。
+
 ## 常见问题
 
 - Doctor 报 reference 缺失：确认六个 source 文件的固定路径和文件名，然后重新运行 `bash core/doctor.sh`。
@@ -453,11 +456,12 @@ CpG 文件固定为 SnapATAC2 `pp.import_values` 可直接读取的四列：`chr
 - 配置校验失败：根据错误修改 `00_config/config.yaml`；只使用参数文档与 config schema 支持的字段。
 - Bismark 配置失败：检查 `bismark.library_type` 与 reference/index。
 - Slurm 作业长时间 PENDING：使用 `squeue -u "$USER"` 查看状态；资源或 partition 问题请联系集群管理员。
+- Slurm 作业反复在已确认故障的节点启动失败：可从项目目录执行 `SBATCH_EXCLUDE=节点名 ./run_pipeline.sh` 排除该节点并断点续跑。launcher 保留此原生 Slurm 变量并显示排除列表；其它外部调度覆盖仍会清除。无需刷新 manifest 或删除已有结果。
 - 分析失败：先查看 `04_logs/` 中对应 rule 的日志，修正问题后重新运行 `./run_pipeline.sh`。
 
 ## 9. 下游 QC 与可视化
 
-使用 Doctor 管理的 notebook 环境运行下游分析（`downstream/`），结果写入项目的 `06_downstream/<delivery_id>/`。Notebook 首格接受 Pipeline、项目和 TSS reference 的绝对路径。第二格可按需强制重算；`RECOMPUTE_RAW_ADATA=True` 从 sealed CpG 重建 AnnData，默认按缓存身份自动复用。
+使用 Doctor 管理的 notebook 环境运行 [下游分析](downstream/README.md)，结果写入项目的 `06_downstream/<delivery_id>/`。Notebook 首格接受 Pipeline、项目和 TSS reference 的绝对路径。第二格可按需强制重算；`RECOMPUTE_RAW_ADATA=True` 从 sealed CpG 重建 AnnData，默认按缓存身份自动复用。
 
 `DNAme_QC_Information.csv` 固定输出 20 列，包含样本身份、甲基化、signal composition、Gini、mapping 与 read-pair retention 指标；完整计数与 backend 诊断保留在主 Pipeline 的最终 manifest 和 MultiQC 中。CpG Density 从 QC 表、sealed manifest 与 composition 缓存读取所需字段。
 

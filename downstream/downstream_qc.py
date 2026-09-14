@@ -216,8 +216,8 @@ def load_sealed_qc_context(
         raise ValueError(f"Sealed snapshot belongs to another project: {snapshot_project}")
 
     pipeline = _mapping(manifest.get("pipeline"), "pipeline metadata")
-    if pipeline.get("name") != "DNA_Pipeline":
-        raise ValueError("run_manifest does not describe DNA_Pipeline")
+    if pipeline.get("name") != "Alopex":
+        raise ValueError("run_manifest does not describe Alopex")
     pipeline_root = Path(str(pipeline.get("source_root", ""))).expanduser().resolve()
     if expected_pipeline_root is not None:
         expected = Path(expected_pipeline_root).expanduser().resolve()
@@ -4722,8 +4722,8 @@ def _notebook_pipeline_root(
     if manifest.get("status") != "complete":
         raise FileNotFoundError("run_manifest delivery is not complete")
     pipeline = manifest.get("pipeline")
-    if not isinstance(pipeline, dict) or pipeline.get("name") != "DNA_Pipeline":
-        raise FileNotFoundError("run_manifest.pipeline is not DNA_Pipeline metadata")
+    if not isinstance(pipeline, dict) or pipeline.get("name") != "Alopex":
+        raise FileNotFoundError("run_manifest.pipeline is not Alopex metadata")
     option = _notebook_root_option(dna_pipeline_root, "DNA_PIPELINE_ROOT")
     if option:
         return _validate_notebook_pipeline_root(Path(option))

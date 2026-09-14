@@ -15,7 +15,7 @@ final manifest 的 canonical read-pair funnel 进入相同计算；backend 原�
 Notebook/Downstream 使用 Doctor 管理的 `conda/current/notebook` 环境，规格唯一定义在 `core/envs.yaml`。可直接执行：
 
 ```bash
-PIPELINE=/path/to/Alopex_dev
+PIPELINE=/path/to/Alopex
 "$PIPELINE/conda/current/notebook/bin/python" \
   "$PIPELINE/downstream/downstream_qc.py" \
   --project-dir /path/to/Patient001
@@ -27,7 +27,7 @@ Pipeline 与项目通常不在同一目录时，直接填写两个绝对路径�
 
 ```python
 DNA_PROJECT_ROOT = Path("/path/to/Patient001")
-DNA_PIPELINE_ROOT = Path("/path/to/Alopex_dev")
+DNA_PIPELINE_ROOT = Path("/path/to/Alopex")
 ```
 
 也可以改为导出同名环境变量。两者都留空时，Notebook 先检查 Jupyter 当前目录及父目录中的
@@ -48,12 +48,12 @@ Processor 子进程沿用 Notebook 的 Python，运行前请使用上述专用 k
 
 ### Jupyter / VS Code kernel
 
-Notebook 元数据要求名为 `dna-pipeline-qc` 的 kernel。交互式运行前把它注册到当前用户的
+Notebook 元数据要求名为 `alopex-qc` 的 kernel。交互式运行前把它注册到当前用户的
 Jupyter kernel 目录；argv 经由 `conda/current` 符号链接指向 Doctor 管理的 notebook 环境，
-后续环境重建不需要重新注册。以下命令自动选择当前系统的 Jupyter 数据目录：
+后续环境重建不需要重新注册。Pipeline 迁移目录后应重新注册并在 Notebook 中选择 `Alopex QC`；确认新 kernel 可启动后移除指向旧目录的专用 kernel。以下命令自动选择当前系统的 Jupyter 数据目录：
 
 ```bash
-PIPELINE=/path/to/Alopex_dev
+PIPELINE=/path/to/Alopex
 "$PIPELINE/conda/current/notebook/bin/python" - "$PIPELINE" <<'PY_KERNEL'
 import json
 import sys
@@ -61,7 +61,7 @@ from pathlib import Path
 from jupyter_core.paths import jupyter_data_dir
 
 pipeline = Path(sys.argv[1]).absolute()
-kernel = Path(jupyter_data_dir()) / "kernels/dna-pipeline-qc"
+kernel = Path(jupyter_data_dir()) / "kernels/alopex-qc"
 kernel.mkdir(parents=True, exist_ok=True)
 (kernel / "kernel.json").write_text(json.dumps({
     "argv": [str(pipeline / "conda/current/notebook/bin/python"),

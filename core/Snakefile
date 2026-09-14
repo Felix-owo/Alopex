@@ -377,12 +377,17 @@ def current_demux_manifest_index():
     return demux_manifest_index(DEMUX_STATE_DIR, tuple(DEMUX_RUN_IDS))
 
 def current_demux_fastq(demux_sample, read_pair):
-    return resolve_demux_fastq_from_manifest(
+    return ancient(resolve_demux_fastq_from_manifest(
         INTERMEDIATE_DIR,
         demux_sample,
         read_pair,
         manifest_index=current_demux_manifest_index(),
-    )
+    ))
+
+def current_demux_source_inputs(wildcards):
+    manifest, _row = current_demux_match(wildcards.demux_sample)
+    raw = RAW_SAMPLES_MAP[manifest.parent.name]
+    return [*raw["r1"], *raw["r2"], SAMPLE_MANIFEST, BARCODE_MAP, str(DEMUX_BINARY)]
 
 @functools.lru_cache(maxsize=None)
 def current_demux_match(demux_sample):
@@ -426,7 +431,7 @@ def current_demux_completion(wildcards):
             f"Checkpoint {run_id!r} returned the wrong manifest: "
             f"{checkpoint_output.manifest} != {manifest}"
         )
-    return str(checkpoint_output.completion)
+    return ancient(str(checkpoint_output.completion))
 
 def current_run_demux_manifest(wildcards):
     checkpoint_job = checkpoints.demux.get(sample=wildcards.sample)
@@ -880,7 +885,7 @@ checkpoint demux:
               --dna-out-dir "$dna_tmp" \
               --rna-out-dir "$rna_tmp" \
               --json-report "$report_tmp" \
-              --sample-name {params.sample_name:q} \
+              --sample-name={params.sample_name:q} \
               --min-matched-read-pairs {params.min_matched_read_pairs} \
               --dna-w-spacer-len {params.dna_w_spacer_len} \
               --mode {params.demux_mode:q} \
@@ -889,7 +894,7 @@ checkpoint demux:
         }}
         run_demux >> {log:q} 2>&1
 
-        python -m dna_pipeline write-demux-metadata \
+        python -m dna_pipeline write-demux-metadata -- \
             "$report_tmp" "$mqc_tmp" "$manifest_tmp" "$dna_final" "$rna_final" \
             {params.pipeline_mode:q} {params.route_id:q} {params.downstream_dna:q} \
             {params.raw_sample:q} {input.cell_manifest:q} >> {log:q} 2>&1
@@ -923,8 +928,8 @@ checkpoint demux:
 
         python -m dna_pipeline write-demux-completion \
             "$completion_tmp" \
-            --run-id {wildcards.sample:q} \
-            --project-sample-id {params.sample_name:q} \
+            --run-id={wildcards.sample:q} \
+            --project-sample-id={params.sample_name:q} \
             --manifest {output.manifest:q} \
             --report {output.json_report:q} \
             --mqc {output.json_mqc:q} \
@@ -967,7 +972,7 @@ if PROTOCOL_POLICY.requires_rna_barcode:
                 --manifest {input.manifest:q} \
                 --intermediate-dir {params.intermediate_dir:q} \
                 --marker {output.marker:q} \
-                --run-id {wildcards.sample} > {log:q} 2>&1
+                --run-id={wildcards.sample:q} > {log:q} 2>&1
             """
 if METHYLATION_BACKEND == "biscuit":
     rule align_sort_dedup:
@@ -975,6 +980,7 @@ if METHYLATION_BACKEND == "biscuit":
         input:
             r1 = lambda wc: current_demux_fastq(wc.demux_sample, 1),
             r2 = lambda wc: current_demux_fastq(wc.demux_sample, 2),
+            demux_sources = current_demux_source_inputs,
             ref = REFERENCE_GENOME,
             ref_fai = str(REFERENCE_FAI),
             ref_indexes = REFERENCE_BISCUIT_INDEXES,
@@ -1003,6 +1009,8 @@ if METHYLATION_BACKEND == "biscuit":
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
+            demux_spacer_len = DNA_W_SPACER_LEN,
+            demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
             rg_header = lambda wc: "@RG\\tID:{0}\\tSM:{0}\\tPL:ILLUMINA".format(
                 wc.demux_sample.replace(os.sep, "_")
             ),
@@ -1129,7 +1137,7 @@ if METHYLATION_BACKEND == "biscuit":
 
             python -m dna_pipeline write-dupsifter-qc \
                 "$tmp_stat" "$tmp_mqc" \
-                --sample {wildcards.demux_sample:q} \
+                --sample={wildcards.demux_sample:q} \
                 --metadata {params.dupsifter_metadata:q} >> {log.main:q} 2>&1
 
             echo "INFO: stage=publish status=START" >&2
@@ -1240,7 +1248,7 @@ if METHYLATION_BACKEND == "biscuit":
                     --high-read-names "$tmp_names"
                     --summary-json "$tmp_summary"
                     --multiqc-json "$tmp_mqc"
-                    --sample-name {params.sample_name:q}
+                    --sample-name={params.sample_name:q}
                     --excluded-contigs-json {params.excluded_contigs_json:q}
                     --alignment-bam {input.bam:q}
                     --samtools {params.samtools:q}
@@ -1343,7 +1351,7 @@ if METHYLATION_BACKEND == "biscuit":
                     --high-read-names "$tmp_names"
                     --summary-json "$tmp_summary"
                     --multiqc-json "$tmp_mqc"
-                    --sample-name {params.sample_name:q}
+                    --sample-name={params.sample_name:q}
                     --excluded-contigs-json {params.excluded_contigs_json:q}
                     --alignment-bam {input.bam:q}
                     --samtools {params.samtools:q}
@@ -1885,6 +1893,7 @@ elif METHYLATION_BACKEND == "rastair":
         input:
             r1 = lambda wc: current_demux_fastq(wc.demux_sample, 1),
             r2 = lambda wc: current_demux_fastq(wc.demux_sample, 2),
+            demux_sources = current_demux_source_inputs,
             reference = REFERENCE_BACKEND_DEPENDENCIES,
             helper = str(BSCONV_MODULE_CODE),
         output:
@@ -1902,6 +1911,8 @@ elif METHYLATION_BACKEND == "rastair":
             disk_mb = lambda wc: static_scratch_mb("preprocess_alignment", wc.demux_sample),
             attempt_no = lambda wc, attempt: int(attempt),
         params:
+            demux_spacer_len = DNA_W_SPACER_LEN,
+            demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
             bwa_prefix = f"{REFERENCE_GENOME}.bwa/genome",
             rg = lambda wc: "@RG\\tID:{0}\\tSM:{0}\\tPL:ILLUMINA".format(wc.demux_sample),
             trim_threads = CUTADAPT_THREADS,
@@ -1944,12 +1955,13 @@ elif METHYLATION_BACKEND == "rastair":
             rm -f -- "$tmpdir/sorted.bam"
             {SAMTOOLS:q} index -@ "$io_threads" "$tmpdir/marked.bam"
             {RASTAIR_PYTHON:q} -m dna_pipeline taps-alignment-qc --bam "$tmpdir/marked.bam" \
-                --samtools {SAMTOOLS:q} --scratch "$tmpdir" --sample {wildcards.demux_sample:q} --output "$tmpdir/qc.json"
+                --samtools {SAMTOOLS:q} --scratch "$tmpdir" --sample={wildcards.demux_sample:q} --output "$tmpdir/qc.json"
             python -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
                 --bam-destination {output.bam:q} --samtools {SAMTOOLS:q} \
                 --file "$tmpdir/cutadapt.json" {output.report:q} \
                 --file "$tmpdir/marked.bam" {output.bam:q} --file "$tmpdir/marked.bam.bai" {output.bai:q} \
                 --file "$tmpdir/qc.json" {output.qc:q}
+            dna_pipeline_release_scratch
             """
 
     rule taps_call_cpg:
@@ -1997,6 +2009,7 @@ elif METHYLATION_BACKEND == "rastair":
             {ZSTD:q} -q -t "$tmpdir/cpg.tsv.zst"
             python -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
                 --file "$tmpdir/cpg.tsv.zst" {output.cpg:q} --file "$tmpdir/qc.json" {output.qc:q}
+            dna_pipeline_release_scratch
             """
 
 else:
@@ -2006,6 +2019,7 @@ else:
         input:
             r1 = lambda wc: current_demux_fastq(wc.demux_sample, 1),
             r2 = lambda wc: current_demux_fastq(wc.demux_sample, 2),
+            demux_sources = current_demux_source_inputs,
             ref = REFERENCE_GENOME,
             ref_fai = str(REFERENCE_FAI),
             bismark_genome = str(REFERENCE_BISMARK_GENOME),
@@ -2024,6 +2038,8 @@ else:
             disk_mb = lambda wildcards: static_scratch_mb("preprocess_alignment", wildcards.demux_sample),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
+            demux_spacer_len = DNA_W_SPACER_LEN,
+            demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
             cutadapt = CUTADAPT,
             cutadapt_threads = CUTADAPT_THREADS,
             cutadapt_quality = CUTADAPT_QUALITY_CUTOFF,
@@ -2208,7 +2224,7 @@ else:
             {params.samtools:q} quickcheck -v "$tmp/processed.bam" >> {log:q} 2>&1
             export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
             python -m dna_pipeline write-filter-summary \
-                --sample {wildcards.demux_sample:q} \
+                --sample={wildcards.demux_sample:q} \
                 --candidate-pairs "$candidate_pairs" --removed-pairs "$removed_pairs" \
                 --excluded-pairs "$excluded_pairs" \
                 --processed-bam "$tmp/processed.bam" --samtools {params.samtools:q} \
@@ -2475,10 +2491,10 @@ def current_final_manifest_qc_inputs(wildcards):
     for sample in active_samples:
         paths = PROJECT_LAYOUT.cell(sample)
         inputs.append(str(paths.cutadapt_json))
+        if KEEP_FINAL_BAM:
+            inputs.extend(map(str, paths.retained_bam_files))
         if METHYLATION_BACKEND == "rastair":
             inputs.append(str(paths.rastair_qc))
-            if KEEP_FINAL_BAM:
-                inputs.extend([str(paths.marked_bam), str(paths.marked_bam_index)])
             continue
         inputs.append(str(paths.high_cph_summary))
         if METHYLATION_BACKEND == "biscuit":

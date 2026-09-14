@@ -5,13 +5,13 @@ if [[ -n "${DNA_PIPELINE_ROOT:-}" ]]; then
     export PYTHONPATH="$DNA_PIPELINE_ROOT/core${PYTHONPATH:+:$PYTHONPATH}"
 fi
 
-# 首次尝试即建立日志硬链接，使 Snakemake 重试清理主日志后仍保留失败证据。
+# 每次尝试建立编号日志硬链接；新一轮首次尝试清理上一轮归档，重试保留本轮证据。
 dna_pipeline_init_attempt_logs() {
     local attempt="$1"
     shift
     local live_log runtime_host
 
-    [[ "$attempt" =~ ^[12]$ ]] || {
+    [[ "$attempt" =~ ^[123]$ ]] || {
         echo "ERROR: unsupported attempt number: $attempt" >&2
         return 2
     }
@@ -24,12 +24,11 @@ dna_pipeline_init_attempt_logs() {
         mkdir -p "$(dirname "$live_log")"
         rm -f -- "$live_log"
         if [[ "$attempt" == "1" ]]; then
-            rm -f -- "${live_log}.attempt1"
-            : > "${live_log}.attempt1"
-            ln -- "${live_log}.attempt1" "$live_log"
-        else
-            : > "$live_log"
+            rm -f -- "${live_log}.attempt2" "${live_log}.attempt3"
         fi
+        rm -f -- "${live_log}.attempt${attempt}"
+        : > "${live_log}.attempt${attempt}"
+        ln -- "${live_log}.attempt${attempt}" "$live_log"
         printf '=== resource attempt %s ===\n' "$attempt" >> "$live_log"
         printf 'runtime_host=%s slurm_job_id=%s slurm_partition=%s slurm_qos=%s slurm_cpus_per_task=%s slurm_mem_per_node=%s\n' \
             "$runtime_host" "${SLURM_JOB_ID:-NA}" "${SLURM_JOB_PARTITION:-NA}" \

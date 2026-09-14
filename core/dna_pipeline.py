@@ -289,8 +289,6 @@ def finalize_release(release_s: str, release_id: str, expected_subdir: str) -> N
     for role in RELEASE_ROLES:
         role_path = release_path / role
         prefix = role_path.resolve(strict=True)
-
-
         if release.parent not in prefix.parents:
             raise ValueError(f"release role escaped managed release store: {role} -> {prefix}")
         identity = read_environment_identity(prefix)
@@ -507,7 +505,7 @@ properties:
         description: false 用 combined-index end-to-end（默认）、true 用 faithful CT/GA + --local；两模式互斥。
         type: boolean
       non_conversion_percentage_cutoff:
-        description: 单 read pair non-CG retention 达到该百分比判为 conversion 异常；越低越严格。
+        description: 任一 mate 的 non-CG retention 达到该百分比且满足 minimum_count 时移除整对；越低越严格。
         type: integer
         minimum: 0
         maximum: 100
@@ -640,8 +638,11 @@ biscuit:
 bismark:
   library_type: non_directional   # directional / non_directional / pbat
   local_alignment: false          # false: combined-index end-to-end（默认）；true: faithful CT/GA + --local
-  non_conversion_percentage_cutoff: 70    # 单 pair non-CG retention 达到该百分比判为 conversion 异常；越低越严格
+  non_conversion_percentage_cutoff: 70    # 任一 mate 的 non-CG retention 达标且满足 minimum_count 时移除整对；越低越严格
   non_conversion_minimum_count: 5         # 至少这么多个 informative non-CG C 才启用百分比判断，防短 CpH 误杀
+
+high_cph:
+  excluded_contigs: [pUC19, lambda, chrM]  # 这些对照不参与 high-CpH 筛除；名称须匹配参考 contig，TAPS 不适用
 
 runtime:
   local_executor_cores: 32        # local executor 的总 CPU 数（snakemake --cores）；影响吞吐不改变结果
@@ -671,17 +672,18 @@ STATIC_TIER_MAX_DEMUX_BYTES = (
     384 * 1024 * 1024,
     None,
 )
-STATIC_MAX_ATTEMPTS = 2
-STATIC_RETRY_MEMORY_RATIO = (3, 2)
+STATIC_MAX_ATTEMPTS = 3
+STATIC_RETRY_MEMORY_RATIOS = ((3, 2), (2, 1))
 BISMARK_CELL_RULE_RUNTIME_MIN = 150
 _INTEGER_TEXT = re.compile(r"^[0-9]+$")
 
 
 def _attempt_memory_mb(first_mem_mb: int, attempt_no: int) -> int:
+    attempt_no = _attempt_number(attempt_no)
     memory_mb = int(first_mem_mb)
     if attempt_no == 1:
         return memory_mb
-    numerator, denominator = STATIC_RETRY_MEMORY_RATIO
+    numerator, denominator = STATIC_RETRY_MEMORY_RATIOS[attempt_no - 2]
     return (memory_mb * numerator + denominator - 1) // denominator
 
 
@@ -822,7 +824,7 @@ def demux_size_tier(total_bytes: object) -> str:
 
 
 def demux_resource_request(total_bytes: object, attempt: int = 1) -> ResourceRequest:
-    """返回按输入字节数分级的 demux 调度请求，重试仅把内存提高至 1.5 倍。"""
+    """返回按输入字节数分级的 demux 调度请求，两次重试仅把内存分别提高至首次的 1.5 倍、2 倍。"""
 
     attempt_no = _attempt_number(attempt)
     key, row = _rule("demux")
@@ -869,7 +871,7 @@ def _attempt_number(attempt: object) -> int:
         or not isinstance(attempt, int)
         or not 1 <= attempt <= STATIC_MAX_ATTEMPTS
     ):
-        raise ValueError("attempt must be 1 or 2")
+        raise ValueError("attempt must be 1, 2 or 3")
     return attempt
 
 
@@ -947,8 +949,6 @@ _BACKEND_STAGE_RULES: Mapping[tuple[str, str], str] = MappingProxyType(
 
 _LOCAL_BACKEND_THREADS: Mapping[str, tuple[int, int, int, int]] = MappingProxyType(
     {
-
-
         "align_sort_dedup": (8, 12, 16, 16),
         "bismark_align_dedup": (8, 12, 16, 16),
         "bismark_align_dedup_local": (12, 12, 16, 16),
@@ -1074,6 +1074,15 @@ class CellOutputPaths:
     @property
     def dna_bam_index(self) -> Path:
         return Path(f"{self.dna_bam}.bai")
+
+    @property
+    def retained_bam_files(self) -> tuple[Path, ...]:
+        """返回 keep_final_bam 要求保留且由当前 backend 实际生成的 BAM/索引。"""
+        if self.backend == "rastair":
+            return self.marked_bam, self.marked_bam_index
+        if self.backend == "biscuit":
+            return self.dna_bam, self.dna_bam_index
+        return (self.processed_bam,)
 
     @property
     def rna_bam(self) -> Path:
@@ -1517,6 +1526,14 @@ def write_filter_summary(
     retained 必须等于 candidate - removed + excluded（processed BAM 的实测
     pair 数）；任何计数矛盾都在写出前失败。
     """
+    if isinstance(minimum_count, bool) or not isinstance(minimum_count, int) or minimum_count < 1:
+        raise SystemExit("filter summary minimum_count must be an integer >= 1")
+    if (
+        isinstance(percentage, bool)
+        or not isinstance(percentage, (int, float))
+        or not 0 <= percentage <= 100
+    ):
+        raise SystemExit("filter summary percentage must be within [0, 100]")
     if min(candidate_pairs, removed_pairs, excluded_pairs, retained_pairs) < 0:
         raise SystemExit("filter summary counts must be non-negative integers")
     if removed_pairs > candidate_pairs:
@@ -1743,6 +1760,8 @@ def _iter_fastq_inventory(
             unsupported.append(path)
             continue
         original_sample, mate, segment = parsed
+        if segment.startswith("L000_"):
+            raise ValueError(f"FASTQ lane must be within 1-999: {path}")
         sample = original_sample.removeprefix("样本_")
         if SAMPLE_ID_RE.fullmatch(sample) is None:
             raise ValueError(
@@ -1778,7 +1797,7 @@ def discover_samples(
 ) -> dict[str, dict[str, list[str]]]:
     """按确定性的 lane/chunk 顺序发现配对 FASTQ。
 
-    支持 R1/R2 或末尾 1/2、1-3 位 lane；仅去掉样本名前缀“样本_”，不改文件名或批次信息。
+    支持 R1/R2 或末尾 1/2、1-999 的 lane；仅去掉样本名前缀“样本_”，不改文件名或批次信息。
     lane 按数值配对排序；归一化身份冲突、重复 mate 与缺配对均拒绝；维护预览可校验虚拟改名清单。
     指定样本集合时仅校验该集合的输入，其余 FASTQ 提示后跳过；未指定时完整扫描供 refresh 使用。
     """
@@ -2985,7 +3004,7 @@ BENCHMARK_SCHEMA_VERSION = 2
 BENCHMARK_ID = "doctor_hpc_raw_v2"
 
 
-def _benchmark_fastq_pairs(r1: Path, r2: Path, *, umi_tagged: bool = False) -> Iterable[tuple[bytes, bytes]]:
+def _benchmark_fastq_pairs(r1: Path, r2: Path) -> Iterable[tuple[bytes, bytes]]:
     with gzip.open(r1, "rb") as left, gzip.open(r2, "rb") as right:
         while True:
             records = [[handle.readline() for _ in range(4)] for handle in (left, right)]
@@ -2997,8 +3016,6 @@ def _benchmark_fastq_pairs(r1: Path, r2: Path, *, umi_tagged: bool = False) -> I
                         or len(lines[1].rstrip()) != len(lines[3].rstrip())):
                     raise ValueError(f"Malformed Doctor FASTQ: {r1 if mate == 1 else r2}")
                 name = lines[0].split()[0]
-                if umi_tagged:
-                    name = re.sub(rb"/[12](?=:[ACGTN]{8}$)", b"", name)
                 names.append(re.sub(rb"/[12]$", b"", name))
             if names[0] != names[1]:
                 raise ValueError(f"Doctor FASTQ mate names disagree: {names}")
@@ -3313,7 +3330,7 @@ def verify_route_outputs(project: Path, benchmark_path: Path, route: str) -> Non
                     if not row[field] or not (project / row[field]).is_file():
                         raise ValueError(f"{sample}: retained SRD {field} missing")
                 for prefix in ("dna_tube_rna_fastq", "rna_enrichment_rna_fastq"):
-                    if sum(1 for _ in _benchmark_fastq_pairs(project / row[prefix + "_r1"], project / row[prefix + "_r2"], umi_tagged=True)) != 12:
+                    if sum(1 for _ in _benchmark_fastq_pairs(project / row[prefix + "_r1"], project / row[prefix + "_r2"])) != 12:
                         raise ValueError(f"{sample}: collected RNA FASTQ pair count mismatch")
                 if not (project / (row["rna_bam_path"] + ".bai")).is_file():
                     raise ValueError(f"{sample}: SRD retained BAM index missing")
@@ -4025,7 +4042,7 @@ def _run_manifest_payload(ready: Mapping[str, object]) -> dict[str, object]:
             "id": ready["delivery_id"],
         },
         "pipeline": {
-            "name": "DNA_Pipeline",
+            "name": "Alopex",
             "source_root": str(pipeline_record.get("root", "")),
         },
         "run": {
@@ -4131,7 +4148,7 @@ def project_status(
 
     provenance snapshot 只是审计记录，不决定既有 Snakemake 工作可否复用；
     复用权威是 Snakemake 自身的 DAG、input、params、code、软件环境与 incomplete-output 逻辑。
-    complete_current 只对比 launcher 本次已创建 snapshot 的内容地址，不重算 basis。
+    complete_current 比较 launcher 本次 snapshot 的内容地址并检查声明的保留 BAM/索引，不重算 basis。
     """
     project = Path(project_dir).expanduser().resolve()
     public_manifest = _manifest_path(project)
@@ -4139,19 +4156,35 @@ def project_status(
         try:
             manifest = load_run_manifest(public_manifest)
         except (FileNotFoundError, ValueError, OSError) as exc:
-
-
             return {
                 "status": "resumable",
                 "reason": f"public manifest will be replaced: {exc}",
             }
         if manifest.get("status") == "complete":
-
-
             if current_snapshot is not None:
                 try:
                     snapshot = load_run_snapshot(Path(current_snapshot))
                     if manifest["run"]["snapshot_id"] == snapshot["snapshot_id"]:
+                        config_path = (
+                            Path(current_snapshot).resolve().parent / "inputs"
+                            / snapshot["input_copies"]["config"]["snapshot_path"]
+                        )
+                        config = load_project_config(config_path)
+                        if config["retention"]["keep_final_bam"]:
+                            layout = ProjectLayout(
+                                project / "02_work", public_manifest.parent,
+                                get_backend(config).name,
+                            )
+                            with (public_manifest.parent / "QC_Results/sample_manifest.tsv").open() as handle:
+                                for row in csv.DictReader(handle, delimiter="\t"):
+                                    if row["analysis_status"] != "PASS":
+                                        continue
+                                    for path in layout.cell(row["sample_id"]).retained_bam_files:
+                                        if not path.is_file():
+                                            return {
+                                                "status": "resumable",
+                                                "reason": f"requested retained BAM/index is missing: {path}",
+                                            }
                         return {
                             "status": "complete_current",
                             "manifest": str(public_manifest),
@@ -4209,7 +4242,7 @@ def publish(
     bam_destination: Path | None,
     samtools: str,
 ) -> None:
-    """将全部 source->destination 对 staged 为 .partial 并校验后按序 os.replace 提交；commit_last 固定最后提交。"""
+    """将文件组 staged 为 .partial 并校验；替换前撤销旧 commit_last，全部完成后最后提交它。"""
     destinations = [destination for _source, destination in pairs]
     if len(destinations) != len(set(destinations)):
         raise ValueError("duplicate destination in atomic publish bundle")
@@ -4248,7 +4281,6 @@ def publish(
 
         ordered = [destination for destination in destinations if destination != commit_last]
         if commit_last is not None:
-
             if commit_last.exists() or commit_last.is_symlink():
                 commit_last.unlink()
             ordered.append(commit_last)
@@ -5295,7 +5327,8 @@ def read_demux_manifest(manifest_path: str) -> list[DemuxRow]:
         project_ids.add(project_id)
         if not cell["plate_id"] or not cell["dna_barcode"] or not cell["dna_r1"] or not cell["dna_r2"]:
             raise ValueError(f"Demux manifest line {line_no} has incomplete cell identity/paths: {path}")
-        nonnegative_int(cell, "cell_order", line_no)
+        if not cell["cell_order"].strip():
+            raise ValueError(f"Demux manifest line {line_no} has empty cell_order: {path}")
         dna_reads = nonnegative_int(cell, "dna_reads", line_no)
         rna_reads = nonnegative_int(cell, "rna_reads", line_no)
         assigned_reads += dna_reads + rna_reads
@@ -6051,7 +6084,7 @@ def _read_high_cph_summary(path: Path, sample: str, backend: str) -> dict[str, o
         or counts["candidate_read_pairs"] > row_counts["observed_metric_rows"]
         or counts["flagged_read_pairs"] > row_counts["flagged_metric_rows"]
         or counts["excluded_read_pairs"] > row_counts["excluded_rows"]
-        or payload["metric"] != "CHH_retention"
+        or payload["metric"] != "CpH_retention"
         or payload["comparison"] != ">"
     ):
         raise ValueError(f"BISCUIT High-CpH row accounting is inconsistent: {path}")
@@ -6348,8 +6381,6 @@ def _merge_committed_generations(
                 str(demux.get("pipeline_mode", "")).strip().lower() == "srd"
                 and str(demux.get("rna_status", "")) == "Pass"
             ):
-
-
                 intermediate = demux_state.parent.parent
                 project_root = intermediate.parent
                 collected = [
@@ -7183,7 +7214,7 @@ def write_dupsifter_mqc(
     mapping = dict(DUPSIFTER_STAT_FIELDS)
     stat = Path(stat_path)
     if stat.exists():
-        for line in stat.read_text().splitlines():
+        for line_no, line in enumerate(stat.read_text().splitlines(), start=1):
             if "]" in line and ":" in line:
                 content = line.split("]", 1)[1].strip()
                 if ":" in content:
@@ -7193,8 +7224,10 @@ def write_dupsifter_mqc(
                     if key in mapping:
                         try:
                             metrics[mapping[key]] = int(value)
-                        except ValueError:
-                            pass
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"Invalid Dupsifter count at {stat}:{line_no}: {key}={value!r}"
+                            ) from exc
     row_key = demux_sample
     output_row = {
         "Protocol": pipeline_mode,
@@ -7257,8 +7290,6 @@ def build_refreshed_rows(
     discovered_set = set(discovered)
     rows_by_id: dict[str, dict[str, str]] = {}
     raw_owners: dict[str, tuple[str, str]] = {}
-
-
     for old in existing_rows:
         current_dna = str(
             old.get("dna_raw_sample", "") or ""
@@ -7467,17 +7498,6 @@ def normalize_read_name(value: str) -> str:
     return str(value).strip().split()[0]
 
 
-def parse_float(value: object) -> float | None:
-    try:
-        return float(str(value).strip())
-    except Exception:
-        return None
-
-
-def is_number(value: object) -> bool:
-    return parse_float(value) is not None
-
-
 def indexed_excluded_contigs(bam_path: Path, samtools: str, excluded: set[str]) -> list[str]:
     proc = subprocess.run(
         [samtools, "idxstats", str(bam_path)],
@@ -7579,17 +7599,25 @@ def _parse_excluded_contigs_json(value: str) -> set[str]:
 def _sort_unique_count(source: Path, destination: Path) -> int:
     env = dict(os.environ)
     env["LC_ALL"] = "C"
-    proc = subprocess.run(
-        ["sort", "-u", str(source), "-o", str(destination)],
-        text=True,
-        capture_output=True,
-        env=env,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise ValueError(proc.stderr.strip() or f"sort -u failed for {source}")
-    with destination.open("r", encoding="utf-8") as handle:
-        return sum(1 for line in handle if line.strip())
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    os.close(fd)
+    temporary_path = Path(temporary)
+    try:
+        proc = subprocess.run(
+            ["sort", "-u", str(source), "-o", str(temporary_path)],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise ValueError(proc.stderr.strip() or f"sort -u failed for {source}")
+        with temporary_path.open("r", encoding="utf-8") as handle:
+            count = sum(1 for line in handle if line.strip())
+        os.replace(temporary_path, destination)
+        return count
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def split_pairs(
@@ -7679,11 +7707,11 @@ def run_bsconv_extraction(args) -> None:
                     if not row or row[0].startswith("#"):
                         continue
                     if len(row) != BSCONV_P_COLUMNS or not all(
-                        is_number(row[idx]) for idx in range(8)
-                    ):
+                        re.fullmatch(r"[0-9]+", value) for value in row[:8]
+                    ) or not row[8].strip():
                         raise ValueError(
-                            "Unexpected biscuit bsconv -p row (expect 8 numeric "
-                            f"CHH fields + QNAME): {row!r}"
+                            f"Unexpected biscuit bsconv -p row at {args.bsconv_tsv}:{reader.line_num} "
+                            f"(expect 8 nonnegative integer cytosine counts + QNAME): {row!r}"
                         )
 
                     read_name = normalize_read_name(row[8])
@@ -7702,8 +7730,8 @@ def run_bsconv_extraction(args) -> None:
                         continue
 
 
-                    retained = parse_float(row[0]) + parse_float(row[2]) + parse_float(row[6])
-                    converted = parse_float(row[1]) + parse_float(row[3]) + parse_float(row[7])
+                    retained = int(row[0]) + int(row[2]) + int(row[6])
+                    converted = int(row[1]) + int(row[3]) + int(row[7])
                     sites = retained + converted
                     if sites == 0:
                         missing_metric += 1
@@ -7713,12 +7741,6 @@ def run_bsconv_extraction(args) -> None:
                     if retained / sites > args.threshold:
                         high_metric_rows += 1
                         raw_high_handle.write(read_name + "\n")
-
-
-        if total > 0 and metric_rows == 0 and excluded_rows < total:
-            raise ValueError(
-                "No CHH retention metric could be parsed from non-control biscuit bsconv -p output"
-            )
 
 
         candidate_unique_path = raw_candidate_path.with_suffix(".unique")
@@ -7757,7 +7779,7 @@ def run_bsconv_extraction(args) -> None:
         "observed_rows": total,
         "excluded_rows": excluded_rows,
         "threshold": args.threshold,
-        "metric": "CHH_retention",
+        "metric": "CpH_retention",
         "comparison": ">",
         "protocol": args.protocol,
         "high_cph_role": args.high_cph_role,
@@ -7879,8 +7901,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     status = commands.add_parser("project-status", help="输出项目交付状态 JSON。")
     status.add_argument("--project", required=True)
     status.add_argument("--current-snapshot")
-    publish_cmd = commands.add_parser("publish-delivery", help="复用 sealed inventory 发布交付。")
-    publish_cmd.add_argument("ready")
     ready = commands.add_parser("delivery-ready", help="写出 delivery_ready 发布事务标记。")
     ready.add_argument("--ready", required=True)
     ready.add_argument("--staged-results", required=True)
@@ -8088,13 +8108,9 @@ def main(argv: list[str] | None = None) -> int:
                 current_snapshot=args.current_snapshot,
             )
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-        elif command == "publish-delivery":
-            print(publish_delivery(args.ready))
         elif command == "delivery-ready":
             run_snapshot = str(args.run_snapshot).strip()
             if not run_snapshot:
-
-
                 raise ValueError(
                     "publishing requires a launcher-managed run snapshot. "
                     "Direct Snakemake runs stop at 02_work/results_stage; rerun via "

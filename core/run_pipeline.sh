@@ -117,7 +117,11 @@ if [[ -n "$DNA_PIPELINE_INIT_PROJECT" ]]; then
     if [[ -x "$DNA_PIPELINE_CONTROL_ENV/bin/python" ]]; then
         DNA_PIPELINE_INIT_PYTHON="$DNA_PIPELINE_CONTROL_ENV/bin/python"
     else
-        DNA_PIPELINE_INIT_PYTHON="$(command -v python3 || command -v python)"
+        DNA_PIPELINE_INIT_PYTHON="$(command -v python3 || command -v python || true)"
+        [[ -n "$DNA_PIPELINE_INIT_PYTHON" ]] || {
+            echo "ERROR: --init-project requires Python; no control Python, python3 or python was found." >&2
+            exit 1
+        }
     fi
     PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_INIT_PYTHON" -m dna_pipeline init-project \
         "$DNA_PIPELINE_INIT_PROJECT" --pipeline-root "$DNA_PIPELINE_ROOT"
@@ -130,6 +134,7 @@ DNA_PIPELINE_RULE_ENV=""
 
 while IFS= read -r variable_name; do
     case "$variable_name" in
+        SBATCH_EXCLUDE) ;;
         SBATCH_*|SNAKEMAKE_*)
             unset "$variable_name"
             ;;
@@ -176,7 +181,7 @@ discover_project_config() {
 DNA_PIPELINE_CONFIG="$(discover_project_config "$DNA_PIPELINE_LAUNCH_DIR" || true)"
 [[ -f "$DNA_PIPELINE_CONFIG" ]] || {
     echo "ERROR: no Alopex project found in the current directory or its parents." >&2
-    echo "Initialize the current directory with: /path/to/Alopex_dev/core/run_pipeline.sh --init-project" >&2
+    echo "Initialize the current directory with: /path/to/Alopex/core/run_pipeline.sh --init-project" >&2
     exit 2
 }
 DNA_PIPELINE_PROJECT_DIR="$(cd "$(dirname "$DNA_PIPELINE_CONFIG")/.." && pwd -P)"
@@ -216,6 +221,14 @@ pipeline_interrupt_tracked_run() {
     fi
     exit "$exit_code"
 }
+
+# 安装 launcher 外层信号处理，恢复临时目录清理与约定退出码。
+install_launcher_signal_traps() {
+    trap 'cleanup_launcher_tmp; exit 130' INT
+    trap 'cleanup_launcher_tmp; exit 143' TERM
+    trap 'cleanup_launcher_tmp; exit 129' HUP
+}
+
 # 受控执行 Snakemake：接管中断信号；完整输出进 controller log，进度以 Snakemake 原生输出为准。
 run_snakemake_tracked() {
     local run_id="$1" rc=0 controller_log
@@ -258,11 +271,11 @@ run_snakemake_tracked() {
     wait "$DNA_PIPELINE_ACTIVE_SNAKEMAKE_PID"
     rc=$?
     DNA_PIPELINE_ACTIVE_SNAKEMAKE_PID=""
-    trap - INT TERM HUP
+    install_launcher_signal_traps
     set -e
     if (( rc != 0 )); then
-        echo "ERROR: workflow 执行失败（rc=${rc}）；以下为日志尾部："
-        tail -n 40 "$controller_log"
+        echo "ERROR: workflow 执行失败（rc=${rc}）；以下为日志尾部：" >&2
+        tail -n 40 "$controller_log" >&2 || true
         if grep -q "cannot be locked" "$controller_log" 2>/dev/null; then
             echo "提示: Snakemake 项目锁未释放。确认没有其它 launcher 在本项目上运行后，" >&2
             echo "删除 $DNA_PIPELINE_PROJECT_DIR/.snakemake/locks 再重试。" >&2
@@ -288,9 +301,7 @@ if (( DNA_PIPELINE_READ_ONLY == 1 )) || [[ "$DNA_PIPELINE_DATA_MODE" == test ]];
     DNA_PIPELINE_RUNTIME_TMP="$(mktemp -d -t dna-pipeline-launch.XXXXXX)"
 fi
 trap cleanup_launcher_tmp EXIT
-trap 'cleanup_launcher_tmp; exit 130' INT
-trap 'cleanup_launcher_tmp; exit 143' TERM
-trap 'cleanup_launcher_tmp; exit 129' HUP
+install_launcher_signal_traps
 
 if [[ "$DNA_PIPELINE_DATA_MODE" == test ]]; then
     [[ "$DNA_PIPELINE_TEST_ROUTE" != auto ]] || DNA_PIPELINE_TEST_ROUTE="hg38-cabernet-bismark"
@@ -350,7 +361,7 @@ fi
 mkdir -p "$XDG_CACHE_HOME"
 export XDG_CACHE_HOME
 
-DNA_PIPELINE_SNAKEMAKE_VERSION="$($DNA_PIPELINE_SNAKEMAKE --version 2>/dev/null | head -n1)"
+DNA_PIPELINE_SNAKEMAKE_VERSION="$("$DNA_PIPELINE_SNAKEMAKE" --version 2>/dev/null | head -n1)"
 DNA_PIPELINE_SNAKEMAKE_MAJOR="$(printf '%s' "$DNA_PIPELINE_SNAKEMAKE_VERSION" | sed -E 's/^([0-9]+).*/\1/')"
 [[ "$DNA_PIPELINE_SNAKEMAKE_MAJOR" =~ ^[0-9]+$ ]] && (( DNA_PIPELINE_SNAKEMAKE_MAJOR >= 9 )) || {
     echo "ERROR: Snakemake >=9 is required; found $DNA_PIPELINE_SNAKEMAKE_VERSION." >&2
@@ -365,7 +376,7 @@ dna_pipeline_prepare_common_args() {
         --profile none
         --workflow-profile none
         --keep-going
-        --retries 1
+        --retries 2
         --rerun-incomplete
         --forcerun all
         --rerun-triggers mtime input params code software-env
@@ -390,7 +401,7 @@ dna_pipeline_prepare_run_snapshot() {
     if [[ "$DNA_PIPELINE_DATA_MODE" == test ]]; then
         snapshot_args+=(--allow-external-config)
     fi
-    DNA_PIPELINE_RUN_SNAPSHOT="$($DNA_PIPELINE_PYTHON -m dna_pipeline snapshot-create "${snapshot_args[@]}")"
+    DNA_PIPELINE_RUN_SNAPSHOT="$("$DNA_PIPELINE_PYTHON" -m dna_pipeline snapshot-create "${snapshot_args[@]}")"
     [[ -f "$DNA_PIPELINE_RUN_SNAPSHOT" ]] || {
         echo "ERROR: run-start snapshot was not created: $DNA_PIPELINE_RUN_SNAPSHOT" >&2
         exit 2
@@ -420,7 +431,7 @@ DNA_PIPELINE_STATUS_ARGS=(--project "$DNA_PIPELINE_PROJECT_DIR")
 if [[ -n "${DNA_PIPELINE_RUN_SNAPSHOT:-}" ]]; then
     DNA_PIPELINE_STATUS_ARGS+=(--current-snapshot "$DNA_PIPELINE_RUN_SNAPSHOT")
 fi
-DNA_PIPELINE_STATUS_JSON="$($DNA_PIPELINE_PYTHON -m dna_pipeline project-status "${DNA_PIPELINE_STATUS_ARGS[@]}")"
+DNA_PIPELINE_STATUS_JSON="$("$DNA_PIPELINE_PYTHON" -m dna_pipeline project-status "${DNA_PIPELINE_STATUS_ARGS[@]}")"
 DNA_PIPELINE_STATUS_LINES="$(pipeline_status_fields "$DNA_PIPELINE_STATUS_JSON")"
 DNA_PIPELINE_PROJECT_STATUS="$(printf '%s\n' "$DNA_PIPELINE_STATUS_LINES" | sed -n 1p)"
 DNA_PIPELINE_PROJECT_STATUS_REASON="$(printf '%s\n' "$DNA_PIPELINE_STATUS_LINES" | sed -n 2p)"
@@ -545,13 +556,14 @@ run_slurm() {
         unset DNA_PIPELINE_NODE_TMPDIR
     fi
     project_hash="$(project_hash8)"
-    plugin_version="$($DNA_PIPELINE_PYTHON -c 'from importlib.metadata import version;print(version("snakemake-executor-plugin-slurm"))' 2>/dev/null || true)"
+    plugin_version="$("$DNA_PIPELINE_PYTHON" -c 'from importlib.metadata import version;print(version("snakemake-executor-plugin-slurm"))' 2>/dev/null || true)"
     [[ -n "$plugin_version" ]] || { echo "ERROR: SLURM executor plugin is missing." >&2; return 127; }
     dna_pipeline_prepare_common_args "$latency_wait"
     default_resources=(); effective_account="$account"
     if [[ -n "$partition" ]]; then default_resources+=("slurm_partition=$partition"); fi
     if [[ -n "$effective_account" ]]; then default_resources+=("slurm_account=$effective_account"); fi
     plugin_args=(--slurm-jobname-prefix "Alopex_${project_hash}" --slurm-logdir "$logdir" --slurm-delete-logfiles-older-than 0 --slurm-status-command squeue)
+    if [[ -n "${SBATCH_EXCLUDE:-}" ]]; then plugin_args+=(--slurm-exclude-failed-nodes "$SBATCH_EXCLUDE"); fi
     if [[ -z "$effective_account" ]]; then plugin_args+=(--slurm-no-account); fi
     if [[ -n "$qos" ]]; then plugin_args+=(--slurm-qos "$qos"); fi
     if (( DNA_PIPELINE_READ_ONLY == 1 )); then
@@ -567,6 +579,7 @@ run_slurm() {
         echo "Executor: slurm (plugin $plugin_version; controller=current login shell)"
     fi
     echo "Protocol: $protocol"; echo "Backend: $DNA_PIPELINE_METHYLATION_BACKEND"; echo "Reference: $reference"; echo "SLURM jobs: $jobs (controller cores=$controller_cores)"
+    if [[ -n "${SBATCH_EXCLUDE:-}" ]]; then echo "SLURM excluded nodes: $SBATCH_EXCLUDE"; fi
     if (( DNA_PIPELINE_READ_ONLY == 0 )); then echo "Run snapshot: $DNA_PIPELINE_RUN_SNAPSHOT"; fi
     if (( DNA_PIPELINE_READ_ONLY == 1 )); then
         cd "$DNA_PIPELINE_RUNTIME_TMP"

@@ -395,7 +395,7 @@ mod cli {
         #[arg(long = "json-report", help = "JSON report 输出路径。")]
         pub(crate) json_report: PathBuf,
 
-        #[arg(long = "sample-name")]
+        #[arg(long = "sample-name", allow_hyphen_values = true)]
         pub(crate) sample_name: String,
 
         #[arg(
@@ -448,12 +448,18 @@ mod fastq_io {
         trim_start: usize,
         umi: Option<&[u8]>,
         trim: bool,
-    ) {
+    ) -> Result<()> {
         output.push(b'@');
-        output.extend_from_slice(id);
         if let Some(umi_seq) = umi {
+            output.extend_from_slice(normalize_read_id(id)?);
             output.push(b':');
             output.extend_from_slice(umi_seq);
+            let header = id.trim_ascii_start();
+            if let Some(comment_start) = header.iter().position(u8::is_ascii_whitespace) {
+                output.extend_from_slice(&header[comment_start..]);
+            }
+        } else {
+            output.extend_from_slice(id);
         }
         output.push(b'\n');
 
@@ -471,6 +477,7 @@ mod fastq_io {
             output.extend_from_slice(qual);
         }
         output.push(b'\n');
+        Ok(())
     }
 
     pub(super) fn normalize_read_id(id: &[u8]) -> Result<&[u8]> {
@@ -1181,12 +1188,15 @@ mod output {
         fate_counts: FateCounts,
     ) -> Result<()> {
         let mut rows = cell_rows.to_vec();
-        rows.sort_by(
-            |a, b| match (a.cell_order.parse::<i64>(), b.cell_order.parse::<i64>()) {
+        rows.sort_by(|a, b| {
+            match (a.cell_order.parse::<i64>(), b.cell_order.parse::<i64>()) {
                 (Ok(left), Ok(right)) => left.cmp(&right),
-                _ => a.cell_order.cmp(&b.cell_order),
-            },
-        );
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                (Err(_), Err(_)) => a.cell_order.cmp(&b.cell_order),
+            }
+            .then_with(|| a.plate_id.cmp(&b.plate_id))
+        });
 
         let mut sample_stats = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1258,6 +1268,46 @@ mod output {
         })?;
         serde_json::to_writer_pretty(file, &report).context("Failed writing JSON report")?;
         Ok(())
+    }
+
+    #[test]
+    fn report_cell_order_has_transitive_numeric_then_text_order() {
+        let root = std::env::temp_dir().join(format!(
+            "alopex_report_order.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let expected = [
+            "-9223372036854775808", "-10", "-2", "01", "1", "+2", "2", "10",
+            "9223372036854775807", "1z", "A1", "B2",
+        ];
+        let rows: Vec<CellRow> = expected.iter().enumerate().map(|(i, order)| CellRow {
+            dna_barcode: format!("barcode{i}"),
+            rna_barcode: String::new(),
+            plate_id: format!("P{i:02}"),
+            cell_order: order.to_string(),
+        }).collect();
+        let paths = OutputPaths {
+            dna_out_dir: root.join("dna"), rna_out_dir: root.join("rna"),
+            json_report: root.join("report.json"), sample_name: "Sort".to_string(),
+            dna_cell_ids: rows.iter().map(|row| (row.dna_barcode.clone(), format!("Sort_{}", row.plate_id))).collect(),
+            rna_cell_ids: AHashMap::new(), min_matched_read_pairs: 1,
+            mode: DemuxMode::DnaOnly, input_fastq_pairs: 1,
+        };
+        for reverse in [false, true] {
+            for shift in 0..rows.len() {
+                let mut input = rows.clone();
+                input.rotate_left(shift);
+                if reverse { input.reverse(); }
+                write_report(&paths, &input, &AHashMap::new(), FateCounts::default()).unwrap();
+                let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&paths.json_report).unwrap()).unwrap();
+                let observed: Vec<&str> = report["samples"].as_array().unwrap().iter()
+                    .map(|sample| sample["cell_order"].as_str().unwrap()).collect();
+                assert_eq!(observed, expected, "reverse={reverse}, shift={shift}");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn output_status(
@@ -1456,10 +1506,10 @@ impl Config {
             );
         }
         for path in &args.r1 {
-            ensure_readable_file(path, "--r1")?;
+            ensure_gzip_fastq(path, "--r1")?;
         }
         for path in &args.r2 {
-            ensure_readable_file(path, "--r2")?;
+            ensure_gzip_fastq(path, "--r2")?;
         }
         ensure_readable_file(&args.barcode_map, "--barcode-map")?;
         ensure_parent_dir(&args.json_report, "--json-report")?;
@@ -2343,7 +2393,7 @@ fn process_chunk(
             result.trim_start,
             result.output_umi(),
             result.is_valid,
-        );
+        )?;
         write_fastq_record(
             &mut bucket.r2_raw,
             &input.r2_ids[r2_id_start..r2_id_end],
@@ -2352,7 +2402,7 @@ fn process_chunk(
             0,
             result.output_umi(),
             false,
-        );
+        )?;
     }
     Ok(())
 }
@@ -2397,6 +2447,23 @@ fn init_tables() {
     });
 }
 
+fn ensure_gzip_fastq(path: &Path, label: &str) -> Result<()> {
+    ensure_readable_file(path, label)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+    if !name.ends_with(".fastq.gz") && !name.ends_with(".fq.gz") {
+        anyhow::bail!("{} requires a .fastq.gz or .fq.gz suffix: {}", label, path.display());
+    }
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Cannot open {} gzip FASTQ: {}", label, path.display()))?;
+    let mut magic = [0u8; 2];
+    std::io::Read::read_exact(&mut file, &mut magic)
+        .with_context(|| format!("Cannot read {} gzip header: {}", label, path.display()))?;
+    if magic != [0x1f, 0x8b] {
+        anyhow::bail!("{} is not gzip FASTQ (expected gzip magic 0x1f 0x8b): {}", label, path.display());
+    }
+    Ok(())
+}
+
 fn ensure_readable_file(path: &Path, label: &str) -> Result<()> {
     let metadata = std::fs::metadata(path).with_context(|| {
         format!(
@@ -2427,6 +2494,56 @@ fn join_thread<T>(handle: JoinHandle<T>, name: &str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_contract_requires_gzip_fastq_suffix_and_magic_on_both_mates() {
+        let root = std::env::temp_dir().join(format!(
+            "alopex_gzip_contract.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, b"@read\nACGT\n+\nIIII\n").unwrap();
+        let gzip = encoder.finish().unwrap();
+        let good = root.join("good.fastq.gz");
+        let barcode = root.join("Barcode_Map.csv");
+        std::fs::write(&good, &gzip).unwrap();
+        std::fs::write(&barcode, "DNA_Barcode,PlateID,Cell_Order\nACGTACGT,A1,A1\n").unwrap();
+        let make_args = |r1: &Path, r2: &Path| {
+            Args::try_parse_from([
+                "demux_rs", "--r1", r1.to_str().unwrap(), "--r2", r2.to_str().unwrap(),
+                "--barcode-map", barcode.to_str().unwrap(),
+                "--dna-out-dir", root.join("dna").to_str().unwrap(),
+                "--rna-out-dir", root.join("rna").to_str().unwrap(),
+                "--json-report", root.join("report.json").to_str().unwrap(),
+                "--sample-name", "AlopexGzip", "--mode", "dna-only",
+            ]).unwrap()
+        };
+        for (name, content, expected) in [
+            ("plain.fastq", b"@read\nACGT\n+\nIIII\n".as_slice(), "suffix"),
+            ("plain.fasta", b">read\nACGT\n".as_slice(), "suffix"),
+            ("renamed.fastq.gz", b"@read\nACGT\n+\nIIII\n".as_slice(), "gzip magic"),
+            ("renamed_fasta.fq.gz", b">read\nACGT\n".as_slice(), "gzip magic"),
+            ("short.fq.gz", b"\x1f".as_slice(), "gzip header"),
+            ("compressed.fasta.gz", gzip.as_slice(), "suffix"),
+        ] {
+            let bad = root.join(name);
+            std::fs::write(&bad, content).unwrap();
+            for (r1, r2, label) in [(&bad, &good, "--r1"), (&good, &bad, "--r2")] {
+                let error = Config::from_args(make_args(r1, r2)).expect_err("invalid gzip FASTQ").to_string();
+                assert!(error.contains(label) && error.contains(expected), "{name}: {error}");
+            }
+            assert!(!root.join("report.json").exists());
+            assert!(!root.join("dna").exists());
+        }
+        for name in ["good.fq.gz", "good.FASTQ.GZ"] {
+            let path = root.join(name);
+            std::fs::write(&path, &gzip).unwrap();
+            Config::from_args(make_args(&good, &path)).expect("valid gzip FASTQ");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn barcode_map_rejects_ambiguous_columns_and_unsafe_plate_ids() {
@@ -2507,6 +2624,23 @@ mod tests {
         let error = validate_paired_read_ids(b"read-1/1", b"read-2/2")
             .expect_err("different molecule IDs must fail");
         assert!(error.to_string().contains("read-ID mismatch"));
+    }
+
+    #[test]
+    fn rna_umi_stays_in_the_shared_qname_before_comments() {
+        for (left, right) in [
+            (&b"read/1"[..], &b"read/2"[..]),
+            (&b"read 1:N:0:ATCG"[..], &b"read 2:N:0:ATCG"[..]),
+            (&b"read"[..], &b"read"[..]),
+        ] {
+            for id in [left, right] {
+                let mut record = Vec::new();
+                write_fastq_record(&mut record, id, b"ACGT", b"IIII", 0, Some(b"ACGTACGT"), false)
+                    .expect("valid RNA FASTQ");
+                assert_eq!(record.split(|b| b.is_ascii_whitespace()).next().unwrap(), b"@read:ACGTACGT");
+                assert!(record.ends_with(b"\nACGT\n+\nIIII\n"));
+            }
+        }
     }
 
     #[test]

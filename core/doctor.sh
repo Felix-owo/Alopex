@@ -911,7 +911,7 @@ publish_release() {
 
 # 保留当前、上一代 release 及其复用角色的实际目录，避免清理后产生悬空链接。
 prune_superseded_releases() {
-    local candidate remaining release prefix resolved referenced
+    local candidate remaining release prefix resolved referenced scan_index=0
     local -a kept=("$NEW_RELEASE_PATH")
     remaining="$(find "$RELEASE_STORE" -mindepth 1 -maxdepth 1 -type d -name '20*' \
         ! -path "$NEW_RELEASE_PATH" | LC_ALL=C sort -r)"
@@ -920,11 +920,22 @@ prune_superseded_releases() {
         kept+=("$candidate")
         break
     done <<< "$remaining"
-    for release in "${kept[@]}"; do
+    while (( scan_index < ${#kept[@]} )); do
+        release="${kept[$scan_index]}"
+        scan_index=$((scan_index + 1))
         for prefix in "$release"/*; do
             [[ -L "$prefix" && -d "$prefix" ]] || continue
             resolved="$(cd "$prefix" && pwd -P)" || return $?
-            case "$resolved" in "$RELEASE_STORE"/*/*) kept+=("${resolved%/*}") ;; esac
+            case "$resolved" in
+                "$RELEASE_STORE"/*/*)
+                    resolved="${resolved%/*}"
+                    referenced=0
+                    for candidate in "${kept[@]}"; do
+                        [[ "$candidate" != "$resolved" ]] || { referenced=1; break; }
+                    done
+                    (( referenced == 1 )) || kept+=("$resolved")
+                    ;;
+            esac
         done
     done
     while IFS= read -r candidate; do
@@ -2260,7 +2271,7 @@ submit_slurm_reference_setup() {
 
     job_output="$($sbatch_bin \
         --parsable \
-        --job-name=alopex_reference_setup \
+        --job-name=Alopex_reference_setup \
         --nodes=1 \
         --ntasks=1 \
         --cpus-per-task="$REFERENCE_SUBMIT_CPUS" \
@@ -2648,7 +2659,7 @@ submit_slurm_build() {
 
     job_output="$($sbatch_bin \
         --parsable \
-        --job-name=alopex_demux_build \
+        --job-name=Alopex_demux_build \
         --nodes=1 \
         --ntasks=1 \
         --cpus-per-task="$SLURM_CPUS" \
@@ -2968,7 +2979,7 @@ cd $(printf '%q' "$project")
 exec env DNA_PIPELINE_DATA_MODE=test DNA_PIPELINE_TEST_ROUTE=$(printf '%q' "$route") DNA_PIPELINE_DOCTOR_LOCAL_CORES=2 bash $(printf '%q' "$RUN_PIPELINE")
 EOF
         chmod +x "$worker"
-        job_output="$(sbatch --parsable --job-name="alopex_doctor_${route}" --nodes=1 --ntasks=1 --cpus-per-task=2 --mem="$worker_mem" --time=00:20:00 --chdir="$PIPELINE_ROOT" --output="$route_log" --error="$route_log" "$worker")" || return $?
+        job_output="$(sbatch --parsable --job-name="Alopex_doctor_${route}" --nodes=1 --ntasks=1 --cpus-per-task=2 --mem="$worker_mem" --time=00:20:00 --chdir="$PIPELINE_ROOT" --output="$route_log" --error="$route_log" "$worker")" || return $?
         job_id="${job_output%%;*}"; job_id="${job_id%%.*}"
         [[ "$job_id" =~ ^[0-9]+$ ]] || return 1
         printf -v "$job_var" '%s' "$job_id"
