@@ -1,4 +1,4 @@
-# Alopex v13.11
+# Alopex v13.12
 
 Alopex 是面向 Cabernet、SRD、Droplet（DD-MET5）和 Cabernet–TAPS+ 单细胞 DNA 甲基化数据的 Snakemake Pipeline。它将原始 paired FASTQ 转为单细胞 CpG 结果、质量报告和可追溯的交付清单：
 
@@ -52,7 +52,7 @@ core/run_pipeline.sh  创建项目、检查输入并运行分析
 获取代码：
 
 ```bash
-git clone --branch v13.11 https://github.com/Felix-owo/Alopex.git
+git clone --branch v13.12 https://github.com/Felix-owo/Alopex.git
 cd Alopex
 ```
 
@@ -142,6 +142,8 @@ bash core/doctor.sh download
 ```
 
 Doctor 统一准备 Conda 环境（含 Rastair 2.2.0）、Rust demultiplexer、hg38/mm10 reference 与三后端索引（含普通 BWA），并执行三条隔离的端到端测试路线（A/B 并行，随后执行独立 TAPS 真值路线）。输出为连续 9 个阶段：平台、Conda、Rust、reference、原始输入完整性、A/B 项目配置、A/B 并行运行、A/B 结果验证、C 项目配置与运行及真值验证。每个阶段只有一组 START/OK，失败显示对应阶段 FAIL；检查后的修复以阶段内 REPAIR 提示。
+
+共享文件系统上的 Conda 冷启动可能较慢。CLI 探针在 GNU timeout 可用时允许 300 秒；超时或命令失败保留原始退出码，只有 help 成功返回后才判断选项是否受支持。
 
 标题、三条路线和 detail/summary 路径仅在启动时显示一次，概要实时写入 summary，结尾显示最终状态与沙箱去留。manifest 刷新、构建命令、退出码及原生诊断写入 detail；`logs/doctor/latest.detail.log` 和 `latest.summary.log` 始终指向最近一次运行。失败保留详细日志与沙箱，终端不重复播放整份日志。
 

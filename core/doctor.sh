@@ -483,17 +483,27 @@ raise SystemExit(0 if seen_native else 1)
 PY
 }
 
-# 如果系统存在 GNU timeout，则最多等待 30 秒；macOS 默认没有 timeout 时直接运行。
+# 为共享文件系统上的 Conda 冷启动保留五分钟，探针失败保留原始退出码。
 run_conda_probe() {
-    local executable="$1" executable_dir
+    local executable="$1" executable_dir rc
     shift
     executable_dir="$(cd "$(dirname "$executable")" && pwd -P)"
 
     if command -v timeout >/dev/null 2>&1; then
-        run_in_sanitized_environment "$executable_dir" timeout 30s "$executable" "$@"
+        if run_in_sanitized_environment "$executable_dir" timeout 300s "$executable" "$@"; then
+            return 0
+        else
+            rc=$?
+        fi
     else
-        run_in_sanitized_environment "$executable_dir" "$executable" "$@"
+        if run_in_sanitized_environment "$executable_dir" "$executable" "$@"; then
+            return 0
+        else
+            rc=$?
+        fi
     fi
+    printf 'ERROR: Conda 探针失败（rc=%s）：%s %s\n' "$rc" "$executable" "$*" >&2
+    return "$rc"
 }
 
 seed_python_path() {
@@ -575,19 +585,7 @@ validate_seed_context() {
         return 1
     }
 
-    if command -v timeout >/dev/null 2>&1; then
-        info_json="$(run_in_sanitized_environment "$SEED_CONDA_DIR" timeout 120s \
-            "$SEED_CONDA" info --json)" || {
-            echo "ERROR: 无法读取 Seed Conda context。" >&2
-            return 1
-        }
-    else
-        info_json="$(run_in_sanitized_environment "$SEED_CONDA_DIR" \
-            "$SEED_CONDA" info --json)" || {
-            echo "ERROR: 无法读取 Seed Conda context。" >&2
-            return 1
-        }
-    fi
+    info_json="$(run_conda_probe "$SEED_CONDA" info --json)" || return $?
 
     printf '%s\n' "$info_json" | run_in_sanitized_environment "$SEED_CONDA_DIR" \
         "$seed_python" -c '
@@ -621,14 +619,15 @@ new_release_id() {
 }
 
 create_control_from_seed() {
-    local target="$1" role="$2" specification
+    local target="$1" role="$2" specification help_text
     local -a format_args=()
     specification="$(extract_env_spec "$role")" || return $?
     echo "使用 Seed Conda 创建 control candidate：$target"
     echo "  seed         : $SEED_CONDA"
     echo "  specification: $specification"
 
-    if run_conda_probe "$SEED_CONDA" env create --help 2>&1 | grep -q -- '--format'; then
+    help_text="$(run_conda_probe "$SEED_CONDA" env create --help)" || return $?
+    if [[ "$help_text" == *"--format"* ]]; then
         format_args=(--format environment-yaml)
     fi
 
@@ -650,14 +649,15 @@ create_control_from_seed() {
 }
 
 create_from_control() {
-    local target="$1" role="$2" specification
+    local target="$1" role="$2" specification help_text
     local -a format_args=()
     specification="$(extract_env_spec "$role")" || return $?
     echo "使用新 control Conda 创建 candidate：$target"
     echo "  control conda: $CONTROL_CONDA"
     echo "  specification: $specification"
 
-    if run_conda_probe "$CONTROL_CONDA" env create --help 2>&1 | grep -q -- '--format'; then
+    help_text="$(run_conda_probe "$CONTROL_CONDA" env create --help)" || return $?
+    if [[ "$help_text" == *"--format"* ]]; then
         format_args=(--format environment-yaml)
     fi
 
@@ -2783,7 +2783,7 @@ if (( $# > 0 )); then
     doctor_usage >&2
     return 2
 fi
-local conda_bin conda_dir role specification warm_root
+local conda_bin conda_dir role specification warm_root help_text
 local -a specifier_args=()
 require_specification "$ENVS_SPEC"
 mkdir -p "$CONDA_ROOT" "$PACKAGE_CACHE" "$SETUP_HOME" "$SETUP_ENVS" "$SETUP_CACHE" "$SETUP_CONFIG" "$ENVS_BUILD_DIR"
@@ -2797,11 +2797,12 @@ else
     conda_bin="$SEED_CONDA"
 fi
 conda_dir="$(cd "$(dirname "$conda_bin")" && pwd -P)"
-run_conda_probe "$conda_bin" create --help 2>&1 | grep -q -- '--download-only' || {
+help_text="$(run_conda_probe "$conda_bin" create --help)" || return $?
+[[ "$help_text" == *"--download-only"* ]] || {
     echo "ERROR: $conda_bin 不支持 conda create --download-only，无法预热包缓存。" >&2
     return 127
 }
-if run_conda_probe "$conda_bin" create --help 2>&1 | grep -q -- '--environment-specifier'; then
+if [[ "$help_text" == *"--environment-specifier"* ]]; then
     specifier_args=(--environment-specifier environment-yaml)
 fi
 export PATH="$conda_dir:$HOST_PATH"
