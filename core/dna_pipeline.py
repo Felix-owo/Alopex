@@ -28,9 +28,13 @@ import uuid
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TextIO, TypedDict, cast
+
+DROPLET_DESIGN_RESOURCE = "resources/droplet_ME5_U3CB_methylation.txt.gz"
+DROPLET_DESIGN_SHA256 = "67981bee6acda8db275257a54e727d1e0a0bf4b884c10d8e761d04eaa9b53588"
 
 
 def disable_snakemake_output_mtime_gate() -> None:
@@ -68,10 +72,11 @@ def sha256_file(path: str | Path, *, chunk_size: int = 4 * 1024 * 1024) -> str:
 
 
 def demux_source_revision(source_root: str | Path) -> str:
-    """按 Cargo manifest、lock 与唯一 main.rs 计算编译期 demux 源码指纹。"""
+    """按 Cargo manifest、lock、唯一 main.rs 与内嵌设计条码资源计算编译期指纹。"""
     root = Path(source_root).expanduser().resolve()
     main_rs = root / "src" / "main.rs"
-    paths = [root / "Cargo.toml", root / "Cargo.lock", main_rs]
+    paths = [root / "Cargo.toml", root / "Cargo.lock", main_rs,
+             root.parent.parent / DROPLET_DESIGN_RESOURCE]
     missing = [path for path in paths if not path.is_file()]
     if missing:
         raise FileNotFoundError(
@@ -84,8 +89,8 @@ def demux_source_revision(source_root: str | Path) -> str:
             + ", ".join(str(path) for path in rust_sources)
         )
     digest = hashlib.sha256()
-    for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
-        relative = path.relative_to(root).as_posix().encode()
+    for path in sorted(paths, key=lambda item: Path(os.path.relpath(item, root)).as_posix()):
+        relative = Path(os.path.relpath(path, root)).as_posix().encode()
         data = path.read_bytes()
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
@@ -2951,6 +2956,8 @@ def validate_barcode_map_for_protocol(
 
             if policy.name == "droplet":
                 cell_identity("sample", "droplet", plate, dna)
+                if dna not in droplet_design_barcodes():
+                    raise ValueError("Droplet called barcode is outside the fixed DD-MET5 design")
                 if rna:
                     raise ValueError("Droplet does not support RNA barcodes")
             else:
@@ -3476,6 +3483,10 @@ def _pipeline_source_identity(root: Path) -> Mapping[str, object]:
                 "size_bytes": path.stat().st_size,
                 "sha256": sha256_file(path),
             })
+    design = root / DROPLET_DESIGN_RESOURCE
+    if design.is_file():
+        records.append({"path": DROPLET_DESIGN_RESOURCE, "size_bytes": design.stat().st_size,
+                        "sha256": sha256_file(design)})
     return {
         "method": "production-source-tree-v1",
         "sha256": sha256_bytes(canonical_json_bytes(records)),
@@ -4854,11 +4865,21 @@ def _parse_project_sample_manifest(
     return rows
 
 
+@lru_cache(maxsize=1)
+def droplet_design_barcodes() -> frozenset[str]:
+    """读取固定内容身份的 DD-MET5 设计条码，供 calling 约束身份，不依赖 RNA 名单。"""
+    path = Path(__file__).resolve().parent.parent / DROPLET_DESIGN_RESOURCE
+    data = path.read_bytes()
+    if sha256_bytes(data) != DROPLET_DESIGN_SHA256:
+        raise ValueError("DD-MET5 design barcode resource SHA256 mismatch")
+    return frozenset(gzip.decompress(data).decode("ascii").splitlines())
+
+
 def call_droplet_cells(
     counts_path: str | Path, output: str | Path, metrics_path: str | Path,
     *, r1: Sequence[str | Path] = (), demux_binary: str | Path | None = None, threads: int = 1,
 ) -> None:
-    """按固定谷底调用，再以差异位点质量和独立共享分子筛除有唯一父条码的错误候选。"""
+    """按固定谷底及质量/共享分子筛查调用，再限定为设计条码并记录被排除的原始身份。"""
     rows = []
     seen = set()
     qualities = {}
@@ -4966,6 +4987,7 @@ def call_droplet_cells(
             decision["reason"] = "pending_molecule_evidence"
             candidates.append(decision)
     try:
+        design = droplet_design_barcodes()
         if candidates:
             if not r1 or demux_binary is None or threads < 1:
                 raise ValueError("Droplet error screening requires raw R1 and demux binary for molecule evidence")
@@ -5019,9 +5041,29 @@ def call_droplet_cells(
         screen.update(molecule_checked=len(candidates),
                       insufficient_molecule_evidence=sum(r["reason"] == "insufficient_shared_molecules" for r in candidates),
                       child_signatures_capped=sum(r["child_saturated"] for r in candidates))
+        design_called = {bc for bc, _ in called if bc in design}
+        excluded = []
+        for barcode, count in called:
+            if barcode in design:
+                continue
+            neighbors = sorted(neighbor for pos, base in enumerate(barcode) for alt in "AGT" if alt != base
+                               if (neighbor := barcode[:pos] + alt + barcode[pos + 1:]) in design_called)
+            excluded.append({"barcode": barcode, "count": count, "called_design_neighbors": neighbors,
+                             "read_assignment": "unique_hamming1" if len(neighbors) == 1 else
+                                                "ambiguous" if neighbors else "unmatched"})
+        metrics["barcode_design_filter"] = {
+            "method": "called_intersect_fixed_design_preserve_uncalled_design",
+            "resource": DROPLET_DESIGN_RESOURCE, "sha256": DROPLET_DESIGN_SHA256,
+            "design_barcodes": len(design), "called_before_design_filter": len(called),
+            "excluded_candidates": len(excluded), "excluded_exact_read_pairs": sum(r["count"] for r in excluded),
+            "excluded": excluded,
+        }
+        called = [(bc, n) for bc, n in called if bc in design_called]
+        if not called:
+            raise ValueError("Droplet calling retained no cells within the fixed DD-MET5 design")
         metrics.update(status="complete", called_cells=len(called), called_read_pairs=sum(n for _, n in called))
     except Exception as exc:
-        metrics.update(status="failed", failure=f"Droplet barcode error screening failed: {exc}")
+        metrics.update(status="failed", failure=f"Droplet calling failed: {exc}")
         Path(metrics_path).write_text(json.dumps(metrics, indent=2) + "\n")
         Path(output).unlink(missing_ok=True)
         raise
@@ -7478,6 +7520,8 @@ def write_demux_mqc(
             raise ValueError("Droplet calling/report cell count mismatch")
         screen = calling["barcode_error_screen"]
         summary.update({"Called_Cells": calling["called_cells"], "Calling_Threshold": calling["threshold"],
+                        "Design_Excluded_Candidates": calling["barcode_design_filter"]["excluded_candidates"],
+                        "Design_Excluded_Exact_Read_Pairs": calling["barcode_design_filter"]["excluded_exact_read_pairs"],
                         "Barcode_Error_Candidates_Removed": screen["removed_barcodes"],
                         "Barcode_Molecule_Candidates_Checked": screen["molecule_checked"],
                         "Barcode_Insufficient_Molecule_Evidence": screen["insufficient_molecule_evidence"],

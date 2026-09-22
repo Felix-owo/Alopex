@@ -48,6 +48,8 @@ from dna_pipeline import (
     scratch_mb,
     validate_barcode_map_for_protocol,
     call_droplet_cells,
+    droplet_design_barcodes,
+    DROPLET_DESIGN_SHA256,
     deduplicate_droplet_bam,
     prepare_high_cph_multiqc_sources,
     write_multiqc_file_list,
@@ -68,7 +70,7 @@ JOB_RUNTIME = _internal_helper("core/job_runtime.sh")
 BSCONV_MODULE_CODE = _internal_helper("core/dna_pipeline.py")
 config = finalize_project_config(config)
 PROTOCOL_POLICY = get_protocol_policy(config)
-DROPLET_CALLING_IDENTITY = hashlib.sha256(ast.dump(ast.parse(inspect.getsource(call_droplet_cells)), include_attributes=False).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
+DROPLET_CALLING_IDENTITY = hashlib.sha256((DROPLET_DESIGN_SHA256 + "".join(ast.dump(ast.parse(inspect.getsource(fn)), include_attributes=False) for fn in (call_droplet_cells, droplet_design_barcodes))).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
 DROPLET_UMI_IDENTITY = hashlib.sha256(ast.dump(ast.parse(inspect.getsource(deduplicate_droplet_bam)), include_attributes=False).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
 BACKEND_POLICY = get_backend(config)
 METHYLATION_BACKEND = BACKEND_POLICY.name

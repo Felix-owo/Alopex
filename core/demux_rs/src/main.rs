@@ -80,8 +80,9 @@ mod barcode_map {
                     || !dna.bytes().all(|b| matches!(b, b'A' | b'G' | b'T'))
                     || !plate.is_empty()
                     || !rna.is_empty()
+                    || !droplet::design_barcodes()?.contains(dna.as_bytes())
                 {
-                    anyhow::bail!("Droplet called cells require 17bp A/G/T DNA_Barcode and empty plate/RNA identities");
+                    anyhow::bail!("Droplet called cells require fixed-design 17bp DNA_Barcode and empty plate/RNA identities");
                 }
             } else {
                 validate_barcode_alphabet(&dna, "DNA_Barcode", line_idx + 2)?;
@@ -1540,7 +1541,42 @@ mod output {
 
 mod droplet {
     use super::*;
-    use std::io::Write;
+    use std::io::{BufRead, BufReader, Write};
+
+    static DESIGN_BARCODES: OnceLock<AHashSet<Vec<u8>>> = OnceLock::new();
+    const DESIGN_BYTES: &[u8] =
+        include_bytes!("../../../resources/droplet_ME5_U3CB_methylation.txt.gz");
+
+    pub(super) fn design_barcodes() -> Result<&'static AHashSet<Vec<u8>>> {
+        if let Some(design) = DESIGN_BARCODES.get() {
+            return Ok(design);
+        }
+        let mut design = AHashSet::with_capacity(829_440);
+        for line in BufReader::new(flate2::read::GzDecoder::new(DESIGN_BYTES)).lines() {
+            let barcode = line?.into_bytes();
+            anyhow::ensure!(
+                barcode.len() == 17 && barcode.iter().all(|b| b"AGT".contains(b)),
+                "Invalid DD-MET5 design barcode"
+            );
+            anyhow::ensure!(design.insert(barcode), "Duplicate DD-MET5 design barcode");
+        }
+        anyhow::ensure!(
+            design.len() == 829_440,
+            "Incomplete DD-MET5 design barcode resource"
+        );
+        let _ = DESIGN_BARCODES.set(design);
+        Ok(DESIGN_BARCODES.get().unwrap())
+    }
+
+    pub(super) fn protect_design(index: &mut BarcodeIndex) -> Result<()> {
+        let design = design_barcodes()?;
+        index.full.retain(|barcode, candidate| {
+            matches!(candidate, MatchCandidate::Unique { distance: 0, .. })
+                || !design.contains(barcode.as_slice())
+        });
+        index.shifted.clear();
+        Ok(())
+    }
 
     const ANCHOR: &[u8] = b"TTTCTTATATGGGCGTCCGTCGTTGCTCGTAGATGTGTATAAGAGACAG";
 
@@ -2731,9 +2767,14 @@ fn run() -> Result<()> {
                     .iter()
                     .filter(move |row| !mixed_dna_lengths || row.dna_barcode.len() == dna_bc_len)
                     .map(|row| row.dna_barcode.clone());
-                BarcodeIndex::from_barcodes(dna_barcodes, dna_bc_len, Modality::Dna)
+                let mut index =
+                    BarcodeIndex::from_barcodes(dna_barcodes, dna_bc_len, Modality::Dna);
+                if config.mode == DemuxMode::DnaOnlyDroplet {
+                    droplet::protect_design(&mut index)?;
+                }
+                Ok(index)
             })
-            .collect::<Vec<_>>(),
+            .collect::<Result<Vec<_>>>()?,
     );
     let rna_idx = if config.mode == DemuxMode::DnaRna {
         let rna_barcodes = cell_rows.iter().map(|row| row.rna_barcode.clone());
@@ -3197,6 +3238,35 @@ mod tests {
             BarcodeMatch::Unique { id: &a }
         );
         assert_eq!(index.match_simple(b"NAAAAAAAAAAAAAAAA"), BarcodeMatch::None);
+    }
+
+    #[test]
+    fn droplet_fixed_design_keeps_exact_and_rejects_ambiguous_correction() {
+        let a = "AAAGAAGAAGAATAGAG".to_string();
+        let b = "AAAGAAGAAGAATAGGA".to_string();
+        let design = droplet::design_barcodes().unwrap();
+        assert_eq!(design.len(), 829_440);
+        assert!(design.contains(a.as_bytes()) && design.contains(b.as_bytes()));
+        assert!(!design.contains(b"AAAAAAAAAAAAAAAAA".as_slice()));
+        let mut index = BarcodeIndex::from_barcodes([a.clone(), b.clone()], 17, Modality::Dna);
+        droplet::protect_design(&mut index).unwrap();
+        assert_eq!(
+            index.match_simple(a.as_bytes()),
+            BarcodeMatch::Unique { id: &a }
+        );
+        assert_eq!(
+            index.match_simple(b.as_bytes()),
+            BarcodeMatch::Unique { id: &b }
+        );
+        assert_eq!(
+            index.match_simple(b"AAAGAAGAAGAATAGAA"),
+            BarcodeMatch::Ambiguous
+        );
+        assert_eq!(
+            index.match_simple(b"CAAGAAGAAGAATAGAG"),
+            BarcodeMatch::Unique { id: &a }
+        );
+        assert_eq!(index.match_simple(b"AAAGAAGAAGAATGAGT"), BarcodeMatch::None);
     }
 
     use super::*;
