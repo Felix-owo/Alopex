@@ -4815,6 +4815,129 @@ def run_qc_processor(
         raise RuntimeError(f"QC Processor failed with exit code {completed.returncode}")
 
 
+def prepare_single_cpg_adata(
+    paths: NotebookPaths,
+    df_qc: pd.DataFrame,
+    *,
+    recompute: bool = False,
+) -> Path:
+    """从当前 RawAdata 生成 single-CpG 矩阵，按细胞身份整合 QC 并关闭全部句柄。
+
+    使用当前物种的 BED3、fraction/mean 和 chunk_size=500；保留全部细胞。
+    已验证的矩阵可复用，仅 QC/HQ 改变时只更新 obs。未知或过期文件须显式
+    recompute；新矩阵完成并关闭后才替换正式文件，不关闭其他 Notebook 的句柄。
+    """
+    if snap is None:
+        raise ImportError("Single-CpG generation requires the Alopex notebook environment")
+    sealed = load_sealed_qc_context(
+        paths.project_dir, expected_pipeline_root=paths.pipeline_root
+    )
+    if sealed.delivery_id != paths.delivery_id:
+        raise ValueError("Delivery changed; rerun the Notebook from its first cell")
+    run_paths = build_paths(paths.project_dir, sealed.delivery_id)
+    if run_paths.qc_results_dir != paths.qc_results_dir:
+        raise ValueError("Notebook QC directory differs from the current delivery")
+    sample_ids = [cell["sample_id"] for cell in read_active_cells(
+        paths.project_dir, sealed_context=sealed
+    )]
+    if not sample_ids:
+        raise ValueError("Single-CpG generation requires at least one cell")
+    if not df_qc.columns.is_unique or not set(QC_INFO_COLUMNS).issubset(df_qc.columns):
+        raise ValueError("df_qc must contain the complete QC table with unique column names")
+    qc = _require_exact_sample_ids(df_qc, sample_ids, "Notebook QC")
+    saved_qc = pd.read_csv(
+        paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
+        float_precision="round_trip",
+    )
+    saved_qc = _require_exact_sample_ids(saved_qc, sample_ids, "Saved QC")
+    pd.testing.assert_frame_equal(
+        qc[list(QC_INFO_COLUMNS)], saved_qc[list(QC_INFO_COLUMNS)],
+        check_dtype=False, check_exact=True,
+    )
+    raw_path = run_paths.raw_adata
+    raw_schema = json.loads(raw_path.with_name("RawAdata.input_schema.json").read_text())
+    if (not _raw_adata_schema_matches(raw_path, raw_schema)
+            or raw_schema["delivery_id"] != sealed.delivery_id
+            or set(raw_schema["sample_ids"]) != set(sample_ids)):
+        raise ValueError("RawAdata is stale or unverified; rerun the QC Processor")
+    genome = str(sealed.config["species"])
+    bed = paths.pipeline_root / "resources" / f"{genome}_reference" / "cpg" / f"{genome}.single_cpg.bed.gz"
+    signature = {
+        "algorithm": "single_cpg_fraction_mean_v1",
+        "snapatac2": importlib.metadata.version("snapatac2"),
+        "delivery_id": sealed.delivery_id,
+        "raw_generation": raw_schema["generation_id"],
+        "raw_h5ad": raw_schema["h5ad"],
+        "bed": _content_binding(bed),
+        "value_type": "fraction", "summary_type": "mean", "chunk_size": 500,
+    }
+    output = paths.qc_results_dir / "SingleCpG_Adata.h5ad"
+    schema_path = output.with_name("SingleCpG_Adata.input_schema.json")
+    cached = None
+    if schema_path.is_file():
+        try:
+            cached = json.loads(schema_path.read_text())
+        except (OSError, ValueError):
+            pass
+    reuse = (output.is_file() and isinstance(cached, dict)
+             and cached.get("input") == signature
+             and cached.get("h5ad") == _raw_adata_stat_binding(output))
+    if output.exists() and not reuse and not recompute:
+        raise ValueError(
+            f"Existing SingleCpG file is unverified or stale: {output}. "
+            "Set RECOMPUTE_SINGLECPG=True to rebuild it explicitly."
+        )
+    temporary = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp.h5ad")
+    raw = matrix = None
+    try:
+        if reuse and not recompute:
+            matrix = snap.read(str(output), backed="r")
+        else:
+            _log("生成 single-CpG 矩阵：fraction/mean，chunk_size=500")
+            raw = snap.read(str(raw_path), backed="r")
+            _require_exact_sample_ids(qc, list(raw.obs_names), "RawAdata QC")
+            matrix = snap.pp.make_peak_matrix(
+                raw, value_type="fraction", summary_type="mean",
+                peak_file=str(bed), inplace=False, file=str(temporary), chunk_size=500,
+            )
+        names = list(matrix.obs_names)
+        aligned = _require_exact_sample_ids(qc, names, "SingleCpG QC")
+        current = matrix.obs[:]
+        merged = current.to_pandas()
+        for column in aligned.columns:
+            merged[column] = aligned[column].array
+        updated = pl.from_pandas(merged)
+        if not updated.equals(current):
+            if reuse and not recompute:
+                matrix.close()
+                matrix = None
+                matrix = snap.read(str(output), backed="r+")
+                schema_path.unlink(missing_ok=True)
+            matrix.obs = updated
+            matrix.obs_names = names
+        matrix.close()
+        matrix = None
+        if not reuse or recompute:
+            _fsync_file(temporary)
+            schema_path.unlink(missing_ok=True)
+            os.replace(temporary, output)
+        _atomic_write_json(
+            {"input": signature, "h5ad": _raw_adata_stat_binding(output)}, schema_path
+        )
+        _log(f"SingleCpG 已就绪，{len(names)} 个细胞，文件已关闭: {output}")
+        return output
+    finally:
+        try:
+            if matrix is not None:
+                matrix.close()
+        finally:
+            try:
+                if raw is not None:
+                    raw.close()
+            finally:
+                temporary.unlink(missing_ok=True)
+
+
 def load_notebook_qc_frame(
     paths: NotebookPaths,
 ) -> tuple[pd.DataFrame, dict[str, str] | None]:

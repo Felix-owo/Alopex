@@ -46,9 +46,27 @@ CpG 输入身份复用 sealed inventory 中的 size/hash，不重复读取所有
 显式指定 Pipeline 路径也要求项目的交付状态为 `complete`、Pipeline 身份有效。
 Processor 子进程沿用 Notebook 的 Python，运行前请使用上述专用 kernel。
 
+### 保存供下游复用的 single-CpG 矩阵
+
+运行 Notebook 最后一格会调用 `prepare_single_cpg_adata(PATHS, df_qc)`，自动使用当前物种的
+single-CpG BED 和本次交付的 `RawAdata.h5ad`，生成同目录的 `SingleCpG_Adata.h5ad`。
+固定参数为 `value_type="fraction"`、`summary_type="mean"`、`chunk_size=500`、`inplace=False`。
+保留全部细胞，按 `Sample_ID` 严格对齐并保存完整 QC、`HQ` 及自行添加的注释，不按 HQ 筛选。
+不要修改 `df_qc` 的原有 QC 列；它们会与磁盘上的当前 QC 表校验。
+
+首次运行需要完成矩阵计算。再次运行按交付、RawAdata generation、BED 内容、参数与
+SnapATAC2 版本复用矩阵，只有注释变化时仅更新 `obs`。已有文件未经验证或来源变化时会提示；
+需要替换它时设置 `RECOMPUTE_SINGLECPG=True`，完成后恢复 `False`。新矩阵先写临时文件，
+关闭后替换正式文件；`SingleCpG_Adata.input_schema.json` 是配套的完成及复用记录。
+函数返回路径并关闭自身打开的全部句柄，不保留 `DNA_ADATA_CpG` 活跃写句柄。
+
+下游把打印出的 `SINGLECPG_ADATA_PATH` 用于 `snap.read(..., backed="r")` 即可读取。
+只读 SnapATAC2 对象不能回填标签；修改标签应使用独立可写副本或合适大小的内存子集。
+MethylTree 分箱后仍须检查并按细胞 ID 对齐 obs，该预生成步骤不修改外部 MethylTree 的转换行为。
+
 ### Jupyter / VS Code kernel
 
-Notebook 元数据要求名为 `alopex-qc` 的 kernel。交互式运行前把它注册到当前用户的
+QC Notebook 元数据要求名为 `alopex-qc` 的 kernel。交互式运行前把它注册到当前用户的
 Jupyter kernel 目录；argv 经由 `conda/current` 符号链接指向 Doctor 管理的 notebook 环境，
 后续环境重建不需要重新注册。Pipeline 迁移目录后应重新注册并在 Notebook 中选择 `Alopex QC`；确认新 kernel 可启动后移除指向旧目录的专用 kernel。以下命令自动选择当前系统的 Jupyter 数据目录：
 
@@ -89,7 +107,7 @@ v48）或 `mm10.genes.gtf`（GENCODE M25）的 protein-coding `gene` 记录自�
 TSS BED（链方向一致的 `±2000 bp / 20 bp` bins，第 9 列为 offset）。脚本还会生成
 `resources/<genome>_reference/cpg/<genome>.single_cpg.bed.gz`，供 SnapATAC2
 按需 `make_peak_matrix(..., peak_file=...)` 使用的 BED3：0-based、half-open，每条记录覆盖一个
-CpG 二核苷酸 `[C, G+1)`，不含 lambda/pUC19。默认 QC 不构建 genome-wide single-CpG matrix；需要时由 SnapATAC2 从已导入 values 生成。Pipeline 的 `03_results/CpG/*.cpg.tsv.zst`
+CpG 二核苷酸 `[C, G+1)`，不含 lambda/pUC19。Notebook 最后一格从已导入 values 生成 single-CpG matrix；命令行 QC Processor 不执行这一步。Pipeline 的 `03_results/CpG/*.cpg.tsv.zst`
 则直接采用 SnapATAC2 `pp.import_values` 四列输入：`chrom, pos, methyl, unmethyl`，其中
 `pos` 为 0-based；Downstream 直接读取 CpG 文件。
 
@@ -131,6 +149,7 @@ TSS profile 只记录有覆盖的 bins。有 CpG 的 cell 也可能没有 TSS �
   本表，保留在主 Pipeline 的 MultiQC 报告。
 - `TSS_Profile_Information.csv`（仅未跳过 TSS 时）
 - `RawAdata.h5ad`
+- `SingleCpG_Adata.h5ad` 与 `SingleCpG_Adata.input_schema.json`（运行 Notebook 最后一格后）
 - `.cache/Mapping_Stats.csv`（内部缓存）
 - `.cache/CpG_Signal_Composition.csv`（内部缓存）
 - `.cache/Gini_Index.csv`（内部缓存）

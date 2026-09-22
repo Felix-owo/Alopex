@@ -1,4 +1,4 @@
-# Alopex v13.8
+# Alopex v13.9
 
 Alopex 是面向 Cabernet、SRD 和 Cabernet–TAPS+ 单细胞 DNA 甲基化数据的 Snakemake Pipeline。它将原始 paired FASTQ 转为单细胞 CpG 结果、质量报告和可追溯的交付清单：
 
@@ -52,7 +52,7 @@ core/run_pipeline.sh  创建项目、检查输入并运行分析
 获取代码：
 
 ```bash
-git clone --branch v13.8 https://github.com/Felix-owo/Alopex.git
+git clone --branch v13.9 https://github.com/Felix-owo/Alopex.git
 cd Alopex
 ```
 
@@ -462,6 +462,8 @@ CpG 文件固定为 SnapATAC2 `pp.import_values` 可直接读取的四列：`chr
 ## 9. 下游 QC 与可视化
 
 使用 Doctor 管理的 notebook 环境运行 [下游分析](downstream/README.md)，结果写入项目的 `06_downstream/<delivery_id>/`。Notebook 首格接受 Pipeline、项目和 TSS reference 的绝对路径。第二格可按需强制重算；`RECOMPUTE_RAW_ADATA=True` 从 sealed CpG 重建 AnnData，默认按缓存身份自动复用。
+
+Notebook 最后一格生成供 MethylTree 等分析复用的 `QC_Results/SingleCpG_Adata.h5ad`，按细胞 ID 保存完整 QC 和 `HQ` 注释，生成后关闭文件。重复运行复用已验证的矩阵，注释变化只更新 `obs`；需要替换过期或未验证的文件时使用 `RECOMPUTE_SINGLECPG=True`。具体参数和读取方式见[下游说明](downstream/README.md#保存供下游复用的-single-cpg-矩阵)。
 
 `DNAme_QC_Information.csv` 固定输出 20 列，包含样本身份、甲基化、signal composition、Gini、mapping 与 read-pair retention 指标；完整计数与 backend 诊断保留在主 Pipeline 的最终 manifest 和 MultiQC 中。CpG Density 从 QC 表、sealed manifest 与 composition 缓存读取所需字段。
 
