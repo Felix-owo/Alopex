@@ -37,6 +37,7 @@ from dna_pipeline import (
 FINAL_MANIFEST = Path("03_results/QC_Results/sample_manifest.tsv")
 
 REQUIRED_MANIFEST_FIELDS = {
+    "protocol",
     "sample_id",
     "project_sample_id",
     "plate_id",
@@ -242,7 +243,7 @@ def load_sealed_qc_context(
     config_backend = str(analysis.get("methylation_backend", "")).strip().lower()
     if not run_species or config_species != run_species:
         raise ValueError("Sealed config species disagrees with the run manifest")
-    if run_protocol not in {"cabernet", "srd", "taps"} or config_protocol != run_protocol:
+    if run_protocol not in {"cabernet", "srd", "taps", "droplet"} or config_protocol != run_protocol:
         raise ValueError("Sealed config protocol disagrees with the run manifest")
 
     reference_path = Path(str(run.get("reference_path", ""))).expanduser().resolve()
@@ -371,6 +372,8 @@ def read_active_cells(
         ):
             continue
         sample_id = row["sample_id"]
+        if row["protocol"] != context.config["analysis"]["protocol"]:
+            raise ValueError(f"Cell {sample_id!r} protocol disagrees with sealed config")
         if not sample_id:
             raise ValueError("Active row in sample_manifest.tsv has an empty sample_id")
         if not row["project_sample_id"]:
@@ -439,7 +442,7 @@ def read_active_cells(
         cell["native_mapping_pct"] = native_pct
         expected_dedup_policy = {
             "biscuit": "dupsifter_wgbs_signature_remove_dups",
-            "bismark": "bismark_paired_endpoint_orientation",
+            "bismark": "umi_tools_directional_physical_r1_ignore_tlen" if row["protocol"] == "droplet" else "bismark_paired_endpoint_orientation",
             "rastair": "samtools_markdup_flag_exclude_in_rastair",
         }[backend]
         if cell["dedup_policy"] != expected_dedup_policy:
@@ -3708,6 +3711,9 @@ def plot_plate_metric_map(
     unique_for_labels = sorted(plot_df['CloneID'].dropna().unique().tolist())
     clone_display_map, omitted = make_cloneid_diff_labels(unique_for_labels)
     plate_id = plot_df['PlateID'].astype('string').str.strip().str.upper()
+    if plate_id.fillna('').eq('').all():
+        print('当前细胞无 PlateID，跳过孔板图。')
+        return
     valid_plate = plate_id.str.fullmatch(r'[A-H](?:[1-9]|1[0-2])', na=False)
     if (~valid_plate).any():
         invalid = plot_df.loc[~valid_plate]

@@ -1,12 +1,12 @@
-# Alopex v13.9
+# Alopex v13.10
 
-Alopex 是面向 Cabernet、SRD 和 Cabernet–TAPS+ 单细胞 DNA 甲基化数据的 Snakemake Pipeline。它将原始 paired FASTQ 转为单细胞 CpG 结果、质量报告和可追溯的交付清单：
+Alopex 是面向 Cabernet、SRD、Droplet（DD-MET5）和 Cabernet–TAPS+ 单细胞 DNA 甲基化数据的 Snakemake Pipeline。它将原始 paired FASTQ 转为单细胞 CpG 结果、质量报告和可追溯的交付清单：
 
 - paired-end FASTQ 样本识别与单细胞 demultiplex；
 - Cabernet adapter trimming（R1/R2 Tn5 技术结构）；
-- Cabernet/SRD 使用 BISCUIT 或 Bismark；TAPS 使用 BWA-MEM + Rastair；
-- Cabernet/SRD 去重；TAPS 标记重复并在甲基化调用时排除；
-- Cabernet/SRD high-CpH / non-conversion 评估与过滤；TAPS 标为不适用；
+- Cabernet/SRD 使用 BISCUIT 或 Bismark；Droplet 使用 Bismark non-directional 和 UMI-tools；TAPS 使用 BWA-MEM + Rastair；
+- Cabernet/SRD 按位置去重；Droplet 按物理 R1 与 UMI 去重；TAPS 标记重复并在甲基化调用时排除；
+- Cabernet/SRD/Droplet high-CpH / non-conversion 评估与过滤；TAPS 标为不适用；
 - 直接生成 SnapATAC2 `pp.import_values` 所需的 0-based CpG 四列表，并生成兼容 `peak_file` 的 single-CpG BED3；
 - BISCUIT 路线的可选 SNP 输出；
 - cell QC、MultiQC 汇总与运行结果清单。
@@ -39,7 +39,7 @@ core/run_pipeline.sh  创建项目、检查输入并运行分析
   → 准备 4 个 FASTA + 2 个 GTF
   → 运行 Doctor，看到 FINAL STATUS: READY
   → 初始化项目
-  → 检查 config.yaml 和 Barcode_Map.csv
+  → 检查 config.yaml（孔板协议另需 Barcode_Map.csv）
   → 将 paired FASTQ 放入 01_raw/
   → 刷新并检查 sample_manifest.tsv
   → dry-run
@@ -52,7 +52,7 @@ core/run_pipeline.sh  创建项目、检查输入并运行分析
 获取代码：
 
 ```bash
-git clone --branch v13.9 https://github.com/Felix-owo/Alopex.git
+git clone --branch v13.10 https://github.com/Felix-owo/Alopex.git
 cd Alopex
 ```
 
@@ -193,7 +193,7 @@ cd /path/to/Patient001
 Patient001/
 ├── 00_config/
 │   ├── config.yaml
-│   ├── Barcode_Map.csv
+│   ├── Barcode_Map.csv        # 仅孔板协议
 │   └── sample_manifest.tsv
 ├── 01_raw/
 ├── 02_work/
@@ -215,12 +215,12 @@ cd /path/to/Patient001
 运行前至少检查：
 
 1. `00_config/config.yaml`；
-2. `00_config/Barcode_Map.csv`；
+2. 孔板协议的 `00_config/Barcode_Map.csv`（Droplet 跳过）；
 3. FASTQ 导入后生成的 `00_config/sample_manifest.tsv`。
 
 ### config.yaml
 
-模板显式列出全部参数及其默认值（`high_cph` 在 Cabernet/SRD 中固定为「统计并剔除」，TAPS 不适用，无开关；
+模板显式列出全部参数及其默认值（`high_cph` 在 Cabernet/SRD/Droplet 中固定为「统计并剔除」，TAPS 不适用，无开关；
 模板列出其唯一参数 `excluded_contigs` 及默认对照列表），
 通常只需要修改物种、实验协议和甲基化后端：
 
@@ -229,8 +229,8 @@ schema_version: 2
 species: hg38
 
 analysis:
-  protocol: cabernet           # cabernet / srd / taps
-  methylation_backend: bismark # cabernet/srd: biscuit/bismark；taps: rastair
+  protocol: cabernet           # cabernet / srd / taps / droplet
+  methylation_backend: bismark # cabernet/srd: biscuit/bismark；droplet: bismark；taps: rastair
 ```
 
 配置项说明：
@@ -239,8 +239,8 @@ analysis:
 | --- | --- |
 | `species` | 选择当前项目物种。标准值为 `hg38` 或 `mm10`。 |
 | `references` | hg38/mm10 通常保留默认值；custom species 需要加入物种名及最终 FASTA 路径。 |
-| `analysis.protocol` | 按实验选择 `cabernet`、`srd` 或 `taps`。 |
-| `analysis.methylation_backend` | Cabernet/SRD 选择 `biscuit` 或 `bismark`；TAPS 只能选 `rastair`。 |
+| `analysis.protocol` | 按实验选择 `cabernet`、`srd`、`droplet` 或 `taps`。 |
+| `analysis.methylation_backend` | Cabernet/SRD 选择 `biscuit` 或 `bismark`；Droplet 只用 `bismark`；TAPS 只用 `rastair`。 |
 | `demux.min_matched_read_pairs` | 一个 barcode bucket 被保留所需的最少 matched read pairs；默认 10。 |
 | `demux.dna_w_spacer_len` | DNA barcode 后 spacer 长度；只有建库设计不同时修改，默认 0。 |
 | `high_cph.excluded_contigs` | 不参与 high-CpH/non-conversion 判定的 control/mitochondrial contig；默认 `pUC19/lambda/chrM`。 |
@@ -286,7 +286,7 @@ TAPS 的 high-CpH/cDNA 剔除不适用，下游两项 CpH 指标为缺失值。M
 
 ### Barcode_Map.csv
 
-初始化项目时会复制默认 barcode map。若实验使用不同 barcode、plate 名称或 cell 顺序，必须在运行前替换或修改 `00_config/Barcode_Map.csv`。
+孔板协议初始化时复制默认 barcode map；已配置 Droplet 的项目跳过此步骤。若实验使用不同 barcode、plate 名称或 cell 顺序，必须在运行前替换或修改 `00_config/Barcode_Map.csv`。
 
 - Cabernet/TAPS 需要 `DNA_Barcode`、`PlateID`、`Cell_Order`；
 - SRD 还需要 `RNA_Barcode`；
@@ -332,7 +332,7 @@ SampleA.R1.fq.gz             SampleA.R2.fq.gz
 已登记输入缺失、缺配对或重名冲突仍报错。**选样后不要再执行 `--refresh-manifest`，
 除非希望重新扫描并补登记所有有效输入。**
 
-该命令会根据 `01_raw/` 更新 `00_config/sample_manifest.tsv`，然后检查配置、FASTQ、barcode map、reference 和待执行任务，不会正式分析数据。若现有 manifest 仅有 CRLF/LF、末尾换行、行顺序、字段外围空白或 protocol 大小写差异，刷新会保持文件字节、mtime 和备份不变；只有样本映射、物种、协议或 notes 等行语义真实变化时才更新滚动 `.bak` 备份并写回，避免无意义刷新触发 demux 及下游全量重算。
+该命令会根据 `01_raw/` 更新 `00_config/sample_manifest.tsv`，然后检查配置、FASTQ、孔板协议的 barcode map、reference 和待执行任务，不会正式分析数据。若现有 manifest 仅有 CRLF/LF、末尾换行、行顺序、字段外围空白或 protocol 大小写差异，刷新会保持文件字节、mtime 和备份不变；只有样本映射、物种、协议或 notes 等行语义真实变化时才更新滚动 `.bak` 备份并写回，避免无意义刷新触发 demux 及下游全量重算。
 
 `sample_manifest.tsv` 的 `rna_sample` 按协议解释：
 
@@ -378,7 +378,7 @@ macOS 使用 local executor。Linux/HPC 的当前 shell 承载 Snakemake control
 
 ### 作业资源与时限
 
-Cabernet/Bismark 的每个 cell 独立组成一个 Slurm 作业，依次执行比对去重（含 Cutadapt）、过滤、extraction 和 CpG 转换。全部 S/M/L/XL 档位均分组，SRD 与 BISCUIT 按规则独立调度。
+Cabernet/Bismark 和 Droplet/Bismark 的每个 cell 独立组成一个 Slurm 作业，依次执行比对去重（含 Cutadapt）、过滤、extraction 和 CpG 转换。全部 S/M/L/XL 档位均分组，SRD 与 BISCUIT 按规则独立调度。
 
 | Alignment mode | S/M/L/XL CPU | 首次内存 | 第一次重试 | 第二次重试 |
 | --- | --- | --- | --- | --- |
@@ -434,7 +434,9 @@ CpG 文件固定为 SnapATAC2 `pp.import_values` 可直接读取的四列：`chr
 
 正式运行成功时，controller log 会记录 `Published sealed delivery`。发布函数自动回收 `02_work/demux/`（先删 `state/` 提交边界，再删整棵 scratch）；state 删除失败则保留 FASTQ 并告警，下次启动可幂等补收。发布之前该目录始终完整保留以支持断点续跑。之后可执行 `./run_pipeline.sh --dry-run` 检查当前 DAG；需要重算哪些规则由 Snakemake 当前 dependency/rerun trigger 决定。
 
-任何依赖 demux 输出的修改都会重新执行 demux checkpoint 并重新生成其 FASTQ scratch；该策略在发布后释放 demux 磁盘空间。重建时间戳本身不触发比对/CpG 重算；这些规则直接跟踪真实 raw 输入、Barcode Map、样本声明、demux binary 和分析参数。不要手动只删除其中 FASTQ 而保留 completion。也不要单独删除 `02_work/results_stage/`：它与公开结果共享 hardlink 内容（不额外占用磁盘），同时也是 Snakemake 增量重算的稳定 biological output stage 与重发布来源。
+任何依赖 demux 输出的修改都会重新执行 demux checkpoint 并重新生成其 FASTQ scratch；该策略在发布后释放 demux 磁盘空间。重建时间戳本身不触发比对/CpG 重算；这些规则直接跟踪真实 raw 输入、孔板路线的 Barcode Map、样本声明、demux binary 和分析参数。不要手动只删除其中 FASTQ 而保留 completion。也不要单独删除 `02_work/results_stage/`：它与公开结果共享 hardlink 内容（不额外占用磁盘），同时也是 Snakemake 增量重算的稳定 biological output stage 与重发布来源。
+
+MultiQC 的 high-CpH 展示 JSON 若已清理，报告规则会从保留的过滤摘要重建；这一展示恢复不会要求重新生成 BAM 或重新比对。
 
 通过 demux 阈值的 cell 即使全未比对或 trim 后全空，也保留合法空 CpG 和 QC，不阻断整批交付；零 primary reads 的 mapping 为 0%，无 CpH 观测为缺失值。
 
@@ -474,3 +476,20 @@ TSS 无覆盖时保留仅表头 CSV 并清理旧 TSS 图；显式跳过 TSS 时�
 ## 许可证
 
 Alopex 以 [GPL-3.0](LICENSE) 发布。本仓库为公开发布副本，与开发仓库按发布版本同步。
+
+## Droplet DD-MET5
+
+在初始化前的 `00_config/config.yaml` 中设置 `analysis.protocol: droplet`、
+`analysis.methylation_backend: bismark` 和 `bismark.library_type: non_directional`，然后使用同一
+`--init-project`、`--refresh-manifest` 和无参数 launcher。Droplet 无需 Barcode Map，manifest 的
+`rna_sample` 留空。每个原始文库独立进行结构计数与谷底调用，输出身份为项目样本加 17 bp barcode，
+`plate_id` 为空；下游仍消费相同的四列 CpG、20 列 QC 和 sealed manifest。
+
+R1 的 CB17、UMI12、TSO13、Linker17、ME19、gap9 在拆分时移除，R2 去除前 9 bp。
+两种转换模式分别匹配，歧义拒绝；UMI 用于物理 R1 位置与方向上的 directional 去重，忽略 R2 端点。
+谷底调用后，结合单碱基近邻、差异位点质量和多个共享 UMI＋insert 筛查错误衍生条码。先保留候选条码的有限分子特征，再完整扫描高丰度近邻查找共享分子；证据不足时保留。复核、筛除、证据不足与采样饱和数量进入 MultiQC。
+Droplet 拆分会在文件句柄限额允许时保留全部细胞的输出 writer，以减少反复开关小文件；容量不足时自动使用有界缓存。
+逐条判定及初始/最终数量进入 calling 日志，移除数进入 MultiQC。该筛查不改变原谷底阈值。
+谷底调用无双峰时明确失败；全部 Droplet 科学参数为固定契约，不暴露为 config 参数。
+官方对照采用 [单细胞 BAM 去重说明](https://github.com/seekgene/SeekSoulMethyl/blob/nf_rna_methy/docs/How_to_deduplicate_single_cell_bam.md)；谷底调用是本 Pipeline 的指定策略，不声称与官方完整流程等价。
+真实数据验证与回归证据保留在开发仓库，代码按发布版本同步。

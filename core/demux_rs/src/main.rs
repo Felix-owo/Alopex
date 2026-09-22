@@ -31,7 +31,10 @@ mod barcode_map {
         if mode == DemuxMode::DnaRna && idx_rna.is_none() {
             anyhow::bail!("Barcode_Map.csv missing required column RNA_Barcode for dna-rna mode");
         }
-        let idx_plate = header_index(&headers, "PlateID")?;
+        let idx_plate = header_index_optional(&headers, "PlateID");
+        if mode != DemuxMode::DnaOnlyDroplet && idx_plate.is_none() {
+            anyhow::bail!("Barcode_Map.csv missing required column PlateID");
+        }
         let idx_order = header_index(&headers, "Cell_Order")?;
 
         let mut rows = Vec::new();
@@ -48,14 +51,18 @@ mod barcode_map {
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let plate = record.get(idx_plate).unwrap_or("").trim().to_string();
+            let plate = idx_plate
+                .and_then(|i| record.get(i))
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let order = record.get(idx_order).unwrap_or("").trim().to_string();
 
             if dna.is_empty() && rna.is_empty() && plate.is_empty() && order.is_empty() {
                 continue;
             }
             if dna.is_empty()
-                || plate.is_empty()
+                || (mode != DemuxMode::DnaOnlyDroplet && plate.is_empty())
                 || order.is_empty()
                 || (mode == DemuxMode::DnaRna && rna.is_empty())
             {
@@ -68,7 +75,17 @@ mod barcode_map {
                 order
             );
             }
-            validate_barcode_alphabet(&dna, "DNA_Barcode", line_idx + 2)?;
+            if mode == DemuxMode::DnaOnlyDroplet {
+                if dna.len() != 17
+                    || !dna.bytes().all(|b| matches!(b, b'A' | b'G' | b'T'))
+                    || !plate.is_empty()
+                    || !rna.is_empty()
+                {
+                    anyhow::bail!("Droplet called cells require 17bp A/G/T DNA_Barcode and empty plate/RNA identities");
+                }
+            } else {
+                validate_barcode_alphabet(&dna, "DNA_Barcode", line_idx + 2)?;
+            }
             if matches!(plate.as_str(), "." | "..")
                 || !plate
                     .bytes()
@@ -167,7 +184,9 @@ mod barcode_map {
                 )?;
             }
 
-            if let Some(existing) = plate_map.insert(row.plate_id.clone(), row.dna_barcode.clone())
+            if let Some(existing) = (!row.plate_id.is_empty())
+                .then(|| plate_map.insert(row.plate_id.clone(), row.dna_barcode.clone()))
+                .flatten()
             {
                 anyhow::bail!(
                     "Barcode_Map.csv PlateID '{}' is duplicated for DNA barcodes '{}' and '{}'",
@@ -187,7 +206,9 @@ mod barcode_map {
                 );
             }
         }
-        audit_correction_neighborhoods(dna_map.keys(), "DNA_Barcode")?;
+        if mode != DemuxMode::DnaOnlyDroplet {
+            audit_correction_neighborhoods(dna_map.keys(), "DNA_Barcode")?;
+        }
         if mode == DemuxMode::DnaRna {
             audit_correction_neighborhoods(rna_map.keys(), "RNA_Barcode")?;
         }
@@ -375,27 +396,38 @@ mod cli {
 
         #[arg(
             long,
-            required = true,
+            required_unless_present_any = ["count_only", "evidence_pairs"],
             help = "R2 FASTQ；数量和顺序必须与 --r1 一一对应。"
         )]
         pub(crate) r2: Vec<PathBuf>,
+
+        #[arg(long, requires = "counts_output")]
+        pub(crate) count_only: bool,
+        #[arg(long, requires = "count_only")]
+        pub(crate) counts_output: Option<PathBuf>,
+        #[arg(long, requires = "count_only")]
+        pub(crate) count_metrics: Option<PathBuf>,
+        #[arg(long, requires = "evidence_output", conflicts_with = "count_only")]
+        pub(crate) evidence_pairs: Option<PathBuf>,
+        #[arg(long, requires = "evidence_pairs")]
+        pub(crate) evidence_output: Option<PathBuf>,
 
         #[arg(
             long = "barcode-map",
             help = "Barcode_Map.csv；必需 DNA_Barcode、PlateID、Cell_Order，dna-rna 模式还需 RNA_Barcode。"
         )]
-        pub(crate) barcode_map: PathBuf,
+        pub(crate) barcode_map: Option<PathBuf>,
 
         #[arg(long = "dna-out-dir", help = "DNA demux FASTQ 输出根目录。")]
-        pub(crate) dna_out_dir: PathBuf,
+        pub(crate) dna_out_dir: Option<PathBuf>,
 
         #[arg(long = "rna-out-dir", help = "RNA demux FASTQ 输出根目录。")]
-        pub(crate) rna_out_dir: PathBuf,
+        pub(crate) rna_out_dir: Option<PathBuf>,
 
         #[arg(long = "json-report", help = "JSON report 输出路径。")]
-        pub(crate) json_report: PathBuf,
+        pub(crate) json_report: Option<PathBuf>,
 
-        #[arg(long = "sample-name", allow_hyphen_values = true)]
+        #[arg(long = "sample-name", allow_hyphen_values = true, default_value = "")]
         pub(crate) sample_name: String,
 
         #[arg(
@@ -430,6 +462,8 @@ mod cli {
         DnaOnly,
         #[value(name = "dna-only-taps")]
         DnaOnlyTaps,
+        #[value(name = "dna-only-droplet")]
+        DnaOnlyDroplet,
         #[value(name = "dna-rna")]
         DnaRna,
     }
@@ -652,6 +686,9 @@ mod matcher {
         dna_w_spacer_len: usize,
         demux_mode: DemuxMode,
     ) -> ProcResult<'a> {
+        if demux_mode == DemuxMode::DnaOnlyDroplet {
+            return droplet::match_read(r1, &dna_indices[0]);
+        }
         let mut dna_match: Option<ProcResult<'a>> = None;
         let mut dna_rejection: Option<ProcResult<'a>> = None;
         for dna_idx in dna_indices {
@@ -739,9 +776,7 @@ mod matcher {
                         None
                     };
                     if payload_start < r1.len() {
-                        if let (BarcodeMatch::Unique { id }, Some(umi)) =
-                            (barcode_match, raw_umi)
-                        {
+                        if let (BarcodeMatch::Unique { id }, Some(umi)) = (barcode_match, raw_umi) {
                             return Some(ProcResult::assigned(
                                 Modality::Rna,
                                 id,
@@ -993,9 +1028,11 @@ mod output {
         writers: AHashMap<BucketKey, (BufWriter<File>, BufWriter<File>)>,
         order: VecDeque<BucketKey>,
         max_pairs: usize,
+        all_buckets_fit: bool,
     }
 
     const MAX_OPEN_BUCKETS: usize = 128;
+    const MAX_RETAINED_DROPLET_BUCKETS: usize = 8192;
     const WRITER_FD_RESERVE: usize = 64;
 
     fn detect_soft_open_file_limit() -> Option<usize> {
@@ -1027,10 +1064,42 @@ mod output {
         requested.min(safe_pairs.max(8))
     }
 
+    fn writer_pair_budget(mode: DemuxMode, buckets: usize, soft_limit: Option<usize>) -> usize {
+        let requested = if mode == DemuxMode::DnaOnlyDroplet
+            && buckets <= MAX_RETAINED_DROPLET_BUCKETS
+            && soft_limit.is_some()
+        {
+            buckets.max(MAX_OPEN_BUCKETS)
+        } else {
+            MAX_OPEN_BUCKETS
+        };
+        let available = safe_writer_pair_limit(requested, soft_limit);
+        if available < buckets {
+            available.min(MAX_OPEN_BUCKETS)
+        } else {
+            available
+        }
+    }
+
+    #[test]
+    fn droplet_writer_budget_retains_all_or_uses_bounded_fallback() {
+        let mode = DemuxMode::DnaOnlyDroplet;
+        assert_eq!(writer_pair_budget(mode, 6000, Some(12064)), 6000);
+        assert_eq!(writer_pair_budget(mode, 6000, Some(12063)), 128);
+        assert_eq!(writer_pair_budget(mode, 6000, Some(256)), 96);
+        assert_eq!(writer_pair_budget(mode, 6000, None), 128);
+        assert_eq!(writer_pair_budget(mode, 9000, Some(100000)), 128);
+        assert_eq!(
+            writer_pair_budget(DemuxMode::DnaRna, 6000, Some(100000)),
+            128
+        );
+    }
+
     impl WriterCache {
-        fn new(max_pairs: usize) -> Self {
+        fn new(mode: DemuxMode, buckets: usize) -> Self {
             let soft_limit = detect_soft_open_file_limit();
-            let effective_max_pairs = safe_writer_pair_limit(max_pairs, soft_limit);
+            let max_pairs = MAX_OPEN_BUCKETS;
+            let effective_max_pairs = writer_pair_budget(mode, buckets, soft_limit);
             if effective_max_pairs < max_pairs {
                 log::warn!(
                 "Reducing max open barcode buckets from {} to {} because the process open-file limit is {:?}; each bucket uses two FASTQ file descriptors",
@@ -1039,14 +1108,25 @@ mod output {
                 soft_limit
             );
             }
+            log::info!(
+                "Writer cache: {} pairs for {} buckets; soft open-file limit {:?}",
+                effective_max_pairs,
+                buckets,
+                soft_limit
+            );
             Self {
                 writers: AHashMap::new(),
                 order: VecDeque::new(),
                 max_pairs: effective_max_pairs,
+                all_buckets_fit: mode == DemuxMode::DnaOnlyDroplet
+                    && buckets <= effective_max_pairs,
             }
         }
 
         fn touch(&mut self, key: &BucketKey) {
+            if self.all_buckets_fit {
+                return;
+            }
             if let Some(pos) = self.order.iter().position(|existing| existing == key) {
                 self.order.remove(pos);
             }
@@ -1097,7 +1177,10 @@ mod output {
         paths: OutputPaths,
         cell_rows: Vec<CellRow>,
     ) -> Result<u64> {
-        let mut writers = WriterCache::new(MAX_OPEN_BUCKETS);
+        let mut writers = WriterCache::new(
+            paths.mode,
+            paths.dna_cell_ids.len() + paths.rna_cell_ids.len(),
+        );
         let mut stats: AHashMap<BucketKey, u64> = AHashMap::new();
         let mut matched_reads = 0u64;
         let mut fate_counts = FateCounts::default();
@@ -1251,6 +1334,7 @@ mod output {
             mode: match paths.mode {
                 DemuxMode::DnaOnly => "dna-only".to_string(),
                 DemuxMode::DnaOnlyTaps => "dna-only-taps".to_string(),
+                DemuxMode::DnaOnlyDroplet => "dna-only-droplet".to_string(),
                 DemuxMode::DnaRna => "dna-rna".to_string(),
             },
             retention_policy: "matched_read_pairs".to_string(),
@@ -1275,35 +1359,66 @@ mod output {
         let root = std::env::temp_dir().join(format!(
             "alopex_report_order.{}.{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir(&root).unwrap();
         let expected = [
-            "-9223372036854775808", "-10", "-2", "01", "1", "+2", "2", "10",
-            "9223372036854775807", "1z", "A1", "B2",
+            "-9223372036854775808",
+            "-10",
+            "-2",
+            "01",
+            "1",
+            "+2",
+            "2",
+            "10",
+            "9223372036854775807",
+            "1z",
+            "A1",
+            "B2",
         ];
-        let rows: Vec<CellRow> = expected.iter().enumerate().map(|(i, order)| CellRow {
-            dna_barcode: format!("barcode{i}"),
-            rna_barcode: String::new(),
-            plate_id: format!("P{i:02}"),
-            cell_order: order.to_string(),
-        }).collect();
+        let rows: Vec<CellRow> = expected
+            .iter()
+            .enumerate()
+            .map(|(i, order)| CellRow {
+                dna_barcode: format!("barcode{i}"),
+                rna_barcode: String::new(),
+                plate_id: format!("P{i:02}"),
+                cell_order: order.to_string(),
+            })
+            .collect();
         let paths = OutputPaths {
-            dna_out_dir: root.join("dna"), rna_out_dir: root.join("rna"),
-            json_report: root.join("report.json"), sample_name: "Sort".to_string(),
-            dna_cell_ids: rows.iter().map(|row| (row.dna_barcode.clone(), format!("Sort_{}", row.plate_id))).collect(),
-            rna_cell_ids: AHashMap::new(), min_matched_read_pairs: 1,
-            mode: DemuxMode::DnaOnly, input_fastq_pairs: 1,
+            dna_out_dir: root.join("dna"),
+            rna_out_dir: root.join("rna"),
+            json_report: root.join("report.json"),
+            sample_name: "Sort".to_string(),
+            dna_cell_ids: rows
+                .iter()
+                .map(|row| (row.dna_barcode.clone(), format!("Sort_{}", row.plate_id)))
+                .collect(),
+            rna_cell_ids: AHashMap::new(),
+            min_matched_read_pairs: 1,
+            mode: DemuxMode::DnaOnly,
+            input_fastq_pairs: 1,
         };
         for reverse in [false, true] {
             for shift in 0..rows.len() {
                 let mut input = rows.clone();
                 input.rotate_left(shift);
-                if reverse { input.reverse(); }
+                if reverse {
+                    input.reverse();
+                }
                 write_report(&paths, &input, &AHashMap::new(), FateCounts::default()).unwrap();
-                let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&paths.json_report).unwrap()).unwrap();
-                let observed: Vec<&str> = report["samples"].as_array().unwrap().iter()
-                    .map(|sample| sample["cell_order"].as_str().unwrap()).collect();
+                let report: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&paths.json_report).unwrap()).unwrap();
+                let observed: Vec<&str> = report["samples"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|sample| sample["cell_order"].as_str().unwrap())
+                    .collect();
                 assert_eq!(observed, expected, "reverse={reverse}, shift={shift}");
             }
         }
@@ -1423,6 +1538,457 @@ mod output {
     }
 }
 
+mod droplet {
+    use super::*;
+    use std::io::Write;
+
+    const ANCHOR: &[u8] = b"TTTCTTATATGGGCGTCCGTCGTTGCTCGTAGATGTGTATAAGAGACAG";
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct Layout<'a> {
+        pub barcode: &'a [u8],
+        pub umi: &'a [u8],
+        pub barcode_start: usize,
+        pub trim_start: usize,
+    }
+
+    fn mismatch(expected: u8, observed: u8, ct: bool) -> usize {
+        usize::from(
+            !(expected == observed
+                || (ct && expected == b'C' && observed == b'T')
+                || (!ct && expected == b'G' && observed == b'A')),
+        )
+    }
+
+    fn distance(observed: &[u8], ct: bool) -> usize {
+        let n = ANCHOR.len();
+        if observed.len() == n {
+            return ANCHOR
+                .iter()
+                .zip(observed)
+                .map(|(&a, &b)| mismatch(a, b, ct))
+                .sum();
+        }
+        let (short, long, deletion) = if observed.len() < n {
+            (observed, ANCHOR, true)
+        } else {
+            (ANCHOR, observed, false)
+        };
+        let cost = |i: usize, j: usize| {
+            if deletion {
+                mismatch(long[j], short[i], ct)
+            } else {
+                mismatch(short[i], long[j], ct)
+            }
+        };
+        let mut suffix: usize = (0..short.len()).map(|i| cost(i, i + 1)).sum();
+        let mut prefix = 0;
+        let mut best = 1 + suffix;
+        for i in 0..short.len() {
+            suffix -= cost(i, i + 1);
+            prefix += cost(i, i);
+            best = best.min(1 + prefix + suffix);
+        }
+        best
+    }
+
+    pub(super) fn extract(seq: &[u8]) -> std::result::Result<Layout<'_>, TerminalFate> {
+        if seq.len() < 28 + ANCHOR.len() - 1 {
+            return Err(TerminalFate::Short);
+        }
+        let mut best = 3;
+        let mut boundary = None;
+        let mut ambiguous = false;
+        for start in 28..=30 {
+            for length in 48..=50 {
+                let end = start + length;
+                if end > seq.len() {
+                    continue;
+                }
+                let score = distance(&seq[start..end], true).min(distance(&seq[start..end], false));
+                if score > 2 {
+                    continue;
+                }
+                if score < best {
+                    best = score;
+                    boundary = Some((start, end));
+                    ambiguous = false;
+                } else if score == best && boundary != Some((start, end)) {
+                    ambiguous = true;
+                }
+            }
+        }
+        if ambiguous {
+            return Err(TerminalFate::Ambiguous);
+        }
+        let (start, end) = boundary.ok_or(TerminalFate::Unmatched)?;
+        if start < 29 || end + 9 >= seq.len() {
+            return Err(TerminalFate::Short);
+        }
+        let barcode = &seq[start - 29..start - 12];
+        let umi = &seq[start - 12..start];
+        if !barcode.iter().all(|b| b"ACGT".contains(b)) || !umi.iter().all(|b| b"ACGTN".contains(b))
+        {
+            return Err(TerminalFate::Unmatched);
+        }
+        Ok(Layout {
+            barcode,
+            umi,
+            barcode_start: start - 29,
+            trim_start: end + 9,
+        })
+    }
+
+    pub(super) fn match_read<'a>(seq: &'a [u8], index: &'a BarcodeIndex) -> ProcResult<'a> {
+        let layout = match extract(seq) {
+            Ok(layout) => layout,
+            Err(fate) => return ProcResult::rejected(fate, None),
+        };
+        match index.match_simple(layout.barcode) {
+            BarcodeMatch::Unique { id } => {
+                ProcResult::assigned(Modality::Dna, id, layout.trim_start, Some(layout.umi))
+            }
+            BarcodeMatch::Ambiguous => {
+                ProcResult::rejected(TerminalFate::Ambiguous, Some(layout.umi))
+            }
+            BarcodeMatch::None => ProcResult::rejected(TerminalFate::Unmatched, Some(layout.umi)),
+        }
+    }
+
+    #[derive(Default, Serialize)]
+    struct CountMetrics {
+        input_reads: u64,
+        structured_reads: u64,
+        ambiguous: u64,
+        unmatched: u64,
+        short: u64,
+        barcode_with_c: u64,
+        umi_with_n: u64,
+        unique_barcodes: usize,
+    }
+
+    #[derive(Default)]
+    struct BarcodeCount {
+        count: u64,
+        below_q20: [u64; 17],
+        q30: [u64; 17],
+    }
+
+    pub(super) fn count_barcodes(args: &Args) -> Result<()> {
+        anyhow::ensure!(
+            args.mode == DemuxMode::DnaOnlyDroplet,
+            "--count-only requires dna-only-droplet"
+        );
+        anyhow::ensure!(args.r2.is_empty(), "--count-only reads R1 only");
+        let counts_path = args
+            .counts_output
+            .as_ref()
+            .context("--counts-output is required")?;
+        let metrics_path = args
+            .count_metrics
+            .as_ref()
+            .context("--count-metrics is required")?;
+        let mut metrics = CountMetrics::default();
+        let mut counts: AHashMap<Vec<u8>, BarcodeCount> = AHashMap::new();
+        let mut batch = Vec::with_capacity(DEFAULT_CHUNK_SIZE);
+        let accumulate = |batch: &mut Vec<(Vec<u8>, Vec<u8>)>,
+                          counts: &mut AHashMap<Vec<u8>, BarcodeCount>,
+                          metrics: &mut CountMetrics| {
+            let layouts: Vec<_> = batch.par_iter().map(|(seq, _)| extract(seq)).collect();
+            for (layout, (_, quality)) in layouts.into_iter().zip(batch.iter()) {
+                metrics.input_reads += 1;
+                match layout {
+                    Ok(layout) => {
+                        metrics.structured_reads += 1;
+                        metrics.barcode_with_c += u64::from(layout.barcode.contains(&b'C'));
+                        metrics.umi_with_n += u64::from(layout.umi.contains(&b'N'));
+                        let count = counts.entry(layout.barcode.to_vec()).or_default();
+                        count.count += 1;
+                        for (i, q) in quality[layout.barcode_start..layout.barcode_start + 17]
+                            .iter()
+                            .enumerate()
+                        {
+                            count.below_q20[i] += u64::from(*q < 53);
+                            count.q30[i] += u64::from(*q >= 63);
+                        }
+                    }
+                    Err(TerminalFate::Ambiguous) => metrics.ambiguous += 1,
+                    Err(TerminalFate::Short) => metrics.short += 1,
+                    Err(_) => metrics.unmatched += 1,
+                }
+            }
+            batch.clear();
+        };
+        for path in &args.r1 {
+            let mut reader = needletail::parse_fastx_file(path)?;
+            while let Some(record) = reader.next() {
+                let record = record?;
+                let seq = record.seq();
+                let qual = record
+                    .qual()
+                    .context("R1 must contain FASTQ quality scores")?;
+                anyhow::ensure!(
+                    seq.len() == qual.len(),
+                    "FASTQ sequence/quality length mismatch"
+                );
+                anyhow::ensure!(
+                    qual.iter().all(|q| (33..=126).contains(q)),
+                    "Invalid FASTQ Phred+33 quality"
+                );
+                normalize_read_id(record.id())?;
+                batch.push((seq.to_vec(), qual.to_vec()));
+                if batch.len() == DEFAULT_CHUNK_SIZE {
+                    accumulate(&mut batch, &mut counts, &mut metrics);
+                }
+            }
+        }
+        accumulate(&mut batch, &mut counts, &mut metrics);
+        metrics.unique_barcodes = counts.len();
+        let mut rows: Vec<_> = counts.into_iter().collect();
+        rows.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(&b.0)));
+        let mut out = std::io::BufWriter::new(std::fs::File::create(counts_path)?);
+        writeln!(out, "barcode\tcount\tbelow_q20\tq30")?;
+        for (barcode, count) in rows {
+            let list = |values: &[u64; 17]| {
+                values
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            writeln!(
+                out,
+                "{}\t{}\t{}\t{}",
+                std::str::from_utf8(&barcode)?,
+                count.count,
+                list(&count.below_q20),
+                list(&count.q30)
+            )?;
+        }
+        out.flush()?;
+        std::fs::write(metrics_path, serde_json::to_vec_pretty(&metrics)?)?;
+        Ok(())
+    }
+
+    const MOLECULE_CAP: usize = 4096;
+
+    fn molecule_key(layout: &Layout<'_>, seq: &[u8]) -> Option<u128> {
+        let insert = seq.get(layout.trim_start..layout.trim_start + 32)?;
+        layout
+            .umi
+            .iter()
+            .chain(insert)
+            .try_fold(0u128, |key, base| {
+                let digit = match base {
+                    b'A' => 0,
+                    b'C' => 1,
+                    b'G' => 2,
+                    b'T' => 3,
+                    _ => return None,
+                };
+                Some((key << 2) | digit)
+            })
+    }
+
+    fn molecule_rank(key: u128) -> (u64, u128) {
+        let mix = |mut x: u64| {
+            x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+            x ^ (x >> 31)
+        };
+        (mix((key as u64) ^ mix((key >> 64) as u64)), key)
+    }
+
+    #[derive(Default)]
+    struct Molecules {
+        reads: u64,
+        saturated: bool,
+        keys: std::collections::BTreeSet<(u64, u128)>,
+    }
+
+    impl Molecules {
+        fn add(&mut self, key: u128) {
+            self.reads += 1;
+            let ranked = molecule_rank(key);
+            if self.keys.len() < MOLECULE_CAP
+                || self.keys.last().is_some_and(|last| ranked <= *last)
+            {
+                self.keys.insert(ranked);
+                if self.keys.len() > MOLECULE_CAP {
+                    self.keys.pop_last();
+                    self.saturated = true;
+                }
+            } else {
+                self.saturated = true;
+            }
+        }
+    }
+
+    fn scan_molecules(
+        args: &Args,
+        selected: &AHashSet<Vec<u8>>,
+        mut consume: impl FnMut(&[u8], u128),
+    ) -> Result<()> {
+        let mut batch = Vec::with_capacity(DEFAULT_CHUNK_SIZE);
+        let mut accumulate = |batch: &mut Vec<Vec<u8>>| {
+            let extracted: Vec<_> = batch
+                .par_iter()
+                .map(|seq| {
+                    let layout = extract(seq).ok()?;
+                    if !selected.contains(layout.barcode) {
+                        return None;
+                    }
+                    Some((layout.barcode, molecule_key(&layout, seq)?))
+                })
+                .collect();
+            for (barcode, key) in extracted.into_iter().flatten() {
+                consume(barcode, key);
+            }
+            batch.clear();
+        };
+        for path in &args.r1 {
+            let mut reader = needletail::parse_fastx_file(path)?;
+            while let Some(record) = reader.next() {
+                let record = record?;
+                let seq = record.seq();
+                anyhow::ensure!(
+                    record.qual().is_some_and(|q| q.len() == seq.len()),
+                    "Molecule evidence requires FASTQ sequence/quality pairs"
+                );
+                normalize_read_id(record.id())?;
+                batch.push(seq.to_vec());
+                if batch.len() == DEFAULT_CHUNK_SIZE {
+                    accumulate(&mut batch);
+                }
+            }
+        }
+        accumulate(&mut batch);
+        Ok(())
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct EvidencePair {
+        barcode: String,
+        parent: String,
+    }
+
+    pub(super) fn molecule_evidence(args: &Args) -> Result<()> {
+        anyhow::ensure!(
+            args.mode == DemuxMode::DnaOnlyDroplet && args.r2.is_empty() && !args.r1.is_empty(),
+            "Droplet molecule evidence reads R1 only"
+        );
+        let pairs: Vec<EvidencePair> =
+            serde_json::from_slice(&std::fs::read(args.evidence_pairs.as_ref().unwrap())?)?;
+        let mut children: AHashMap<Vec<u8>, Molecules> = AHashMap::new();
+        for pair in &pairs {
+            anyhow::ensure!(
+                [&pair.barcode, &pair.parent]
+                    .into_iter()
+                    .all(|bc| bc.len() == 17 && bc.bytes().all(|b| b"AGT".contains(&b)))
+                    && pair.barcode != pair.parent,
+                "Invalid molecule evidence pair"
+            );
+            anyhow::ensure!(
+                children
+                    .insert(pair.barcode.as_bytes().to_vec(), Molecules::default())
+                    .is_none(),
+                "Duplicate molecule evidence child"
+            );
+        }
+        anyhow::ensure!(
+            !pairs.is_empty(),
+            "Molecule evidence pairs must not be empty"
+        );
+        scan_molecules(args, &children.keys().cloned().collect(), |barcode, key| {
+            children.get_mut(barcode).unwrap().add(key);
+        })?;
+        let mut targets: AHashMap<Vec<u8>, AHashMap<u128, Vec<usize>>> = AHashMap::new();
+        let mut parent_reads: AHashMap<Vec<u8>, u64> = AHashMap::new();
+        let mut shared: Vec<AHashSet<u128>> = pairs.iter().map(|_| AHashSet::new()).collect();
+        for (index, pair) in pairs.iter().enumerate() {
+            let lookup = targets.entry(pair.parent.as_bytes().to_vec()).or_default();
+            parent_reads
+                .entry(pair.parent.as_bytes().to_vec())
+                .or_default();
+            for (_, key) in &children[pair.barcode.as_bytes()].keys {
+                lookup.entry(*key).or_default().push(index);
+            }
+        }
+        scan_molecules(args, &targets.keys().cloned().collect(), |barcode, key| {
+            *parent_reads.get_mut(barcode).unwrap() += 1;
+            if let Some(indices) = targets[barcode].get(&key) {
+                for index in indices {
+                    shared[*index].insert(key);
+                }
+            }
+        })?;
+        let evidence: BTreeMap<_, _> = pairs.iter().enumerate().map(|(index, pair)| {
+            let child = &children[pair.barcode.as_bytes()];
+            let mut keys: Vec<_> = shared[index].iter().copied().collect();
+            keys.sort_unstable();
+            (pair.barcode.clone(), serde_json::json!({
+                "parent": pair.parent,
+                "child_eligible_reads": child.reads,
+                "child_sampled_signatures": child.keys.len(),
+                "child_saturated": child.saturated,
+                "parent_eligible_reads": parent_reads[pair.parent.as_bytes()],
+                "shared_signatures": keys.into_iter().map(|key| format!("{key:022x}")).collect::<Vec<_>>()
+            }))
+        }).collect();
+        std::fs::write(
+            args.evidence_output.as_ref().unwrap(),
+            serde_json::to_vec(
+                &serde_json::json!({"signature": "exact_umi12_insert32", "child_cap": MOLECULE_CAP,
+                    "parent_scan": "complete", "pairs": evidence}),
+            )?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn molecule_sample_is_bounded_order_independent_and_duplicate_safe() {
+        let mut forward = Molecules::default();
+        let mut reverse = Molecules::default();
+        for key in 0..10000u128 {
+            forward.add(key);
+            forward.add(key);
+        }
+        for key in (0..10000u128).rev() {
+            reverse.add(key);
+        }
+        assert_eq!(forward.keys, reverse.keys);
+        assert_eq!(forward.keys.len(), MOLECULE_CAP);
+        assert!(forward.saturated && reverse.saturated);
+        assert_eq!(forward.reads, 20000);
+        let mut small = Molecules::default();
+        for _ in 0..10000 {
+            small.add(123);
+        }
+        assert_eq!(small.keys.len(), 1);
+        assert!(!small.saturated);
+    }
+
+    #[test]
+    fn molecule_signature_uses_complete_umi_and_insert_without_ambiguous_bases() {
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGT";
+        let mut layout = Layout {
+            barcode: b"AAAAAAAAAAAAAAAAA",
+            umi: b"ACGTACGTACGT",
+            barcode_start: 0,
+            trim_start: 0,
+        };
+        let key = molecule_key(&layout, seq).unwrap();
+        layout.umi = b"TCGTACGTACGT";
+        assert_ne!(molecule_key(&layout, seq).unwrap(), key);
+        layout.umi = b"NCGTACGTACGT";
+        assert!(molecule_key(&layout, seq).is_none());
+        layout.umi = b"ACGTACGTACGT";
+        assert!(molecule_key(&layout, &seq[..31]).is_none());
+        assert!(molecule_key(&layout, b"NCGTACGTACGTACGTACGTACGTACGTACGT").is_none());
+    }
+}
+
 use barcode_map::*;
 use fastq_io::*;
 use matcher::*;
@@ -1511,15 +2077,27 @@ impl Config {
         for path in &args.r2 {
             ensure_gzip_fastq(path, "--r2")?;
         }
-        ensure_readable_file(&args.barcode_map, "--barcode-map")?;
-        ensure_parent_dir(&args.json_report, "--json-report")?;
+        let barcode_map = args
+            .barcode_map
+            .context("--barcode-map is required for demux")?;
+        let dna_out_dir = args
+            .dna_out_dir
+            .context("--dna-out-dir is required for demux")?;
+        let rna_out_dir = args
+            .rna_out_dir
+            .context("--rna-out-dir is required for demux")?;
+        let json_report = args
+            .json_report
+            .context("--json-report is required for demux")?;
+        ensure_readable_file(&barcode_map, "--barcode-map")?;
+        ensure_parent_dir(&json_report, "--json-report")?;
         Ok(Self {
             r1: args.r1,
             r2: args.r2,
-            barcode_map: args.barcode_map,
-            dna_out_dir: args.dna_out_dir,
-            rna_out_dir: args.rna_out_dir,
-            json_report: args.json_report,
+            barcode_map,
+            dna_out_dir,
+            rna_out_dir,
+            json_report,
             sample_name: args.sample_name,
             min_matched_read_pairs: args.min_matched_read_pairs,
             threads: args.threads,
@@ -2066,7 +2644,7 @@ impl<'a> ProcResult<'a> {
     }
 
     fn output_umi(&self) -> Option<&'a [u8]> {
-        if self.is_valid && self.modality == Some(Modality::Rna) {
+        if self.is_valid {
             self.umi
         } else {
             None
@@ -2097,11 +2675,20 @@ fn run() -> Result<()> {
     init_tables();
 
     let args = Args::parse();
-    let config = Config::from_args(args)?;
+    if args.threads == 0 {
+        anyhow::bail!("--threads must be greater than 0");
+    }
     rayon::ThreadPoolBuilder::new()
-        .num_threads(config.threads)
+        .num_threads(args.threads)
         .build_global()
         .context("Cannot initialize Rayon global thread pool")?;
+    if args.count_only {
+        return droplet::count_barcodes(&args);
+    }
+    if args.evidence_pairs.is_some() {
+        return droplet::molecule_evidence(&args);
+    }
+    let config = Config::from_args(args)?;
 
     log::info!(
         "Start demux. Sample: {}; build_version={}; source_revision={}",
@@ -2164,7 +2751,15 @@ fn run() -> Result<()> {
         .map(|row| {
             (
                 row.dna_barcode.clone(),
-                format!("{}_{}", config.sample_name, row.plate_id),
+                format!(
+                    "{}_{}",
+                    config.sample_name,
+                    if config.mode == DemuxMode::DnaOnlyDroplet {
+                        &row.dna_barcode
+                    } else {
+                        &row.plate_id
+                    }
+                ),
             )
         })
         .collect::<AHashMap<_, _>>();
@@ -2366,7 +2961,7 @@ fn process_chunk(
             acc.fates.record(TerminalFate::Short);
             continue;
         }
-        let result = process_read(
+        let mut result = process_read(
             r1_seq,
             dna_indices,
             rna_idx,
@@ -2375,7 +2970,13 @@ fn process_chunk(
             dna_w_spacer_len,
             demux_mode,
         );
+        if demux_mode == DemuxMode::DnaOnlyDroplet && result.is_valid && r2_end - r2_start <= 9 {
+            result = ProcResult::rejected(TerminalFate::Short, result.umi);
+        }
         acc.fates.record(result.fate);
+        if result.fate == TerminalFate::Short {
+            continue;
+        }
         let key = bucket_key_for_result(&result);
         let is_matched_bucket = key.is_matched();
         let bucket = acc.bucket_mut(key);
@@ -2387,7 +2988,11 @@ fn process_chunk(
 
         write_fastq_record(
             &mut bucket.r1_raw,
-            &input.r1_ids[r1_id_start..r1_id_end],
+            if demux_mode == DemuxMode::DnaOnlyDroplet {
+                normalize_read_id(&input.r1_ids[r1_id_start..r1_id_end])?
+            } else {
+                &input.r1_ids[r1_id_start..r1_id_end]
+            },
             r1_seq,
             &input.r1_quals[r1_start..r1_end],
             result.trim_start,
@@ -2396,12 +3001,20 @@ fn process_chunk(
         )?;
         write_fastq_record(
             &mut bucket.r2_raw,
-            &input.r2_ids[r2_id_start..r2_id_end],
+            if demux_mode == DemuxMode::DnaOnlyDroplet {
+                normalize_read_id(&input.r2_ids[r2_id_start..r2_id_end])?
+            } else {
+                &input.r2_ids[r2_id_start..r2_id_end]
+            },
             &input.r2_seqs[r2_start..r2_end],
             &input.r2_quals[r2_start..r2_end],
-            0,
+            if demux_mode == DemuxMode::DnaOnlyDroplet {
+                9
+            } else {
+                0
+            },
             result.output_umi(),
-            false,
+            demux_mode == DemuxMode::DnaOnlyDroplet,
         )?;
     }
     Ok(())
@@ -2449,9 +3062,17 @@ fn init_tables() {
 
 fn ensure_gzip_fastq(path: &Path, label: &str) -> Result<()> {
     ensure_readable_file(path, label)?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
     if !name.ends_with(".fastq.gz") && !name.ends_with(".fq.gz") {
-        anyhow::bail!("{} requires a .fastq.gz or .fq.gz suffix: {}", label, path.display());
+        anyhow::bail!(
+            "{} requires a .fastq.gz or .fq.gz suffix: {}",
+            label,
+            path.display()
+        );
     }
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("Cannot open {} gzip FASTQ: {}", label, path.display()))?;
@@ -2459,7 +3080,11 @@ fn ensure_gzip_fastq(path: &Path, label: &str) -> Result<()> {
     std::io::Read::read_exact(&mut file, &mut magic)
         .with_context(|| format!("Cannot read {} gzip header: {}", label, path.display()))?;
     if magic != [0x1f, 0x8b] {
-        anyhow::bail!("{} is not gzip FASTQ (expected gzip magic 0x1f 0x8b): {}", label, path.display());
+        anyhow::bail!(
+            "{} is not gzip FASTQ (expected gzip magic 0x1f 0x8b): {}",
+            label,
+            path.display()
+        );
     }
     Ok(())
 }
@@ -2493,6 +3118,87 @@ fn join_thread<T>(handle: JoinHandle<T>, name: &str) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn droplet_profiles_offsets_and_edits() {
+        let anchor = b"TTTCTTATATGGGCGTCCGTCGTTGCTCGTAGATGTGTATAAGAGACAG";
+        let cb = b"AGTAGTAGTAGTAGTAG";
+        let umi = b"ACGTNACGTACG";
+        for ct in [true, false] {
+            let converted: Vec<u8> = anchor
+                .iter()
+                .map(|&b| {
+                    if ct && b == b'C' {
+                        b'T'
+                    } else if !ct && b == b'G' {
+                        b'A'
+                    } else {
+                        b
+                    }
+                })
+                .collect();
+            let mut seq = [
+                cb.as_slice(),
+                umi,
+                &converted,
+                b"AAAAAAAAA",
+                b"GCGCGCGCGCGCGCGCGCGC",
+            ]
+            .concat();
+            let found = droplet::extract(&seq).unwrap();
+            assert_eq!(found.barcode, cb);
+            assert_eq!(found.umi, umi);
+            assert_eq!(found.trim_start, 87);
+            seq.insert(0, b'G');
+            assert_eq!(droplet::extract(&seq).unwrap().trim_start, 88);
+            seq.remove(0);
+            seq.remove(0);
+            assert!(droplet::extract(&seq).is_err());
+        }
+        let original = [
+            cb.as_slice(),
+            umi,
+            anchor,
+            b"AAAAAAAAA",
+            b"GCGCGCGCGCGCGCGCGCGC",
+        ]
+        .concat();
+        let mut inserted = original.clone();
+        inserted.insert(51, b'A');
+        assert_eq!(droplet::extract(&inserted).unwrap().trim_start, 88);
+        let mut deleted = original.clone();
+        deleted.remove(51);
+        assert_eq!(droplet::extract(&deleted).unwrap().trim_start, 86);
+        let mut truncated = original.clone();
+        truncated.truncate(70);
+        assert!(droplet::extract(&truncated).is_err());
+        let mut invalid = original.clone();
+        invalid[0] = b'N';
+        assert!(droplet::extract(&invalid).is_err());
+        let mut invalid_umi = original;
+        invalid_umi[20] = b'X';
+        assert!(droplet::extract(&invalid_umi).is_err());
+    }
+
+    #[test]
+    fn droplet_correction_rejects_equal_neighbors_but_keeps_exact() {
+        let a = "AAAAAAAAAAAAAAAAA".to_string();
+        let b = "TGAAAAAAAAAAAAAAA".to_string();
+        let index = BarcodeIndex::from_barcodes([a.clone(), b], 17, Modality::Dna);
+        assert_eq!(
+            index.match_simple(a.as_bytes()),
+            BarcodeMatch::Unique { id: &a }
+        );
+        assert_eq!(
+            index.match_simple(b"TAAAAAAAAAAAAAAAA"),
+            BarcodeMatch::Ambiguous
+        );
+        assert_eq!(
+            index.match_simple(b"CAAAAAAAAAAAAAAAA"),
+            BarcodeMatch::Unique { id: &a }
+        );
+        assert_eq!(index.match_simple(b"NAAAAAAAAAAAAAAAA"), BarcodeMatch::None);
+    }
+
     use super::*;
 
     #[test]
@@ -2500,7 +3206,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "alopex_gzip_contract.{}.{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir(&root).unwrap();
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -2512,27 +3221,56 @@ mod tests {
         std::fs::write(&barcode, "DNA_Barcode,PlateID,Cell_Order\nACGTACGT,A1,A1\n").unwrap();
         let make_args = |r1: &Path, r2: &Path| {
             Args::try_parse_from([
-                "demux_rs", "--r1", r1.to_str().unwrap(), "--r2", r2.to_str().unwrap(),
-                "--barcode-map", barcode.to_str().unwrap(),
-                "--dna-out-dir", root.join("dna").to_str().unwrap(),
-                "--rna-out-dir", root.join("rna").to_str().unwrap(),
-                "--json-report", root.join("report.json").to_str().unwrap(),
-                "--sample-name", "AlopexGzip", "--mode", "dna-only",
-            ]).unwrap()
+                "demux_rs",
+                "--r1",
+                r1.to_str().unwrap(),
+                "--r2",
+                r2.to_str().unwrap(),
+                "--barcode-map",
+                barcode.to_str().unwrap(),
+                "--dna-out-dir",
+                root.join("dna").to_str().unwrap(),
+                "--rna-out-dir",
+                root.join("rna").to_str().unwrap(),
+                "--json-report",
+                root.join("report.json").to_str().unwrap(),
+                "--sample-name",
+                "AlopexGzip",
+                "--mode",
+                "dna-only",
+            ])
+            .unwrap()
         };
         for (name, content, expected) in [
-            ("plain.fastq", b"@read\nACGT\n+\nIIII\n".as_slice(), "suffix"),
+            (
+                "plain.fastq",
+                b"@read\nACGT\n+\nIIII\n".as_slice(),
+                "suffix",
+            ),
             ("plain.fasta", b">read\nACGT\n".as_slice(), "suffix"),
-            ("renamed.fastq.gz", b"@read\nACGT\n+\nIIII\n".as_slice(), "gzip magic"),
-            ("renamed_fasta.fq.gz", b">read\nACGT\n".as_slice(), "gzip magic"),
+            (
+                "renamed.fastq.gz",
+                b"@read\nACGT\n+\nIIII\n".as_slice(),
+                "gzip magic",
+            ),
+            (
+                "renamed_fasta.fq.gz",
+                b">read\nACGT\n".as_slice(),
+                "gzip magic",
+            ),
             ("short.fq.gz", b"\x1f".as_slice(), "gzip header"),
             ("compressed.fasta.gz", gzip.as_slice(), "suffix"),
         ] {
             let bad = root.join(name);
             std::fs::write(&bad, content).unwrap();
             for (r1, r2, label) in [(&bad, &good, "--r1"), (&good, &bad, "--r2")] {
-                let error = Config::from_args(make_args(r1, r2)).expect_err("invalid gzip FASTQ").to_string();
-                assert!(error.contains(label) && error.contains(expected), "{name}: {error}");
+                let error = Config::from_args(make_args(r1, r2))
+                    .expect_err("invalid gzip FASTQ")
+                    .to_string();
+                assert!(
+                    error.contains(label) && error.contains(expected),
+                    "{name}: {error}"
+                );
             }
             assert!(!root.join("report.json").exists());
             assert!(!root.join("dna").exists());
@@ -2635,9 +3373,20 @@ mod tests {
         ] {
             for id in [left, right] {
                 let mut record = Vec::new();
-                write_fastq_record(&mut record, id, b"ACGT", b"IIII", 0, Some(b"ACGTACGT"), false)
-                    .expect("valid RNA FASTQ");
-                assert_eq!(record.split(|b| b.is_ascii_whitespace()).next().unwrap(), b"@read:ACGTACGT");
+                write_fastq_record(
+                    &mut record,
+                    id,
+                    b"ACGT",
+                    b"IIII",
+                    0,
+                    Some(b"ACGTACGT"),
+                    false,
+                )
+                .expect("valid RNA FASTQ");
+                assert_eq!(
+                    record.split(|b| b.is_ascii_whitespace()).next().unwrap(),
+                    b"@read:ACGTACGT"
+                );
                 assert!(record.ends_with(b"\nACGT\n+\nIIII\n"));
             }
         }

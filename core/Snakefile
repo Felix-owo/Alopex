@@ -1,4 +1,6 @@
 import hashlib
+import ast
+import inspect
 import functools
 import json
 import os
@@ -45,6 +47,9 @@ from dna_pipeline import (
     resource_threads,
     scratch_mb,
     validate_barcode_map_for_protocol,
+    call_droplet_cells,
+    deduplicate_droplet_bam,
+    prepare_high_cph_multiqc_sources,
     write_multiqc_file_list,
 )
 
@@ -63,6 +68,8 @@ JOB_RUNTIME = _internal_helper("core/job_runtime.sh")
 BSCONV_MODULE_CODE = _internal_helper("core/dna_pipeline.py")
 config = finalize_project_config(config)
 PROTOCOL_POLICY = get_protocol_policy(config)
+DROPLET_CALLING_IDENTITY = hashlib.sha256(ast.dump(ast.parse(inspect.getsource(call_droplet_cells)), include_attributes=False).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
+DROPLET_UMI_IDENTITY = hashlib.sha256(ast.dump(ast.parse(inspect.getsource(deduplicate_droplet_bam)), include_attributes=False).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
 BACKEND_POLICY = get_backend(config)
 METHYLATION_BACKEND = BACKEND_POLICY.name
 
@@ -154,13 +161,13 @@ if RUN_SNAPSHOT:
     SAMPLE_MANIFEST = (_snapshot_inputs_root / str(
         _snapshot_inputs["sample_manifest"]["snapshot_path"]
     )).resolve()
-    BARCODE_MAP = (_snapshot_inputs_root / str(
+    BARCODE_MAP = ((_snapshot_inputs_root / str(
         _snapshot_inputs["barcode_map"]["snapshot_path"]
-    )).resolve()
+    )).resolve() if PROTOCOL_POLICY.name != "droplet" else None)
     RUN_SNAPSHOT_DEP = [str(PROVENANCE_SNAPSHOT_PATH)]
 else:
     SAMPLE_MANIFEST = CONFIG_DIR / "sample_manifest.tsv"
-    BARCODE_MAP = CONFIG_DIR / "Barcode_Map.csv"
+    BARCODE_MAP = CONFIG_DIR / "Barcode_Map.csv" if PROTOCOL_POLICY.name != "droplet" else None
     RUN_SNAPSHOT_DEP = []
 DNA_OUT_DIR = INTERMEDIATE_DIR / "demux" / "DNA"
 RNA_OUT_DIR = INTERMEDIATE_DIR / "demux" / "RNA"
@@ -172,7 +179,7 @@ for required_path, label in (
     (SAMPLE_MANIFEST, "sample manifest"),
     (BARCODE_MAP, "Barcode Map"),
 ):
-    if not required_path.is_file():
+    if required_path is not None and not required_path.is_file():
         raise FileNotFoundError(f"Project {label} not found: {required_path}")
 
 PIPELINE_EXECUTOR = str(os.environ.get("DNA_PIPELINE_EXECUTOR", "local") or "local").strip().lower()
@@ -219,9 +226,9 @@ DEMUX_RUN_ROUTES = {
     for run_id, info in RAW_SAMPLES_MAP.items()
 }
 
-CUTADAPT_ADAPTER_R1 = "CTGTCTCTTATACACATCT"
-CUTADAPT_ADAPTER_R2 = "N{9}CTGTCTCTTATACACATCT"
-CUTADAPT_R1_MIN_OVERLAP = 3
+CUTADAPT_ADAPTER_R1 = "N{9}CTGTCTCTTATACACATCT" if PROTOCOL_POLICY.name == "droplet" else "CTGTCTCTTATACACATCT"
+CUTADAPT_ADAPTER_R2 = "N{9}CTRTCTCTTATACACATCT" if PROTOCOL_POLICY.name == "droplet" else "N{9}CTGTCTCTTATACACATCT"
+CUTADAPT_R1_MIN_OVERLAP = 12 if PROTOCOL_POLICY.name == "droplet" else 3
 CUTADAPT_R2_MIN_OVERLAP = 12
 CUTADAPT_ADAPTER_R1_SPEC = f"{CUTADAPT_ADAPTER_R1};min_overlap={CUTADAPT_R1_MIN_OVERLAP}"
 CUTADAPT_ADAPTER_R2_SPEC = f"{CUTADAPT_ADAPTER_R2};min_overlap={CUTADAPT_R2_MIN_OVERLAP}"
@@ -262,7 +269,8 @@ BISMARK_NONCONVERSION_MIN_COUNT = int(
     config["bismark"]["non_conversion_minimum_count"]
 )
 
-validate_barcode_map_for_protocol(BARCODE_MAP, PROTOCOL_POLICY)
+if BARCODE_MAP is not None:
+    validate_barcode_map_for_protocol(BARCODE_MAP, PROTOCOL_POLICY)
 SPECIES = str(config["species"])
 _CONFIGURED_REFERENCE_GENOME = resolve_reference(
     config, SPECIES, PROJECT_DIR, pipeline_root=PIPELINE_ROOT
@@ -387,7 +395,7 @@ def current_demux_fastq(demux_sample, read_pair):
 def current_demux_source_inputs(wildcards):
     manifest, _row = current_demux_match(wildcards.demux_sample)
     raw = RAW_SAMPLES_MAP[manifest.parent.name]
-    return [*raw["r1"], *raw["r2"], SAMPLE_MANIFEST, BARCODE_MAP, str(DEMUX_BINARY)]
+    return [*raw["r1"], *raw["r2"], SAMPLE_MANIFEST, *([] if BARCODE_MAP is None else [BARCODE_MAP]), str(DEMUX_BINARY)]
 
 @functools.lru_cache(maxsize=None)
 def current_demux_match(demux_sample):
@@ -701,10 +709,11 @@ onsuccess:
 
 
 rule initial_cell_manifest:
-    """合并项目 sample manifest 与 Barcode Map，生成协议/物种感知的初始 cell manifest。"""
+    """合并项目 manifest 与孔板 map 或逐文库 called cells，生成初始 cell manifest。"""
     input:
         project_manifest = SAMPLE_MANIFEST,
-        barcode_map = BARCODE_MAP
+        barcode_map = [BARCODE_MAP] if BARCODE_MAP is not None else [],
+        called = expand(str(INTERMEDIATE_DIR / "demux/calling/{sample}/called_cells.csv"), sample=DEMUX_RUN_IDS) if PROTOCOL_POLICY.name == "droplet" else []
     output:
         manifest = INTERMEDIATE_DIR / "sample_manifest.tsv"
     log:
@@ -719,7 +728,9 @@ rule initial_cell_manifest:
         )
     params:
         species = SPECIES,
-        protocol = PROTOCOL_POLICY.name
+        protocol = PROTOCOL_POLICY.name,
+        barcode_map = shlex.quote(str(BARCODE_MAP) if BARCODE_MAP is not None else ""),
+        called_args = " ".join("--called-cells=" + shlex.quote(RAW_SAMPLES_MAP[run]["sample_id"] + ":" + str(INTERMEDIATE_DIR / "demux/calling" / run / "called_cells.csv")) for run in DEMUX_RUN_IDS) if PROTOCOL_POLICY.name == "droplet" else ""
     shell:
         r"""
         set -euo pipefail
@@ -727,17 +738,57 @@ rule initial_cell_manifest:
         mkdir -p "$(dirname {output.manifest:q})" "$(dirname {log:q})"
         python -m dna_pipeline write-cell-manifest \
             {input.project_manifest:q} \
-            {input.barcode_map:q} \
+            {params.barcode_map} \
             {output.manifest:q} \
             --species {params.species:q} \
-            --protocol {params.protocol:q} > {log:q} 2>&1
+            --protocol {params.protocol:q} {params.called_args} > {log:q} 2>&1
         """
+if PROTOCOL_POLICY.name == "droplet":
+    rule droplet_call_cells:
+        """按原始文库统计完整结构并调用细胞，失败时保留谷底诊断。"""
+        input:
+            r1 = lambda wc: RAW_SAMPLES_MAP[wc.sample]["r1"],
+            binary = str(DEMUX_BINARY)
+        output:
+            counts = INTERMEDIATE_DIR / "demux/calling/{sample}/counts.tsv",
+            structure = INTERMEDIATE_DIR / "demux/calling/{sample}/structure.json",
+            metrics = INTERMEDIATE_DIR / "demux/calling/{sample}/calling.json",
+            cells = INTERMEDIATE_DIR / "demux/calling/{sample}/called_cells.csv"
+        params:
+            calling_identity = DROPLET_CALLING_IDENTITY,
+            r1_args = lambda wc: repeated_cli_flag("--r1", RAW_SAMPLES_MAP[wc.sample]["r1"])
+        log:
+            LOGS_DIR / "rules/droplet_calling/{sample}.log"
+        threads: DEMUX_THREADS
+        resources:
+            mem_mb = lambda wc, attempt: demux_resource_mem_mb(wc.sample, attempt),
+            runtime = lambda wc, attempt: demux_resource_runtime_min(wc.sample, attempt)
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+            mkdir -p "$(dirname {output.cells:q})" "$(dirname {log:q})"
+            {input.binary:q} --mode dna-only-droplet --count-only \
+                {params.r1_args} --threads {threads} \
+                --counts-output {output.counts:q} --count-metrics {output.structure:q} > {log:q} 2>&1
+            if ! python -m dna_pipeline call-droplet-cells --counts {output.counts:q} \
+                --output {output.cells:q} --metrics {output.metrics:q} \
+                {params.r1_args} --demux-binary {input.binary:q} --threads {threads} >> {log:q} 2>&1; then
+                cat {output.metrics:q} >> {log:q}
+                exit 1
+            fi
+            cat {output.structure:q} {output.metrics:q} >> {log:q}
+            """
+
+
 checkpoint demux:
     """按 raw run 原子提交解复用 FASTQ、manifest、报告与 completion 边界。"""
     input:
         r1 = lambda wc: RAW_SAMPLES_MAP[wc.sample]["r1"],
         r2 = lambda wc: RAW_SAMPLES_MAP[wc.sample]["r2"],
-        barcode_map = BARCODE_MAP,
+        barcode_map = lambda wc: str(INTERMEDIATE_DIR / "demux/calling" / wc.sample / "called_cells.csv") if PROTOCOL_POLICY.name == "droplet" else str(BARCODE_MAP),
+        calling = lambda wc: [str(INTERMEDIATE_DIR / "demux/calling" / wc.sample / "calling.json"), str(INTERMEDIATE_DIR / "demux/calling" / wc.sample / "structure.json")] if PROTOCOL_POLICY.name == "droplet" else [],
         cell_manifest = rules.initial_cell_manifest.output.manifest,
         binary = str(DEMUX_BINARY),
     output:
@@ -755,6 +806,8 @@ checkpoint demux:
         dna_w_spacer_len = DNA_W_SPACER_LEN,
         demux_mode = lambda wc: DEMUX_RUN_ROUTES[wc.sample].demux_mode,
         pipeline_mode = PROTOCOL_POLICY.name,
+        calling_identity = DROPLET_CALLING_IDENTITY,
+        calling_args = lambda wc: "--calling-metrics " + shlex.quote(str(INTERMEDIATE_DIR / "demux/calling" / wc.sample / "calling.json")) + " --structure-metrics " + shlex.quote(str(INTERMEDIATE_DIR / "demux/calling" / wc.sample / "structure.json")) if PROTOCOL_POLICY.name == "droplet" else "",
         route_id = lambda wc: DEMUX_RUN_ROUTES[wc.sample].route_id,
         downstream_dna = lambda wc: DEMUX_RUN_ROUTES[wc.sample].downstream_dna,
         dna_dir = lambda wc: str(DNA_OUT_DIR / wc.sample),
@@ -894,7 +947,7 @@ checkpoint demux:
         }}
         run_demux >> {log:q} 2>&1
 
-        python -m dna_pipeline write-demux-metadata -- \
+        python -m dna_pipeline write-demux-metadata {params.calling_args} -- \
             "$report_tmp" "$mqc_tmp" "$manifest_tmp" "$dna_final" "$rna_final" \
             {params.pipeline_mode:q} {params.route_id:q} {params.downstream_dna:q} \
             {params.raw_sample:q} {input.cell_manifest:q} >> {log:q} 2>&1
@@ -1010,6 +1063,7 @@ if METHYLATION_BACKEND == "biscuit":
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
             demux_spacer_len = DNA_W_SPACER_LEN,
+            calling_identity = DROPLET_CALLING_IDENTITY,
             demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
             rg_header = lambda wc: "@RG\\tID:{0}\\tSM:{0}\\tPL:ILLUMINA".format(
                 wc.demux_sample.replace(os.sep, "_")
@@ -1912,6 +1966,7 @@ elif METHYLATION_BACKEND == "rastair":
             attempt_no = lambda wc, attempt: int(attempt),
         params:
             demux_spacer_len = DNA_W_SPACER_LEN,
+            calling_identity = DROPLET_CALLING_IDENTITY,
             demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
             bwa_prefix = f"{REFERENCE_GENOME}.bwa/genome",
             rg = lambda wc: "@RG\\tID:{0}\\tSM:{0}\\tPL:ILLUMINA".format(wc.demux_sample),
@@ -2015,7 +2070,7 @@ elif METHYLATION_BACKEND == "rastair":
 else:
     rule bismark_align_dedup:
         """在单个 scratch 作业内完成 Cutadapt、Bismark 比对与 paired-end 去重。"""
-        group: "bismark_cell" if PROTOCOL_POLICY.name == "cabernet" else None
+        group: "bismark_cell" if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else None
         input:
             r1 = lambda wc: current_demux_fastq(wc.demux_sample, 1),
             r2 = lambda wc: current_demux_fastq(wc.demux_sample, 2),
@@ -2028,17 +2083,18 @@ else:
             report = CELL_PATH_PATTERN.cutadapt_json,
             bam = temp(CELL_PATH_PATTERN.post_alignment_bam),
             align_report = CELL_PATH_PATTERN.bismark_align_report,
-            dedup_report = CELL_PATH_PATTERN.bismark_dedup_report
+            dedup_report = CELL_PATH_PATTERN.droplet_umi_qc if PROTOCOL_POLICY.name == "droplet" else CELL_PATH_PATTERN.bismark_dedup_report
         log:
             LOGS_DIR / "rules/bismark/{demux_sample}_align.log"
         threads: BISMARK_ALIGN_THREADS
         resources:
             mem_mb = lambda wildcards, attempt: backend_stage_mem_mb("bismark", "align", wildcards.demux_sample, attempt),
-            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name == "cabernet" else backend_preprocess_runtime_min("bismark", wildcards.demux_sample, attempt),
+            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else backend_preprocess_runtime_min("bismark", wildcards.demux_sample, attempt),
             disk_mb = lambda wildcards: static_scratch_mb("preprocess_alignment", wildcards.demux_sample),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
             demux_spacer_len = DNA_W_SPACER_LEN,
+            calling_identity = DROPLET_CALLING_IDENTITY,
             demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
             cutadapt = CUTADAPT,
             cutadapt_threads = CUTADAPT_THREADS,
@@ -2047,6 +2103,9 @@ else:
             adapter_r1_spec = lambda wc: CUTADAPT_ADAPTER_R1_SPEC,
             adapter_r2_spec = lambda wc: CUTADAPT_ADAPTER_R2_SPEC,
             bismark = BISMARK,
+            protocol = PROTOCOL_POLICY.name,
+            umi_tools = str(Path(BISMARK).parent / "umi_tools"),
+            umi_identity = DROPLET_UMI_IDENTITY,
             bowtie2_dir = str(Path(BOWTIE2).parent),
             alignment_instances = BISMARK_ALIGNMENT_INSTANCES,
             library_flag = BISMARK_LIBRARY_FLAG,
@@ -2107,9 +2166,17 @@ else:
             test -s "$align_report"
 
             dedup_threads=$(( {threads} < 4 ? {threads} : 4 ))
-            {params.bismark:q} dedup --bam -p --parallel "$dedup_threads" --output_dir "$out" -o {wildcards.demux_sample:q} "$align_bam" >> {log:q} 2>&1
-            final_bam=$(dna_pipeline_find_single_output "$out" '*.deduplicated.bam')
-            dedup_report=$(dna_pipeline_find_single_output "$out" '*deduplication_report.txt')
+            if [[ {params.protocol:q} == droplet ]]; then
+                final_bam="$out/droplet.deduplicated.bam"
+                dedup_report="$out/droplet.umi_dedup.json"
+                python -m dna_pipeline dedup-droplet-bam --bam "$align_bam" --output "$final_bam" \
+                    --qc "$dedup_report" --sample={wildcards.demux_sample:q} --scratch "$tmpdir" --umi-tools {params.umi_tools:q} \
+                    --threads "$dedup_threads" >> {log:q} 2>&1
+            else
+                {params.bismark:q} dedup --bam -p --parallel "$dedup_threads" --output_dir "$out" -o {wildcards.demux_sample:q} "$align_bam" >> {log:q} 2>&1
+                final_bam=$(dna_pipeline_find_single_output "$out" '*.deduplicated.bam')
+                dedup_report=$(dna_pipeline_find_single_output "$out" '*deduplication_report.txt')
+            fi
             test -s "$dedup_report"
             {params.samtools:q} quickcheck -v "$final_bam" >> {log:q} 2>&1
             python -m dna_pipeline atomic-publish \
@@ -2125,7 +2192,7 @@ else:
             """
     rule bismark_filter_nonconversion:
         """执行 bismark filter 非 CG（non-CG）评估/过滤，并保持输出 BAM 中 read pair 相邻。"""
-        group: "bismark_cell" if PROTOCOL_POLICY.name == "cabernet" else None
+        group: "bismark_cell" if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else None
         input:
             demux_completion = current_demux_completion,
             bam = rules.bismark_align_dedup.output.bam
@@ -2141,7 +2208,7 @@ else:
             mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
                 "high_cph_read_names", wildcards.demux_sample, attempt
             ),
-            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name == "cabernet" else combined_static_runtime_min(
+            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else combined_static_runtime_min(
                 HIGH_CPH_FILTER_RULES, wildcards.demux_sample, attempt
             ),
             disk_mb = lambda wildcards: static_scratch_mb(
@@ -2301,7 +2368,7 @@ else:
                 """
     rule bismark_extract:
         """直接在 pair-adjacent 过滤 BAM 上运行 Bismark methylation extraction，产出合并 cov、M-bias 与报告。"""
-        group: "bismark_cell" if PROTOCOL_POLICY.name == "cabernet" else None
+        group: "bismark_cell" if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else None
         input:
             demux_completion = current_demux_completion,
             bam = BISMARK_ANALYSIS_BAM
@@ -2316,7 +2383,7 @@ else:
             mem_mb = lambda wildcards, attempt: backend_stage_mem_mb(
                 "bismark", "extract", wildcards.demux_sample, attempt
             ),
-            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name == "cabernet" else backend_stage_runtime_min(
+            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else backend_stage_runtime_min(
                 "bismark", "extract", wildcards.demux_sample, attempt
             ),
             disk_mb = lambda wildcards: static_scratch_mb(
@@ -2377,7 +2444,7 @@ else:
             """
     rule bismark_cpg:
         """将 Bismark observed coverage 直接流式转换为 SnapATAC2 import_values 四列 CpG 格式。"""
-        group: "bismark_cell" if PROTOCOL_POLICY.name == "cabernet" else None
+        group: "bismark_cell" if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else None
         input:
             demux_completion = current_demux_completion,
             cov = rules.bismark_extract.output.cov
@@ -2390,7 +2457,7 @@ else:
             mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
                 "generate_cpg_input", wildcards.demux_sample, attempt
             ),
-            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name == "cabernet" else static_resource_runtime_min(
+            runtime = lambda wildcards, attempt: BISMARK_CELL_RULE_RUNTIME_MIN if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else static_resource_runtime_min(
                 "generate_cpg_input", wildcards.demux_sample, attempt
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
@@ -2459,7 +2526,7 @@ def current_multiqc_source_inputs(wildcards):
         sources.append(str(paths.cutadapt_json))
         if METHYLATION_BACKEND == "biscuit":
             sources.append(str(paths.dupsifter_multiqc))
-            sources.append(str(paths.high_cph_multiqc))
+            sources.append(str(paths.high_cph_multiqc if paths.high_cph_multiqc.is_file() else paths.high_cph_summary))
             sources.extend(
                 str(path)
                 for path in paths.biscuit_qc_sources(
@@ -2474,8 +2541,9 @@ def current_multiqc_source_inputs(wildcards):
                     str(paths.bismark_mbias),
                 ]
             )
-            sources.append(str(paths.high_cph_multiqc))
-            sources.append(str(paths.bismark_dedup_report))
+            sources.append(str(paths.high_cph_multiqc if paths.high_cph_multiqc.is_file() else paths.high_cph_summary))
+            if PROTOCOL_POLICY.name != "droplet":
+                sources.append(str(paths.bismark_dedup_report))
     sources.extend([
         str(FINAL_SAMPLE_PAIR_QC),
         str(FINAL_SAMPLE_CUTADAPT_QC),
@@ -2507,7 +2575,7 @@ def current_final_manifest_qc_inputs(wildcards):
         else:
             inputs.extend(
                 [
-                    str(paths.bismark_dedup_report),
+                    str(paths.droplet_umi_qc if PROTOCOL_POLICY.name == "droplet" else paths.bismark_dedup_report),
                     str(paths.bismark_align_report),
                     str(paths.bismark_extract_report),
                     str(paths.bismark_mbias),
@@ -2544,6 +2612,7 @@ rule multiqc:
     output:
         report = STAGED_RESULTS_DIR / "QC_Results" / "multiqc_report.html",
         file_list = temp(INTERMEDIATE_DIR / "multiqc" / "multiqc_sources.txt"),
+        high_cph = temp(INTERMEDIATE_DIR / "multiqc" / "high_cph_rebuilt_mqc.json"),
     log:
         LOGS_DIR / "rules/multiqc.log"
     threads: MULTIQC_THREADS
@@ -2564,7 +2633,10 @@ rule multiqc:
     run:
         shell("source {JOB_RUNTIME:q}; dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}")
         count, skipped = write_multiqc_file_list(
-            list(input.sources) + [str(input.pair_qc), str(input.cutadapt_qc)],
+            prepare_high_cph_multiqc_sources(
+                list(input.sources) + [str(input.pair_qc), str(input.cutadapt_qc)],
+                Path(output.high_cph),
+            ),
             str(output.file_list),
         )
         with open(str(log), "a", encoding="utf-8") as handle:

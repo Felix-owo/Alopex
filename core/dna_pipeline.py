@@ -422,9 +422,9 @@ properties:
     required: [protocol, methylation_backend]
     properties:
       protocol:
-        description: 建库协议（srd / cabernet / taps）；manifest 的 rna_sample 在 srd 为本地 RNA tube，在 cabernet/taps 为可选外部 RNA raw 关联。
+        description: 建库协议（srd / cabernet / taps / droplet）；manifest 的 rna_sample 在 srd 为本地 RNA tube，在 cabernet/taps 为可选外部 RNA raw 关联，在 droplet 必须留空。
         type: string
-        enum: [srd, cabernet, taps]
+        enum: [srd, cabernet, taps, droplet]
       methylation_backend:
         description: 甲基化分析后端（biscuit / bismark / rastair），决定 alignment 与 CpG 生产路线。
         type: string
@@ -450,7 +450,7 @@ properties:
 
 
   high_cph:
-    description: Cabernet/SRD 的 high-CpH / non-conversion 处理参数，固定统计并剔除；TAPS 不适用，无用户开关；省略时使用内置默认。
+    description: Cabernet/SRD/Droplet 的 high-CpH / non-conversion 处理参数，固定统计并剔除；TAPS 不适用，无用户开关；省略时使用内置默认。
     type: object
     additionalProperties: false
     required:
@@ -623,8 +623,8 @@ references:
   mm10: resources/mm10_reference/mm10.primary.lambda.puc19.fa  # primary genome + lambda + pUC19；也接受绝对路径
 
 analysis:
-  protocol: cabernet              # cabernet / srd / taps；manifest 的 rna_sample 在 srd 为本地输入，其余为外部 RNA raw 关联
-  methylation_backend: bismark    # cabernet/srd 选 biscuit/bismark；taps 仅选 rastair
+  protocol: cabernet              # cabernet / srd / taps / droplet；manifest 的 rna_sample 在 srd 为本地输入，cabernet/taps 为外部 RNA raw 关联，droplet 必须留空
+  methylation_backend: bismark    # cabernet/srd 选 biscuit/bismark；droplet 仅 bismark；taps 仅 rastair
 
 demux:
   min_matched_read_pairs: 10   # 单 cell barcode 匹配 read pairs 低于该值时不产出结果；0 关闭门槛
@@ -1164,6 +1164,10 @@ class CellOutputPaths:
         return self.bismark_dir / f"{self.sample_id}.deduplication_report.txt"
 
     @property
+    def droplet_umi_qc(self) -> Path:
+        return self.bismark_dir / f"{self.sample_id}.umi_dedup.json"
+
+    @property
     def bismark_extract_report(self) -> Path:
         return self.bismark_dir / f"{self.sample_id}_splitting_report.txt"
 
@@ -1408,19 +1412,103 @@ def _read_filter_summary(path: Path, sample: str) -> dict[str, Any]:
         raise ValueError("Bismark non-conversion minimum_count must be >= 1")
     if not isinstance(filter_applied, bool):
         raise ValueError("Bismark non-conversion filter_applied must be boolean")
-    if payload["protocol"] not in {"cabernet", "srd"}:
+    if payload["protocol"] not in {"cabernet", "srd", "droplet"}:
         raise ValueError("Bismark non-conversion protocol is invalid")
     if payload["high_cph_role"] not in {
         "cdna_contamination",
         "residual_high_cph",
     }:
         raise ValueError("Bismark non-conversion high_cph_role is invalid")
-    expected_role = {"cabernet": "cdna_contamination", "srd": "residual_high_cph"}
+    expected_role = {"cabernet": "cdna_contamination", "droplet": "cdna_contamination", "srd": "residual_high_cph"}
     if payload["high_cph_role"] != expected_role[payload["protocol"]]:
         raise ValueError("Bismark non-conversion protocol/role contract is invalid")
     if not filter_applied:
         raise ValueError("Bismark non-conversion summary must record the fixed filter action")
     return payload
+
+
+DROPLET_DEDUP_POLICY = "umi_tools_directional_physical_r1_ignore_tlen"
+
+
+def deduplicate_droplet_bam(bam: str | Path, output: str | Path, qc: str | Path, *, sample: str, scratch: str | Path, umi_tools: str, threads: int = 1) -> None:
+    """按物理 R1 与 UMI 去重，并恢复 Bismark flags、配对顺序及甲基化标签。"""
+    import pysam
+    from importlib.metadata import version
+
+    if SAMPLE_ID_RE.fullmatch(sample) is None:
+        raise ValueError("Invalid Droplet UMI sample identity")
+    if version("umi_tools") != "1.1.6":
+        raise ValueError("Droplet dedup requires umi_tools 1.1.6")
+    root = Path(tempfile.mkdtemp(prefix="droplet_umi_", dir=scratch))
+    total = kept = umi_n = 0
+    seen = set()
+    try:
+        normalized = root / "normalized.bam"
+        with pysam.AlignmentFile(str(bam), "rb") as source, pysam.AlignmentFile(str(normalized), "wb", template=source) as target:
+            iterator = iter(source)
+            for r1 in iterator:
+                r2 = next(iterator, None)
+                if r2 is None or r1.query_name != r2.query_name or r1.query_name in seen:
+                    raise ValueError("Droplet BAM requires unique, adjacent complete physical read pairs")
+                seen.add(r1.query_name)
+                if (r1.flag, r2.flag) not in {(99, 147), (163, 83), (147, 99), (83, 163)}:
+                    raise ValueError("Unexpected Bismark paired flags")
+                umi = r1.query_name.rsplit(":", 1)[-1]
+                if not re.fullmatch(r"[ACGTN]{12}", umi):
+                    raise ValueError(f"Droplet QNAME must end with a 12 bp UMI: {r1.query_name!r}")
+                for index, record in enumerate((r1, r2)):
+                    if any(not record.has_tag(tag) for tag in ("XM", "XR", "XG")) or record.has_tag("ZF"):
+                        raise ValueError("Bismark methylation tags missing or reserved ZF tag present")
+                    record.set_tag("ZF", record.flag, value_type="i")
+                    record.flag = (record.flag & ~(64 | 128)) | (64 if index == 0 else 128)
+                    record.set_tag("UR", umi, value_type="Z")
+                    target.write(record)
+                total += 1
+                umi_n += int("N" in umi)
+        del seen
+        coordinate = root / "coordinate.bam"
+        selected = root / "selected.bam"
+        ordered = root / "ordered.bam"
+        pysam.sort("-@", str(max(1, threads)), "-o", str(coordinate), str(normalized))
+        pysam.index(str(coordinate))
+        if total:
+            subprocess.run([umi_tools, "dedup", "--stdin", str(coordinate), "--stdout", str(selected),
+                            "--paired", "--ignore-tlen", "--extract-umi-method", "tag", "--umi-tag", "UR",
+                            "--method", "directional", "--edit-distance-threshold", "1", "--random-seed", "1"], check=True)
+        else:
+            shutil.copyfile(coordinate, selected)
+        pysam.sort("-n", "-@", str(max(1, threads)), "-o", str(ordered), str(selected))
+        with pysam.AlignmentFile(str(ordered), "rb") as source, pysam.AlignmentFile(str(output), "wb", template=source) as target:
+            iterator = iter(source)
+            for r1 in iterator:
+                r2 = next(iterator, None)
+                if r2 is None or r1.query_name != r2.query_name or not r1.is_read1 or not r2.is_read2:
+                    raise ValueError("UMI dedup did not preserve complete physical pairs")
+                for record in (r1, r2):
+                    record.flag = record.get_tag("ZF")
+                    record.set_tag("ZF", None)
+                    target.write(record)
+                kept += 1
+        if kept > total:
+            raise ValueError("UMI pair accounting is inconsistent")
+        Path(qc).write_text(json.dumps({"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY,
+            "umi_tools_version": "1.1.6", "method": "directional", "edit_distance": 1, "random_seed": 1,
+            "input_pairs": total, "retained_pairs": kept, "removed_pairs": total - kept,
+            "umi_with_n_pairs": umi_n}, indent=2) + "\n")
+    finally:
+        shutil.rmtree(root)
+
+
+def read_droplet_umi_qc(path: str | Path, sample: str) -> dict[str, int]:
+    """校验 UMI 去重参数与 pair 守恒，返回统一的去重计数。"""
+    data = _read_json(Path(path), "Droplet UMI QC")
+    for key, value in {"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY, "umi_tools_version": "1.1.6", "method": "directional", "edit_distance": 1, "random_seed": 1}.items():
+        if data.get(key) != value:
+            raise ValueError(f"Invalid Droplet UMI QC {key}: {path}")
+    numbers = {key: _integer(data.get(key), key, Path(path)) for key in ("input_pairs", "retained_pairs", "removed_pairs", "umi_with_n_pairs")}
+    if numbers["retained_pairs"] + numbers["removed_pairs"] != numbers["input_pairs"] or numbers["umi_with_n_pairs"] > numbers["input_pairs"]:
+        raise ValueError(f"Droplet UMI QC pair accounting mismatch: {path}")
+    return {"total": numbers["input_pairs"], "removed": numbers["removed_pairs"], "leftover": numbers["retained_pairs"]}
 
 
 def build_metrics(
@@ -1430,6 +1518,7 @@ def build_metrics(
     alignment_report: Path,
     dedup_report: Path,
     filter_summary: Mapping[str, Any],
+    protocol: str = "cabernet",
 ) -> dict[str, Any]:
     """reconcile 各 pair-level 来源：alignment/dedup 报告与恒定执行的 non-conversion
     已统一校验的过滤摘要（含 processed BAM 的 retained 实测计数）必须守恒，矛盾即抛错。"""
@@ -1455,7 +1544,7 @@ def build_metrics(
     discarded_pairs = int(alignment["discarded"])
     accepted_pairs = unique_pairs - discarded_pairs
 
-    dedup = parse_dedup_report(dedup_report)
+    dedup = read_droplet_umi_qc(dedup_report, sample) if protocol == "droplet" else parse_dedup_report(dedup_report)
     if dedup["total"] != accepted_pairs:
         raise ValueError(
             "Bismark deduplication input disagrees with usable uniquely aligned pairs: "
@@ -1568,12 +1657,7 @@ def write_filter_summary(
     )
     multiqc.write_text(
         json.dumps(
-            {
-                "id": "dna_pipeline_bismark_nonconversion",
-                "section_name": "Bismark non-conversion filtering",
-                "plot_type": "table",
-                "data": {sample: payload},
-            },
+            _high_cph_multiqc_payload(sample, payload, protocol, high_cph_role),
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -2634,6 +2718,11 @@ def validate_config_semantics(config: Mapping[str, object]) -> None:
     get_backend(dict(config))
     biscuit_library_mode(config)
     bismark_library_flag(dict(config))
+    if config["analysis"]["protocol"] == "droplet":
+        if config["analysis"]["methylation_backend"] != "bismark" or config["bismark"]["library_type"] != "non_directional":
+            raise ValueError("Droplet requires bismark/non_directional")
+        if config["demux"]["dna_w_spacer_len"] != 0:
+            raise ValueError("Droplet has a fixed structure; dna_w_spacer_len must be 0")
 
 
 @dataclass(frozen=True)
@@ -2663,6 +2752,10 @@ class RawRoutePolicy:
 
 
 _PROTOCOLS = {
+    "droplet": ProtocolPolicy(
+        name="droplet", demux_mode="dna-only-droplet", requires_rna_barcode=False,
+        rna_output_role="not_used", high_cph_role="cdna_contamination", publishes_rna_bam=False,
+    ),
     "taps": ProtocolPolicy(
         name="taps", demux_mode="dna-only-taps", requires_rna_barcode=False,
         rna_output_role="not_used", high_cph_role="not_applicable",
@@ -2700,6 +2793,7 @@ def _raw_route(
 
 
 _RAW_ROUTES = {
+    "droplet_dna": _raw_route("droplet_dna", "droplet", True),
     "taps_dna_nucleus": _raw_route("taps_dna_nucleus", "taps", True),
     "cabernet_dna_nucleus": _raw_route("cabernet_dna_nucleus", "cabernet", True),
     "srd_dna_tube": _raw_route("srd_dna_tube", "srd", True),
@@ -2819,7 +2913,7 @@ def validate_barcode_map_for_protocol(
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         headers = _header_map(reader.fieldnames)
-        required = ["dna_barcode", "plateid", "cell_order"]
+        required = ["dna_barcode", "cell_order"] + ([] if policy.name == "droplet" else ["plateid"])
         if policy.requires_rna_barcode:
             required.append("rna_barcode")
         missing = [name for name in required if name not in headers]
@@ -2848,15 +2942,20 @@ def validate_barcode_map_for_protocol(
             if not any((dna, rna, plate, order)):
                 continue
             usable_rows += 1
-            if not dna or not plate or not order or (policy.requires_rna_barcode and not rna):
+            if not dna or (not plate and policy.name != "droplet") or not order or (policy.requires_rna_barcode and not rna):
                 raise ValueError(
                     f"Barcode_Map.csv row {row_index} has empty required field(s) for "
                     f"protocol={policy.name}: DNA_Barcode={dna!r}, RNA_Barcode={rna!r}, "
                     f"PlateID={plate!r}, Cell_Order={order!r}"
                 )
 
-            _validate_barcode(dna, column="DNA_Barcode", row_number=row_index)
-            if SAMPLE_ID_RE.fullmatch(plate) is None:
+            if policy.name == "droplet":
+                cell_identity("sample", "droplet", plate, dna)
+                if rna:
+                    raise ValueError("Droplet does not support RNA barcodes")
+            else:
+                _validate_barcode(dna, column="DNA_Barcode", row_number=row_index)
+            if plate and SAMPLE_ID_RE.fullmatch(plate) is None:
                 raise ValueError(f"Barcode_Map.csv row {row_index} has an unsafe PlateID: {plate!r}")
             dna_lengths.add(len(dna))
             if rna:
@@ -2865,7 +2964,7 @@ def validate_barcode_map_for_protocol(
 
             if dna in seen_dna:
                 raise ValueError(f"Duplicate DNA_Barcode {dna!r} at row {row_index}")
-            if plate in seen_plate:
+            if plate and plate in seen_plate:
                 raise ValueError(f"Duplicate PlateID {plate!r} at row {row_index}")
             if order in seen_order:
                 raise ValueError(f"Duplicate Cell_Order {order!r} at row {row_index}")
@@ -2888,14 +2987,15 @@ def validate_barcode_map_for_protocol(
 
         if usable_rows == 0:
             raise ValueError(f"Barcode map contains no usable rows: {path}")
-        if not dna_lengths.issubset(_SUPPORTED_BARCODE_LENGTHS):
+        if not dna_lengths.issubset({17} if policy.name == "droplet" else _SUPPORTED_BARCODE_LENGTHS):
             raise ValueError(f"Unsupported DNA barcode lengths: {sorted(dna_lengths)}")
         if policy.requires_rna_barcode and len(rna_lengths) != 1:
             raise ValueError(
                 "SRD/dna-rna mode requires one uniform RNA barcode length; "
                 f"found {sorted(rna_lengths)}"
             )
-        _audit_one_substitution_neighborhoods(sorted(seen_dna), "DNA_Barcode")
+        if policy.name != "droplet":
+            _audit_one_substitution_neighborhoods(sorted(seen_dna), "DNA_Barcode")
         if policy.requires_rna_barcode:
             _audit_one_substitution_neighborhoods(sorted(seen_rna), "RNA_Barcode")
         return barcode_rows
@@ -3504,7 +3604,7 @@ def _snapshot_basis(
 
     sample_manifest = project_dir / "00_config" / "sample_manifest.tsv"
     barcode_map = project_dir / "00_config" / "Barcode_Map.csv"
-    for path in (config_path, sample_manifest, barcode_map):
+    for path in (config_path, sample_manifest, *([] if config["analysis"]["protocol"] == "droplet" else [barcode_map])):
         if not path.is_file():
             raise FileNotFoundError(f"run-start input is missing: {path}")
 
@@ -3535,7 +3635,7 @@ def _snapshot_basis(
             "path": str(project_dir.resolve()),
             "config": stable_file_identity(config_path, hash_content=True),
             "sample_manifest": stable_file_identity(sample_manifest, hash_content=True),
-            "barcode_map": stable_file_identity(barcode_map, hash_content=True),
+            **({} if protocol == "droplet" else {"barcode_map": stable_file_identity(barcode_map, hash_content=True)}),
         },
         "raw_fastqs": _fastq_inventory(
             project_dir / "01_raw",
@@ -3667,10 +3767,10 @@ def create_run_snapshot(
                 Path(str(project_basis["sample_manifest"]["path"])),
                 inputs_dir / "sample_manifest.tsv", project_basis["sample_manifest"], input_store,
             ),
-            "barcode_map": _copy_observed_file(
+            **({} if basis["analysis"]["protocol"] == "droplet" else {"barcode_map": _copy_observed_file(
                 Path(str(project_basis["barcode_map"]["path"])),
                 inputs_dir / "Barcode_Map.csv", project_basis["barcode_map"], input_store,
-            ),
+            )}),
         }
         payload = {
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
@@ -3737,7 +3837,7 @@ def load_run_snapshot(path: str | Path) -> Mapping[str, object]:
     copies = payload.get("input_copies")
     if not isinstance(project, Mapping) or not isinstance(copies, Mapping):
         raise ValueError(f"run snapshot input copies are malformed: {manifest}")
-    for key in ("config", "sample_manifest", "barcode_map"):
+    for key in ("config", "sample_manifest", *([] if payload["basis"]["analysis"]["protocol"] == "droplet" else ["barcode_map"])):
         _validate_input_copy(manifest.parent, copies.get(key), project.get(key), key)
     return payload
 
@@ -4560,7 +4660,7 @@ def read_demux_report(path: str | Path) -> DemuxReport:
     for field in ("build_version", "source_revision", "mode", "retention_policy"):
         _text(report[field], field, source)
     mode = cast(str, report["mode"])
-    if mode not in {"dna-only", "dna-only-taps", "dna-rna"}:
+    if mode not in {"dna-only", "dna-only-taps", "dna-rna", "dna-only-droplet"}:
         raise ValueError(f"Demux report mode is unsupported: {mode!r}: {source}")
     if report["retention_policy"] != "matched_read_pairs":
         raise ValueError(f"Demux report retention_policy is unsupported: {source}")
@@ -4599,14 +4699,14 @@ def read_demux_report(path: str | Path) -> DemuxReport:
             "sample_name", "cell_sample_id", "plate_id", "cell_order", "dna_barcode",
             "dna_status", "rna_status",
         ):
-            _text(sample[field], f"{label}.{field}", source)
+            _text(sample[field], f"{label}.{field}", source, empty=(field == "plate_id" and mode == "dna-only-droplet"))
         _text(sample["rna_barcode"], f"{label}.rna_barcode", source, empty=True)
         sample_name, cell_id, plate = (
             cast(str, sample[key]) for key in ("sample_name", "cell_sample_id", "plate_id")
         )
         if SAMPLE_ID_RE.fullmatch(sample_name) is None or SAMPLE_ID_RE.fullmatch(cell_id) is None:
             raise ValueError(f"{label} has an invalid sample identity: {source}")
-        if cell_id != f"{sample_name}_{plate}":
+        if cell_id != cell_identity(sample_name, "droplet" if mode == "dna-only-droplet" else "cabernet", plate, sample["dna_barcode"]):
             raise ValueError(f"{label}.cell_sample_id does not match sample_name/plate_id: {source}")
         if cell_id in cell_ids:
             raise ValueError(f"Demux report repeats cell_sample_id={cell_id!r}: {source}")
@@ -4715,6 +4815,8 @@ def _parse_project_sample_manifest(
                 f"sample_manifest.tsv line {line_no} species={row['species']!r} "
                 f"does not match config species={species!r}"
             )
+        if protocol == "droplet" and row["rna_sample"]:
+            raise ValueError("Droplet does not support RNA association")
         row_protocol = row["protocol"].lower()
         if not row_protocol:
             raise ValueError(f"sample_manifest.tsv line {line_no} has empty protocol")
@@ -4752,6 +4854,198 @@ def _parse_project_sample_manifest(
     return rows
 
 
+def call_droplet_cells(
+    counts_path: str | Path, output: str | Path, metrics_path: str | Path,
+    *, r1: Sequence[str | Path] = (), demux_binary: str | Path | None = None, threads: int = 1,
+) -> None:
+    """按固定谷底调用，再以差异位点质量和独立共享分子筛除有唯一父条码的错误候选。"""
+    rows = []
+    seen = set()
+    qualities = {}
+    with Path(counts_path).open() as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames != ["barcode", "count", "below_q20", "q30"]:
+            raise ValueError("Droplet counts require barcode/count/below_q20/q30 columns")
+        for row in reader:
+            barcode, count = row["barcode"], int(row["count"])
+            if not re.fullmatch(r"[ACGT]{17}", barcode) or count < 1 or barcode in seen:
+                raise ValueError("Invalid or duplicate Droplet barcode count")
+            low, high = ([int(n) for n in row[key].split(",")] for key in ("below_q20", "q30"))
+            if len(low) != 17 or len(high) != 17 or any(a < 0 or b < 0 or a + b > count for a, b in zip(low, high)):
+                raise ValueError("Invalid Droplet per-base quality counts")
+            seen.add(barcode)
+            if "C" not in barcode and count > 100:
+                rows.append((barcode, count))
+                qualities[barcode] = (low, high)
+    rows.sort(key=lambda row: (-row[1], row[0]))
+    metrics = {"method": "log10_count_plus_one_valley_200bins_23smooth_20distance", "eligible_barcodes": len(rows), "called_cells": 0}
+    failure = "Droplet calling requires two separated peaks among AGT barcodes with count >100"
+    if rows and rows[0][1] != rows[-1][1]:
+        values = [math.log10(count + 1) for _, count in rows]
+        lower, upper = min(values), max(values)
+        width = (upper - lower) / 200
+        hist = [0] * 200
+        for value in values:
+            hist[min(199, int((value - lower) / width))] += 1
+        smooth = [sum(hist[max(0, i - 11):min(200, i + 12)]) / 23 for i in range(200)]
+        centers = [lower + (i + 0.5) * width for i in range(200)]
+        peaks = []
+        i = 1
+        while i < 199:
+            start = i
+            while i < 199 and abs(smooth[i + 1] - smooth[start]) <= 1e-12:
+                i += 1
+            if smooth[start] > smooth[start - 1] + 1e-12 and i < 199 and smooth[i] > smooth[i + 1] + 1e-12:
+                peaks.append((start + i) // 2)
+            i += 1
+        selected = []
+        for peak in sorted(peaks, key=lambda p: (-smooth[p], p)):
+            if all(abs(peak - other) >= 20 for other in selected):
+                selected.append(peak)
+        metrics.update(histogram=hist, smoothed=smooth, bin_centers=centers, peaks=selected)
+        if len(selected) >= 2:
+            left, right = sorted(selected[:2])
+            valley = smooth[left + 1:right]
+            low = min(valley)
+            minima = [i + left + 1 for i, value in enumerate(valley) if abs(value - low) <= 1e-12]
+            start = end = int(minima[0])
+            for pos in minima[1:]:
+                if pos != end + 1:
+                    break
+                end = int(pos)
+            valley_bin = (start + end) // 2
+            threshold = float(10 ** centers[valley_bin] - 1)
+            called = [(bc, n) for bc, n in rows if n >= threshold]
+            metrics.update(valley_bin=valley_bin, threshold=threshold, called_cells=len(called), called_read_pairs=sum(n for _, n in called))
+            failure = "" if called and low < min(smooth[left], smooth[right]) - 1e-12 else failure
+        else:
+            called = []
+    else:
+        called = []
+    metrics["status"] = "failed" if failure else "screening"
+    metrics["failure"] = failure
+    Path(metrics_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(metrics_path).write_text(json.dumps(metrics, indent=2) + "\n")
+    if failure:
+        Path(output).unlink(missing_ok=True)
+        raise ValueError(failure)
+    metrics["initial_called_cells"] = len(called)
+    metrics["initial_called_read_pairs"] = metrics["called_read_pairs"]
+    screen = {"method": "unique_hamming1_quality_complete_parent_scan", "parent_min_ratio": 5,
+              "child_min_below_q20_fraction": 0.2, "low_quality_min_enrichment": 5,
+              "independent_support": "child Q30 reads at the differing base below original valley threshold",
+              "minimum_shared_umis": 3, "minimum_shared_inserts": 3,
+              "signature": "exact_umi12_insert32", "child_signature_cap": 4096, "parent_scan": "complete",
+              "evaluated": [], "removed_barcodes": 0, "removed_exact_read_pairs": 0}
+    metrics["barcode_error_screen"] = screen
+    counts = dict(called)
+    candidates = []
+    for child, count in called:
+        neighbors = [(neighbor, pos) for pos, base in enumerate(child) for alternative in "AGT"
+                     if alternative != base
+                     if counts.get(neighbor := child[:pos] + alternative + child[pos + 1:], 0) > count]
+        if not neighbors:
+            continue
+        decision = {"barcode": child, "count": count, "higher_neighbors": sorted(bc for bc, _ in neighbors),
+                    "decision": "retain", "reason": "multiple_higher_neighbors"}
+        screen["evaluated"].append(decision)
+        if len(neighbors) != 1:
+            continue
+        parent, pos = neighbors[0]
+        low, high = qualities[child]
+        parent_low = qualities[parent][0][pos]
+        decision.update(parent=parent, position=pos + 1, parent_count=counts[parent],
+                        below_q20=low[pos], q30=high[pos], parent_below_q20=parent_low)
+        if counts[parent] < 5 * count:
+            decision["reason"] = "insufficient_abundance_ratio"
+        elif high[pos] >= threshold:
+            decision["reason"] = "independent_q30_support"
+        elif low[pos] < 0.2 * count or low[pos] * counts[parent] < 5 * parent_low * count:
+            decision["reason"] = "insufficient_quality_evidence"
+        else:
+            decision["reason"] = "pending_molecule_evidence"
+            candidates.append(decision)
+    try:
+        if candidates:
+            if not r1 or demux_binary is None or threads < 1:
+                raise ValueError("Droplet error screening requires raw R1 and demux binary for molecule evidence")
+            selected = [{key: r[key] for key in ("barcode", "parent")} for r in candidates]
+            with tempfile.TemporaryDirectory(prefix=".droplet_evidence.", dir=Path(metrics_path).parent) as tmp:
+                pair_file, evidence_file = Path(tmp) / "pairs.json", Path(tmp) / "molecules.json"
+                pair_file.write_text(json.dumps(selected))
+                command = [str(demux_binary), "--mode", "dna-only-droplet", "--threads", str(threads),
+                           "--evidence-pairs", str(pair_file), "--evidence-output", str(evidence_file)]
+                for path in r1:
+                    command.extend(["--r1", str(path)])
+                subprocess.run(command, check=True)
+                evidence = json.loads(evidence_file.read_text())
+            if (evidence["signature"] != screen["signature"] or evidence["child_cap"] != screen["child_signature_cap"]
+                    or evidence["parent_scan"] != "complete" or set(evidence["pairs"]) != {r["barcode"] for r in selected}):
+                raise ValueError("Droplet molecule evidence identity mismatch")
+            proposed = set()
+            for decision in candidates:
+                child, parent = decision["barcode"], decision["parent"]
+                values = evidence["pairs"][child]
+                shared = values["shared_signatures"]
+                sampled, child_reads, parent_reads = (values[key] for key in
+                    ("child_sampled_signatures", "child_eligible_reads", "parent_eligible_reads"))
+                if (values["parent"] != parent or any(type(n) is not int for n in (sampled, child_reads, parent_reads))
+                        or not 0 <= len(shared) <= sampled <= min(evidence["child_cap"], child_reads)
+                        or not 0 <= child_reads <= counts[child] or not len(shared) <= parent_reads <= counts[parent]
+                        or type(values["child_saturated"]) is not bool
+                        or (values["child_saturated"] and (sampled != evidence["child_cap"] or child_reads <= sampled))
+                        or any(re.fullmatch(r"[0-9a-f]{22}", key) is None for key in shared) or len(set(shared)) != len(shared)):
+                    raise ValueError("Invalid Droplet molecule evidence signatures or pair identity")
+                shared = sorted(shared)
+                umis = {key[:6] for key in shared}
+                inserts = {key[6:] for key in shared}
+                decision.update(child_sampled_signatures=sampled, child_eligible_reads=child_reads,
+                                child_saturated=values["child_saturated"], parent_eligible_reads=parent_reads,
+                                shared_signatures=len(shared), shared_umis=len(umis), shared_inserts=len(inserts),
+                                shared_examples=shared[:3])
+                decision["reason"] = "insufficient_shared_molecules"
+                if len(umis) >= 3 and len(inserts) >= 3:
+                    proposed.add(child)
+            removed = set()
+            for decision in candidates:
+                if decision["barcode"] in proposed:
+                    if decision["parent"] in proposed:
+                        decision["reason"] = "parent_is_error_candidate"
+                    else:
+                        decision.update(decision="remove", reason="quality_and_shared_molecules")
+                        removed.add(decision["barcode"])
+            screen.update(removed_barcodes=len(removed), removed_exact_read_pairs=sum(counts[bc] for bc in removed))
+            called = [(bc, n) for bc, n in called if bc not in removed]
+        screen.update(molecule_checked=len(candidates),
+                      insufficient_molecule_evidence=sum(r["reason"] == "insufficient_shared_molecules" for r in candidates),
+                      child_signatures_capped=sum(r["child_saturated"] for r in candidates))
+        metrics.update(status="complete", called_cells=len(called), called_read_pairs=sum(n for _, n in called))
+    except Exception as exc:
+        metrics.update(status="failed", failure=f"Droplet barcode error screening failed: {exc}")
+        Path(metrics_path).write_text(json.dumps(metrics, indent=2) + "\n")
+        Path(output).unlink(missing_ok=True)
+        raise
+    Path(metrics_path).write_text(json.dumps(metrics, indent=2) + "\n")
+    destination = Path(output)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    content = "DNA_Barcode,Cell_Order\n" + "".join(f"{bc},{i}\n" for i, (bc, _) in enumerate(called, 1))
+    if not destination.exists() or destination.read_text() != content:
+        temporary = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".tmp")
+        temporary.write_text(content)
+        os.replace(temporary, destination)
+
+
+def cell_identity(project: str, protocol: str, plate: str, barcode: str) -> str:
+    """按孔板或液滴协议构造唯一 cell ID。"""
+    if protocol == "droplet":
+        if plate or not re.fullmatch(r"[AGT]{17}", barcode):
+            raise ValueError("Droplet requires a 17 bp AGT barcode and empty plate_id")
+        return f"{project}_{barcode}"
+    if not plate or SAMPLE_ID_RE.fullmatch(plate) is None:
+        raise ValueError("Plate protocol requires a valid plate_id")
+    return f"{project}_{plate}"
+
+
 def write_initial_cell_manifest(
     project_manifest: str,
     barcode_map: str,
@@ -4759,20 +5053,25 @@ def write_initial_cell_manifest(
     *,
     species: str,
     protocol: str,
+    called_cells: Sequence[Sequence[str]] = (),
 ) -> None:
-    """把项目样本与 barcode map 展开为规范 cell 身份并写出初始 manifest。"""
+    """按孔板 map 或逐文库 called cells 展开规范 cell 身份，写出初始 manifest。"""
     project_rows = read_project_sample_manifest(
         Path(project_manifest), species=species, protocol=protocol
     )
-    barcode_rows = validate_barcode_map_for_protocol(
-        Path(barcode_map), get_protocol(protocol)
-    )
+    called = dict(called_cells)
+    if protocol == "droplet":
+        if len(called) != len(called_cells) or set(called) != {r["sample_id"] for r in project_rows}:
+            raise ValueError("Called-cell libraries must exactly match project manifest")
+    elif called:
+        raise ValueError("Called-cell inputs require droplet protocol")
     rows: list[CellIdentityRow] = []
     seen: set[str] = set()
     for project in project_rows:
         project_id = project["sample_id"]
+        barcode_rows = validate_barcode_map_for_protocol(Path(called[project_id] if protocol == "droplet" else barcode_map), get_protocol(protocol))
         for barcode in barcode_rows:
-            cell_id = f"{project_id}_{barcode['plate_id']}"
+            cell_id = cell_identity(project_id, protocol, barcode["plate_id"], barcode["dna_barcode"])
             if SAMPLE_ID_RE.fullmatch(cell_id) is None:
                 raise ValueError(
                     f"Canonical cell Sample ID contains unsupported characters: {cell_id!r}. "
@@ -4842,7 +5141,7 @@ def read_cell_identity_manifest(path: str | Path) -> dict[str, CellIdentityRow]:
                     f"Initial cell manifest line {line_no} has invalid project_sample_id="
                     f"{row.get('project_sample_id')!r}: {source}"
                 )
-            if cell_id != f"{row['project_sample_id']}_{row['plate_id']}":
+            if cell_id != cell_identity(row["project_sample_id"], row["protocol"], row["plate_id"], row["dna_barcode"]):
                 raise ValueError(
                     f"Initial cell manifest line {line_no} sample_id does not match "
                     f"project_sample_id/plate_id: {source}"
@@ -5034,6 +5333,7 @@ def write_demux_manifest(
     downstream_dna: bool,
     raw_sample: str,
     cell_manifest_path: str,
+    *, calling_metrics: str = "", structure_metrics: str = "",
 ) -> None:
     """把 Rust report 转换为规范的 checkpoint manifest。"""
     rep = report
@@ -5325,7 +5625,7 @@ def read_demux_manifest(manifest_path: str) -> list[DemuxRow]:
                 f"Demux manifest line {line_no} has invalid project_sample_id={project_id!r}: {path}"
             )
         project_ids.add(project_id)
-        if not cell["plate_id"] or not cell["dna_barcode"] or not cell["dna_r1"] or not cell["dna_r2"]:
+        if (not cell["plate_id"] and route.protocol != "droplet") or not cell["dna_barcode"] or not cell["dna_r1"] or not cell["dna_r2"]:
             raise ValueError(f"Demux manifest line {line_no} has incomplete cell identity/paths: {path}")
         if not cell["cell_order"].strip():
             raise ValueError(f"Demux manifest line {line_no} has empty cell_order: {path}")
@@ -5369,10 +5669,11 @@ def write_run_metadata(
     downstream_dna: str,
     raw_sample: str,
     cell_manifest_path: str,
+    *, calling_metrics: str = "", structure_metrics: str = "",
 ) -> None:
     """把 Rust report 一次性转换为 MQC JSON 与 checkpoint manifest。"""
     report = read_demux_report(report_path)
-    write_demux_mqc(report, mqc_path, pipeline_mode, route_id)
+    write_demux_mqc(report, mqc_path, pipeline_mode, route_id, calling_metrics=calling_metrics, structure_metrics=structure_metrics)
     write_demux_manifest(
         report,
         manifest_path,
@@ -6020,7 +6321,7 @@ def _read_high_cph_summary(path: Path, sample: str, backend: str) -> dict[str, o
         or payload["backend"] != backend
         or payload["sample"] != sample
         or payload["metric_unit"] != "read_pairs"
-        or payload["protocol"] not in {"cabernet", "srd"}
+        or payload["protocol"] not in {"cabernet", "srd", "droplet"}
         or payload["high_cph_role"]
         not in {"cdna_contamination", "residual_high_cph"}
     ):
@@ -6690,6 +6991,7 @@ def _metrics_for_cell(job: Mapping[str, object]) -> tuple[str, dict[str, object]
             alignment_report=paths["bismark_align_report"],
             dedup_report=paths["bismark_dedup_report"],
             filter_summary=bsconv,
+            protocol=record["protocol"],
         )
         total_pairs = int(metrics["total_pairs"])
         if total_pairs != trimmed_pairs:
@@ -6746,7 +7048,7 @@ def _metrics_for_cell(job: Mapping[str, object]) -> tuple[str, dict[str, object]
             "dedup_policy": (
                 "dupsifter_wgbs_signature_remove_dups"
                 if backend == "biscuit"
-                else "bismark_paired_endpoint_orientation"
+                else DROPLET_DEDUP_POLICY if record["protocol"] == "droplet" else "bismark_paired_endpoint_orientation"
             ),
             "pair_qc_metric_unit": "read_pairs",
             "r1_adapter_pct": float(cutadapt["r1_adapter_pct"]),
@@ -6853,7 +7155,7 @@ def _apply_cell_metrics(
                     "biscuit_qc_dir": paths.biscuit_qc_dir,
                     "high_cph_summary": paths.high_cph_summary,
                     "bismark_align_report": paths.bismark_align_report,
-                    "bismark_dedup_report": paths.bismark_dedup_report,
+                    "bismark_dedup_report": paths.droplet_umi_qc if record["protocol"] == "droplet" else paths.bismark_dedup_report,
                     "bismark_extract_report": paths.bismark_extract_report,
                     "bismark_mbias": paths.bismark_mbias,
                     "cpg": paths.cpg,
@@ -7099,8 +7401,36 @@ def write_multiqc_file_list(
     return len(unique_sources), skipped
 
 
+def prepare_high_cph_multiqc_sources(
+    inputs: Iterable[str | Path], out_json: Path,
+) -> list[str]:
+    """从保留的过滤摘要重建已清理的展示 JSON，避免报告重建回溯科学规则。"""
+    sources: list[str] = []
+    aggregate: dict[str, object] = {
+        "id": "dna_pipeline_high_cph_rebuilt", "section_name": "High-CpH Read Assessment",
+        "plot_type": "table", "data": {},
+    }
+    for raw in inputs:
+        path = Path(raw)
+        if not path.name.endswith("_filter_summary.json"):
+            sources.append(str(path))
+            continue
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        payload = _high_cph_multiqc_payload(
+            summary["sample"], summary, summary["protocol"], summary["high_cph_role"]
+        )
+        if not aggregate["data"]:
+            aggregate = payload
+        else:
+            aggregate["data"].update(payload["data"])
+    atomic_write_json(out_json, aggregate)
+    sources.append(str(out_json))
+    return sources
+
+
 def write_demux_mqc(
-    report: DemuxReport, out_json: str, pipeline_mode: str, route_id: str
+    report: DemuxReport, out_json: str, pipeline_mode: str, route_id: str,
+    *, calling_metrics: str = "", structure_metrics: str = "",
 ) -> None:
     """把 demultiplexing 统计转换为 MultiQC custom content。"""
     rep = report
@@ -7141,6 +7471,18 @@ def write_demux_mqc(
         "Ambiguous_Read_Pairs": fate["ambiguous"],
         "Unmatched_Read_Pairs": fate["unmatched"],
     }
+    if pipeline_mode == "droplet":
+        calling = _read_json(Path(calling_metrics), "Droplet calling")
+        structure = _read_json(Path(structure_metrics), "Droplet structure")
+        if calling.get("status") != "complete" or calling["called_cells"] != len(rep["samples"]):
+            raise ValueError("Droplet calling/report cell count mismatch")
+        screen = calling["barcode_error_screen"]
+        summary.update({"Called_Cells": calling["called_cells"], "Calling_Threshold": calling["threshold"],
+                        "Barcode_Error_Candidates_Removed": screen["removed_barcodes"],
+                        "Barcode_Molecule_Candidates_Checked": screen["molecule_checked"],
+                        "Barcode_Insufficient_Molecule_Evidence": screen["insufficient_molecule_evidence"],
+                        "Barcode_Child_Signatures_Capped": screen["child_signatures_capped"],
+                        "Structured_Reads": structure["structured_reads"], "Structured_UMI_With_N": structure["umi_with_n"]})
     route_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", route.route_id)
     obj = {
         "id": f"demux_rs_{route_key}",
@@ -7542,14 +7884,18 @@ def excluded_reads_from_bam(bam_path: Path, samtools: str, excluded: set[str]) -
     return names
 
 
-def write_multiqc(
-    path: Path,
+def _high_cph_multiqc_payload(
     sample_name: str,
     summary: Mapping[str, object],
     protocol: str,
     high_cph_role: str,
-) -> None:
-    """把 high-CpH 评估汇总写成 MultiQC custom-content table JSON。"""
+) -> dict[str, object]:
+    if summary.get("backend") == "bismark":
+        return {
+            "id": "dna_pipeline_bismark_nonconversion",
+            "section_name": "Bismark non-conversion filtering",
+            "plot_type": "table", "data": {sample_name: dict(summary)},
+        }
     fraction = float(summary["high_cph_fraction"])
     row = {
         "Candidate_Read_Pairs": int(summary["candidate_read_pairs"]),
@@ -7563,7 +7909,7 @@ def write_multiqc(
         if high_cph_role == "cdna_contamination"
         else "residual high-CpH/non-converted DNA reads"
     )
-    obj = {
+    return {
         "id": "bsconv_filter",
         "section_name": "High-CpH Read Assessment",
         "description": (
@@ -7578,6 +7924,17 @@ def write_multiqc(
         },
         "data": {sample_name: row},
     }
+
+
+def write_multiqc(
+    path: Path,
+    sample_name: str,
+    summary: Mapping[str, object],
+    protocol: str,
+    high_cph_role: str,
+) -> None:
+    """把 high-CpH 评估汇总写成 MultiQC custom-content table JSON。"""
+    obj = _high_cph_multiqc_payload(sample_name, summary, protocol, high_cph_role)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2) + "\n")
 
@@ -7827,7 +8184,7 @@ def init_project_directory(project_dir: str | Path, pipeline_root: str | Path) -
             encoding="utf-8",
         )
     barcode = project / "00_config" / "Barcode_Map.csv"
-    if not barcode.exists():
+    if not barcode.exists() and load_project_config(config)["analysis"]["protocol"] != "droplet":
         source = root / "resources" / "Barcode_Map.csv"
         if not source.is_file():
             raise FileNotFoundError(f"Barcode Map template is missing: {source}")
@@ -7926,10 +8283,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     write_initial.add_argument("out_tsv")
     write_initial.add_argument("--species", required=True)
     write_initial.add_argument("--protocol", required=True)
+    write_initial.add_argument("--called-cells", action="append", type=lambda value: value.split(":", 1), default=[])
+    umi = commands.add_parser("dedup-droplet-bam", help="按物理 R1 与 UMI 去重并恢复 Bismark 标志。")
+    for field in ("bam", "output", "qc", "scratch", "umi-tools", "sample"):
+        umi.add_argument("--" + field, required=True)
+    umi.add_argument("--threads", type=int, default=1)
+    calling = commands.add_parser("call-droplet-cells", help="按双峰谷底调用 Droplet 细胞。")
+    for field in ("counts", "output", "metrics"):
+        calling.add_argument("--" + field, required=True)
+    calling.add_argument("--r1", action="append", required=True)
+    calling.add_argument("--demux-binary", required=True)
+    calling.add_argument("--threads", type=int, default=1)
     write_metadata = commands.add_parser("write-demux-metadata", help="demux 事务内写出 MQC 与 manifest。")
     for arg in ("report_path", "mqc_path", "manifest_path", "dna_dir", "rna_dir",
                 "pipeline_mode", "route_id", "downstream_dna", "raw_sample", "cell_manifest_path"):
         write_metadata.add_argument(arg)
+    write_metadata.add_argument("--calling-metrics", default="")
+    write_metadata.add_argument("--structure-metrics", default="")
     write_completion = commands.add_parser("write-demux-completion", help="demux 事务内写出 completion 提交记录。")
     write_completion.add_argument("out_json")
     write_completion.add_argument("--run-id", required=True)
@@ -7967,7 +8337,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          help="JSON array of canonical reference contig names excluded from assessment.")
     extract.add_argument("--alignment-bam", required=True, type=Path)
     extract.add_argument("--samtools", default="samtools")
-    extract.add_argument("--protocol", choices=("cabernet", "srd"), required=True)
+    extract.add_argument("--protocol", choices=("cabernet", "srd", "droplet"), required=True)
     extract.add_argument("--high-cph-role", choices=("cdna_contamination", "residual_high_cph"),
                          required=True)
     split = commands.add_parser("split-bismark-pairs", help="Bismark BAM 配对路由与计数。")
@@ -8130,16 +8500,21 @@ def main(argv: list[str] | None = None) -> int:
                 samtools=args.samtools,
             )
 
+        elif command == "dedup-droplet-bam":
+            deduplicate_droplet_bam(args.bam, args.output, args.qc, sample=args.sample, scratch=args.scratch, umi_tools=args.umi_tools, threads=args.threads)
+        elif command == "call-droplet-cells":
+            call_droplet_cells(args.counts, args.output, args.metrics, r1=args.r1, demux_binary=args.demux_binary, threads=args.threads)
         elif command == "write-cell-manifest":
             write_initial_cell_manifest(
                 args.project_manifest, args.barcode_map, args.out_tsv,
-                species=args.species, protocol=args.protocol,
+                species=args.species, protocol=args.protocol, called_cells=args.called_cells,
             )
         elif command == "write-demux-metadata":
             write_run_metadata(
                 args.report_path, args.mqc_path, args.manifest_path, args.dna_dir,
                 args.rna_dir, args.pipeline_mode, args.route_id, args.downstream_dna,
                 args.raw_sample, args.cell_manifest_path,
+                calling_metrics=args.calling_metrics, structure_metrics=args.structure_metrics,
             )
         elif command == "write-demux-completion":
             write_demux_completion(
