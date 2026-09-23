@@ -672,9 +672,9 @@ STATIC_TIER_MAX_READS = (1_000_000, 4_000_000, 6_000_000, None)
 
 
 STATIC_TIER_MAX_DEMUX_BYTES = (
-    64 * 1024 * 1024,
-    256 * 1024 * 1024,
-    384 * 1024 * 1024,
+    5 * 1024 ** 3,
+    50 * 1024 ** 3,
+    300 * 1024 ** 3,
     None,
 )
 STATIC_MAX_ATTEMPTS = 3
@@ -719,7 +719,7 @@ class _StaticRuleRequest:
 
 STATIC_RESOURCE_REQUESTS: Mapping[str, _StaticRuleRequest] = MappingProxyType(
     {
-        "demux": _StaticRuleRequest((4, 4, 4, 4), (16, 16, 16, 16), (720, 720, 720, 720)),
+        "demux": _StaticRuleRequest((4, 4, 4, 4), (4, 8, 24, 32), (120, 360, 720, 1440)),
         "cutadapt": _StaticRuleRequest((4, 4, 4, 4), (2, 2, 2, 4), (30, 45, 60, 90)),
         "align_sort_dedup": _StaticRuleRequest(
             (16, 16, 16, 16), (24, 32, 40, 40), (120, 180, 240, 240)
@@ -829,13 +829,26 @@ def demux_size_tier(total_bytes: object) -> str:
 
 
 def demux_resource_request(total_bytes: object, attempt: int = 1) -> ResourceRequest:
-    """返回按输入字节数分级的 demux 调度请求，两次重试仅把内存分别提高至首次的 1.5 倍、2 倍。"""
+    """返回按输入字节数分级的 demux 调度请求，两次重试仅把内存分别提高至首次的 1.5 倍、2 倍。
+
+    XL 档按实测斜率外推：count 阶段峰值内存 ≈ 2 GiB + 0.048×输入GiB（F-real-2609SG，
+    619 GiB 输入实测 29.5 GiB、12.04B reads），请求值乘 1.3 余量；runtime 按 1.1 min/GiB。
+    字节数不可得时沿用表内 XL 保底值（32 GiB / 1440 min）。
+    """
 
     attempt_no = _attempt_number(attempt)
     key, row = _rule("demux")
     tier = demux_size_tier(total_bytes)
     tier_index = _tier_index(tier)
-    mem_mb = _attempt_memory_mb(row.memory_gib[tier_index] * 1024, attempt_no)
+    total = _read_count(total_bytes)
+    if tier_index == 3 and total is not None:
+        input_gib = total / 1024 ** 3
+        base_mem_mb = math.ceil((2 + 0.048 * input_gib) * 1.3 * 1024)
+        runtime_min = max(720, math.ceil(1.1 * input_gib))
+    else:
+        base_mem_mb = row.memory_gib[tier_index] * 1024
+        runtime_min = row.runtime_min[tier_index]
+    mem_mb = _attempt_memory_mb(base_mem_mb, attempt_no)
     return ResourceRequest(
         policy=STATIC_POLICY,
         rule_key=key,
@@ -843,7 +856,7 @@ def demux_resource_request(total_bytes: object, attempt: int = 1) -> ResourceReq
         dna_reads=None,
         threads=row.threads[tier_index],
         mem_mb=mem_mb,
-        runtime_min=row.runtime_min[tier_index],
+        runtime_min=runtime_min,
     )
 
 

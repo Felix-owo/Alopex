@@ -1,4 +1,4 @@
-# Alopex v13.12
+# Alopex v13.13
 
 Alopex 是面向 Cabernet、SRD、Droplet（DD-MET5）和 Cabernet–TAPS+ 单细胞 DNA 甲基化数据的 Snakemake Pipeline。它将原始 paired FASTQ 转为单细胞 CpG 结果、质量报告和可追溯的交付清单：
 
@@ -52,7 +52,7 @@ core/run_pipeline.sh  创建项目、检查输入并运行分析
 获取代码：
 
 ```bash
-git clone --branch v13.12 https://github.com/Felix-owo/Alopex.git
+git clone --branch v13.13 https://github.com/Felix-owo/Alopex.git
 cd Alopex
 ```
 
@@ -500,12 +500,14 @@ Droplet 拆分会在文件句柄限额允许时保留全部细胞的输出 write
 
 ### Droplet 的配套 RNA 独立关联
 
-配套 DD-MET5 RNA 在 Lemmus（RNA_DARLIN_Pipeline）的 `pipeline_mode: droplet` 路线独立前处理、simpleaf/piscem/alevin-fry EM 定量、emptyDrops 调用及 RNA QC。DNA 的 called cells、阈值、UMI 去重和 QC 不受 RNA 名单约束；DNA droplet manifest 的 `rna_sample` 继续为空。
+配套 DD-MET5 RNA 在 Lemmus（RNA_DARLIN_Pipeline）的 `pipeline_mode: droplet` 路线独立前处理、
+simpleaf/piscem/alevin-fry 定量、emptyDrops 调用与 RNA QC；DNA 的 called cells、阈值、UMI 去重和
+QC 不受 RNA 名单约束，DNA droplet manifest 的 `rna_sample` 继续为空。
 
-文库关联表位于 RNA 项目的 `00_config/dna_rna_library_map.tsv`，两列 `dna_project_sample_id`、`rna_sample`（原始 RNA basename），仅由 RNA 下游的 `--dna-project-root`＋`--dna-rna-library-map` 消费，不是 Alopex 的配置或任何上游科学 DAG 输入。关联读取当前 complete Alopex sealed manifest 的 `dna_barcode` 与同代 DNA QC，再按明确对应文库＋完整17bp barcode 精确匹配 finalized RNA.h5ad；不用 PlateID、Cell_Order、样本名猜测或跨模态纠错。修改该表无需重新发布 DNA 或重跑两边 calling／比对／定量。
-
-`DNA_RNA_cell_links.csv` 保留双方细胞全集及 both／DNA独有／RNA独有／未映射文库和缺失结果状态；`Integrated_QC_Information.csv` 只包含共同且双方 QC 可用的细胞，允许零交集。重复身份、多对一映射、未知文库和错误交付代际拒绝。DNA QC 仍为20列、RNA QC仍为13列；RNA `qc_pass` 与 DNA QC可用状态独立，不为 DNA独有细胞补零RNA表达。上述集合差异规则只用于 Droplet，Cabernet/TAPS/SRD 继续执行原有孔板关联合同。
-
-RNA 下游可单独调整基因数、expected UMI 数和 mt 百分比阈值；实际设置记录在 RNA `qc_summary.json`，仅更新 RNA `qc_pass` 及关联表，不改变 DNA calling／QC 或 RNA 定量／emptyDrops。RNA 默认 mt<10% 保持不变，项目调整需保留质量分布证据；后续仅修改文库表时沿用该 RNA QC 输出目录的已记录阈值。
-
-RNA 协议参数与使用方法见 Lemmus（RNA_DARLIN_Pipeline）仓库；本轮真实 RNA／DNA 子集验证的范围和结果保留在开发仓库。
+两模态由 RNA 项目 `00_config/dna_rna_library_map.tsv`（`dna_project_sample_id`/`rna_sample` 两列）
+关联：RNA 下游读取当前 complete Alopex sealed manifest 的 `dna_barcode` 与同代 DNA QC，按明确对应
+文库＋完整 17 bp barcode 精确匹配 finalized RNA.h5ad，不用 PlateID、Cell_Order 或样本名猜测；修改
+该表无需重新发布 DNA。RNA 下游输出 `DNA_RNA_cell_links.csv`（双方细胞全集与归属）与
+`Integrated_QC_Information.csv`（仅共同且双方 QC 可用细胞），重复身份、多对一映射与错误交付代际
+直接报错。完整关联契约、RNA 侧 QC 阈值规则与 Lemmus 参数见 Lemmus 文档与开发仓库维护规范；
+本轮真实 RNA／DNA 子集验证的范围和结果保留在开发仓库。
