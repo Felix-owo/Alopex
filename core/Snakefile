@@ -490,7 +490,8 @@ def static_resource_runtime_min(rule_key, demux_sample=None, attempt=1):
     return int(static_resource_request(rule_key, demux_sample, attempt).runtime_min)
 
 @functools.lru_cache(maxsize=None)
-def demux_run_total_bytes(run_id):
+def demux_run_total_bytes(run_id, mates=("r1", "r2")):
+    """统计 run 指定 mate 的压缩 FASTQ 字节；identity 缺 size_bytes 时回退 stat 实际路径。"""
     if not RUN_SNAPSHOT:
         return None
     basis = RUN_SNAPSHOT.get("basis")
@@ -502,18 +503,32 @@ def demux_run_total_bytes(run_id):
     for record in records:
         if str(record.get("raw_sample", "")) != target:
             continue
-        for mate in ("r1", "r2"):
+        for mate in mates:
             identity = record.get(mate)
-            if isinstance(identity, Mapping):
-                total += int(identity.get("size_bytes", 0) or 0)
+            if not isinstance(identity, Mapping):
+                continue
+            size_bytes = int(identity.get("size_bytes", 0) or 0)
+            if size_bytes <= 0:
+                path = str(identity.get("path", "") or "")
+                try:
+                    size_bytes = os.path.getsize(path) if path else 0
+                except OSError:
+                    size_bytes = 0
+            total += size_bytes
     return total
 
-def demux_resource_mem_mb(run_id, attempt=1):
-    request = demux_resource_request(demux_run_total_bytes(run_id), int(attempt))
+def demux_resource_mem_mb(run_id, attempt=1, count_only=False):
+    request = demux_resource_request(
+        demux_run_total_bytes(run_id, mates=("r1",) if count_only else ("r1", "r2")),
+        int(attempt), count_only=count_only,
+    )
     return int(request.mem_mb)
 
-def demux_resource_runtime_min(run_id, attempt=1):
-    request = demux_resource_request(demux_run_total_bytes(run_id), int(attempt))
+def demux_resource_runtime_min(run_id, attempt=1, count_only=False):
+    request = demux_resource_request(
+        demux_run_total_bytes(run_id, mates=("r1",) if count_only else ("r1", "r2")),
+        int(attempt), count_only=count_only,
+    )
     return int(request.runtime_min)
 
 def demux_resource_log(run_id):
@@ -763,8 +778,8 @@ if PROTOCOL_POLICY.name == "droplet":
             LOGS_DIR / "rules/droplet_calling/{sample}.log"
         threads: DEMUX_THREADS
         resources:
-            mem_mb = lambda wc, attempt: demux_resource_mem_mb(wc.sample, attempt),
-            runtime = lambda wc, attempt: demux_resource_runtime_min(wc.sample, attempt)
+            mem_mb = lambda wc, attempt: demux_resource_mem_mb(wc.sample, attempt, count_only=True),
+            runtime = lambda wc, attempt: demux_resource_runtime_min(wc.sample, attempt, count_only=True)
         conda: ENVIRONMENT_YAML
         shell:
             r"""

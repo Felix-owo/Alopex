@@ -719,7 +719,7 @@ class _StaticRuleRequest:
 
 STATIC_RESOURCE_REQUESTS: Mapping[str, _StaticRuleRequest] = MappingProxyType(
     {
-        "demux": _StaticRuleRequest((4, 4, 4, 4), (4, 8, 24, 32), (120, 360, 720, 1440)),
+        "demux": _StaticRuleRequest((4, 4, 4, 4), (4, 8, 12, 12), (120, 360, 720, 1440)),
         "cutadapt": _StaticRuleRequest((4, 4, 4, 4), (2, 2, 2, 4), (30, 45, 60, 90)),
         "align_sort_dedup": _StaticRuleRequest(
             (16, 16, 16, 16), (24, 32, 40, 40), (120, 180, 240, 240)
@@ -828,12 +828,14 @@ def demux_size_tier(total_bytes: object) -> str:
     return "XL"
 
 
-def demux_resource_request(total_bytes: object, attempt: int = 1) -> ResourceRequest:
+def demux_resource_request(total_bytes: object, attempt: int = 1, count_only: bool = False) -> ResourceRequest:
     """返回按输入字节数分级的 demux 调度请求，两次重试仅把内存分别提高至首次的 1.5 倍、2 倍。
 
-    XL 档按实测斜率外推：count 阶段峰值内存 ≈ 2 GiB + 0.048×输入GiB（F-real-2609SG，
-    619 GiB 输入实测 29.5 GiB、12.04B reads），请求值乘 1.3 余量；runtime 按 1.1 min/GiB。
-    字节数不可得时沿用表内 XL 保底值（32 GiB / 1440 min）。
+    ``count_only=True``（droplet 细胞调用的全条码计数）按实测斜率外推：峰值内存 ≈
+    2 GiB + 0.048×输入GiB（F-real-2609SG，619 GiB R1 实测 29.5 GiB、12.04B reads），
+    请求值乘 1.3 余量；runtime 按 1.1 min/GiB。``count_only=False``（配对 demux，
+    writer 缓存与 called 集索引画像）用表内保守值，XL 与 L 同档。字节数不可得时
+    沿用表内 XL 保底值。
     """
 
     attempt_no = _attempt_number(attempt)
@@ -841,7 +843,7 @@ def demux_resource_request(total_bytes: object, attempt: int = 1) -> ResourceReq
     tier = demux_size_tier(total_bytes)
     tier_index = _tier_index(tier)
     total = _read_count(total_bytes)
-    if tier_index == 3 and total is not None:
+    if count_only and tier_index == 3 and total is not None:
         input_gib = total / 1024 ** 3
         base_mem_mb = math.ceil((2 + 0.048 * input_gib) * 1.3 * 1024)
         runtime_min = max(720, math.ceil(1.1 * input_gib))
@@ -850,7 +852,7 @@ def demux_resource_request(total_bytes: object, attempt: int = 1) -> ResourceReq
         runtime_min = row.runtime_min[tier_index]
     mem_mb = _attempt_memory_mb(base_mem_mb, attempt_no)
     return ResourceRequest(
-        policy=STATIC_POLICY,
+        policy=STATIC_POLICY + (":count" if count_only else ""),
         rule_key=key,
         tier=tier,
         dna_reads=None,
