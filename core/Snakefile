@@ -498,7 +498,8 @@ def demux_run_total_bytes(run_id, mates=("r1", "r2")):
     records = basis.get("raw_fastqs") if isinstance(basis, Mapping) else None
     if not isinstance(records, list):
         return None
-    target = str(run_id).strip()
+    run_key = str(run_id).strip()
+    target = str(RAW_SAMPLES_MAP.get(run_key, {}).get("raw_sample", run_key))
     total = 0
     for record in records:
         if str(record.get("raw_sample", "")) != target:
