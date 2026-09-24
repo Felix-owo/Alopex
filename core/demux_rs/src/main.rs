@@ -1033,7 +1033,6 @@ mod output {
     }
 
     const MAX_OPEN_BUCKETS: usize = 128;
-    const MAX_RETAINED_DROPLET_BUCKETS: usize = 8192;
     const WRITER_FD_RESERVE: usize = 64;
 
     fn detect_soft_open_file_limit() -> Option<usize> {
@@ -1066,10 +1065,7 @@ mod output {
     }
 
     fn writer_pair_budget(mode: DemuxMode, buckets: usize, soft_limit: Option<usize>) -> usize {
-        let requested = if mode == DemuxMode::DnaOnlyDroplet
-            && buckets <= MAX_RETAINED_DROPLET_BUCKETS
-            && soft_limit.is_some()
-        {
+        let requested = if mode == DemuxMode::DnaOnlyDroplet && soft_limit.is_some() {
             buckets.max(MAX_OPEN_BUCKETS)
         } else {
             MAX_OPEN_BUCKETS
@@ -1089,7 +1085,9 @@ mod output {
         assert_eq!(writer_pair_budget(mode, 6000, Some(12063)), 128);
         assert_eq!(writer_pair_budget(mode, 6000, Some(256)), 96);
         assert_eq!(writer_pair_budget(mode, 6000, None), 128);
-        assert_eq!(writer_pair_budget(mode, 9000, Some(100000)), 128);
+        assert_eq!(writer_pair_budget(mode, 13203, Some(65536)), 13203);
+        assert_eq!(writer_pair_budget(mode, 40000, Some(65536)), 128);
+        assert_eq!(writer_pair_budget(mode, 9000, Some(100000)), 9000);
         assert_eq!(
             writer_pair_budget(DemuxMode::DnaRna, 6000, Some(100000)),
             128
