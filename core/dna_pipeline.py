@@ -876,6 +876,29 @@ def demux_resource_request(total_bytes: object, attempt: int = 1, count_only: bo
     )
 
 
+def multiqc_resource_request(source_count: object, attempt: int = 1) -> ResourceRequest:
+    """按 MultiQC 源文件数缩放的调度请求，两次重试仅把内存分别提高至首次的 1.5 倍、2 倍。
+
+    实测锚点（F-real-2609SG）：52,816 个源、13,203 样本，峰值 RSS 4.35 GiB、
+    file-list 模式 14 min / 目录发现模式 17 min。请求内存 = 1.5×(512 MiB + 0.075 MiB/源)；
+    runtime = max(60, ceil(源数/600)) min。
+    """
+
+    attempt_no = _attempt_number(attempt)
+    count = _read_count(source_count) or 0
+    base_mem_mb = math.ceil((512 + 0.075 * count) * 1.5)
+    mem_mb = _attempt_memory_mb(max(base_mem_mb, 1024), attempt_no)
+    return ResourceRequest(
+        policy=STATIC_POLICY + ":multiqc_sources",
+        rule_key="multiqc",
+        tier="NA",
+        dna_reads=None,
+        threads=1,
+        mem_mb=mem_mb,
+        runtime_min=max(60, math.ceil(count / 600)),
+    )
+
+
 def controller_resource_request(rule_key: str, attempt: int = 1) -> ResourceRequest:
     """返回控制器类小任务的固定调度请求（键不存在即硬错误）。"""
 

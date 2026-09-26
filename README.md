@@ -1,4 +1,4 @@
-# Alopex v13.17
+# Alopex v13.18
 
 Alopex 是面向 Cabernet、SRD、Droplet（DD-MET5）和 Cabernet–TAPS+ 单细胞 DNA 甲基化数据的 Snakemake Pipeline。它将原始 paired FASTQ 转为单细胞 CpG 结果、质量报告和可追溯的交付清单：
 
@@ -52,7 +52,7 @@ core/run_pipeline.sh  创建项目、检查输入并运行分析
 获取代码：
 
 ```bash
-git clone --branch v13.17 https://github.com/Felix-owo/Alopex.git
+git clone --branch v13.18 https://github.com/Felix-owo/Alopex.git
 cd Alopex
 ```
 

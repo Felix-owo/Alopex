@@ -5,6 +5,7 @@ import functools
 import json
 import os
 import shlex
+from snakemake.exceptions import IncompleteCheckpointException
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -29,6 +30,7 @@ from dna_pipeline import (
     controller_resource_request,
     demux_manifest_index,
     demux_resource_request,
+    multiqc_resource_request,
     demux_source_revision,
     read_demux_chunks,
     _run_indexed_demux,
@@ -536,6 +538,22 @@ def demux_resource_mem_mb(run_id, attempt=1, count_only=False):
         int(attempt), count_only=count_only,
     )
     return int(request.mem_mb)
+
+def multiqc_source_count(wildcards):
+    """资源视角的 MultiQC 源数；checkpoint 未完成（dry-run）时按 0 走最小档。"""
+    try:
+        return len(current_multiqc_source_inputs(wildcards)) + 2
+    except IncompleteCheckpointException:
+        return 0
+
+
+def multiqc_resource_mem_mb(source_count, attempt=1):
+    return int(multiqc_resource_request(source_count, int(attempt)).mem_mb)
+
+
+def multiqc_resource_runtime_min(source_count, attempt=1):
+    return int(multiqc_resource_request(source_count, int(attempt)).runtime_min)
+
 
 def demux_resource_runtime_min(run_id, attempt=1, count_only=False):
     request = demux_resource_request(
@@ -2637,7 +2655,7 @@ else:
             rm -f -- "$tmp_cpg"
             trap - EXIT
             """
-localrules: initial_cell_manifest, demux_completion_barrier, multiqc, final_sample_manifest, delivery_ready
+localrules: initial_cell_manifest, demux_completion_barrier, final_sample_manifest, delivery_ready
 
 DEMUX_COMPLETION_TARGETS = expand(
     [str(path) for path in rules.demux.output],
@@ -2762,11 +2780,11 @@ rule multiqc:
     threads: MULTIQC_THREADS
     conda: ENVIRONMENT_YAML
     resources:
-        mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
-            "multiqc", None, attempt
+        mem_mb = lambda wildcards, attempt: multiqc_resource_mem_mb(
+            multiqc_source_count(wildcards), attempt
         ),
-        runtime = lambda wildcards, attempt: static_resource_runtime_min(
-            "multiqc", None, attempt
+        runtime = lambda wildcards, attempt: multiqc_resource_runtime_min(
+            multiqc_source_count(wildcards), attempt
         ),
         attempt_no = lambda wildcards, attempt: int(attempt)
     params:
