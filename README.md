@@ -1,4 +1,4 @@
-# Alopex v13.16
+# Alopex v13.17
 
 Alopex 是面向 Cabernet、SRD、Droplet（DD-MET5）和 Cabernet–TAPS+ 单细胞 DNA 甲基化数据的 Snakemake Pipeline。它将原始 paired FASTQ 转为单细胞 CpG 结果、质量报告和可追溯的交付清单：
 
@@ -52,7 +52,7 @@ core/run_pipeline.sh  创建项目、检查输入并运行分析
 获取代码：
 
 ```bash
-git clone --branch v13.16 https://github.com/Felix-owo/Alopex.git
+git clone --branch v13.17 https://github.com/Felix-owo/Alopex.git
 cd Alopex
 ```
 
@@ -382,6 +382,16 @@ macOS 使用 local executor。Linux/HPC 的当前 shell 承载 Snakemake control
 
 Cabernet/Bismark 和 Droplet/Bismark 的每个 cell 独立组成一个 Slurm 作业，依次执行比对去重（含 Cutadapt）、过滤、extraction 和 CpG 转换。全部 S/M/L/XL 档位均分组，SRD 与 BISCUIT 按规则独立调度。
 
+Droplet 的 calling 按原始文库提交单个 4 核作业，连续读取全部 R1 后统一计算谷底和 called cells；内存和时限按文库大小分级。需要分子证据时仍执行全库复核，已有有效 calling 可复用。
+配对 demux 按块提交独立作业：`slurm.jobs: 30` 表示 calling、索引、demux 块及后续作业合计最多并发 30 个。
+原始配对 gzip 顺序读取压缩流、并行验证并生成各块所需的小索引；索引与 calling 可独立调度。
+demux 通过索引直接读取原始 gzip 区段，无需生成分块 FASTQ 副本。每块使用 6 核、首次 8 GiB，区段解码关闭跨区段的异步预读。
+两次重试内存分别提高至首次的 1.5 倍和 2 倍，CPU 不变。随后每个 demux 块在节点 scratch 处理后打包写回，
+最终按原顺序合并并执行全库保留阈值。失败只重试相应块，调大 jobs 不改变块边界或科学结果。
+合并使用 8 核、首次 16 GiB：最多 8 个任务各连续读取一组最多 32 个相邻细胞，按原块号连接 gzip 成员；文件句柄不足时自动缩小分组。此策略减少跨 pack 跳读，保持文件内容与 read 顺序。
+建立索引和最终合并仍计入总耗时；索引在成功发布前保留，需预留索引、分块结果及节点 scratch 空间。
+各阶段资源与恢复边界属于固定实现契约，不暴露为分析 config；实测验证证据保留在开发仓库。
+
 | Alignment mode | S/M/L/XL CPU | 首次内存 | 第一次重试 | 第二次重试 |
 | --- | --- | --- | --- | --- |
 | combined-index end-to-end（默认） | 8/12/12/16 | 均为 16 GiB | 均为 24 GiB | 均为 32 GiB |
@@ -491,7 +501,7 @@ R1 的 CB17、UMI12、TSO13、Linker17、ME19、gap9 在拆分时移除，R2 去
 两种转换模式分别匹配，歧义拒绝；UMI 用于物理 R1 位置与方向上的 directional 去重，忽略 R2 端点。
 谷底调用后，结合单碱基近邻、差异位点质量和多个共享 UMI＋insert 筛查错误衍生条码。先保留候选条码的有限分子特征，再完整扫描高丰度近邻查找共享分子；证据不足时保留。复核、筛除、证据不足与采样饱和数量进入 MultiQC。
 筛查后再与固定的官方 ME5 设计白名单取交集；原谷底保持不变。设计外候选的条码、计数和纠错去向留在 calling 诊断中，不标成空液滴。拆分时精确匹配优先；合法但未 called 的设计条码保持未分配，其余观测只做唯一 Hamming-1，歧义拒绝，不按丰度强行分配。DNA 不使用 RNA 空液滴名单。白名单为 [SeekSoulMethyl 官方 ME5/U3CB_methylation](https://github.com/seekgene/SeekSoulMethyl/blob/nf_rna_methy/dependence/seeksoultools/utils/barcode/ME5/U3CB_methylation.txt.gz)（829,440 个 AGT17），随仓库分发于 `resources/`，Python 运行时与 Rust 编译均按固定 SHA256 校验。
-Droplet 拆分会在文件句柄限额允许时保留全部细胞的输出 writer，以减少反复开关小文件；容量不足时自动使用有界缓存。
+Droplet 解复用会在文件句柄限额允许时保留全部细胞的输出 writer，以减少反复开关小文件；容量不足时自动使用有界缓存。各协议的 FASTQ 输出使用固定 gzip level 1，Droplet 配对解复用按 200,000 对处理一批，以减少共享存储写入量和小 gzip 块的开销；解压后的 reads 内容和顺序保持一致。仅调整 Rust output 模块或只重编译不会重跑已经完成的 calling；Rust 计数/分子复核、依赖、设计资源或 Python calling 算法变化仍由科学身份触发重算。
 逐条判定及初始/最终数量进入 calling 日志，移除数进入 MultiQC。该筛查不改变原谷底阈值。
 谷底调用无双峰时明确失败；全部 Droplet 科学参数为固定契约，不暴露为 config 参数。
 官方对照采用 [单细胞 BAM 去重说明](https://github.com/seekgene/SeekSoulMethyl/blob/nf_rna_methy/docs/How_to_deduplicate_single_cell_bam.md)；谷底调用是本 Pipeline 的指定策略，不声称与官方完整流程等价。

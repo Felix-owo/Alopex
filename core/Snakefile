@@ -29,6 +29,18 @@ from dna_pipeline import (
     controller_resource_request,
     demux_manifest_index,
     demux_resource_request,
+    demux_source_revision,
+    read_demux_chunks,
+    _run_indexed_demux,
+    _read_gzip_line_index,
+    _write_gzip_range_index,
+    _plan_demux_pair_chunks,
+    _rapidgzip_command,
+    index_demux_fastqs,
+    run_demux_chunk,
+    merge_demux_chunks,
+    DEMUX_CHUNK_READ_PAIRS,
+    DEMUX_CHUNK_RAW_BYTES,
     disable_snakemake_output_mtime_gate,
     discover_samples,
     finalize_project_config,
@@ -70,7 +82,7 @@ JOB_RUNTIME = _internal_helper("core/job_runtime.sh")
 BSCONV_MODULE_CODE = _internal_helper("core/dna_pipeline.py")
 config = finalize_project_config(config)
 PROTOCOL_POLICY = get_protocol_policy(config)
-DROPLET_CALLING_IDENTITY = hashlib.sha256((DROPLET_DESIGN_SHA256 + "".join(ast.dump(ast.parse(inspect.getsource(fn)), include_attributes=False) for fn in (call_droplet_cells, droplet_design_barcodes))).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
+DROPLET_CALLING_IDENTITY = hashlib.sha256((DROPLET_DESIGN_SHA256 + demux_source_revision(PIPELINE_ROOT / "core/demux_rs", count_only=True) + "".join(ast.dump(ast.parse(inspect.getsource(fn)), include_attributes=False) for fn in (call_droplet_cells, droplet_design_barcodes))).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
 DROPLET_UMI_IDENTITY = hashlib.sha256(ast.dump(ast.parse(inspect.getsource(deduplicate_droplet_bam)), include_attributes=False).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
 BACKEND_POLICY = get_backend(config)
 METHYLATION_BACKEND = BACKEND_POLICY.name
@@ -609,6 +621,30 @@ def backend_preprocess_runtime_min(backend, demux_sample=None, attempt=1):
     )
 
 DEMUX_THREADS = resource_threads("demux")
+
+def demux_index_dir(sample):
+    return str(INTERMEDIATE_DIR / "demux/index" / sample)
+
+def demux_packs_dir(sample):
+    return str(INTERMEDIATE_DIR / "demux/chunks" / sample)
+
+def demux_chunk_inputs_source(wildcards, mates):
+    index_dir = checkpoints.demux_index.get(sample=wildcards.sample).output.parts
+    plan = read_demux_chunks(index_dir)
+    entry = plan["chunks"][int(wildcards.chunk)]
+    source = plan["inputs"][entry["source"]]
+    return [str(Path(index_dir) / "manifest.json"),
+            *[value for mate in mates for value in (source[f"r{mate}"]["path"],
+              str(Path(index_dir) / entry[f"r{mate}_index"]))]]
+
+def demux_chunk_inputs(wildcards):
+    if PROTOCOL_POLICY.name != "droplet":
+        return []
+    index_dir = checkpoints.demux_index.get(sample=wildcards.sample).output.parts
+    plan = read_demux_chunks(index_dir)
+    return [str(Path(index_dir) / "manifest.json"),
+            *[str(Path(demux_packs_dir(wildcards.sample)) / (chunk["id"] + suffix))
+              for chunk in plan["chunks"] for suffix in (".pack", ".json")]]
 CUTADAPT_THREADS = resource_threads("cutadapt")
 ALIGN_THREADS = lambda wildcards: backend_stage_threads("biscuit", "align", wildcards)
 BISMARK_ALIGN_THREADS = lambda wildcards: backend_stage_threads("bismark", "align", wildcards)
@@ -766,7 +802,7 @@ if PROTOCOL_POLICY.name == "droplet":
         """按原始文库统计完整结构并调用细胞，失败时保留谷底诊断。"""
         input:
             r1 = lambda wc: RAW_SAMPLES_MAP[wc.sample]["r1"],
-            binary = str(DEMUX_BINARY)
+            binary = ancient(str(DEMUX_BINARY))
         output:
             counts = INTERMEDIATE_DIR / "demux/calling/{sample}/counts.tsv",
             structure = INTERMEDIATE_DIR / "demux/calling/{sample}/structure.json",
@@ -780,16 +816,19 @@ if PROTOCOL_POLICY.name == "droplet":
         threads: DEMUX_THREADS
         resources:
             mem_mb = lambda wc, attempt: demux_resource_mem_mb(wc.sample, attempt, count_only=True),
-            runtime = lambda wc, attempt: demux_resource_runtime_min(wc.sample, attempt, count_only=True)
+            runtime = lambda wc, attempt: demux_resource_runtime_min(wc.sample, attempt, count_only=True),
+            attempt_no = lambda wc, attempt: int(attempt)
         conda: ENVIRONMENT_YAML
         shell:
             r"""
             set -euo pipefail
+            source {JOB_RUNTIME:q}
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
             export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
             mkdir -p "$(dirname {output.cells:q})" "$(dirname {log:q})"
             {input.binary:q} --mode dna-only-droplet --count-only \
                 {params.r1_args} --threads {threads} \
-                --counts-output {output.counts:q} --count-metrics {output.structure:q} > {log:q} 2>&1
+                --counts-output {output.counts:q} --count-metrics {output.structure:q} >> {log:q} 2>&1
             if ! python -m dna_pipeline call-droplet-cells --counts {output.counts:q} \
                 --output {output.cells:q} --metrics {output.metrics:q} \
                 {params.r1_args} --demux-binary {input.binary:q} --threads {threads} >> {log:q} 2>&1; then
@@ -797,6 +836,82 @@ if PROTOCOL_POLICY.name == "droplet":
                 exit 1
             fi
             cat {output.structure:q} {output.metrics:q} >> {log:q}
+            """
+
+
+    checkpoint demux_index:
+        """并行校验原始 gzip 并提交各块小索引及有界区段清单，不复制 FASTQ。"""
+        input:
+            r1 = lambda wc: RAW_SAMPLES_MAP[wc.sample]["r1"],
+            r2 = lambda wc: RAW_SAMPLES_MAP[wc.sample]["r2"]
+        output:
+            parts = directory(INTERMEDIATE_DIR / "demux/index/{sample}")
+        wildcard_constraints:
+            sample = r"[A-Za-z0-9_.-]+"
+        params:
+            r1_args = lambda wc: repeated_cli_flag("--r1", RAW_SAMPLES_MAP[wc.sample]["r1"]),
+            r2_args = lambda wc: repeated_cli_flag("--r2", RAW_SAMPLES_MAP[wc.sample]["r2"]),
+            index_identity = hashlib.sha256("".join(ast.dump(ast.parse(inspect.getsource(f)), include_attributes=False) for f in (index_demux_fastqs, _read_gzip_line_index, _write_gzip_range_index, _plan_demux_pair_chunks, _rapidgzip_command)).encode()).hexdigest(),
+            chunk_pairs = DEMUX_CHUNK_READ_PAIRS,
+            chunk_bytes = DEMUX_CHUNK_RAW_BYTES
+        threads: resource_threads("demux_index")
+        resources:
+            mem_mb = lambda wc, attempt: static_resource_mem_mb("demux_index", attempt=attempt),
+            runtime = lambda wc, attempt: static_resource_runtime_min("demux_index", attempt=attempt),
+            attempt_no = lambda wc, attempt: int(attempt)
+        log:
+            LOGS_DIR / "rules/demux_index/{sample}.log"
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+            export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+            python -m dna_pipeline index-demux-fastq {params.r1_args} {params.r2_args} \
+                --output {output.parts:q} --threads {threads} >> {log:q} 2>&1
+            """
+
+    rule demux_chunk:
+        """独立处理一个 Droplet 块，在节点 scratch 写细胞 FASTQ 并只向共享盘提交 pack 与 metadata。"""
+        input:
+            source = lambda wc: demux_chunk_inputs_source(wc, (1, 2)),
+            barcode_map = INTERMEDIATE_DIR / "demux/calling/{sample}/called_cells.csv",
+            binary = str(DEMUX_BINARY)
+        output:
+            pack = temp(INTERMEDIATE_DIR / "demux/chunks/{sample}/{chunk}.pack"),
+            metadata = temp(INTERMEDIATE_DIR / "demux/chunks/{sample}/{chunk}.json")
+        wildcard_constraints:
+            chunk = r"[0-9]{6}"
+        params:
+            index_dir = lambda wc: demux_index_dir(wc.sample),
+            sample_name = lambda wc: RAW_SAMPLES_MAP[wc.sample]["sample_id"],
+            scratch_cell = lambda wc: wc.sample + "." + wc.chunk,
+            chunk_identity = hashlib.sha256("".join(ast.dump(ast.parse(inspect.getsource(f)), include_attributes=False) for f in (run_demux_chunk, _run_indexed_demux, _rapidgzip_command)).encode()).hexdigest()
+        threads: resource_threads("demux_chunk")
+        resources:
+            mem_mb = lambda wc, attempt: static_resource_mem_mb("demux_chunk", attempt=attempt),
+            runtime = lambda wc, attempt: static_resource_runtime_min("demux_chunk", attempt=attempt),
+            disk_mb = lambda wc: static_scratch_mb("demux_chunk"),
+            attempt_no = lambda wc, attempt: int(attempt)
+        log:
+            LOGS_DIR / "rules/demux_chunk/{sample}/{chunk}.log"
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
+            export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+            dna_pipeline_allocate_scratch {NODE_TMPDIR:q} {SCRATCH_NAMESPACE:q} demux_chunk \
+                {params.scratch_cell:q} {resources.disk_mb} {PROJECT_DIR:q} >> {log:q} 2>&1
+            dna_pipeline_install_scratch_cleanup
+            dna_pipeline_log_scratch >> {log:q} 2>&1
+            python -m dna_pipeline demux-chunk --index-dir {params.index_dir:q} --chunk {wildcards.chunk:q} \
+                --binary {input.binary:q} --barcode-map {input.barcode_map:q} \
+                --sample={params.sample_name:q} --scratch "$TMPDIR" \
+                --pack {output.pack:q} --metadata {output.metadata:q} --threads {threads} >> {log:q} 2>&1
+            dna_pipeline_release_scratch
             """
 
 
@@ -809,6 +924,7 @@ checkpoint demux:
         calling = lambda wc: [str(INTERMEDIATE_DIR / "demux/calling" / wc.sample / "calling.json"), str(INTERMEDIATE_DIR / "demux/calling" / wc.sample / "structure.json")] if PROTOCOL_POLICY.name == "droplet" else [],
         cell_manifest = rules.initial_cell_manifest.output.manifest,
         binary = str(DEMUX_BINARY),
+        chunks = demux_chunk_inputs,
     output:
         completion = update(DEMUX_COMPLETION_PATTERN),
         json_report = update(DEMUX_STATE_DIR / "{sample}" / "report.json"),
@@ -830,15 +946,18 @@ checkpoint demux:
         downstream_dna = lambda wc: DEMUX_RUN_ROUTES[wc.sample].downstream_dna,
         dna_dir = lambda wc: str(DNA_OUT_DIR / wc.sample),
         rna_dir = lambda wc: str(RNA_OUT_DIR / wc.sample),
-        resource_log = lambda wc: demux_resource_log(wc.sample)
-    threads: DEMUX_THREADS
+        resource_log = lambda wc: static_resource_log("demux_merge") if PROTOCOL_POLICY.name == "droplet" else demux_resource_log(wc.sample),
+        index_dir = lambda wc: demux_index_dir(wc.sample),
+        packs_dir = lambda wc: demux_packs_dir(wc.sample),
+        merge_identity = hashlib.sha256(ast.dump(ast.parse(inspect.getsource(merge_demux_chunks)), include_attributes=False).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
+    threads: resource_threads("demux_merge") if PROTOCOL_POLICY.name == "droplet" else DEMUX_THREADS
     resources:
         mem_mb = lambda wildcards, attempt: demux_resource_mem_mb(
             wildcards.sample, attempt
-        ),
+        ) if PROTOCOL_POLICY.name != "droplet" else static_resource_mem_mb("demux_merge", attempt=attempt),
         runtime = lambda wildcards, attempt: demux_resource_runtime_min(
             wildcards.sample, attempt
-        ),
+        ) if PROTOCOL_POLICY.name != "droplet" else static_resource_runtime_min("demux_merge", attempt=attempt),
         attempt_no = lambda wildcards, attempt: int(attempt)
     conda: ENVIRONMENT_YAML
     log:
@@ -963,7 +1082,14 @@ checkpoint demux:
               --threads "$worker_threads" \
               "$@"
         }}
-        run_demux >> {log:q} 2>&1
+        if [[ {params.pipeline_mode:q} == droplet ]]; then
+            python -m dna_pipeline merge-demux-chunks \
+                --index-dir {params.index_dir:q} --packs-dir {params.packs_dir:q} \
+                --dna-dir "$dna_tmp" --report "$report_tmp" \
+                --threshold {params.min_matched_read_pairs} --threads {threads} >> {log:q} 2>&1
+        else
+            run_demux >> {log:q} 2>&1
+        fi
 
         python -m dna_pipeline write-demux-metadata {params.calling_args} -- \
             "$report_tmp" "$mqc_tmp" "$manifest_tmp" "$dna_final" "$rna_final" \

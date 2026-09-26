@@ -402,11 +402,14 @@ mod cli {
         )]
         pub(crate) r2: Vec<PathBuf>,
 
+        #[arg(long, hide = true, conflicts_with = "evidence_pairs")]
+        pub(crate) fastq_stream: bool,
+
         #[arg(long, requires = "counts_output")]
         pub(crate) count_only: bool,
-        #[arg(long, requires = "count_only")]
+        #[arg(long)]
         pub(crate) counts_output: Option<PathBuf>,
-        #[arg(long, requires = "count_only")]
+        #[arg(long)]
         pub(crate) count_metrics: Option<PathBuf>,
         #[arg(long, requires = "evidence_output", conflicts_with = "count_only")]
         pub(crate) evidence_pairs: Option<PathBuf>,
@@ -961,7 +964,8 @@ mod output {
     use std::process::Command;
 
     pub(super) fn compress_accumulation(acc: &mut AccumulationBuffer) -> Result<()> {
-        let mut compressor = Compressor::new(CompressionLvl::fastest());
+        let mut compressor =
+            Compressor::new(CompressionLvl::new(1).expect("compression level 1 is supported"));
         for (key, bucket) in acc.map.iter_mut() {
             if bucket.count == 0 || matches!(key, BucketKey::Unmatched) {
                 continue;
@@ -1492,6 +1496,11 @@ mod output {
                 .chain(config.r2.iter().map(|path| ("--r2", path)))
                 .chain(std::iter::once(("--barcode-map", &config.barcode_map)))
             {
+                if matches!(input_label, "--r1" | "--r2")
+                    && input_path.parent() == Some(Path::new("/dev/fd"))
+                {
+                    continue;
+                }
                 let input = input_path.canonicalize().with_context(|| {
                     format!("Cannot resolve {input_label}: {}", input_path.display())
                 })?;
@@ -1689,7 +1698,8 @@ mod droplet {
         }
     }
 
-    #[derive(Default, Serialize)]
+    #[derive(Default, Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct CountMetrics {
         input_reads: u64,
         structured_reads: u64,
@@ -1777,6 +1787,15 @@ mod droplet {
             }
         }
         accumulate(&mut batch, &mut counts, &mut metrics);
+        write_counts(counts, metrics, counts_path, metrics_path)
+    }
+
+    fn write_counts(
+        counts: AHashMap<Vec<u8>, BarcodeCount>,
+        mut metrics: CountMetrics,
+        counts_path: &Path,
+        metrics_path: &Path,
+    ) -> Result<()> {
         metrics.unique_barcodes = counts.len();
         let mut rows: Vec<_> = counts.into_iter().collect();
         rows.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(&b.0)));
@@ -2106,10 +2125,10 @@ impl Config {
             );
         }
         for path in &args.r1 {
-            ensure_gzip_fastq(path, "--r1")?;
+            ensure_fastq_input(path, "--r1", args.fastq_stream)?;
         }
         for path in &args.r2 {
-            ensure_gzip_fastq(path, "--r2")?;
+            ensure_fastq_input(path, "--r2", args.fastq_stream)?;
         }
         let barcode_map = args
             .barcode_map
@@ -2137,7 +2156,11 @@ impl Config {
             threads: args.threads,
             dna_w_spacer_len: args.dna_w_spacer_len,
             mode: args.mode,
-            chunk_size: DEFAULT_CHUNK_SIZE,
+            chunk_size: if args.mode == DemuxMode::DnaOnlyDroplet {
+                200_000
+            } else {
+                DEFAULT_CHUNK_SIZE
+            },
         })
     }
 }
@@ -2712,6 +2735,15 @@ fn run() -> Result<()> {
     if args.threads == 0 {
         anyhow::bail!("--threads must be greater than 0");
     }
+    if args.fastq_stream {
+        anyhow::ensure!(
+            args.mode == DemuxMode::DnaOnlyDroplet,
+            "FASTQ streams require dna-only-droplet"
+        );
+        for path in args.r1.iter().chain(args.r2.iter()) {
+            ensure_fastq_input(path, "FASTQ stream", true)?;
+        }
+    }
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
         .build_global()
@@ -3099,7 +3131,24 @@ fn init_tables() {
     });
 }
 
-fn ensure_gzip_fastq(path: &Path, label: &str) -> Result<()> {
+fn ensure_fastq_input(path: &Path, label: &str, stream: bool) -> Result<()> {
+    if stream {
+        use std::os::unix::fs::FileTypeExt;
+        let metadata = std::fs::metadata(path)?;
+        anyhow::ensure!(
+            metadata.file_type().is_fifo()
+                && path.parent() == Some(Path::new("/dev/fd"))
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.parse::<u32>().ok())
+                    .is_some(),
+            "{} must be an inherited pipe: {}",
+            label,
+            path.display()
+        );
+        return Ok(());
+    }
     ensure_readable_file(path, label)?;
     let name = path
         .file_name()
