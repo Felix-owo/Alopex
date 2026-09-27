@@ -276,12 +276,22 @@ dna_pipeline_run_bsconv_classification() {
 
 # 把后端计数流统一写成四列 canonical CpG；压缩固定单线程，避免嵌套并行。
 dna_pipeline_emit_canonical_cpg() {
-    local zstd="${1:?}" pos_expr="${2:?}" out_tmp="${3:?}"
+    local zstd="${1:?}" pos_expr="${2:?}" out_tmp="${3:?}" source="${4:-stdin}"
     {
         printf 'chrom\tpos\tmethyl\tunmethyl\n'
-        awk -v OFF="$pos_expr" 'BEGIN{OFS="\t"} NF>=6 {
-            pos=$2+OFF; m=$5+0; u=$6+0;
-            if(pos>=0 && m+u>0) print $1,pos,m,u;
+        LC_ALL=C awk -F '\t' -v OFF="$pos_expr" -v SOURCE="$source" '
+        function invalid(reason) {
+            printf "ERROR: invalid CpG record at %s:%d: %s\n", SOURCE, NR, reason > "/dev/stderr";
+            exit 1;
+        }
+        BEGIN{OFS="\t"; OFMT="%.0f"}
+        {
+            if (NF < 6 || $1 == "" || $2 == "" || $3 == "" || $5 == "" || $6 == "") invalid("expected nonempty chromosome, coordinates and counts in six tab-separated columns");
+            if (($2 $3 $5 $6) ~ /[^0-9]/) invalid("coordinates and counts must be nonnegative integers");
+            start=$2+0; end=$3+0; m=$5+0; u=$6+0; pos=start+OFF;
+            if (start > 9007199254740991 || end > 9007199254740991 || m > 9007199254740991 || u > 9007199254740991) invalid("integer exceeds exact range");
+            if (pos < 0 || end < start) invalid("invalid coordinate interval");
+            if (m+u>0) print $1, pos, m, u;
         }'
     } | "$zstd" -q -T1 -c > "$out_tmp"
 }

@@ -1,6 +1,4 @@
 import hashlib
-import ast
-import inspect
 import functools
 import json
 import os
@@ -31,15 +29,8 @@ from dna_pipeline import (
     demux_resource_request,
     multiqc_resource_request,
     demux_source_revision,
+    scientific_code_identity,
     read_demux_chunks,
-    _run_indexed_demux,
-    _read_gzip_line_index,
-    _write_gzip_range_index,
-    _plan_demux_pair_chunks,
-    _rapidgzip_command,
-    index_demux_fastqs,
-    run_demux_chunk,
-    merge_demux_chunks,
     DEMUX_CHUNK_READ_PAIRS,
     DEMUX_CHUNK_RAW_BYTES,
     disable_snakemake_output_mtime_gate,
@@ -60,10 +51,7 @@ from dna_pipeline import (
     resource_threads,
     scratch_mb,
     validate_barcode_map_for_protocol,
-    call_droplet_cells,
-    droplet_design_barcodes,
     DROPLET_DESIGN_SHA256,
-    deduplicate_droplet_bam,
     prepare_high_cph_multiqc_sources,
     write_multiqc_file_list,
 )
@@ -80,11 +68,10 @@ def _internal_helper(relative_path):
     return helper
 
 JOB_RUNTIME = _internal_helper("core/job_runtime.sh")
-BSCONV_MODULE_CODE = _internal_helper("core/dna_pipeline.py")
 config = finalize_project_config(config)
 PROTOCOL_POLICY = get_protocol_policy(config)
-DROPLET_CALLING_IDENTITY = hashlib.sha256((DROPLET_DESIGN_SHA256 + demux_source_revision(PIPELINE_ROOT / "core/demux_rs", count_only=True) + "".join(ast.dump(ast.parse(inspect.getsource(fn)), include_attributes=False) for fn in (call_droplet_cells, droplet_design_barcodes))).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
-DROPLET_UMI_IDENTITY = hashlib.sha256(ast.dump(ast.parse(inspect.getsource(deduplicate_droplet_bam)), include_attributes=False).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
+DROPLET_CALLING_IDENTITY = hashlib.sha256((DROPLET_DESIGN_SHA256 + demux_source_revision(PIPELINE_ROOT / "core/demux_rs", count_only=True) + scientific_code_identity(("call_droplet_cells",))).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
+DROPLET_UMI_IDENTITY = scientific_code_identity(("deduplicate_droplet_bam",)) if PROTOCOL_POLICY.name == "droplet" else ""
 BACKEND_POLICY = get_backend(config)
 METHYLATION_BACKEND = BACKEND_POLICY.name
 
@@ -399,6 +386,17 @@ def current_demux_manifest_index():
         checkpoints.demux.get(sample=run_id)
     return demux_manifest_index(DEMUX_STATE_DIR, tuple(DEMUX_RUN_IDS))
 
+@functools.lru_cache(maxsize=1)
+def current_demux_rows_by_manifest():
+    rows_by_path = {}
+    for entries in current_demux_manifest_index().values():
+        for manifest, row in entries:
+            rows_by_path.setdefault(manifest, []).append(row)
+    resolved = {}
+    for manifest, rows in rows_by_path.items():
+        resolved.setdefault(manifest.resolve(), []).extend(rows)
+    return resolved
+
 def current_demux_fastq(demux_sample, read_pair):
     return ancient(resolve_demux_fastq_from_manifest(
         INTERMEDIATE_DIR,
@@ -669,13 +667,7 @@ def passing_dna_rows(checkpoints_obj, run_id, workflow_config):
             f"Demux checkpoint {run_id!r} returned an unexpected manifest: "
             f"{chk_output.manifest} != {expected_manifest}"
         )
-    index = current_demux_manifest_index()
-    rows = [
-        row
-        for entries in index.values()
-        for _manifest, row in entries
-        if _manifest.resolve() == expected_manifest
-    ]
+    rows = current_demux_rows_by_manifest().get(expected_manifest, [])
     passing = []
     for row in rows:
         demux_sample = row.get("demux_sample", "")
@@ -781,6 +773,7 @@ rule initial_cell_manifest:
             "initial_cell_manifest", attempt
         )
     params:
+        scientific_identity = scientific_code_identity(('write_initial_cell_manifest',), ()),
         species = SPECIES,
         protocol = PROTOCOL_POLICY.name,
         barcode_map = shlex.quote(str(BARCODE_MAP) if BARCODE_MAP is not None else ""),
@@ -851,7 +844,7 @@ if PROTOCOL_POLICY.name == "droplet":
         params:
             r1_args = lambda wc: repeated_cli_flag("--r1", RAW_SAMPLES_MAP[wc.sample]["r1"]),
             r2_args = lambda wc: repeated_cli_flag("--r2", RAW_SAMPLES_MAP[wc.sample]["r2"]),
-            index_identity = hashlib.sha256("".join(ast.dump(ast.parse(inspect.getsource(f)), include_attributes=False) for f in (index_demux_fastqs, _read_gzip_line_index, _write_gzip_range_index, _plan_demux_pair_chunks, _rapidgzip_command)).encode()).hexdigest(),
+            index_identity = scientific_code_identity(("index_demux_fastqs",)),
             chunk_pairs = DEMUX_CHUNK_READ_PAIRS,
             chunk_bytes = DEMUX_CHUNK_RAW_BYTES
         threads: resource_threads("demux_index")
@@ -887,7 +880,7 @@ if PROTOCOL_POLICY.name == "droplet":
             index_dir = lambda wc: demux_index_dir(wc.sample),
             sample_name = lambda wc: RAW_SAMPLES_MAP[wc.sample]["sample_id"],
             scratch_cell = lambda wc: wc.sample + "." + wc.chunk,
-            chunk_identity = hashlib.sha256("".join(ast.dump(ast.parse(inspect.getsource(f)), include_attributes=False) for f in (run_demux_chunk, _run_indexed_demux, _rapidgzip_command)).encode()).hexdigest()
+            chunk_identity = scientific_code_identity(("run_demux_chunk",))
         threads: resource_threads("demux_chunk")
         resources:
             mem_mb = lambda wc, attempt: static_resource_mem_mb("demux_chunk", attempt=attempt),
@@ -931,6 +924,7 @@ checkpoint demux:
         json_mqc = update(DEMUX_STATE_DIR / "{sample}" / "demux_mqc.json"),
         manifest = update(DEMUX_STATE_DIR / "{sample}" / "manifest.tsv"),
     params:
+        scientific_identity = scientific_code_identity(('write_run_metadata', 'write_demux_completion'), ()),
         sample_name = lambda wc: RAW_SAMPLES_MAP[wc.sample]["sample_id"],
         raw_sample = lambda wc: RAW_SAMPLES_MAP[wc.sample]["raw_sample"],
         r1_args = lambda wc: repeated_cli_flag("--r1", RAW_SAMPLES_MAP[wc.sample]["r1"]),
@@ -949,7 +943,7 @@ checkpoint demux:
         resource_log = lambda wc: static_resource_log("demux_merge") if PROTOCOL_POLICY.name == "droplet" else demux_resource_log(wc.sample),
         index_dir = lambda wc: demux_index_dir(wc.sample),
         packs_dir = lambda wc: demux_packs_dir(wc.sample),
-        merge_identity = hashlib.sha256(ast.dump(ast.parse(inspect.getsource(merge_demux_chunks)), include_attributes=False).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
+        merge_identity = scientific_code_identity(("merge_demux_chunks",)) if PROTOCOL_POLICY.name == "droplet" else ""
     threads: resource_threads("demux_merge") if PROTOCOL_POLICY.name == "droplet" else DEMUX_THREADS
     resources:
         mem_mb = lambda wildcards, attempt: demux_resource_mem_mb(
@@ -1159,6 +1153,7 @@ if PROTOCOL_POLICY.requires_rna_barcode:
         log:
             LOGS_DIR / "rules/demux/{sample}_rna_collect.log"
         params:
+            scientific_identity = scientific_code_identity(('collect_rna_fastq',), ()),
             intermediate_dir = str(INTERMEDIATE_DIR),
         shell:
             r"""
@@ -1206,6 +1201,7 @@ if METHYLATION_BACKEND == "biscuit":
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
+            scientific_identity = scientific_code_identity(('write_dupsifter_mqc',), ('dna_pipeline_run_cutadapt',)),
             demux_spacer_len = DNA_W_SPACER_LEN,
             calling_identity = DROPLET_CALLING_IDENTITY,
             demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
@@ -1377,7 +1373,7 @@ if METHYLATION_BACKEND == "biscuit":
                 bam = CELL_PATH_PATTERN.post_alignment_bam,
                 bai = CELL_PATH_PATTERN.post_alignment_bam_index,
                 ref = REFERENCE_GENOME,
-                helper = str(BSCONV_MODULE_CODE),
+
             output:
                 summary = CELL_PATH_PATTERN.high_cph_summary,
                 mqc = temp(CELL_PATH_PATTERN.high_cph_multiqc),
@@ -1399,6 +1395,7 @@ if METHYLATION_BACKEND == "biscuit":
                 ),
                 attempt_no = lambda wildcards, attempt: int(attempt)
             params:
+                scientific_identity = scientific_code_identity(('run_bsconv_extraction',), ('dna_pipeline_run_bsconv_classification',)),
                 biscuit = BISCUIT,
                 samtools = SAMTOOLS,
                 threshold = BISCUIT_HIGH_CPH_RETENTION_THRESHOLD,
@@ -1499,7 +1496,7 @@ if METHYLATION_BACKEND == "biscuit":
                 bam = CELL_PATH_PATTERN.post_alignment_bam,
                 bai = CELL_PATH_PATTERN.post_alignment_bam_index,
                 ref = REFERENCE_GENOME,
-                helper = str(BSCONV_MODULE_CODE),
+
             output:
                 names = temp(CELL_PATH_PATTERN.high_cph_read_names),
                 summary = CELL_PATH_PATTERN.high_cph_summary,
@@ -1516,6 +1513,7 @@ if METHYLATION_BACKEND == "biscuit":
                 ),
                 attempt_no = lambda wildcards, attempt: int(attempt)
             params:
+                scientific_identity = scientific_code_identity(('run_bsconv_extraction',), ('dna_pipeline_run_bsconv_classification',)),
                 biscuit = BISCUIT,
                 samtools = SAMTOOLS,
                 threshold = BISCUIT_HIGH_CPH_RETENTION_THRESHOLD,
@@ -1592,6 +1590,7 @@ if METHYLATION_BACKEND == "biscuit":
                 ),
                 attempt_no = lambda wildcards, attempt: int(attempt)
             params:
+                scientific_identity = scientific_code_identity((), ('dna_pipeline_coordinate_sort_and_stage',)),
                 samtools = SAMTOOLS,
                 resource_log = lambda wc: static_resource_log("bsconv_dna", wc.demux_sample)
             conda: ENVIRONMENT_YAML
@@ -1729,6 +1728,7 @@ if METHYLATION_BACKEND == "biscuit":
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
+            scientific_identity = scientific_code_identity((), ('dna_pipeline_write_pileup_stats',)),
             biscuit = BISCUIT,
             samtools = SAMTOOLS,
             bgzip = BGZIP,
@@ -1798,6 +1798,7 @@ if METHYLATION_BACKEND == "biscuit":
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
+            scientific_identity = scientific_code_identity((), ('dna_pipeline_emit_canonical_cpg', 'dna_pipeline_pileup_stat')),
             biscuit = BISCUIT,
             zstd = ZSTD,
             resource_log = lambda wc: static_resource_log("generate_cpg_input", wc.demux_sample)
@@ -1819,11 +1820,11 @@ if METHYLATION_BACKEND == "biscuit":
             trap cleanup_cpg_tmp EXIT
             variant_rows=$(dna_pipeline_pileup_stat {input.stats:q} variant_records)
             if [ "$variant_rows" -eq 0 ]; then
-                dna_pipeline_emit_canonical_cpg {params.zstd:q} 0 "$tmp_cpg" < /dev/null
+                dna_pipeline_emit_canonical_cpg {params.zstd:q} 0 "$tmp_cpg" {input.vcf:q} < /dev/null
                 echo "WARNING: pileup VCF has no records; publishing a header-only SnapATAC2 CpG table." >> {log:q}
             else
                 {params.biscuit:q} vcf2bed -t cg -k 1 -c {input.vcf:q} 2>> {log:q} | \
-                    dna_pipeline_emit_canonical_cpg {params.zstd:q} 0 "$tmp_cpg"
+                    dna_pipeline_emit_canonical_cpg {params.zstd:q} 0 "$tmp_cpg" {input.vcf:q}
             fi
             {params.zstd:q} -q -t "$tmp_cpg" >> {log:q} 2>&1
             python -m dna_pipeline atomic-publish \
@@ -1858,6 +1859,7 @@ if METHYLATION_BACKEND == "biscuit":
                 ),
                 attempt_no = lambda wildcards, attempt: int(attempt)
             params:
+                scientific_identity = scientific_code_identity((), ('dna_pipeline_pileup_stat',)),
                 biscuit = BISCUIT,
                 bgzip = BGZIP,
                 tabix = TABIX,
@@ -1924,6 +1926,7 @@ if METHYLATION_BACKEND == "biscuit":
             attempt_no = lambda wildcards, attempt: int(attempt)
         conda: ENVIRONMENT_YAML
         params:
+            scientific_identity = scientific_code_identity((), ('dna_pipeline_pileup_stat',)),
             sample_name = lambda wc: wc.demux_sample.replace(os.sep, "_"),
             biscuit = BISCUIT,
             samtools = SAMTOOLS,
@@ -1979,9 +1982,8 @@ if METHYLATION_BACKEND == "biscuit":
             trap cleanup_qc_tmp EXIT
             sample_name={params.sample_name:q}
 
-            read -r mapped_reads unmapped_reads <<EOF_STATS
-    $({params.samtools:q} idxstats {params.abs_bam:q} | awk '{{m += $3; u += $4}} END {{print m + 0, u + 0}}')
-EOF_STATS
+            idxstats_counts="$({params.samtools:q} idxstats {params.abs_bam:q} | awk '{{m += $3; u += $4}} END {{printf "%.0f %.0f\n", m, u}}')"
+            read -r mapped_reads unmapped_reads <<< "$idxstats_counts"
             total_reads=$((mapped_reads + unmapped_reads))
             {{
                 echo "BISCUIT native QC"
@@ -2093,7 +2095,7 @@ elif METHYLATION_BACKEND == "rastair":
             r2 = lambda wc: current_demux_fastq(wc.demux_sample, 2),
             demux_sources = current_demux_source_inputs,
             reference = REFERENCE_BACKEND_DEPENDENCIES,
-            helper = str(BSCONV_MODULE_CODE),
+
         output:
             report = CELL_PATH_PATTERN.cutadapt_json,
             bam = CELL_PATH_PATTERN.marked_bam if KEEP_FINAL_BAM else temp(CELL_PATH_PATTERN.marked_bam),
@@ -2109,6 +2111,7 @@ elif METHYLATION_BACKEND == "rastair":
             disk_mb = lambda wc: static_scratch_mb("preprocess_alignment", wc.demux_sample),
             attempt_no = lambda wc, attempt: int(attempt),
         params:
+            scientific_identity = scientific_code_identity(('write_taps_alignment_qc',), ('dna_pipeline_run_cutadapt',)),
             demux_spacer_len = DNA_W_SPACER_LEN,
             calling_identity = DROPLET_CALLING_IDENTITY,
             demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
@@ -2170,7 +2173,7 @@ elif METHYLATION_BACKEND == "rastair":
             bai = CELL_PATH_PATTERN.marked_bam_index,
             qc = rules.taps_align_mark.output.qc,
             reference = REFERENCE_GENOME,
-            helper = str(BSCONV_MODULE_CODE),
+
             fai = str(REFERENCE_FAI),
         output:
             cpg = CELL_PATH_PATTERN.cpg,
@@ -2184,6 +2187,8 @@ elif METHYLATION_BACKEND == "rastair":
             disk_mb = lambda wc: static_scratch_mb("preprocess_alignment", wc.demux_sample),
             attempt_no = lambda wc, attempt: int(attempt),
         conda: ENVIRONMENT_YAML
+        params:
+            scientific_identity = scientific_code_identity(('emit_rastair_cpg', 'TAPS_MIN_MAPQ', 'TAPS_MIN_BASEQ', 'TAPS_INCLUDE_FLAGS', 'TAPS_EXCLUDE_FLAGS'), ('dna_pipeline_emit_canonical_cpg',))
         shell:
             r"""
             set -euo pipefail
@@ -2204,7 +2209,7 @@ elif METHYLATION_BACKEND == "rastair":
                 --bed "$tmpdir/native.bed" {input.bam:q}
             {RASTAIR_PYTHON:q} -m dna_pipeline rastair-cpg --bed "$tmpdir/native.bed" --reference {input.reference:q} \
                 --alignment-qc {input.qc:q} --output-qc "$tmpdir/qc.json" | \
-                dna_pipeline_emit_canonical_cpg {ZSTD:q} 0 "$tmpdir/cpg.tsv.zst"
+                dna_pipeline_emit_canonical_cpg {ZSTD:q} 0 "$tmpdir/cpg.tsv.zst" "$tmpdir/native.bed"
             {ZSTD:q} -q -t "$tmpdir/cpg.tsv.zst"
             python -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
                 --file "$tmpdir/cpg.tsv.zst" {output.cpg:q} --file "$tmpdir/qc.json" {output.qc:q}
@@ -2237,6 +2242,7 @@ else:
             disk_mb = lambda wildcards: static_scratch_mb("preprocess_alignment", wildcards.demux_sample),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
+            scientific_identity = scientific_code_identity((), ('dna_pipeline_run_cutadapt', 'dna_pipeline_find_single_output')),
             demux_spacer_len = DNA_W_SPACER_LEN,
             calling_identity = DROPLET_CALLING_IDENTITY,
             demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
@@ -2360,6 +2366,7 @@ else:
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
+            scientific_identity = scientific_code_identity(('run_bismark_pair_split', 'write_filter_summary'), ('dna_pipeline_find_single_output',)),
             bismark = BISMARK,
             samtools = SAMTOOLS,
             excluded_contigs_json = HIGH_CPH_EXCLUDED_CONTIGS_JSON,
@@ -2487,6 +2494,7 @@ else:
                 ),
                 attempt_no = lambda wildcards, attempt: int(attempt)
             params:
+                scientific_identity = scientific_code_identity((), ('dna_pipeline_coordinate_sort_and_stage',)),
                 samtools = SAMTOOLS,
                 resource_log = lambda wc: static_resource_log("high_cph_bam", wc.demux_sample),
             conda: ENVIRONMENT_YAML
@@ -2535,6 +2543,7 @@ else:
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
+            scientific_identity = scientific_code_identity((), ('dna_pipeline_find_single_output',)),
             bismark = BISMARK,
             samtools = SAMTOOLS,
             local_tmp = NODE_TMPDIR,
@@ -2606,6 +2615,7 @@ else:
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
+            scientific_identity = scientific_code_identity((), ('dna_pipeline_emit_canonical_cpg',)),
             zstd = ZSTD,
             gzip = GZIP,
             resource_log = lambda wc: static_resource_log(
@@ -2628,7 +2638,7 @@ else:
             trap cleanup_cpg_tmp EXIT
             {params.gzip:q} -t {input.cov:q}
             {params.gzip:q} -dc {input.cov:q} | \
-                dna_pipeline_emit_canonical_cpg {params.zstd:q} -1 "$tmp_cpg"
+                dna_pipeline_emit_canonical_cpg {params.zstd:q} -1 "$tmp_cpg" {input.cov:q}
             {params.zstd:q} -q -t "$tmp_cpg"
             python -m dna_pipeline atomic-publish \
                 --commit-last {output.cpg:q} \
@@ -2762,6 +2772,7 @@ rule multiqc:
         runtime = lambda wildcards, input, attempt: multiqc_resource_request(len(input), attempt).runtime_min,
         attempt_no = lambda wildcards, attempt: int(attempt)
     params:
+        scientific_identity = scientific_code_identity(('prepare_high_cph_multiqc_sources', 'write_multiqc_file_list'), ()),
         outdir = STAGED_RESULTS_DIR / "QC_Results",
         tmpout = INTERMEDIATE_DIR / "multiqc" / "output_tmp",
         multiqc = MULTIQC
@@ -2831,6 +2842,7 @@ rule final_sample_manifest:
     log:
         LOGS_DIR / "rules/final_sample_manifest.log"
     conda: ENVIRONMENT_YAML
+    threads: controller_resource_request("final_sample_manifest").threads
     resources:
         mem_mb = lambda wildcards, attempt: controller_resource_mem_mb(
             "final_sample_manifest", attempt
@@ -2839,6 +2851,7 @@ rule final_sample_manifest:
             "final_sample_manifest", attempt
         )
     params:
+        scientific_identity = scientific_code_identity(('write_final_sample_manifest',), ()),
         bismark = BISMARK,
         initial_manifest = lambda wc, input: str(input.initial_manifest),
         intermediate = str(INTERMEDIATE_DIR),
@@ -2868,6 +2881,7 @@ rule final_sample_manifest:
             {output.pair_qc:q} \
             {output.cutadapt_qc:q} \
             --bismark {params.bismark:q} \
+            --workers {threads} \
             --options-json {params.options_json:q} > {log:q} 2>&1
         """
 

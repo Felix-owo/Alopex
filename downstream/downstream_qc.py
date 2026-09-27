@@ -33,6 +33,7 @@ from dna_pipeline import (
     sha256_file,
     snapshot_input_path,
 )
+from dna_pipeline import effective_cpu_count
 
 FINAL_MANIFEST = Path("03_results/QC_Results/sample_manifest.tsv")
 
@@ -1006,9 +1007,7 @@ def _bounded_process_workers(requested: int, task_count: int) -> int:
 
     if task_count <= 0:
         return 0
-    available = max(1, os.cpu_count() or 1)
-    wanted = int(requested) if int(requested) > 0 else available
-    return max(1, min(wanted, MAX_CPG_PROCESS_WORKERS, task_count))
+    return min(effective_cpu_count(requested), MAX_CPG_PROCESS_WORKERS, task_count)
 
 
 def _process_map_ordered(function, tasks: list[tuple], worker_count: int) -> list:
@@ -2591,7 +2590,7 @@ def _run_pipeline_impl(
             [cpg_by_sample[sid] for sid in sample_ids],
             sample_ids,
             allowed_chroms=frozenset(_read_chrom_sizes(cfg.ref_fai)),
-            workers=(workers if workers and workers > 0 else (os.cpu_count() or 1)),
+            workers=workers,
             return_composition=True,
             empty_cpg_sample_ids=empty_cpg_sample_ids,
         )
@@ -4748,8 +4747,7 @@ def run_qc_processor(
 ) -> None:
     """以独立子进程运行 downstream_qc 计算 main 并在失败时终止 Notebook。
 
-    线程环境变量对齐当前 Notebook allocation（SLURM_CPUS_ON_NODE 或全部
-    CPU），使 Processor 留在 allocation 内的同时其 native 库可用全部核；
+    worker 与 native 线程共同受进程 affinity 和 Slurm allocation 的 CPU 预算约束；
     recompute 开关透传 CLI 的 --recompute-* 重算参数，其中 raw_adata 强制
     从 sealed CpG 重建 RawAdata.h5ad，其余默认按缓存身份自动判定复用。
     """
@@ -4758,7 +4756,7 @@ def run_qc_processor(
     processor = paths.pipeline_root / "downstream" / "downstream_qc.py"
     if not processor.is_file():
         raise FileNotFoundError(f"Downstream QC processor is missing: {processor}")
-    worker_count = os.environ.get("SLURM_CPUS_ON_NODE", str(os.cpu_count() or 1))
+    worker_count = str(effective_cpu_count())
     command = [
         sys.executable,
         str(processor),

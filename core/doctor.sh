@@ -3210,7 +3210,7 @@ run_logged "Route B manifest refresh" run_manifest_refresh "$SMOKE_MM10" || {
     return 1
 }
 doctor_step_ok
-doctor_step_start "Route A/B 并行 workflow"
+doctor_step_start "Route A/B workflow"
 ROUTE_A_LOG="$TMP_ROOT/route_a.hg38-cabernet-bismark.log"
 ROUTE_B_LOG="$TMP_ROOT/route_b.mm10-srd-biscuit.log"
 HG38_START_EPOCH="$(date +%s)"
@@ -3221,32 +3221,42 @@ start_doctor_route hg38-cabernet-bismark "$SMOKE_HG38" "$ROUTE_A_LOG" ROUTE_A_JO
     summary "[FAIL] 无法启动 Route A"
     return 1
 }
-printf '+ route B: mm10/SRD/BISCUIT\n' >> "$DETAIL_LOG"
-ROUTE_B_JOB_ID=""
-start_doctor_route mm10-srd-biscuit "$SMOKE_MM10" "$ROUTE_B_LOG" ROUTE_B_JOB_ID ROUTE_B_PID || {
-    [[ "$ROUTE_A_JOB_ID" =~ ^[0-9]+$ ]] && scancel "$ROUTE_A_JOB_ID" >> "$DETAIL_LOG" 2>&1 || true
-    doctor_terminate_pid_bounded "$ROUTE_A_PID" "Route A after Route B launch failure"
-    summary "[FAIL] 无法启动 Route B"
-    return 1
-}
-DOCTOR_ACTIVE_ROUTE_PIDS="$ROUTE_A_PID $ROUTE_B_PID"
-DOCTOR_ACTIVE_ROUTE_JOB_IDS="${ROUTE_A_JOB_ID:+$ROUTE_A_JOB_ID }${ROUTE_B_JOB_ID:-}"
+ROUTE_B_JOB_ID=""; ROUTE_B_PID=""
+: > "$ROUTE_B_LOG"
+DOCTOR_ACTIVE_ROUTE_PIDS="$ROUTE_A_PID"
+DOCTOR_ACTIVE_ROUTE_JOB_IDS="$ROUTE_A_JOB_ID"
+DOCTOR_PARALLEL_ROUTES=0
 if [[ "$SYSTEM_NAME" == Linux && -z "${SLURM_JOB_ID:-}" ]]; then
+    DOCTOR_PARALLEL_ROUTES=1
     DOCTOR_ROUTE_EXECUTION_LABEL="two Slurm workers (2 CPU each; Bismark 16 GiB / BISCUIT 24 GiB; local Snakemake with mem-budgeted scheduling)"
 elif [[ "$SYSTEM_NAME" == Linux ]]; then
-    DOCTOR_ROUTE_EXECUTION_LABEL="current allocation (2 local cores per route)"
+    DOCTOR_ROUTE_EXECUTION_LABEL="current allocation (sequential routes; up to 2 local cores)"
 else
-    DOCTOR_ROUTE_EXECUTION_LABEL="local (2 cores per route)"
+    DOCTOR_ROUTE_EXECUTION_LABEL="local (sequential routes; up to 2 cores)"
 fi
 ROUTE_A_RC=""; ROUTE_B_RC=""; ROUTE_A_FINISHED=""; ROUTE_B_FINISHED=""
 ROUTE_A_CANCELLED=0; ROUTE_B_CANCELLED=0
 while [[ -z "$ROUTE_A_RC" || -z "$ROUTE_B_RC" ]]; do
+    if [[ -z "$ROUTE_B_PID" && -z "$ROUTE_B_RC" ]] && { (( DOCTOR_PARALLEL_ROUTES == 1 )) || [[ "$ROUTE_A_RC" == 0 ]]; }; then
+        MM10_START_EPOCH="$(date +%s)"
+        printf '+ route B: mm10/SRD/BISCUIT\n' >> "$DETAIL_LOG"
+        if ! start_doctor_route mm10-srd-biscuit "$SMOKE_MM10" "$ROUTE_B_LOG" ROUTE_B_JOB_ID ROUTE_B_PID; then
+            if [[ -z "$ROUTE_A_RC" ]]; then
+                [[ "$ROUTE_A_JOB_ID" =~ ^[0-9]+$ ]] && scancel "$ROUTE_A_JOB_ID" >> "$DETAIL_LOG" 2>&1 || true
+                doctor_terminate_pid_bounded "$ROUTE_A_PID" "Route A after Route B launch failure"
+            fi
+            summary "[FAIL] 无法启动 Route B"
+            return 1
+        fi
+        DOCTOR_ACTIVE_ROUTE_JOB_IDS="${ROUTE_A_JOB_ID:+$ROUTE_A_JOB_ID }${ROUTE_B_JOB_ID:-}"
+        doctor_refresh_active_route_pids
+    fi
     ROUTE_NOW="$(date +%s)"
     if [[ -z "$ROUTE_A_RC" ]] && ! kill -0 "$ROUTE_A_PID" 2>/dev/null; then
         wait "$ROUTE_A_PID"; ROUTE_A_RC=$?; ROUTE_A_FINISHED="$ROUTE_NOW"
         printf 'Route A（hg38/Cabernet/Bismark）结束，rc=%s\n' "$ROUTE_A_RC" >> "$DETAIL_LOG"
     fi
-    if [[ -z "$ROUTE_B_RC" ]] && ! kill -0 "$ROUTE_B_PID" 2>/dev/null; then
+    if [[ -z "$ROUTE_B_RC" && -n "$ROUTE_B_PID" ]] && ! kill -0 "$ROUTE_B_PID" 2>/dev/null; then
         wait "$ROUTE_B_PID"; ROUTE_B_RC=$?; ROUTE_B_FINISHED="$ROUTE_NOW"
         printf 'Route B（mm10/SRD/BISCUIT）结束，rc=%s\n' "$ROUTE_B_RC" >> "$DETAIL_LOG"
     fi

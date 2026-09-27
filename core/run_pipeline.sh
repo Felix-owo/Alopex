@@ -232,7 +232,7 @@ install_launcher_signal_traps() {
 # 受控执行 Snakemake：接管中断信号；完整输出进 controller log，进度以 Snakemake 原生输出为准。
 run_snakemake_tracked() {
     local run_id="$1" rc=0 controller_log
-    local progress_interval last done_n total_n pct_n
+    local progress_interval last="" done_n total_n pct_n
     shift
     local arg is_dry_run=0
     for arg in "$@"; do [[ "$arg" == "--dry-run" ]] && is_dry_run=1; done
@@ -251,17 +251,21 @@ run_snakemake_tracked() {
     DNA_PIPELINE_ACTIVE_SNAKEMAKE_PID=$!
     progress_interval=60
     [[ -t 1 ]] || progress_interval=300
-    local polled_seconds=0
+    local polled_seconds=0 progress_offset=0 progress_fields new_offset new_done new_total new_pct
     while kill -0 "$DNA_PIPELINE_ACTIVE_SNAKEMAKE_PID" 2>/dev/null; do
         sleep 2
         polled_seconds=$((polled_seconds + 2))
         kill -0 "$DNA_PIPELINE_ACTIVE_SNAKEMAKE_PID" 2>/dev/null || break
         (( polled_seconds % progress_interval == 0 )) || continue
-        last="$(grep -E '^[0-9]+ of [0-9]+ steps' "$controller_log" 2>/dev/null | tail -1)"
+        if progress_fields="$("$DNA_PIPELINE_PYTHON" -m dna_pipeline controller-progress --log "$controller_log" --offset "$progress_offset" 2>/dev/null)"; then
+            read -r new_offset new_done new_total new_pct <<< "$progress_fields"
+            (( new_offset >= progress_offset )) || last=""
+            progress_offset="$new_offset"
+            if [[ -n "$new_done" ]]; then
+                done_n="$new_done"; total_n="$new_total"; pct_n="$new_pct"; last=1
+            fi
+        fi
         if [[ -n "$last" ]]; then
-            done_n="$(printf '%s\n' "$last" | awk '{print $1}')"
-            total_n="$(printf '%s\n' "$last" | awk '{print $3}')"
-            pct_n="$(printf '%s\n' "$last" | sed -E 's/.*\(([0-9]+)%\).*/\1/')"
             printf '进度: 已完成 %s/%s 个作业（%s%%；完整输出见 %s）\n' \
                 "$done_n" "$total_n" "$pct_n" "$controller_log"
         else
@@ -440,7 +444,6 @@ if [[ "$DNA_PIPELINE_PROJECT_STATUS" == complete_current ]]; then
     printf 'Alopex delivery is complete and current: %s\n' \
         "$DNA_PIPELINE_PROJECT_DIR/03_results/run_manifest.json"
     printf 'No workflow work is required. Snakemake state was left untouched.\n'
-    "$DNA_PIPELINE_PYTHON" -m dna_pipeline clean-demux-scratch --project "$DNA_PIPELINE_PROJECT_DIR"
     exit 0
 elif [[ "$DNA_PIPELINE_PROJECT_STATUS" == resumable ]]; then
     if [[ -n "$DNA_PIPELINE_PROJECT_STATUS_REASON" ]]; then
@@ -502,6 +505,7 @@ run_local() {
     protocol="$CFG_PROTOCOL"
     reference="$CFG_SPECIES"
     [[ "$cores" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: runtime.local_executor_cores must be positive." >&2; return 2; }
+    cores="$("$DNA_PIPELINE_PYTHON" -c 'import sys; from dna_pipeline import effective_cpu_count; print(effective_cpu_count(int(sys.argv[1])))' "$cores")" || return $?
     [[ "$latency_wait" =~ ^[0-9]+$ ]] || { echo "ERROR: runtime.latency_wait_seconds must be >=0." >&2; return 2; }
     mem_budget="$(dna_pipeline_local_mem_budget_mib)" || return $?
     dna_pipeline_prepare_common_args "$latency_wait"

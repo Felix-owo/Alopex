@@ -1,4 +1,4 @@
-# Alopex 下游 QC 与可视化
+# Alopex v14.0 下游 QC 与可视化
 
 这套下游分析以当前 `Alopex` 的 sealed delivery 为输入，通过
 `03_results/run_manifest.json` 解析 immutable config snapshot、reference FAI、
@@ -20,6 +20,9 @@ PIPELINE=/path/to/Alopex
   "$PIPELINE/downstream/downstream_qc.py" \
   --project-dir /path/to/Patient001
 ```
+
+`--workers=0` 自动选择 CpG worker 数（最多 32）；显式值同样受 affinity、Slurm allocation
+和调用方预算限制，每个 worker 内 native 线程固定为 1。Notebook 启动器使用同一 CPU 预算规则。
 
 完成后打开 `downstream/DNA_QC_Visualization.ipynb`。第一格包含可编辑参数。
 Pipeline 与项目通常不在同一目录时，直接填写两个绝对路径；显式值优先于环境变量，
@@ -172,34 +175,16 @@ RawAdata 的样本集合以 sealed final manifest 为准；临时 CpG 导入文�
 Notebook 的 `FINAL_QC_MODE` 可选 `per_clone_samples` 或 `distribution`；前者的 `FINAL_QC_METRIC` 可填单个指标或指标列表。
 
 
-## 指标定义
+## 指标与筛选
 
-- `Native_Mapping%`：backend-native mapping。BISCUIT 定义为 primary `MAPQ>=40` individual reads 占全部 primary reads（dedup 后 alignment 口径）的比例；Bismark 定义为 unique concordant pairs / trimmed pairs；TAPS 定义为至少一个主比对 mate 达到 proper-pair、两端 mapped、非 QC fail、MAPQ≥20 的 pairs / trimmed pairs（此时忽略 duplicate flag）。不同口径不作为跨 backend 同义指标；完整 policy/unit 记录在主 Pipeline MultiQC。
-- `Trim_Retention%`：`trimmed_pairs / cutadapt_input_pairs * 100`。
-- `Duplicate_Pair_Rate%`：`duplicate_pairs / backend_accepted_pairs * 100`。
-- `Final_Pair_Yield%`：`final_retained_pairs / cutadapt_input_pairs * 100`；
-  `final_retained_pairs` 为去重并按 high-CpH filtering 剔除后保留的 read pairs；TAPS 为至少一个非重复 mate 达到上述调用条件的 pairs，未要求覆盖高质量 CpG，
-  不乘 CpG signal 的 host 比例。
-- `High_CpH_Flag_Rate%`：`high_cph_flagged_pairs / high_cph_assessed_pairs * 100`；TAPS 不适用，显示缺失值。
-- `Non_CpG_Methylation%`：BISCUIT 来自 CpH retention；Bismark 来自 extraction report
-  的 CHG+CHH methylated / total；TAPS 首版只调用 CpG，显示缺失值。来源记录在主 Pipeline MultiQC。
-- CpG methylation、CpG signal composition、Gini 和 TSS profile 均从当前 canonical
-  CpG 表计算。
-- `Gini_Index`：在有覆盖的固定宽度 bins 间计算 `methyl + unmethyl` coverage 的不均匀度，包含全部 canonical contigs；只有空 CpG cell 为缺失，未覆盖 bins 不参与。
-- TSS `count`：甲基化 CpG 信号总数（mCpG Signal Sum），不是 read-pair 数，也不是 methyl + unmethyl 总覆盖。
+20 列 QC 的分母、backend 原生 mapping 单位与 TAPS 控制含义的统一定义保留在开发仓库
+参数表。不同 backend 的
+`Native_Mapping%` 不视为同义指标；TAPS 的 CpH 两列为缺失值，不能补零。
+Gini 使用有覆盖 bins 的 coverage，不纳入未覆盖 bins；TSS count 为甲基化信号之和。
 
-`CpG_Signal_Composition` 按 CpG 文件的 coverage/signal 计算 host、lambda、pUC19
-和 mtDNA 比例。
-
-Notebook 默认不把 mapping rate 纳入统一 HQ gate，因为各 backend 的 mapping policy
-不同。默认 HQ 使用 Lambda methylation `< 10`、pUC19 methylation `> 90`、unique CpG
-sites `> 500000` 且 Gini `< 0.5`；只有项目完成跨 backend 回归后，才显式设置
-`MAPPING_THRESHOLD`。
-
-TAPS/Rastair 的 canonical 计数表示 5mC+5hmC；仍使用相同 0-based 四列 CpG 和 20 列 QC 表。`High_CpH_Flag_Rate%` 与 `Non_CpG_Methylation%` 为缺失值，表示本路线未执行 high-CpH/cDNA 筛除且未测量 CpH；不得补成零或套用旧 CpH gate。lambda/pUC19 的 TAPS 控制含义及分母见 final manifest/MultiQC。未来 SNP/SNV 分析从 final manifest 指向的 `02_work/rastair/*.marked.bam` 与 BAI 开始，保留 TAPS 化学信息并使用相应变异调用方法。
-
-Doctor 的真实 Cabernet 抽样与合成补充回归保存于 `logs/doctor/doctor.<run>.<route>.json`。其中 SRD RNA 和 TAPS 化学为合成检验；下游 20 列 QC 契约不变，混合对照计数不用于评价真实实验转化效率。
-
+Notebook 默认 HQ 使用 Lambda methylation `< 10`、pUC19 methylation `> 90`、unique CpG
+sites `> 500000` 且 Gini `< 0.5`；mapping 默认不参与统一 HQ，只有完成对应数据回归后才设置
+`MAPPING_THRESHOLD`。真实数据与合成对照的验证边界保留在开发仓库。
 
 ## 关联 RNA_DARLIN 结果
 
@@ -214,3 +199,9 @@ RNA Processor 从当前 complete DNA delivery 读取 sealed manifest 与同代�
 不会读取未发布的 config 修改或选择 mtime 较新的旧 QC。DNA 20 列 QC 不增加关联列，
 实际文库映射及输入哈希保存在 RNA `analysis_summary.json`。更新关联后先重跑 DNA 发布
 和当前代际 downstream，再重新整合。
+
+Droplet 的配套 RNA 独立进行细胞调用与 QC。RNA 项目用
+`00_config/dna_rna_library_map.tsv` 指定 DNA/RNA 文库，再按完整 CB17 关联；DNA manifest 的
+`rna_sample` 留空。RNA 侧输出双方细胞全集 `DNA_RNA_cell_links.csv`，整合 QC 只含共同且双方
+QC 可用的细胞；文库冲突或错误交付代际直接失败。该流程不同于孔板的完整细胞集合对应，
+完整契约保留在开发仓库维护规范。

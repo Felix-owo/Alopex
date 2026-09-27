@@ -8,6 +8,7 @@ Shell / Snakefile 经 ``python -m dna_pipeline <子命令>`` 调用；子命令�
 from __future__ import annotations
 
 import argparse
+import ast
 import bisect
 import copy
 import csv
@@ -63,6 +64,94 @@ def sha256_bytes(data: bytes) -> str:
     """返回内存字节串的 SHA-256 摘要。"""
 
     return hashlib.sha256(data).hexdigest()
+
+
+def effective_cpu_count(requested: int = 0) -> int:
+    """取宿主、进程 affinity、Slurm allocation 与调用方预算的最小正 CPU 数。"""
+    limits = [max(1, os.cpu_count() or 1)]
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            limits.append(max(1, len(os.sched_getaffinity(0))))
+        except OSError:
+            pass
+    process_count = getattr(os, "process_cpu_count", lambda: None)()
+    if process_count:
+        limits.append(process_count)
+    for name in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+        value = os.environ.get(name, "")
+        if value.isdecimal() and int(value) > 0:
+            limits.append(int(value))
+    if requested > 0:
+        limits.append(int(requested))
+    return min(limits)
+
+
+def read_controller_progress(path: str | Path, offset: int = 0) -> tuple[int, str]:
+    """有界读取新增进度；半行留待下次，文件缩短时从头读取，长日志行不整体驻留。"""
+    progress = ""
+    with Path(path).open("rb") as handle:
+        size = os.fstat(handle.fileno()).st_size
+        handle.seek(offset if 0 <= offset <= size else 0)
+        offset = handle.tell()
+        line_start, pending = True, ""
+        while fragment := handle.readline(64 * 1024):
+            if line_start:
+                match = re.match(rb"^(\d+) of (\d+) steps \((\d+)%\)", fragment)
+                pending = " ".join(part.decode("ascii") for part in match.groups()) if match else ""
+            line_start = fragment.endswith(b"\n")
+            if line_start:
+                offset = handle.tell()
+                if pending:
+                    progress = pending
+    return offset, progress
+
+
+@lru_cache(maxsize=1)
+def _scientific_python_bindings() -> dict[str, ast.AST]:
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str):
+                node.body.pop(0)
+    bindings = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bindings[node.name] = node
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                for child in ast.walk(target):
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                        bindings[child.id] = node
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bindings[alias.asname or alias.name.split(".")[0]] = node
+    return bindings
+
+
+@lru_cache(maxsize=None)
+def scientific_code_identity(python: tuple[str, ...] = (), shell: tuple[str, ...] = ()) -> str:
+    """为阶段计算科学函数及其模块内依赖的语义身份，忽略 Python 注释和 docstring。"""
+    bindings = _scientific_python_bindings()
+    missing = set(python) - bindings.keys()
+    if missing:
+        raise ValueError(f"Unknown scientific Python roots: {sorted(missing)}")
+    pending, selected = list(python), {}
+    while pending:
+        name = pending.pop()
+        if name in selected or name not in bindings or name == "effective_cpu_count":
+            continue
+        node = bindings[name]
+        selected[name] = ast.dump(node, include_attributes=False)
+        pending.extend(child.id for child in ast.walk(node)
+                       if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load))
+    shell_code = ""
+    if shell:
+        shell_code = subprocess.check_output(
+            ["bash", "-c", 'source "$1"; shift; declare -f "$@"', "_",
+             str(Path(__file__).with_name("job_runtime.sh")), *shell], text=True,
+        )
+    return sha256_bytes(json.dumps({"python": selected, "shell": shell_code}, sort_keys=True).encode())
 
 
 def sha256_file(path: str | Path, *, chunk_size: int = 4 * 1024 * 1024) -> str:
@@ -789,7 +878,7 @@ STATIC_FUSED_RULES: Mapping[str, tuple[str, ...]] = MappingProxyType(
 CONTROLLER_RESOURCE_REQUESTS: Mapping[str, tuple[int, int, int]] = MappingProxyType(
     {
         "initial_cell_manifest": (1, 512, 10),
-        "final_sample_manifest": (1, 2048, 30),
+        "final_sample_manifest": (8, 2048, 30),
         "delivery_ready": (1, 1024, 15),
     }
 )
@@ -7012,6 +7101,7 @@ def write_final_sample_manifest(
     bismark: str | None = None,
     pair_qc_multiqc_json: str | None = None,
     cutadapt_qc_multiqc_json: str | None = None,
+    workers: int = 1,
 ) -> None:
     """把已提交的 demux 身份与已启用的 per-cell 结果产物连接成最终 manifest。
 
@@ -7050,6 +7140,7 @@ def write_final_sample_manifest(
         generate_snp=opts["generate_snp"],
         keep_final_bam=opts["keep_final_bam"],
         bismark=bismark,
+        workers=workers,
     )
     _emit_final_tsv(cells, output, pair_qc_multiqc_json, cutadapt_qc_multiqc_json)
 
@@ -7626,6 +7717,7 @@ def _apply_cell_metrics(
     generate_snp: bool,
     bismark: str | None,
     keep_final_bam: bool,
+    workers: int = 1,
 ) -> None:
     published_results = published_layout.result_root
     project_root = published_results.parent
@@ -7687,10 +7779,7 @@ def _apply_cell_metrics(
         )
     if not jobs:
         return
-    workers = int(os.environ.get("DNA_PIPELINE_FINAL_WORKERS", "0") or 0)
-    if workers <= 0:
-        workers = min(8, os.cpu_count() or 1)
-    workers = max(1, min(workers, len(jobs)))
+    workers = min(effective_cpu_count(workers), 8, len(jobs))
     if workers == 1:
         for job in jobs:
             cell_id, updates = _metrics_for_cell(job)
@@ -7710,7 +7799,7 @@ def _apply_cell_metrics(
     else:
         try:
             with pool:
-                pending = list(pool.map(_metrics_for_cell, jobs))
+                pending = list(pool.map(_metrics_for_cell, jobs, chunksize=max(1, min(16, len(jobs) // workers))))
         except BrokenProcessPool as exc:
             print(f"WARNING: metric worker pool unavailable ({exc}); falling back to sequential",
                   file=sys.stderr)
@@ -8744,10 +8833,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init-project", help="初始化项目骨架（目录/模板/launcher symlink）。")
     init.add_argument("path", nargs="?", default=".", help="项目目录；默认当前目录。")
     init.add_argument("--pipeline-root", required=True, help="Pipeline 安装根，用于模板与 symlink。")
-    clean_demux = commands.add_parser("clean-demux-scratch", help="完成发布后按提交边界顺序回收 demux scratch。")
-    clean_demux.add_argument("--project", required=True)
     scalars = commands.add_parser("config-scalars", help="把平台路由所需的 config 标量输出为可 eval 的 shell 赋值。")
     scalars.add_argument("--config", required=True)
+    progress = commands.add_parser("controller-progress", help="增量读取 controller 日志进度，不写状态文件。")
+    progress.add_argument("--log", required=True)
+    progress.add_argument("--offset", type=int, default=0)
     resolve_tmp = commands.add_parser("resolve-tmpdir", help="把 slurm.node_tmpdir 展开为绝对路径（根目录由语义校验拒绝）。")
     resolve_tmp.add_argument("--path", required=True)
     synthesize = commands.add_parser("synthesize-config", help="合成 test 模式 effective config。")
@@ -8848,6 +8938,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                 "published_results_dir", "out_tsv", "pair_qc_json", "cutadapt_qc_json"):
         write_final.add_argument(arg)
     write_final.add_argument("--bismark", required=True)
+    write_final.add_argument("--workers", required=True, type=int)
     write_final.add_argument("--options-json", required=True)
     write_dupsifter = commands.add_parser("write-dupsifter-qc", help="写出 Dupsifter MultiQC 内容。")
     write_dupsifter.add_argument("stat_path")
@@ -8970,8 +9061,9 @@ def main(argv: list[str] | None = None) -> int:
             config = load_project_config(args.config)
             for var, value in export_config_scalars(config).items():
                 print(f"{var}={shlex.quote(value)}")
-        elif command == "clean-demux-scratch":
-            clean_demux_scratch_after_publish(args.project)
+        elif command == "controller-progress":
+            offset, progress = read_controller_progress(args.log, args.offset)
+            print(offset, progress)
         elif command == "resolve-tmpdir":
             print(Path(args.path).expanduser().resolve(strict=False))
         elif command == "synthesize-config":
@@ -9075,6 +9167,7 @@ def main(argv: list[str] | None = None) -> int:
                 bismark=args.bismark,
                 pair_qc_multiqc_json=args.pair_qc_json,
                 cutadapt_qc_multiqc_json=args.cutadapt_qc_json,
+                workers=args.workers,
             )
         elif command == "taps-alignment-qc":
             write_taps_alignment_qc(args.bam, args.samtools, args.scratch, args.sample, args.output)
