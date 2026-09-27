@@ -5,7 +5,6 @@ import functools
 import json
 import os
 import shlex
-from snakemake.exceptions import IncompleteCheckpointException
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -539,22 +538,6 @@ def demux_resource_mem_mb(run_id, attempt=1, count_only=False):
     )
     return int(request.mem_mb)
 
-def multiqc_source_count(wildcards):
-    """资源视角的 MultiQC 源数；checkpoint 未完成（dry-run）时按 0 走最小档。"""
-    try:
-        return len(current_multiqc_source_inputs(wildcards)) + 2
-    except IncompleteCheckpointException:
-        return 0
-
-
-def multiqc_resource_mem_mb(source_count, attempt=1):
-    return int(multiqc_resource_request(source_count, int(attempt)).mem_mb)
-
-
-def multiqc_resource_runtime_min(source_count, attempt=1):
-    return int(multiqc_resource_request(source_count, int(attempt)).runtime_min)
-
-
 def demux_resource_runtime_min(run_id, attempt=1, count_only=False):
     request = demux_resource_request(
         demux_run_total_bytes(run_id, mates=("r1",) if count_only else ("r1", "r2")),
@@ -674,7 +657,6 @@ CPG_THREADS = resource_threads("generate_cpg_input")
 BISMARK_EXTRACT_THREADS = lambda wildcards: backend_stage_threads("bismark", "extract", wildcards)
 SNP_THREADS = resource_threads("generate_snp_input")
 BISCUIT_QC_THREADS = resource_threads("biscuit_qc")
-MULTIQC_THREADS = resource_threads("multiqc")
 HIGH_CPH_FILTER_RULES = STATIC_FUSED_RULES["high_cph_filter"]
 
 def passing_dna_rows(checkpoints_obj, run_id, workflow_config):
@@ -2706,10 +2688,6 @@ def current_multiqc_source_inputs(wildcards):
             sources.append(str(paths.high_cph_multiqc if paths.high_cph_multiqc.is_file() else paths.high_cph_summary))
             if PROTOCOL_POLICY.name != "droplet":
                 sources.append(str(paths.bismark_dedup_report))
-    sources.extend([
-        str(FINAL_SAMPLE_PAIR_QC),
-        str(FINAL_SAMPLE_CUTADAPT_QC),
-    ])
     return sources
 
 
@@ -2777,23 +2755,20 @@ rule multiqc:
         high_cph = temp(INTERMEDIATE_DIR / "multiqc" / "high_cph_rebuilt_mqc.json"),
     log:
         LOGS_DIR / "rules/multiqc.log"
-    threads: MULTIQC_THREADS
+    threads: multiqc_resource_request(0).threads
     conda: ENVIRONMENT_YAML
     resources:
-        mem_mb = lambda wildcards, attempt: multiqc_resource_mem_mb(
-            multiqc_source_count(wildcards), attempt
-        ),
-        runtime = lambda wildcards, attempt: multiqc_resource_runtime_min(
-            multiqc_source_count(wildcards), attempt
-        ),
+        mem_mb = lambda wildcards, input, attempt: multiqc_resource_request(len(input), attempt).mem_mb,
+        runtime = lambda wildcards, input, attempt: multiqc_resource_request(len(input), attempt).runtime_min,
         attempt_no = lambda wildcards, attempt: int(attempt)
     params:
         outdir = STAGED_RESULTS_DIR / "QC_Results",
         tmpout = INTERMEDIATE_DIR / "multiqc" / "output_tmp",
-        multiqc = MULTIQC,
-        resource_log = lambda wc: static_resource_log("multiqc")
+        multiqc = MULTIQC
     run:
         shell("source {JOB_RUNTIME:q}; dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}")
+        request = multiqc_resource_request(len(input), resources.attempt_no)
+        resource_log = f"policy={request.policy} rule={request.rule_key} tier={request.tier}"
         count, skipped = write_multiqc_file_list(
             prepare_high_cph_multiqc_sources(
                 list(input.sources) + [str(input.pair_qc), str(input.cutadapt_qc)],
@@ -2802,7 +2777,7 @@ rule multiqc:
             str(output.file_list),
         )
         with open(str(log), "a", encoding="utf-8") as handle:
-            handle.write(f"INFO: multiqc_sources={count}\n")
+            handle.write(f"INFO: multiqc_declared_sources={len(input)} multiqc_file_list_sources={count}\n")
             for item in skipped:
                 handle.write(f"WARNING: skipped_multiqc_source={item}\n")
         shell(
@@ -2811,7 +2786,7 @@ rule multiqc:
             source {JOB_RUNTIME:q}
             mkdir -p {params.outdir:q} "$(dirname {log:q})" "$(dirname {params.tmpout:q})"
             printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
-                {params.resource_log:q} {resources.attempt_no} {threads} \
+                {resource_log:q} {resources.attempt_no} {threads} \
                 {resources.mem_mb} {resources.runtime} >> {log:q}
 
             tmpout={params.tmpout:q}.attempt{resources.attempt_no}.$$

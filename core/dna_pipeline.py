@@ -766,7 +766,6 @@ STATIC_RESOURCE_REQUESTS: Mapping[str, _StaticRuleRequest] = MappingProxyType(
             (1, 1, 1, 1), (2, 4, 4, 8), (60, 120, 180, 240)
         ),
         "biscuit_qc": _StaticRuleRequest((1, 1, 1, 1), (2, 4, 4, 8), (120, 180, 240, 360)),
-        "multiqc": _StaticRuleRequest((1, 1, 1, 1), (4, 4, 4, 4), (240, 240, 240, 240)),
     }
 )
 
@@ -877,7 +876,7 @@ def demux_resource_request(total_bytes: object, attempt: int = 1, count_only: bo
 
 
 def multiqc_resource_request(source_count: object, attempt: int = 1) -> ResourceRequest:
-    """按 MultiQC 源文件数缩放的调度请求，两次重试仅把内存分别提高至首次的 1.5 倍、2 倍。
+    """按 MultiQC 声明依赖数缩放资源，两次重试仅把内存提高至首次的 1.5 倍、2 倍。
 
     实测锚点（F-real-2609SG）：52,816 个源、13,203 样本，峰值 RSS 4.35 GiB、
     file-list 模式 14 min / 目录发现模式 17 min。请求内存 = 1.5×(512 MiB + 0.075 MiB/源)；

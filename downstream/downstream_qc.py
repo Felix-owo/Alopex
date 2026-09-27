@@ -1307,46 +1307,6 @@ def _mapped_numeric(sid: pd.Series, values: pd.Series) -> np.ndarray:
     )
 
 
-def prepare_flat_cpg_symlink_dir(
-    temporary_root: Path,
-    selected_files: list[Path],
-) -> tuple[Path, dict[str, str]]:
-    temporary_root = Path(temporary_root).resolve()
-    flat_dir = temporary_root / "cpg_symlinks"
-    flat_dir.mkdir(parents=True, exist_ok=False)
-
-    files = [Path(path).resolve() for path in selected_files]
-    for path in files:
-        if not path.is_file() or path.stat().st_size == 0:
-            raise FileNotFoundError(f"Selected CpG result is missing or empty: {path}")
-
-    linkname2paths = {}
-    linkname2clean = {}
-
-    for p in files:
-        base = p.name
-        link_base = base.removesuffix(".cpg.tsv.zst") + ".tsv.zst"
-        linkname2paths.setdefault(link_base, []).append(p)
-
-    for link_base, ps in linkname2paths.items():
-        if len(ps) != 1:
-            raise ValueError(
-                f"More than one active CpG file maps to {link_base!r}: "
-                + ", ".join(str(path) for path in ps)
-            )
-        src = ps[0]
-        link_path = flat_dir / link_base
-        os.symlink(src.resolve(), link_path)
-
-        clean = _clean_cpg_table_name(link_base)
-
-        linkname2clean[link_base] = clean
-        if link_base.endswith(".tsv.zst"):
-            linkname2clean[link_base[: -len(".zst")]] = clean
-
-    return flat_dir, linkname2clean
-
-
 def _clean_cpg_table_name(filename: str) -> str:
     for suffix in (".tsv.zst", ".tsv"):
         if filename.endswith(suffix):
@@ -1355,25 +1315,24 @@ def _clean_cpg_table_name(filename: str) -> str:
 
 
 def load_or_create_raw_adata(
-    source_dir: Path,
+    selected_files: list[Path],
     out_file: Path,
     fai_path: Path | None,
-    linkname2clean: dict,
     *,
     reuse_existing: bool,
     expected_sample_ids: list[str],
-    empty_cpg_sample_ids: set[str],
+    zero_mapped_sample_ids: set[str],
     sealed_delivery_id: str,
     sealed_snapshot_id: str,
     cpg_output_identities: Mapping[str, Mapping[str, object]],
 ):
-    """按 sealed inventory 绑定 CpG 输入并复用或重建 RawAdata，不重复扫描 CpG 计算哈希。"""
+    """绑定 sealed inventory 复用 RawAdata 与空表集合，仅缓存失配时解码并创建导入链接。"""
     expected = [str(value) for value in expected_sample_ids]
-    empty_cpg = {str(value) for value in empty_cpg_sample_ids}
+    zero_mapped = {str(value) for value in zero_mapped_sample_ids}
     if len(expected) != len(set(expected)):
         raise ValueError("Current manifest contains duplicate Sample_ID values")
-    if empty_cpg - set(expected):
-        raise ValueError("Empty-CpG Sample_ID set differs from current manifest")
+    if zero_mapped - set(expected):
+        raise ValueError("Zero-mapped Sample_ID set differs from current manifest")
     if set(cpg_output_identities) != set(expected):
         raise ValueError("Sealed CpG inventory Sample_ID set differs from current manifest")
     for label, value in (
@@ -1383,18 +1342,32 @@ def load_or_create_raw_adata(
         if re.fullmatch(r"[0-9a-f]{64}", str(value)) is None:
             raise ValueError(f"{label} must be a 64-character content identity")
     schema_file = out_file.with_name(f"{out_file.stem}.input_schema.json")
+    files = sorted(Path(path).resolve() for path in selected_files)
     cpg_bindings = []
-    for path in sorted(source_dir.iterdir()):
-        if not path.is_symlink():
-            continue
-        clean_name = linkname2clean.get(path.name, _clean_cpg_table_name(path.name))
-        record = cpg_output_identities[clean_name]
+    sources = {}
+    linkname2clean = {}
+    for path in files:
+        name = path.name.removesuffix(".cpg.tsv.zst") + ".tsv.zst"
+        sample_id = _clean_cpg_table_name(name)
+        if sample_id in sources:
+            raise ValueError(f"More than one active CpG file maps to {sample_id!r}")
+        if sample_id not in cpg_output_identities:
+            raise ValueError(f"CpG input is absent from sealed inventory: {path}")
+        record = cpg_output_identities[sample_id]
+        if not path.is_file() or path.stat().st_size != record["size_bytes"] or not record["size_bytes"]:
+            raise FileNotFoundError(f"Selected CpG result is missing or has a wrong size: {path}")
+        sources[sample_id] = path
+        linkname2clean[name] = sample_id
+        linkname2clean[name.removesuffix(".zst")] = sample_id
         cpg_bindings.append({
-            "sample_id": clean_name,
-            "path": str(path.resolve()),
+            "sample_id": sample_id,
+            "path": str(path),
             "size_bytes": record["size_bytes"],
             "sha256": record["sha256"],
         })
+    if set(sources) != set(expected):
+        raise ValueError("CpG input Sample_ID set differs from current manifest")
+    cpg_bindings.sort(key=lambda record: record["sample_id"])
     input_signature = {
         "schema_version": RAW_ADATA_SCHEMA_VERSION,
         "algorithm_version": RAW_ADATA_ALGORITHM_VERSION,
@@ -1404,7 +1377,6 @@ def load_or_create_raw_adata(
         "cpg_header": "snapatac2_import_values_0based",
         "empty_cpg_sentinel": f"{EMPTY_CPG_SENTINEL_CONTIG}:0:0:1",
         "sample_ids": sorted(expected),
-        "empty_cpg_sample_ids": sorted(empty_cpg),
         "reference_fai": _content_binding(fai_path) if fai_path is not None else None,
         "cpg_files": cpg_bindings,
     }
@@ -1414,8 +1386,16 @@ def load_or_create_raw_adata(
             schema_payload = json.loads(schema_file.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             schema_payload = None
-    schema_matches = _raw_adata_schema_matches(
-        out_file, schema_payload, input_signature
+    cached_empty = schema_payload.get("empty_cpg_sample_ids") if isinstance(schema_payload, dict) else None
+    valid_empty = (
+        isinstance(cached_empty, list)
+        and all(isinstance(value, str) for value in cached_empty)
+        and cached_empty == sorted(set(cached_empty))
+        and set(cached_empty) <= set(expected)
+        and zero_mapped <= set(cached_empty)
+    )
+    schema_matches = valid_empty and _raw_adata_schema_matches(
+        out_file, schema_payload, {**input_signature, "empty_cpg_sample_ids": cached_empty}
     )
 
     if reuse_existing and out_file.exists() and out_file.is_file():
@@ -1430,7 +1410,7 @@ def load_or_create_raw_adata(
             if schema_matches:
                 validated = existing
                 existing = None
-                return validated
+                return validated, set(cached_empty)
             raise ValueError(
                 "RawAdata does not match the current SnapATAC2 0-based four-column input schema"
             )
@@ -1440,8 +1420,12 @@ def load_or_create_raw_adata(
             if existing is not None:
                 existing.close()
 
+    empty_cpg = {sample_id for sample_id, path in sources.items() if _cpg_table_is_empty(path)}
+    if zero_mapped - empty_cpg:
+        raise ValueError("Zero-mapped cells must have an empty current CpG result")
+    input_signature["empty_cpg_sample_ids"] = sorted(empty_cpg)
     if fai_path is None or not fai_path.exists():
-        return None
+        return None, empty_cpg
 
     chrom_sizes = _read_chrom_sizes(fai_path)
 
@@ -1456,19 +1440,15 @@ def load_or_create_raw_adata(
     try:
 
 
-        for source in sorted(source_dir.iterdir()):
-            if not source.is_symlink():
-                continue
-            sample_id = linkname2clean.get(
-                source.name, _clean_cpg_table_name(source.name)
-            )
-            target = import_dir / source.name
+        for sample_id, source in sources.items():
+            name = sample_id + ".tsv.zst"
+            target = import_dir / name
             if sample_id not in empty_cpg:
                 os.symlink(source.resolve(), target)
                 continue
 
 
-            target = import_dir / source.name.removesuffix(".zst")
+            target = import_dir / name.removesuffix(".zst")
             target.write_text(
                 "chrom\tpos\tmethyl\tunmethyl\n"
                 f"{EMPTY_CPG_SENTINEL_CONTIG}\t0\t0\t1\n",
@@ -1510,7 +1490,7 @@ def load_or_create_raw_adata(
         temporary.unlink(missing_ok=True)
         shutil.rmtree(import_dir, ignore_errors=True)
 
-    return snap.read(str(out_file), backed="r")
+    return snap.read(str(out_file), backed="r"), empty_cpg
 
 
 def _raw_adata_schema_mode(out_file: Path) -> str:
@@ -2506,13 +2486,6 @@ def _run_pipeline_impl(
         for record in records
         if int(record["backend_accepted_pairs"]) == 0
     }
-    empty_cpg_sample_ids = {
-        str(record["sample_id"])
-        for record, path in zip(records, cpg_files, strict=True)
-        if _cpg_table_is_empty(path)
-    }
-    if zero_mapped_sample_ids - empty_cpg_sample_ids:
-        raise ValueError("Zero-mapped cells must have an empty current CpG result")
     dt = timer.stop("current_outputs")
     if dt is not None:
         _log(f"  done: {dt:.2f}s")
@@ -2524,22 +2497,17 @@ def _run_pipeline_impl(
         _log("Forcing RawAdata rebuild (--recompute-raw-adata)")
     if not paths.cpg_dir.is_dir():
         raise FileNotFoundError(f"Sealed CpG directory is missing: {paths.cpg_dir}")
-    with tempfile.TemporaryDirectory(prefix="dna-pipeline-cpg-links-") as temporary:
-        flat_dir, linkname2clean = prepare_flat_cpg_symlink_dir(
-            Path(temporary), cpg_files
-        )
-        raw_adata = load_or_create_raw_adata(
-            flat_dir,
-            paths.raw_adata,
-            cfg.ref_fai,
-            linkname2clean,
-            reuse_existing=not recompute_raw_adata,
-            expected_sample_ids=manifest_sample_ids,
-            empty_cpg_sample_ids=empty_cpg_sample_ids,
-            sealed_delivery_id=sealed.delivery_id,
-            sealed_snapshot_id=sealed.snapshot_id,
-            cpg_output_identities=cpg_output_identities,
-        )
+    raw_adata, empty_cpg_sample_ids = load_or_create_raw_adata(
+        cpg_files,
+        paths.raw_adata,
+        cfg.ref_fai,
+        reuse_existing=not recompute_raw_adata,
+        expected_sample_ids=manifest_sample_ids,
+        zero_mapped_sample_ids=zero_mapped_sample_ids,
+        sealed_delivery_id=sealed.delivery_id,
+        sealed_snapshot_id=sealed.snapshot_id,
+        cpg_output_identities=cpg_output_identities,
+    )
     if raw_adata is not None:
         _raw_adata_owner.append(raw_adata)
 

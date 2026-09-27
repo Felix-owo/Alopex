@@ -1,4 +1,4 @@
-# Alopex v13.18
+# Alopex v13.19
 
 Alopex 是面向 Cabernet、SRD、Droplet（DD-MET5）和 Cabernet–TAPS+ 单细胞 DNA 甲基化数据的 Snakemake Pipeline。它将原始 paired FASTQ 转为单细胞 CpG 结果、质量报告和可追溯的交付清单：
 
@@ -52,7 +52,7 @@ core/run_pipeline.sh  创建项目、检查输入并运行分析
 获取代码：
 
 ```bash
-git clone --branch v13.18 https://github.com/Felix-owo/Alopex.git
+git clone --branch v13.19 https://github.com/Felix-owo/Alopex.git
 cd Alopex
 ```
 
@@ -449,6 +449,8 @@ CpG 文件固定为 SnapATAC2 `pp.import_values` 可直接读取的四列：`chr
 任何依赖 demux 输出的修改都会重新执行 demux checkpoint 并重新生成其 FASTQ scratch；该策略在发布后释放 demux 磁盘空间。重建时间戳本身不触发比对/CpG 重算；这些规则直接跟踪真实 raw 输入、孔板路线的 Barcode Map、样本声明、demux binary 和分析参数。不要手动只删除其中 FASTQ 而保留 completion。也不要单独删除 `02_work/results_stage/`：它与公开结果共享 hardlink 内容（不额外占用磁盘），同时也是 Snakemake 增量重算的稳定 biological output stage 与重发布来源。
 
 MultiQC 的 high-CpH 展示 JSON 若已清理，报告规则会从保留的过滤摘要重建；这一展示恢复不会要求重新生成 BAM 或重新比对。
+HPC 的 MultiQC 由 Slurm 独立执行，macOS 使用 local executor。资源按已解析的声明输入数量计算，
+无需为资源求值重复扫描逐细胞文件；日志同时给出声明依赖数和汇总后的实际 file-list 数，二者可能不同。
 
 通过 demux 阈值的 cell 即使全未比对或 trim 后全空，也保留合法空 CpG 和 QC，不阻断整批交付；零 primary reads 的 mapping 为 0%，无 CpH 观测为缺失值。
 
@@ -482,6 +484,8 @@ Notebook 最后一格生成供 MethylTree 等分析复用的 `QC_Results/SingleC
 `DNAme_QC_Information.csv` 固定输出 20 列，包含样本身份、甲基化、signal composition、Gini、mapping 与 read-pair retention 指标；完整计数与 backend 诊断保留在主 Pipeline 的最终 manifest 和 MultiQC 中。CpG Density 从 QC 表、sealed manifest 与 composition 缓存读取所需字段。
 
 CpG 统计、Gini 与 TSS 分别缓存，缓存身份包含相关输入、参数、计算代码与库版本。修改绘图或说明文字可复用科学统计；修改 Gini bin size 或 TSS BED 只使对应统计失效。
+
+RawAdata 缓存通过当前 sealed 输入、reference、算法和矩阵身份校验后，同时复用已记录的空表集合；命中时省去逐细胞解压检查和临时链接。缓存失配仍完整检查输入并重建，更新导入算法后首次运行会正常重建。
 
 TSS 无覆盖时保留仅表头 CSV 并清理旧 TSS 图；显式跳过 TSS 时清理该交付的旧 TSS CSV/PDF。
 

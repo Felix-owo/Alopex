@@ -40,6 +40,8 @@ Notebook 第二格的 `RECOMPUTE_RAW_ADATA`、`RECOMPUTE_METHYL_STATS`、
 按输入和算法身份自动复用缓存，CSV 中的科学浮点值读回时保持原精度。RawAdata 与统计缓存的
 CpG 输入身份复用 sealed inventory 中的 size/hash，不重复读取所有 CpG 计算哈希。需要强制重建 AnnData 时将 `RECOMPUTE_RAW_ADATA`
 设为 `True`；它从 sealed CpG 重建 `RawAdata.h5ad`，结果仍只写入 `06_downstream/`。
+
+RawAdata 的 schema、文件身份、样本集合及当前 sealed 输入全部匹配时，直接复用其空 CpG 集合，不逐细胞启动解压或创建临时链接。失配时重新检查表头和空表，确认 zero-mapped cells 为空后再导入；临时链接只在重建时创建。导入算法更新仍触发正常重建，不复用旧算法身份。
 命令行对应 `--recompute-raw-adata`；其余开关对应 `--recompute-methyl-stats`、
 `--recompute-composition`、`--recompute-gini`、`--recompute-tss`。
 
