@@ -1,4 +1,4 @@
-# Alopex v14.0 下游 QC 与可视化
+# Alopex v14.1 下游 QC 与可视化
 
 这套下游分析以当前 `Alopex` 的 sealed delivery 为输入，通过
 `03_results/run_manifest.json` 解析 immutable config snapshot、reference FAI、

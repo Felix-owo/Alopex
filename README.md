@@ -1,4 +1,4 @@
-# Alopex v14.0
+# Alopex v14.1
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -32,6 +32,7 @@ conda --version
 
 也可使用源码归档部署，无需 `.git`。在目标机器上构建 Conda、Rust 和 reference indexes，
 不要跨平台复制已构建环境。版本以 Git tag 为准。
+Doctor 使用 Seed Conda 自带的 `ruamel.yaml` 抽取环境配置，无需在 Seed 中额外安装 PyYAML。
 
 ## 2. 准备标准 reference
 

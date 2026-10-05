@@ -281,10 +281,10 @@ ENVS_SPEC_NAME = "envs.yaml"
 
 
 def envs_section(envs_path: str | Path, role: str) -> dict[str, object]:
-    """从五角色 envs.yaml 读取指定角色的 conda specification section。"""
-    import yaml as _yaml
+    """用 Conda 自带的 ruamel.yaml 读取角色 spec，支持未安装 PyYAML 的 Seed。"""
+    from ruamel.yaml import YAML
 
-    payload = _yaml.safe_load(Path(envs_path).read_text(encoding="utf-8"))
+    payload = YAML(typ="safe", pure=True).load(Path(envs_path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get(role) is None:
         raise ValueError(f"envs.yaml has no section for role {role!r}: {envs_path}")
     section = payload[role]
@@ -306,14 +306,16 @@ def envs_spec_logical_name(role: str) -> str:
 
 def write_envs_section_spec(envs_path: str | Path, role: str, destination: str | Path) -> Path:
     """把角色 section 抽取为独立 conda spec 文件（conda env create 的输入）。"""
-    import yaml as _yaml
+    from ruamel.yaml import YAML
 
     section = envs_section(envs_path, role)
     target = Path(destination)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        _yaml.safe_dump(section, sort_keys=False, allow_unicode=True), encoding="utf-8"
-    )
+    parser = YAML(typ="safe", pure=True)
+    parser.default_flow_style = False
+    parser.sort_base_mapping_type_on_output = False
+    stream = io.StringIO()
+    parser.dump(section, stream)
+    atomic_write_bytes(target, stream.getvalue().encode("utf-8"))
     return target
 
 
