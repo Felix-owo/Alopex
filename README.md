@@ -1,4 +1,4 @@
-# Alopex v14.1
+# Alopex v14.2
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -19,6 +19,8 @@ Rust demultiplexer、下游 QC、Doctor 端到端回归 fixture（真实 Caberne
 数据集命名与来源身份已中性化）以及默认 Barcode Map 模板。维护规范、参数表、流程图、
 测试套件与内部 benchmark 归档不随公开副本分发；Doctor 的九个阶段在本副本均可完整执行。
 
+Bismark paired-end 比对在所有协议与比对模式下固定使用 `--maxins 1000`（等价 `-X 1000`），最大插入片段长度为 1000 bp。
+
 ## 1. 安装
 
 支持 macOS 和 Linux；Linux 正式运行使用 Slurm，需要 `sbatch`、`squeue`、`sacct`。
@@ -33,6 +35,7 @@ conda --version
 也可使用源码归档部署，无需 `.git`。在目标机器上构建 Conda、Rust 和 reference indexes，
 不要跨平台复制已构建环境。版本以 Git tag 为准。
 Doctor 使用 Seed Conda 自带的 `ruamel.yaml` 抽取环境配置，无需在 Seed 中额外安装 PyYAML。
+科学规则的 Python 入口固定到所选 backend 环境，避免 HPC 已激活环境的 PATH 顺序影响依赖加载。
 
 ## 2. 准备标准 reference
 
@@ -99,7 +102,7 @@ Doctor 检查或修复环境、Rust demultiplexer、hg38/mm10 reference 与三�
 然后运行 A（hg38/Cabernet/Bismark）、B（mm10/SRD/BISCUIT）和 C（TAPS/Rastair）三条隔离路线。
 登录节点的 A/B 为独立 Slurm workers，可并行；macOS 或已有 allocation 内串行，避免重复使用
 整份内存预算。每条 route 最多 2 CPU，Bismark 16 GiB、BISCUIT/Rastair 24 GiB、20 min。
-C 在 A/B 成功后执行；真实 TAPS/SRD 文库尚未经过完整科学验收。
+C 在 A/B 成功后执行；真实 TAPS 子集已完成生命周期与下游回归；完整 TAPS/SRD 文库仍未完成科学验收。
 
 成功结尾必须为 `FINAL STATUS: READY`。详细日志在 `logs/doctor/`，成功清理测试沙箱，
 失败保留沙箱和原生诊断。Doctor 每次都重跑三条路线，READY 只代表本次检查和回归通过。
@@ -114,7 +117,7 @@ bash core/doctor.sh demux --check
 ```
 
 去掉 `--check` 即检查并按需修复。Conda 构建在 macOS 或 HPC 登录节点执行；已有 allocation
-允许只读 `conda --check`。
+允许只读 `conda --check`。环境与 reference 的角色及恢复机制由 Doctor 统一检查。
 
 ## 4. 初始化与配置
 
@@ -151,7 +154,7 @@ analysis:
   methylation_backend: bismark
 ```
 
-完整模板与各参数默认值见 `00_config/config.yaml` 的行内注释。
+完整模板、默认值、可调参数及计数单位见初始化生成的 config 行内注释。
 Droplet 使用 `protocol: droplet`、Bismark `non_directional`，不需要 Barcode Map，
 `rna_sample` 留空；若在初始化前写好 Droplet config，初始化会直接跳过 Barcode Map。
 TAPS 使用 `protocol: taps`、`methylation_backend: rastair`。
@@ -214,6 +217,9 @@ launcher，再移除项目 `.snakemake/locks`。不要仅凭进度百分比判�
 `03_results/`，最后提交 `run_manifest.json`；两处必须位于同一文件系统。发布中断可复用
 stage 重试。已完成的快路只读退出；清理失败保留残留与告警，待后续持锁发布再回收。
 `retention.keep_final_bam: true` 要求保留 BAM/索引齐全，缺失时会进入 DAG 恢复。
+改回 `false` 后，成功发布会在同一个锁内清理当前 backend 活跃细胞的最终 BAM/索引；
+残留清理失败时，下次启动会重试。SRD 的 RNA BAM 不受此开关影响。
+下游读取期间若上游重新发布，旧交付 context 会拒绝继续读取或提交 QC，需要重新启动下游。
 
 ## 7. 结果与完成确认
 
@@ -237,7 +243,7 @@ CpG 唯一格式为 `chrom, pos, methyl, unmethyl`，tab 分隔、pos 为 0-base
 3. 再次运行 launcher 显示 `Alopex delivery is complete and current`，不启动科学作业。
 
 MultiQC 汇总原生 mapping、pair funnel、重复、过滤、对照和适用的 M-bias；不同 backend
-的 mapping 分母不同。科学解释与空结果的判定以 `00_config/config.yaml` 模板注释为准。
+的 mapping 分母不同。科学解释与空结果的判定以 `00_config/config.yaml` 模板注释为准；已验证数据范围见本版 release 说明。
 
 ## 8. 下游
 

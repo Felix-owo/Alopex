@@ -681,7 +681,7 @@ properties:
     required: [keep_final_bam]
     properties:
       keep_final_bam:
-        description: true 时保留 02_work/ 最终 BAM；TAPS 保留全部记录的 marked BAM+BAI 供变异重分析，其余后端保留过滤后 DNA BAM；默认 false。
+        description: true 保留 02_work/ 最终 BAM；false 在持锁成功发布后回收活跃 cell 的最终 BAM/索引，SRD RNA BAM 除外；默认 false。
         type: boolean
 
 allOf:
@@ -755,7 +755,7 @@ runtime:
   latency_wait_seconds: 120       # snakemake --latency-wait：等待输出文件在文件系统可见的秒数
 
 retention:
-  keep_final_bam: false          # 保留 02_work/ 最终 BAM；TAPS 为全部记录的 marked BAM+BAI，供后续 SNP/SNV
+  keep_final_bam: false          # true 保留最终 BAM/索引；false 在持锁成功发布后回收，SRD RNA BAM 除外
 
 slurm:
   jobs: 30                        # SLURM 全局并发上限，含 Droplet 全库 calling、demux 块和后续 cell 作业
@@ -4275,9 +4275,8 @@ def _prune_stale_public_files(public: Path, allowed: set[str]) -> None:
             _remove_path(path)
 
 
-def _run_manifest_payload(ready: Mapping[str, object]) -> dict[str, object]:
+def _run_manifest_payload(ready: Mapping[str, object], snapshot: Mapping[str, object]) -> dict[str, object]:
     snapshot_path = Path(str(ready["run_snapshot_path"])).resolve()
-    snapshot = load_run_snapshot(snapshot_path)
     basis = snapshot["basis"]
     if not isinstance(basis, Mapping):
         raise ValueError("run snapshot basis is missing")
@@ -4320,7 +4319,7 @@ def publish_delivery(ready_path: str | Path) -> Path:
     「混合代结果 + complete marker」。交付内容全部来自 stable stage 的硬链接，
     逐文件原子落地（os.replace）；发布中断不损坏 stable stage，重新运行
     launcher 会直接重走本流程。生产调用必须位于 Snakemake 持有项目锁的
-    onsuccess 回调内，锁在发布与 demux 清理完成后释放。
+    onsuccess 回调内，锁在发布与 BAM/demux 清理完成后释放。
     """
     ready_manifest = Path(ready_path).expanduser().resolve()
     ready = load_delivery_ready(ready_manifest, validate_staged=False)
@@ -4329,7 +4328,12 @@ def publish_delivery(ready_path: str | Path) -> Path:
     stage = (project / "02_work" / "results_stage").resolve(strict=False)
 
     outputs = _validate_inventory(stage, ready.get("outputs"), label="staged delivery")
-    payload = _run_manifest_payload(ready)
+    snapshot_path = Path(str(ready["run_snapshot_path"])).resolve()
+    snapshot = load_run_snapshot(snapshot_path)
+    payload = _run_manifest_payload(ready, snapshot)
+    config = load_project_config(
+        snapshot_path.parent / "inputs" / snapshot["input_copies"]["config"]["snapshot_path"]
+    )
     for record in outputs:
         _check_result_directories(public, Path(record["path"]), label="published delivery")
 
@@ -4349,11 +4353,37 @@ def publish_delivery(ready_path: str | Path) -> Path:
 
     atomic_write_json(marker, payload)
 
+    if not config["retention"]["keep_final_bam"]:
+        try:
+            for path in _retained_bam_paths(project, config):
+                path.unlink(missing_ok=True)
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not fully reclaim unretained BAMs: %s", exc)
+
     finalize_root = project / "05_tmp" / "finalize"
     if ready_manifest.parent.parent == finalize_root:
         _remove_path(ready_manifest.parent)
     clean_demux_scratch_after_publish(project)
     return marker
+
+
+def _retained_bam_paths(project: Path, config: Mapping[str, object]) -> tuple[Path, ...]:
+    layout = ProjectLayout(project / "02_work", project / "03_results", get_backend(config).name)
+    for directory in (layout.intermediate_dir, layout.intermediate_dir / layout.backend):
+        if directory.is_symlink():
+            raise ValueError(f"Refusing to access retained BAMs through a symlink: {directory}")
+    paths = []
+    with (layout.result_root / "QC_Results/sample_manifest.tsv").open() as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if not {"sample_id", "analysis_status"} <= set(reader.fieldnames or ()):
+            raise ValueError("Final manifest is missing BAM retention identity/status")
+        for row in reader:
+            if row["analysis_status"] != "PASS":
+                continue
+            if SAMPLE_ID_RE.fullmatch(row["sample_id"]) is None:
+                raise ValueError(f"Invalid retained BAM sample_id: {row['sample_id']!r}")
+            paths.extend(layout.cell(row["sample_id"]).retained_bam_files)
+    return tuple(paths)
 
 
 def clean_demux_scratch_after_publish(project_dir: str | Path) -> None:
@@ -4423,21 +4453,18 @@ def project_status(
                             / snapshot["input_copies"]["config"]["snapshot_path"]
                         )
                         config = load_project_config(config_path)
-                        if config["retention"]["keep_final_bam"]:
-                            layout = ProjectLayout(
-                                project / "02_work", public_manifest.parent,
-                                get_backend(config).name,
-                            )
-                            with (public_manifest.parent / "QC_Results/sample_manifest.tsv").open() as handle:
-                                for row in csv.DictReader(handle, delimiter="\t"):
-                                    if row["analysis_status"] != "PASS":
-                                        continue
-                                    for path in layout.cell(row["sample_id"]).retained_bam_files:
-                                        if not path.is_file():
-                                            return {
-                                                "status": "resumable",
-                                                "reason": f"requested retained BAM/index is missing: {path}",
-                                            }
+                        keep_bam = config["retention"]["keep_final_bam"]
+                        for path in _retained_bam_paths(project, config):
+                            if keep_bam and not path.is_file():
+                                return {
+                                    "status": "resumable",
+                                    "reason": f"requested retained BAM/index is missing: {path}",
+                                }
+                            if not keep_bam and (path.exists() or path.is_symlink()):
+                                return {
+                                    "status": "resumable",
+                                    "reason": f"unretained BAM/index awaits cleanup under the Snakemake lock: {path}",
+                                }
                         return {
                             "status": "complete_current",
                             "manifest": str(public_manifest),

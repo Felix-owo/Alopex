@@ -104,7 +104,7 @@ BISMARK = _rule_executable("bismark")
 BOWTIE2 = _rule_executable("bowtie2")
 BWA = _rule_executable("bwa")
 RASTAIR = _rule_executable("rastair")
-RASTAIR_PYTHON = _rule_executable("python")
+RULE_PYTHON = _rule_executable("python")
 
 _active_config_env = str(os.environ.get("DNA_PIPELINE_CONFIG", "") or "").strip()
 if _active_config_env:
@@ -263,6 +263,7 @@ BISMARK_SEED_MISMATCHES = 0
 BISMARK_SEED_LENGTH = 20
 BISMARK_EFFORT_D = 15
 BISMARK_RESEED_R = 2
+BISMARK_MAX_INSERT = 1000
 BISMARK_ANALYSIS_BAM = CELL_PATH_PATTERN.processed_bam
 BISMARK_NONCONVERSION_PERCENTAGE_CUTOFF = int(
     config["bismark"]["non_conversion_percentage_cutoff"]
@@ -783,7 +784,7 @@ rule initial_cell_manifest:
         set -euo pipefail
         export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
         mkdir -p "$(dirname {output.manifest:q})" "$(dirname {log:q})"
-        python -m dna_pipeline write-cell-manifest \
+        {RULE_PYTHON:q} -m dna_pipeline write-cell-manifest \
             {input.project_manifest:q} \
             {params.barcode_map} \
             {output.manifest:q} \
@@ -822,7 +823,7 @@ if PROTOCOL_POLICY.name == "droplet":
             {input.binary:q} --mode dna-only-droplet --count-only \
                 {params.r1_args} --threads {threads} \
                 --counts-output {output.counts:q} --count-metrics {output.structure:q} >> {log:q} 2>&1
-            if ! python -m dna_pipeline call-droplet-cells --counts {output.counts:q} \
+            if ! {RULE_PYTHON:q} -m dna_pipeline call-droplet-cells --counts {output.counts:q} \
                 --output {output.cells:q} --metrics {output.metrics:q} \
                 {params.r1_args} --demux-binary {input.binary:q} --threads {threads} >> {log:q} 2>&1; then
                 cat {output.metrics:q} >> {log:q}
@@ -861,7 +862,7 @@ if PROTOCOL_POLICY.name == "droplet":
             source {JOB_RUNTIME:q}
             dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
             export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
-            python -m dna_pipeline index-demux-fastq {params.r1_args} {params.r2_args} \
+            {RULE_PYTHON:q} -m dna_pipeline index-demux-fastq {params.r1_args} {params.r2_args} \
                 --output {output.parts:q} --threads {threads} >> {log:q} 2>&1
             """
 
@@ -900,7 +901,7 @@ if PROTOCOL_POLICY.name == "droplet":
                 {params.scratch_cell:q} {resources.disk_mb} {PROJECT_DIR:q} >> {log:q} 2>&1
             dna_pipeline_install_scratch_cleanup
             dna_pipeline_log_scratch >> {log:q} 2>&1
-            python -m dna_pipeline demux-chunk --index-dir {params.index_dir:q} --chunk {wildcards.chunk:q} \
+            {RULE_PYTHON:q} -m dna_pipeline demux-chunk --index-dir {params.index_dir:q} --chunk {wildcards.chunk:q} \
                 --binary {input.binary:q} --barcode-map {input.barcode_map:q} \
                 --sample={params.sample_name:q} --scratch "$TMPDIR" \
                 --pack {output.pack:q} --metadata {output.metadata:q} --threads {threads} >> {log:q} 2>&1
@@ -1077,7 +1078,7 @@ checkpoint demux:
               "$@"
         }}
         if [[ {params.pipeline_mode:q} == droplet ]]; then
-            python -m dna_pipeline merge-demux-chunks \
+            {RULE_PYTHON:q} -m dna_pipeline merge-demux-chunks \
                 --index-dir {params.index_dir:q} --packs-dir {params.packs_dir:q} \
                 --dna-dir "$dna_tmp" --report "$report_tmp" \
                 --threshold {params.min_matched_read_pairs} --threads {threads} >> {log:q} 2>&1
@@ -1085,7 +1086,7 @@ checkpoint demux:
             run_demux >> {log:q} 2>&1
         fi
 
-        python -m dna_pipeline write-demux-metadata {params.calling_args} -- \
+        {RULE_PYTHON:q} -m dna_pipeline write-demux-metadata {params.calling_args} -- \
             "$report_tmp" "$mqc_tmp" "$manifest_tmp" "$dna_final" "$rna_final" \
             {params.pipeline_mode:q} {params.route_id:q} {params.downstream_dna:q} \
             {params.raw_sample:q} {input.cell_manifest:q} >> {log:q} 2>&1
@@ -1117,7 +1118,7 @@ checkpoint demux:
         mv "$mqc_tmp" {output.json_mqc:q}
         mv "$manifest_tmp" {output.manifest:q}
 
-        python -m dna_pipeline write-demux-completion \
+        {RULE_PYTHON:q} -m dna_pipeline write-demux-completion \
             "$completion_tmp" \
             --run-id={wildcards.sample:q} \
             --project-sample-id={params.sample_name:q} \
@@ -1160,7 +1161,7 @@ if PROTOCOL_POLICY.requires_rna_barcode:
             set -euo pipefail
             export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
             mkdir -p "$(dirname {output.marker:q})" "$(dirname {log:q})"
-            python -m dna_pipeline collect-rna-fastq \
+            {RULE_PYTHON:q} -m dna_pipeline collect-rna-fastq \
                 --manifest {input.manifest:q} \
                 --intermediate-dir {params.intermediate_dir:q} \
                 --marker {output.marker:q} \
@@ -1329,13 +1330,13 @@ if METHYLATION_BACKEND == "biscuit":
             {params.samtools:q} quickcheck -v "$tmp_bam" >> {log.main:q} 2>&1
             {params.samtools:q} index -@ "$sort_extra_threads" "$tmp_bam" >> {log.sort:q} 2>&1
 
-            python -m dna_pipeline write-dupsifter-qc \
+            {RULE_PYTHON:q} -m dna_pipeline write-dupsifter-qc \
                 "$tmp_stat" "$tmp_mqc" \
                 --sample={wildcards.demux_sample:q} \
                 --metadata {params.dupsifter_metadata:q} >> {log.main:q} 2>&1
 
             echo "INFO: stage=publish status=START" >&2
-            python -m dna_pipeline atomic-publish \
+            {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
                 --samtools {params.samtools:q} \
                 --bam-destination {output.bam:q} \
                 --commit-last {output.bam:q} \
@@ -1475,7 +1476,7 @@ if METHYLATION_BACKEND == "biscuit":
                 {params.samtools:q} quickcheck -v "$tmp_bam" >> {log.filter:q} 2>&1
                 {params.samtools:q} index "$tmp_bam" >> {log.filter:q} 2>&1
 
-                python -m dna_pipeline atomic-publish \
+                {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
                     --samtools {params.samtools:q} \
                     --bam-destination {output.dna:q} \
                     --commit-last {output.dna:q} \
@@ -1696,7 +1697,7 @@ if METHYLATION_BACKEND == "biscuit":
                 fi
                 {params.samtools:q} quickcheck -v "$tmp_bam" >> {log:q} 2>&1
                 {params.samtools:q} index "$tmp_bam" >> {log:q} 2>&1
-                python -m dna_pipeline atomic-publish \
+                {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
                     --samtools {params.samtools:q} \
                     --bam-destination {output.rna_bam:q} \
                     --commit-last {output.rna_bam:q} \
@@ -1827,7 +1828,7 @@ if METHYLATION_BACKEND == "biscuit":
                     dna_pipeline_emit_canonical_cpg {params.zstd:q} 0 "$tmp_cpg" {input.vcf:q}
             fi
             {params.zstd:q} -q -t "$tmp_cpg" >> {log:q} 2>&1
-            python -m dna_pipeline atomic-publish \
+            {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
                 --commit-last {output.cpg:q} \
                 --file "$tmp_cpg" {output.cpg:q} \
                 >> {log:q} 2>&1
@@ -2156,9 +2157,9 @@ elif METHYLATION_BACKEND == "rastair":
             {SAMTOOLS:q} markdup -S -s -@ "$io_threads" -T "$tmpdir/markdup" "$tmpdir/sorted.bam" "$tmpdir/marked.bam"
             rm -f -- "$tmpdir/sorted.bam"
             {SAMTOOLS:q} index -@ "$io_threads" "$tmpdir/marked.bam"
-            {RASTAIR_PYTHON:q} -m dna_pipeline taps-alignment-qc --bam "$tmpdir/marked.bam" \
+            {RULE_PYTHON:q} -m dna_pipeline taps-alignment-qc --bam "$tmpdir/marked.bam" \
                 --samtools {SAMTOOLS:q} --scratch "$tmpdir" --sample={wildcards.demux_sample:q} --output "$tmpdir/qc.json"
-            python -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
+            {RULE_PYTHON:q} -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
                 --bam-destination {output.bam:q} --samtools {SAMTOOLS:q} \
                 --file "$tmpdir/cutadapt.json" {output.report:q} \
                 --file "$tmpdir/marked.bam" {output.bam:q} --file "$tmpdir/marked.bam.bai" {output.bai:q} \
@@ -2207,11 +2208,11 @@ elif METHYLATION_BACKEND == "rastair":
                 -q {TAPS_MIN_MAPQ} -Q {TAPS_MIN_BASEQ} -f {TAPS_INCLUDE_FLAGS} -F {TAPS_EXCLUDE_FLAGS} \
                 --cpgs-only --all --m-min-depth 1 --nOT 0,0,0,0 --nOB 0,0,0,0 \
                 --bed "$tmpdir/native.bed" {input.bam:q}
-            {RASTAIR_PYTHON:q} -m dna_pipeline rastair-cpg --bed "$tmpdir/native.bed" --reference {input.reference:q} \
+            {RULE_PYTHON:q} -m dna_pipeline rastair-cpg --bed "$tmpdir/native.bed" --reference {input.reference:q} \
                 --alignment-qc {input.qc:q} --output-qc "$tmpdir/qc.json" | \
                 dna_pipeline_emit_canonical_cpg {ZSTD:q} 0 "$tmpdir/cpg.tsv.zst" "$tmpdir/native.bed"
             {ZSTD:q} -q -t "$tmpdir/cpg.tsv.zst"
-            python -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
+            {RULE_PYTHON:q} -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
                 --file "$tmpdir/cpg.tsv.zst" {output.cpg:q} --file "$tmpdir/qc.json" {output.qc:q}
             dna_pipeline_release_scratch
             """
@@ -2266,6 +2267,7 @@ else:
             seed_length = BISMARK_SEED_LENGTH,
             effort_d = BISMARK_EFFORT_D,
             reseed_r = BISMARK_RESEED_R,
+            max_insert = BISMARK_MAX_INSERT,
             samtools = SAMTOOLS,
             local_tmp = NODE_TMPDIR,
             scratch_namespace = SCRATCH_NAMESPACE,
@@ -2303,12 +2305,13 @@ else:
             {params.bismark:q} align \
                 --genome "$(dirname {input.bismark_genome:q})" \
                 --path_to_bowtie2 {params.bowtie2_dir:q} \
-                --basename {wildcards.demux_sample:q} \
+                --basename={wildcards.demux_sample:q} \
                 --output_dir "$out" --temp_dir "$tmpdir" \
                 "$@" {params.alignment_flag} {params.library_flag} {params.local_alignment_flag} \
                 --score_min {params.score_min:q} \
                 --seedmms {params.seed_mismatches} --seedlen {params.seed_length} \
                 -D {params.effort_d} -R {params.reseed_r} \
+                --maxins {params.max_insert} \
                 -1 "$r1" -2 "$r2" >> {log:q} 2>&1
             align_bam=$(dna_pipeline_find_single_output "$out" --exclude-glob '*deduplicated*' '*.bam')
             align_report=$(dna_pipeline_find_single_output "$out" '*PE_report.txt' '*SE_report.txt')
@@ -2319,17 +2322,17 @@ else:
             if [[ {params.protocol:q} == droplet ]]; then
                 final_bam="$out/droplet.deduplicated.bam"
                 dedup_report="$out/droplet.umi_dedup.json"
-                python -m dna_pipeline dedup-droplet-bam --bam "$align_bam" --output "$final_bam" \
+                {RULE_PYTHON:q} -m dna_pipeline dedup-droplet-bam --bam "$align_bam" --output "$final_bam" \
                     --qc "$dedup_report" --sample={wildcards.demux_sample:q} --scratch "$tmpdir" --umi-tools {params.umi_tools:q} \
                     --threads "$dedup_threads" >> {log:q} 2>&1
             else
-                {params.bismark:q} dedup --bam -p --parallel "$dedup_threads" --output_dir "$out" -o {wildcards.demux_sample:q} "$align_bam" >> {log:q} 2>&1
+                {params.bismark:q} dedup --bam -p --parallel "$dedup_threads" --output_dir "$out" --outfile={wildcards.demux_sample:q} "$align_bam" >> {log:q} 2>&1
                 final_bam=$(dna_pipeline_find_single_output "$out" '*.deduplicated.bam')
                 dedup_report=$(dna_pipeline_find_single_output "$out" '*deduplication_report.txt')
             fi
             test -s "$dedup_report"
             {params.samtools:q} quickcheck -v "$final_bam" >> {log:q} 2>&1
-            python -m dna_pipeline atomic-publish \
+            {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
                 --samtools {params.samtools:q} \
                 --bam-destination {output.bam:q} \
                 --commit-last {output.bam:q} \
@@ -2441,7 +2444,7 @@ else:
             fi
             {params.samtools:q} quickcheck -v "$tmp/processed.bam" >> {log:q} 2>&1
             export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
-            python -m dna_pipeline write-filter-summary \
+            {RULE_PYTHON:q} -m dna_pipeline write-filter-summary \
                 --sample={wildcards.demux_sample:q} \
                 --candidate-pairs "$candidate_pairs" --removed-pairs "$removed_pairs" \
                 --excluded-pairs "$excluded_pairs" \
@@ -2451,7 +2454,7 @@ else:
                 --summary-path "$tmp/summary.json" --multiqc-path "$tmp/mqc.json" >> {log:q} 2>&1
 
             if {params.publish_removed}; then
-                python -m dna_pipeline atomic-publish \
+                {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
                     --samtools {params.samtools:q} \
                     --bam-destination {output.bam:q} \
                     --commit-last {output.bam:q} \
@@ -2461,7 +2464,7 @@ else:
                     --file "$tmp/processed.bam" {output.bam:q} \
                     >> {log:q} 2>&1
             else
-                python -m dna_pipeline atomic-publish \
+                {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
                     --samtools {params.samtools:q} \
                     --bam-destination {output.bam:q} \
                     --commit-last {output.bam:q} \
@@ -2576,10 +2579,12 @@ else:
 
             echo "INFO: stage=bismark_extract allocated_threads={threads} parallel=1" >> {log:q}
 
+            extract_bam="$tmp/cell_"{wildcards.demux_sample:q}".processed.bam"
+            ln -s {input.bam:q} "$extract_bam"
             {params.bismark:q} extract \
                 --gzip --bedGraph --comprehensive --parallel 1 \
                 --output_dir "$out" \
-                {input.bam:q} >> {log:q} 2>&1
+                "$extract_bam" >> {log:q} 2>&1
             cov=$(dna_pipeline_find_single_output "$out" '*.bismark.cov.gz')
             extract_report=$(dna_pipeline_find_single_output "$out" '*splitting_report.txt')
             mbias=$(dna_pipeline_find_single_output "$out" '*M-bias.txt')
@@ -2587,7 +2592,7 @@ else:
             test -s "$extract_report"
             test -s "$mbias"
 
-            python -m dna_pipeline atomic-publish \
+            {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
                 --commit-last {output.cov:q} \
                 --file "$extract_report" {output.extract_report:q} \
                 --file "$mbias" {output.mbias:q} \
@@ -2640,7 +2645,7 @@ else:
             {params.gzip:q} -dc {input.cov:q} | \
                 dna_pipeline_emit_canonical_cpg {params.zstd:q} -1 "$tmp_cpg" {input.cov:q}
             {params.zstd:q} -q -t "$tmp_cpg"
-            python -m dna_pipeline atomic-publish \
+            {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
                 --commit-last {output.cpg:q} \
                 --file "$tmp_cpg" {output.cpg:q} \
                 >> {log:q} 2>&1
@@ -2872,7 +2877,7 @@ rule final_sample_manifest:
         set -euo pipefail
         export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
         mkdir -p "$(dirname {output.manifest:q})" "$(dirname {log:q})"
-        python -m dna_pipeline write-sample-manifest \
+        {RULE_PYTHON:q} -m dna_pipeline write-sample-manifest \
             {params.initial_manifest:q} \
             {params.intermediate:q} \
             {params.staged_results:q} \
@@ -2913,7 +2918,7 @@ rule delivery_ready:
         set -euo pipefail
         export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
         mkdir -p "$(dirname {output.ready:q})" "$(dirname {log:q})"
-        python -m dna_pipeline delivery-ready \
+        {RULE_PYTHON:q} -m dna_pipeline delivery-ready \
             --ready {output.ready:q} \
             --staged-results {params.staged_results:q} \
             --run-snapshot {params.run_snapshot:q} > {log:q} 2>&1

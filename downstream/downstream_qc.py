@@ -115,6 +115,21 @@ class SealedQCContext:
     cpg_representation: str
     methylation_backend: str
     output_inventory: Mapping[str, Mapping[str, object]]
+    marker_state: tuple[int, ...]
+
+    def assert_current(self) -> None:
+        """确认公开输入仍属加载时的交付；发布失效或替换 marker 后必须重新加载。"""
+        try:
+            current = _delivery_marker_state(self.run_manifest_path)
+        except OSError as exc:
+            raise ValueError("Sealed delivery changed; rerun downstream from the current delivery") from exc
+        if current != self.marker_state:
+            raise ValueError("Sealed delivery changed; rerun downstream from the current delivery")
+
+
+def _delivery_marker_state(path: Path) -> tuple[int, ...]:
+    stat = path.lstat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
 def _read_tsv(path: Path) -> tuple[list[dict[str, str]], list[str]]:
@@ -194,6 +209,7 @@ def load_sealed_qc_context(
     """加载完整交付及其不可变的 config/reference 契约。"""
     project = Path(project_dir).expanduser().resolve()
     manifest_path = project / "03_results" / "run_manifest.json"
+    marker_state = _delivery_marker_state(manifest_path)
     manifest = load_run_manifest(
         manifest_path,
         validate_outputs=True,
@@ -269,7 +285,7 @@ def load_sealed_qc_context(
     output_inventory = _safe_inventory(manifest.get("outputs"))
     if "QC_Results/sample_manifest.tsv" not in output_inventory:
         raise ValueError("Sealed delivery inventory omits QC_Results/sample_manifest.tsv")
-    return SealedQCContext(
+    context = SealedQCContext(
         project_dir=project,
         run_manifest_path=manifest_path,
         run_manifest=manifest,
@@ -287,7 +303,10 @@ def load_sealed_qc_context(
         cpg_representation=cpg_representation,
         methylation_backend=methylation_backend,
         output_inventory=output_inventory,
+        marker_state=marker_state,
     )
+    context.assert_current()
+    return context
 
 
 def _inventory_record_for_project_file(
@@ -350,6 +369,7 @@ def read_active_cells(
     project = Path(project_dir).expanduser().resolve()
     if project != context.project_dir:
         raise ValueError("project_dir and sealed_context refer to different projects")
+    context.assert_current()
     manifest = project / FINAL_MANIFEST
     _inventory_record_for_project_file(
         context, FINAL_MANIFEST, label="final sample manifest"
@@ -511,6 +531,7 @@ def read_active_cells(
 
     if not active:
         raise ValueError("Final sample manifest contains no completed DNA cells")
+    context.assert_current()
     return active
 
 
@@ -578,6 +599,7 @@ def source_identity(
     project = Path(project_dir).expanduser().resolve()
     if project != sealed.project_dir:
         raise ValueError("project_dir and sealed_context refer to different projects")
+    sealed.assert_current()
 
     output_records: dict[str, Mapping[str, object]] = {
         "QC_Results/sample_manifest.tsv": sealed.output_inventory["QC_Results/sample_manifest.tsv"]
@@ -616,6 +638,7 @@ def source_identity(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     payload["identity_sha256"] = hashlib.sha256(encoded).hexdigest()
+    sealed.assert_current()
     return payload
 
 
@@ -1321,11 +1344,11 @@ def load_or_create_raw_adata(
     reuse_existing: bool,
     expected_sample_ids: list[str],
     zero_mapped_sample_ids: set[str],
-    sealed_delivery_id: str,
-    sealed_snapshot_id: str,
+    sealed_context: SealedQCContext,
     cpg_output_identities: Mapping[str, Mapping[str, object]],
 ):
     """绑定 sealed inventory 复用 RawAdata 与空表集合，仅缓存失配时解码并创建导入链接。"""
+    sealed_context.assert_current()
     expected = [str(value) for value in expected_sample_ids]
     zero_mapped = {str(value) for value in zero_mapped_sample_ids}
     if len(expected) != len(set(expected)):
@@ -1335,8 +1358,8 @@ def load_or_create_raw_adata(
     if set(cpg_output_identities) != set(expected):
         raise ValueError("Sealed CpG inventory Sample_ID set differs from current manifest")
     for label, value in (
-        ("sealed_delivery_id", sealed_delivery_id),
-        ("sealed_snapshot_id", sealed_snapshot_id),
+        ("sealed_delivery_id", sealed_context.delivery_id),
+        ("sealed_snapshot_id", sealed_context.snapshot_id),
     ):
         if re.fullmatch(r"[0-9a-f]{64}", str(value)) is None:
             raise ValueError(f"{label} must be a 64-character content identity")
@@ -1371,8 +1394,8 @@ def load_or_create_raw_adata(
         "schema_version": RAW_ADATA_SCHEMA_VERSION,
         "algorithm_version": RAW_ADATA_ALGORITHM_VERSION,
         "algorithm_sha256": _algorithm_fingerprints()["raw"],
-        "delivery_id": str(sealed_delivery_id),
-        "snapshot_id": str(sealed_snapshot_id),
+        "delivery_id": sealed_context.delivery_id,
+        "snapshot_id": sealed_context.snapshot_id,
         "cpg_header": "snapatac2_import_values_0based",
         "empty_cpg_sentinel": f"{EMPTY_CPG_SENTINEL_CONTIG}:0:0:1",
         "sample_ids": sorted(expected),
@@ -1407,6 +1430,7 @@ def load_or_create_raw_adata(
                     "RawAdata Sample_ID set differs from current final manifest"
                 )
             if schema_matches:
+                sealed_context.assert_current()
                 validated = existing
                 existing = None
                 return validated, set(cached_empty)
@@ -1414,12 +1438,14 @@ def load_or_create_raw_adata(
                 "RawAdata does not match the current SnapATAC2 0-based four-column input schema"
             )
         except Exception as e:
+            sealed_context.assert_current()
             _log(f"读取现有 h5ad 失败，尝试重建: {e}", level="WARNING")
         finally:
             if existing is not None:
                 existing.close()
 
     empty_cpg = {sample_id for sample_id, path in sources.items() if _cpg_table_is_empty(path)}
+    sealed_context.assert_current()
     if zero_mapped - empty_cpg:
         raise ValueError("Zero-mapped cells must have an empty current CpG result")
     input_signature["empty_cpg_sample_ids"] = sorted(empty_cpg)
@@ -1477,6 +1503,7 @@ def load_or_create_raw_adata(
         snap_data.obs_names = new_names
         snap_data.close()
         snap_data = None
+        sealed_context.assert_current()
         _publish_raw_adata_generation(
             temporary, out_file, schema_file, input_signature
         )
@@ -2503,8 +2530,7 @@ def _run_pipeline_impl(
         reuse_existing=not recompute_raw_adata,
         expected_sample_ids=manifest_sample_ids,
         zero_mapped_sample_ids=zero_mapped_sample_ids,
-        sealed_delivery_id=sealed.delivery_id,
-        sealed_snapshot_id=sealed.snapshot_id,
+        sealed_context=sealed,
         cpg_output_identities=cpg_output_identities,
     )
     if raw_adata is not None:
@@ -2594,6 +2620,7 @@ def _run_pipeline_impl(
             return_composition=True,
             empty_cpg_sample_ids=empty_cpg_sample_ids,
         )
+        sealed.assert_current()
         _atomic_write_csv(df_qc, paths.methyl_stats_cache)
 
     dt = timer.stop("methyl_stats")
@@ -2725,6 +2752,7 @@ def _run_pipeline_impl(
         df_qc = _require_exact_sample_ids(
             df_qc, manifest_sample_ids, "Final QC output"
         )
+        sealed.assert_current()
         _atomic_write_csv(df_qc, paths.qc_info)
         _atomic_write_json(identity, paths.input_identity)
     dt = timer.stop("export")
