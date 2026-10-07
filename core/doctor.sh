@@ -218,7 +218,6 @@ BISCUIT_REQUIRED=(
 )
 
 BISMARK_RUNTIME_REQUIRED=(
-    bin/umi_tools
     bin/python
     bin/bismark
     bin/bowtie2
@@ -718,8 +717,7 @@ smoke_bismark() {
     local prefix="$1"
     prefix_has_tools "$prefix" "${BISMARK_REQUIRED[@]}" || return 1
     prefix_matches_native_platform "$prefix" || return 1
-    prefix_python_imports "$prefix" yaml pysam umi_tools rapidgzip || return 1
-    [[ "$(run_in_sanitized_environment "$prefix/bin" "$prefix/bin/umi_tools" --version)" == *"1.1.6"* ]] || return 1
+    prefix_python_imports "$prefix" yaml pysam rapidgzip || return 1
     run_in_sanitized_environment "$prefix/bin" "$prefix/bin/bismark" --version >/dev/null 2>&1 || return 1
     run_in_sanitized_environment "$prefix/bin" "$prefix/bin/bismark" prepare --help >/dev/null 2>&1 || return 1
     run_in_sanitized_environment "$prefix/bin" "$prefix/bin/bismark_genome_preparation" --help >/dev/null 2>&1 || return 1

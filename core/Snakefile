@@ -71,7 +71,7 @@ JOB_RUNTIME = _internal_helper("core/job_runtime.sh")
 config = finalize_project_config(config)
 PROTOCOL_POLICY = get_protocol_policy(config)
 DROPLET_CALLING_IDENTITY = hashlib.sha256((DROPLET_DESIGN_SHA256 + demux_source_revision(PIPELINE_ROOT / "core/demux_rs", count_only=True) + scientific_code_identity(("call_droplet_cells",))).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
-DROPLET_UMI_IDENTITY = scientific_code_identity(("deduplicate_droplet_bam",)) if PROTOCOL_POLICY.name == "droplet" else ""
+DROPLET_UMI_IDENTITY = scientific_code_identity(("call_droplet_cpg",)) if PROTOCOL_POLICY.name == "droplet" else ""
 BACKEND_POLICY = get_backend(config)
 METHYLATION_BACKEND = BACKEND_POLICY.name
 
@@ -2219,7 +2219,7 @@ elif METHYLATION_BACKEND == "rastair":
 
 else:
     rule bismark_align_dedup:
-        """在单个 scratch 作业内完成 Cutadapt、Bismark 比对与 paired-end 去重。"""
+        """在单个 scratch 作业内完成 Cutadapt 与比对；孔板执行 paired-end 去重，Droplet 保留全部 pairs。"""
         group: "bismark_cell" if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else None
         input:
             r1 = lambda wc: current_demux_fastq(wc.demux_sample, 1),
@@ -2233,7 +2233,7 @@ else:
             report = CELL_PATH_PATTERN.cutadapt_json,
             bam = temp(CELL_PATH_PATTERN.post_alignment_bam),
             align_report = CELL_PATH_PATTERN.bismark_align_report,
-            dedup_report = CELL_PATH_PATTERN.droplet_umi_qc if PROTOCOL_POLICY.name == "droplet" else CELL_PATH_PATTERN.bismark_dedup_report
+            dedup_report = [] if PROTOCOL_POLICY.name == "droplet" else CELL_PATH_PATTERN.bismark_dedup_report
         log:
             LOGS_DIR / "rules/bismark/{demux_sample}_align.log"
         threads: BISMARK_ALIGN_THREADS
@@ -2255,8 +2255,6 @@ else:
             adapter_r2_spec = lambda wc: CUTADAPT_ADAPTER_R2_SPEC,
             bismark = BISMARK,
             protocol = PROTOCOL_POLICY.name,
-            umi_tools = str(Path(BISMARK).parent / "umi_tools"),
-            umi_identity = DROPLET_UMI_IDENTITY,
             bowtie2_dir = str(Path(BOWTIE2).parent),
             alignment_instances = BISMARK_ALIGNMENT_INSTANCES,
             library_flag = BISMARK_LIBRARY_FLAG,
@@ -2318,19 +2316,17 @@ else:
             {params.samtools:q} quickcheck -v "$align_bam" >> {log:q} 2>&1
             test -s "$align_report"
 
-            dedup_threads=$(( {threads} < 4 ? {threads} : 4 ))
+            set --
             if [[ {params.protocol:q} == droplet ]]; then
-                final_bam="$out/droplet.deduplicated.bam"
-                dedup_report="$out/droplet.umi_dedup.json"
-                {RULE_PYTHON:q} -m dna_pipeline dedup-droplet-bam --bam "$align_bam" --output "$final_bam" \
-                    --qc "$dedup_report" --sample={wildcards.demux_sample:q} --scratch "$tmpdir" --umi-tools {params.umi_tools:q} \
-                    --threads "$dedup_threads" >> {log:q} 2>&1
+                final_bam="$align_bam"
             else
+                dedup_threads=$(( {threads} < 4 ? {threads} : 4 ))
                 {params.bismark:q} dedup --bam -p --parallel "$dedup_threads" --output_dir "$out" --outfile={wildcards.demux_sample:q} "$align_bam" >> {log:q} 2>&1
                 final_bam=$(dna_pipeline_find_single_output "$out" '*.deduplicated.bam')
                 dedup_report=$(dna_pipeline_find_single_output "$out" '*deduplication_report.txt')
+                test -s "$dedup_report"
+                set -- --file "$dedup_report" {output.dedup_report:q}
             fi
-            test -s "$dedup_report"
             {params.samtools:q} quickcheck -v "$final_bam" >> {log:q} 2>&1
             {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
                 --samtools {params.samtools:q} \
@@ -2338,7 +2334,7 @@ else:
                 --commit-last {output.bam:q} \
                 --file "$cj" {output.report:q} \
                 --file "$align_report" {output.align_report:q} \
-                --file "$dedup_report" {output.dedup_report:q} \
+                "$@" \
                 --file "$final_bam" {output.bam:q} \
                 >> {log:q} 2>&1
             dna_pipeline_release_scratch
@@ -2522,14 +2518,16 @@ else:
                 trap - EXIT
                 """
     rule bismark_extract:
-        """直接在 pair-adjacent 过滤 BAM 上运行 Bismark methylation extraction，产出合并 cov、M-bias 与报告。"""
+        """从过滤 BAM 调用甲基化；Droplet 汇集逐胞嘧啶 UMI 共识，孔板使用原生 extraction。"""
         group: "bismark_cell" if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else None
         input:
             demux_completion = current_demux_completion,
-            bam = BISMARK_ANALYSIS_BAM
+            bam = BISMARK_ANALYSIS_BAM,
+            reference = REFERENCE_GENOME if PROTOCOL_POLICY.name == "droplet" else [],
+            reference_fai = str(REFERENCE_FAI) if PROTOCOL_POLICY.name == "droplet" else []
         output:
-            cov = temp(CELL_PATH_PATTERN.bismark_cov),
-            extract_report = CELL_PATH_PATTERN.bismark_extract_report,
+            cov = temp(CELL_PATH_PATTERN.droplet_umi_cov if PROTOCOL_POLICY.name == "droplet" else CELL_PATH_PATTERN.bismark_cov),
+            extract_report = CELL_PATH_PATTERN.droplet_umi_qc if PROTOCOL_POLICY.name == "droplet" else CELL_PATH_PATTERN.bismark_extract_report,
             mbias = CELL_PATH_PATTERN.bismark_mbias
         log:
             LOGS_DIR / "rules/bismark/{demux_sample}_extract.log"
@@ -2547,6 +2545,8 @@ else:
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
             scientific_identity = scientific_code_identity((), ('dna_pipeline_find_single_output',)),
+            umi_identity = DROPLET_UMI_IDENTITY,
+            protocol = PROTOCOL_POLICY.name,
             bismark = BISMARK,
             samtools = SAMTOOLS,
             local_tmp = NODE_TMPDIR,
@@ -2577,17 +2577,25 @@ else:
 
             {params.samtools:q} quickcheck -v {input.bam:q} >> {log:q} 2>&1
 
-            echo "INFO: stage=bismark_extract allocated_threads={threads} parallel=1" >> {log:q}
-
-            extract_bam="$tmp/cell_"{wildcards.demux_sample:q}".processed.bam"
-            ln -s {input.bam:q} "$extract_bam"
-            {params.bismark:q} extract \
-                --gzip --bedGraph --comprehensive --parallel 1 \
-                --output_dir "$out" \
-                "$extract_bam" >> {log:q} 2>&1
-            cov=$(dna_pipeline_find_single_output "$out" '*.bismark.cov.gz')
-            extract_report=$(dna_pipeline_find_single_output "$out" '*splitting_report.txt')
-            mbias=$(dna_pipeline_find_single_output "$out" '*M-bias.txt')
+            if [[ {params.protocol:q} == droplet ]]; then
+                cov="$out/umi.cov.gz"; extract_report="$out/umi.json"; mbias="$out/M-bias.txt"
+                {RULE_PYTHON:q} -m dna_pipeline call-droplet-cpg \
+                    --bam {input.bam:q} --reference {input.reference:q} \
+                    --coverage "$cov" --qc "$extract_report" --mbias "$mbias" \
+                    --sample={wildcards.demux_sample:q} --scratch "$tmp" \
+                    --samtools {params.samtools:q} --threads {threads} >> {log:q} 2>&1
+            else
+                echo "INFO: stage=bismark_extract allocated_threads={threads} parallel=1" >> {log:q}
+                extract_bam="$tmp/cell_"{wildcards.demux_sample:q}".processed.bam"
+                ln -s {input.bam:q} "$extract_bam"
+                {params.bismark:q} extract \
+                    --gzip --bedGraph --comprehensive --parallel 1 \
+                    --output_dir "$out" \
+                    "$extract_bam" >> {log:q} 2>&1
+                cov=$(dna_pipeline_find_single_output "$out" '*.bismark.cov.gz')
+                extract_report=$(dna_pipeline_find_single_output "$out" '*splitting_report.txt')
+                mbias=$(dna_pipeline_find_single_output "$out" '*M-bias.txt')
+            fi
             {GZIP:q} -t "$cov" >> {log:q} 2>&1
             test -s "$extract_report"
             test -s "$mbias"
@@ -2696,7 +2704,7 @@ def current_multiqc_source_inputs(wildcards):
             sources.extend(
                 [
                     str(paths.bismark_align_report),
-                    str(paths.bismark_extract_report),
+                    str(paths.droplet_umi_qc if PROTOCOL_POLICY.name == "droplet" else paths.bismark_extract_report),
                     str(paths.bismark_mbias),
                 ]
             )
@@ -2730,12 +2738,13 @@ def current_final_manifest_qc_inputs(wildcards):
         else:
             inputs.extend(
                 [
-                    str(paths.droplet_umi_qc if PROTOCOL_POLICY.name == "droplet" else paths.bismark_dedup_report),
                     str(paths.bismark_align_report),
-                    str(paths.bismark_extract_report),
+                    str(paths.droplet_umi_qc if PROTOCOL_POLICY.name == "droplet" else paths.bismark_extract_report),
                     str(paths.bismark_mbias),
                 ]
             )
+            if PROTOCOL_POLICY.name != "droplet":
+                inputs.append(str(paths.bismark_dedup_report))
     return inputs
 
 

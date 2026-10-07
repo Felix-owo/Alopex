@@ -46,7 +46,6 @@ bismark:
   - pip
   - pip:
     - rapidgzip==0.16.0
-  - umi_tools=1.1.6
   - bowtie2>=2.5,<3
   - cutadapt>=5.2,<6
   - samtools>=1.24,<1.25

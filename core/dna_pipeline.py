@@ -1312,7 +1312,11 @@ class CellOutputPaths:
 
     @property
     def droplet_umi_qc(self) -> Path:
-        return self.bismark_dir / f"{self.sample_id}.umi_dedup.json"
+        return self.bismark_dir / f"{self.sample_id}.umi_consensus_mqc.json"
+
+    @property
+    def droplet_umi_cov(self) -> Path:
+        return self.bismark_dir / f"{self.sample_id}.umi.cov.gz"
 
     @property
     def bismark_extract_report(self) -> Path:
@@ -1574,88 +1578,229 @@ def _read_filter_summary(path: Path, sample: str) -> dict[str, Any]:
     return payload
 
 
-DROPLET_DEDUP_POLICY = "umi_tools_directional_physical_r1_ignore_tlen"
+DROPLET_DEDUP_POLICY = "per_cytosine_umi_consensus_hamming1"
+DROPLET_MIN_MAPQ = 10
+DROPLET_MIN_BASEQ = 20
 
 
-def deduplicate_droplet_bam(bam: str | Path, output: str | Path, qc: str | Path, *, sample: str, scratch: str | Path, umi_tools: str, threads: int = 1) -> None:
-    """按物理 R1 与 UMI 去重，并恢复 Bismark flags、配对顺序及甲基化标签。"""
+def droplet_umi_consensus(groups: Mapping[str, Sequence[int]]) -> tuple[int, int, int, int]:
+    """逐位点按原始丰度合并 Hamming-1 UMI；多数碱基优先，平票比较平均质量，仍平票则不调用。"""
+    counts = {umi: int(v[0]) + int(v[1]) for umi, v in groups.items()}
+    remaining = {umi: list(v) for umi, v in groups.items()}
+    merged = ambiguous = methyl = unmethyl = 0
+    for umi in sorted(counts, key=lambda key: (-counts[key], key)):
+        if umi not in remaining:
+            continue
+        value = remaining[umi]
+        if counts[umi] > 1 and len(remaining) > 1:
+            if len(remaining) < 48:
+                neighbors = [key for key in remaining if counts[key] < counts[umi]
+                             and sum(a != b for a, b in zip(umi, key)) == 1]
+                neighbors.sort(key=lambda key: next((i, "ACGTN".index(b)) for i, (a, b) in enumerate(zip(umi, key)) if a != b))
+            else:
+                neighbors = [umi[:i] + alternate + umi[i + 1:] for i, base in enumerate(umi)
+                             for alternate in "ACGTN" if alternate != base]
+            for neighbor in neighbors:
+                if neighbor in remaining and counts[neighbor] < counts[umi]:
+                    other = remaining.pop(neighbor)
+                    value = [a + b for a, b in zip(value, other)]
+                    merged += 1
+        remaining.pop(umi)
+        m, u, qm, qu = value
+        if m > u or (m == u and qm > qu):
+            methyl += 1
+        elif u > m or (m == u and qu > qm):
+            unmethyl += 1
+        else:
+            ambiguous += 1
+    return methyl, unmethyl, merged, ambiguous
+
+
+def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Path,
+                     qc: str | Path, mbias: str | Path, *, sample: str,
+                     scratch: str | Path, samtools: str, threads: int = 1) -> None:
+    """保留过滤 BAM 的全部 pairs，按参考胞嘧啶/UMI 生成分子共识 coverage、QC 及 read-level M-bias。"""
     import pysam
-    from importlib.metadata import version
 
     if SAMPLE_ID_RE.fullmatch(sample) is None:
-        raise ValueError("Invalid Droplet UMI sample identity")
-    if version("umi_tools") != "1.1.6":
-        raise ValueError("Droplet dedup requires umi_tools 1.1.6")
-    root = Path(tempfile.mkdtemp(prefix="droplet_umi_", dir=scratch))
-    total = kept = umi_n = 0
-    seen = set()
+        raise ValueError("Invalid Droplet sample identity")
+    root = Path(tempfile.mkdtemp(prefix="droplet_consensus_", dir=scratch))
+    proc = None
     try:
-        normalized = root / "normalized.bam"
-        with pysam.AlignmentFile(str(bam), "rb") as source, pysam.AlignmentFile(str(normalized), "wb", template=source) as target:
+        converted = root / "conversion.bam"
+        ordered = root / "coordinate.bam"
+        pairs = umi_n = 0
+        seen = set()
+        checked_contigs = set()
+        with pysam.FastaFile(str(reference)) as fasta:
+            reference_lengths = dict(zip(fasta.references, fasta.lengths))
+        with pysam.AlignmentFile(str(bam), "rb") as source, pysam.AlignmentFile(str(converted), "wb", template=source) as target:
             iterator = iter(source)
-            for r1 in iterator:
-                r2 = next(iterator, None)
-                if r2 is None or r1.query_name != r2.query_name or r1.query_name in seen:
-                    raise ValueError("Droplet BAM requires unique, adjacent complete physical read pairs")
-                seen.add(r1.query_name)
-                if (r1.flag, r2.flag) not in {(99, 147), (163, 83), (147, 99), (83, 163)}:
+            for first in iterator:
+                second = next(iterator, None)
+                if second is None or first.query_name != second.query_name or first.query_name in seen:
+                    raise ValueError("Droplet calling requires unique, adjacent complete read pairs")
+                seen.add(first.query_name)
+                if (first.flag, second.flag) not in {(99, 147), (163, 83), (147, 99), (83, 163)}:
                     raise ValueError("Unexpected Bismark paired flags")
-                umi = r1.query_name.rsplit(":", 1)[-1]
+                umi = first.query_name.rsplit(":", 1)[-1]
                 if not re.fullmatch(r"[ACGTN]{12}", umi):
-                    raise ValueError(f"Droplet QNAME must end with a 12 bp UMI: {r1.query_name!r}")
-                for index, record in enumerate((r1, r2)):
-                    if any(not record.has_tag(tag) for tag in ("XM", "XR", "XG")) or record.has_tag("ZF"):
-                        raise ValueError("Bismark methylation tags missing or reserved ZF tag present")
-                    record.set_tag("ZF", record.flag, value_type="i")
-                    record.flag = (record.flag & ~(64 | 128)) | (64 if index == 0 else 128)
+                    raise ValueError("Droplet QNAME must end with a 12 bp UMI")
+                for mate, record in enumerate((first, second), 1):
+                    contig = record.reference_name
+                    if contig not in checked_contigs:
+                        if contig not in reference_lengths or source.get_reference_length(contig) != reference_lengths[contig]:
+                            raise ValueError(f"Droplet BAM/reference contig mismatch: {contig}")
+                        checked_contigs.add(contig)
+                    if any(not record.has_tag(tag) for tag in ("XM", "XR", "XG")):
+                        raise ValueError("Bismark methylation tags missing")
+                    if record.has_tag("UR") and record.get_tag("UR") != umi:
+                        raise ValueError("Droplet UR tag disagrees with QNAME")
+                    conversion = record.get_tag("XG")
+                    if conversion not in {"CT", "GA"}:
+                        raise ValueError("Invalid Bismark genome conversion")
                     record.set_tag("UR", umi, value_type="Z")
+                    record.set_tag("YI", f"{mate}{'R' if record.is_reverse else 'F'}", value_type="Z")
+                    record.is_reverse = conversion == "GA"
+                    record.mate_is_reverse = conversion == "GA"
                     target.write(record)
-                total += 1
+                pairs += 1
                 umi_n += int("N" in umi)
         del seen
-        coordinate = root / "coordinate.bam"
-        selected = root / "selected.bam"
-        ordered = root / "ordered.bam"
-        pysam.sort("-@", str(max(1, threads)), "-o", str(coordinate), str(normalized))
-        pysam.index(str(coordinate))
-        if total:
-            subprocess.run([umi_tools, "dedup", "--stdin", str(coordinate), "--stdout", str(selected),
-                            "--paired", "--ignore-tlen", "--extract-umi-method", "tag", "--umi-tag", "UR",
-                            "--method", "directional", "--edit-distance-threshold", "1", "--random-seed", "1"], check=True)
-        else:
-            shutil.copyfile(coordinate, selected)
-        pysam.sort("-n", "-@", str(max(1, threads)), "-o", str(ordered), str(selected))
-        with pysam.AlignmentFile(str(ordered), "rb") as source, pysam.AlignmentFile(str(output), "wb", template=source) as target:
-            iterator = iter(source)
-            for r1 in iterator:
-                r2 = next(iterator, None)
-                if r2 is None or r1.query_name != r2.query_name or not r1.is_read1 or not r2.is_read2:
-                    raise ValueError("UMI dedup did not preserve complete physical pairs")
-                for record in (r1, r2):
-                    record.flag = record.get_tag("ZF")
-                    record.set_tag("ZF", None)
-                    target.write(record)
-                kept += 1
-        if kept > total:
-            raise ValueError("UMI pair accounting is inconsistent")
-        Path(qc).write_text(json.dumps({"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY,
-            "umi_tools_version": "1.1.6", "method": "directional", "edit_distance": 1, "random_seed": 1,
-            "input_pairs": total, "retained_pairs": kept, "removed_pairs": total - kept,
-            "umi_with_n_pairs": umi_n}, indent=2) + "\n")
+        subprocess.run([samtools, "sort", "-@", str(max(0, min(threads, 4) - 1)),
+                        "-m", "512M", "-T", str(root / "sort"), "-o", str(ordered), str(converted)], check=True)
+        converted.unlink()
+        contexts = {key: {"methyl": 0, "unmethyl": 0, "read_observations": 0,
+                          "umi_groups": 0, "merged_umis": 0, "ambiguous_umis": 0,
+                          "strand_sites": 0} for key in ("CpG", "CHG", "CHH")}
+        cycles: dict[tuple[str, str, int], list[int]] = {}
+        command = [samtools, "mpileup", "-Q", str(DROPLET_MIN_BASEQ), "-q", str(DROPLET_MIN_MAPQ),
+                   "-B", "-d", "0", "-f", str(reference), "--output-BP", "--output-extra", "RLEN,UR,YI",
+                   "--no-output-ins-mods", "--no-output-ins", "--no-output-ins",
+                   "--no-output-del", "--no-output-del", "--no-output-ends", str(ordered)]
+        with pysam.FastaFile(str(reference)) as fa, gzip.open(root / "coverage.gz", "wt") as handle:
+            proc = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, bufsize=1024 * 1024)
+            chrom = None
+            sequence = ""
+            for line in proc.stdout:
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) != 10:
+                    raise ValueError("Unexpected samtools mpileup columns")
+                if int(fields[3]) == 0:
+                    continue
+                base = fields[2].upper()
+                if base not in {"C", "G"}:
+                    continue
+                if chrom != fields[0]:
+                    chrom = fields[0]
+                    sequence = fa.fetch(chrom).upper()
+                pos = int(fields[1]) - 1
+                if not 0 <= pos < len(sequence) or sequence[pos] != base:
+                    raise ValueError("Droplet pileup coordinate disagrees with reference")
+                context_seq = sequence[pos:pos + 3] if base == "C" else sequence[max(0, pos - 2):pos + 1][::-1].translate(str.maketrans("ACGT", "TGCA"))
+                if context_seq.startswith("CG"):
+                    context = "CpG"
+                elif len(context_seq) == 3 and context_seq[1] in "ACT" and context_seq[2] in "ACGT":
+                    context = "CHG" if context_seq[2] == "G" else "CHH"
+                else:
+                    continue
+                bases, qualities = fields[4:6]
+                positions, lengths, umis, mates = (value.split(",") for value in fields[6:10])
+                if len({len(bases), len(qualities), len(positions), len(lengths), len(umis), len(mates), int(fields[3])}) != 1:
+                    raise ValueError(f"Unpaired mpileup observations at {chrom}:{pos + 1}")
+                methyl_base, unmethyl_base = (".", "T") if base == "C" else (",", "a")
+                groups: dict[str, list[int]] = {}
+                for observed, quality, position, length, umi, mate in zip(bases, qualities, positions, lengths, umis, mates):
+                    if observed not in (methyl_base, unmethyl_base):
+                        continue
+                    if not re.fullmatch(r"[ACGTN]{12}", umi) or mate not in {"1F", "1R", "2F", "2R"}:
+                        raise ValueError("Invalid Droplet pileup molecule identity")
+                    state = int(observed == unmethyl_base)
+                    values = groups.setdefault(umi, [0, 0, 0, 0])
+                    values[state] += 1
+                    values[state + 2] += ord(quality) - 33
+                    cycle = int(position) if mate[1] == "F" else int(length) - int(position) + 1
+                    if not 1 <= cycle <= int(length):
+                        raise ValueError("Invalid Droplet pileup read position")
+                    cycles.setdefault((context, mate[0], cycle), [0, 0])[state] += 1
+                if not groups:
+                    continue
+                m, u, merged, ambiguous = droplet_umi_consensus(groups)
+                stats = contexts[context]
+                stats["read_observations"] += sum(v[0] + v[1] for v in groups.values())
+                stats["umi_groups"] += len(groups)
+                stats["merged_umis"] += merged
+                stats["ambiguous_umis"] += ambiguous
+                stats["methyl"] += m
+                stats["unmethyl"] += u
+                stats["strand_sites"] += int(m + u > 0)
+                if context == "CpG" and m + u:
+                    handle.write(f"{chrom}\t{pos + 1}\t{pos + 1}\t{100 * m / (m + u):.8f}\t{m}\t{u}\n")
+            proc.stdout.close()
+            if proc.wait() != 0:
+                raise RuntimeError("Droplet samtools mpileup failed")
+            proc = None
+        with (root / "mbias.txt").open("w") as handle:
+            handle.write("Alopex Droplet read-level M-bias; MAPQ>=10, baseQ>=20, before UMI consensus\n\n")
+            for context in contexts:
+                for mate in ("1", "2"):
+                    handle.write(f"{context} context (R{mate})\n====================\nposition\tcount_methylated\tcount_unmethylated\t% methylation\tcoverage\n")
+                    for ctx, read, cycle in sorted(cycles):
+                        if ctx == context and read == mate:
+                            m, u = cycles[(ctx, read, cycle)]
+                            handle.write(f"{cycle}\t{m}\t{u}\t{100 * m / (m + u):.8f}\t{m + u}\n")
+                    handle.write("\n")
+        cpg = contexts["CpG"]
+        payload = {"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY,
+                   "min_mapq": DROPLET_MIN_MAPQ, "min_baseq": DROPLET_MIN_BASEQ,
+                   "metric_unit": "cytosine_umi_consensus", "processed_pairs": pairs,
+                   "umi_with_n_pairs": umi_n, "contexts": contexts,
+                   "id": "alopex_droplet_umi_consensus", "section_name": "Droplet UMI consensus",
+                   "description": "逐胞嘧啶 UMI 共识；read-level 观测及分子计数不等同 read-pair 去重率。M-bias 为质量过滤后、UMI 共识前的 read-level 统计。",
+                   "plot_type": "table", "data": {sample: {"CpG_read_observations": cpg["read_observations"],
+                       "CpG_UMI_observations": cpg["methyl"] + cpg["unmethyl"],
+                       "CpG_ambiguous_UMIs": cpg["ambiguous_umis"], "CpG_strand_sites": cpg["strand_sites"]}}}
+        (root / "qc.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        read_droplet_umi_qc(root / "qc.json", sample)
+        for name, target in (("coverage.gz", coverage), ("mbias.txt", mbias), ("qc.json", qc)):
+            os.replace(root / name, target)
     finally:
+        if proc is not None:
+            proc.stdout.close()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
         shutil.rmtree(root)
 
 
-def read_droplet_umi_qc(path: str | Path, sample: str) -> dict[str, int]:
-    """校验 UMI 去重参数与 pair 守恒，返回统一的去重计数。"""
-    data = _read_json(Path(path), "Droplet UMI QC")
-    for key, value in {"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY, "umi_tools_version": "1.1.6", "method": "directional", "edit_distance": 1, "random_seed": 1}.items():
+def read_droplet_umi_qc(path: str | Path, sample: str) -> dict[str, Any]:
+    """校验逐胞嘧啶 UMI 共识计数、单位与实际参数，禁止作为 read-pair 去重率解释。"""
+    data = _read_json(Path(path), "Droplet UMI consensus QC")
+    for key, value in {"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY,
+                       "min_mapq": DROPLET_MIN_MAPQ, "min_baseq": DROPLET_MIN_BASEQ,
+                       "metric_unit": "cytosine_umi_consensus"}.items():
         if data.get(key) != value:
             raise ValueError(f"Invalid Droplet UMI QC {key}: {path}")
-    numbers = {key: _integer(data.get(key), key, Path(path)) for key in ("input_pairs", "retained_pairs", "removed_pairs", "umi_with_n_pairs")}
-    if numbers["retained_pairs"] + numbers["removed_pairs"] != numbers["input_pairs"] or numbers["umi_with_n_pairs"] > numbers["input_pairs"]:
-        raise ValueError(f"Droplet UMI QC pair accounting mismatch: {path}")
-    return {"total": numbers["input_pairs"], "removed": numbers["removed_pairs"], "leftover": numbers["retained_pairs"]}
+    for key in ("processed_pairs", "umi_with_n_pairs"):
+        data[key] = _integer(data.get(key), key, Path(path))
+    if not 0 <= data["umi_with_n_pairs"] <= data["processed_pairs"]:
+        raise ValueError("Invalid Droplet UMI pair counts")
+    for context in ("CpG", "CHG", "CHH"):
+        values = data.get("contexts", {}).get(context, {})
+        for key in ("methyl", "unmethyl", "read_observations", "umi_groups", "merged_umis", "ambiguous_umis", "strand_sites"):
+            values[key] = _integer(values.get(key), key, Path(path))
+            if values[key] < 0:
+                raise ValueError("Negative Droplet UMI count")
+        called = values["methyl"] + values["unmethyl"]
+        if not (values["strand_sites"] <= called <= values["umi_groups"] <= values["read_observations"]):
+            raise ValueError("Droplet UMI observation accounting is inconsistent")
+        if values["umi_groups"] != called + values["merged_umis"] + values["ambiguous_umis"]:
+            raise ValueError("Droplet UMI consensus accounting does not close")
+    return data
 
 
 def build_metrics(
@@ -1691,7 +1836,8 @@ def build_metrics(
     discarded_pairs = int(alignment["discarded"])
     accepted_pairs = unique_pairs - discarded_pairs
 
-    dedup = read_droplet_umi_qc(dedup_report, sample) if protocol == "droplet" else parse_dedup_report(dedup_report)
+    umi_qc = read_droplet_umi_qc(dedup_report, sample) if protocol == "droplet" else None
+    dedup = {"total": accepted_pairs, "removed": 0, "leftover": accepted_pairs} if umi_qc is not None else parse_dedup_report(dedup_report)
     if dedup["total"] != accepted_pairs:
         raise ValueError(
             "Bismark deduplication input disagrees with usable uniquely aligned pairs: "
@@ -1721,7 +1867,10 @@ def build_metrics(
             f"expected={postdedup_pairs - removed_pairs}"
         )
 
+    if umi_qc is not None and umi_qc["processed_pairs"] != final_retained_pairs:
+        raise ValueError("Droplet caller input disagrees with non-conversion retained pairs")
     return {
+        "umi_qc": umi_qc,
         "total_pairs": int(alignment["total"]),
         "accepted_pairs": accepted_pairs,
         "unmapped_pairs": int(alignment["no_alignment"]) + discarded_pairs,
@@ -7048,9 +7197,11 @@ def _write_pair_level_multiqc(rows: list[dict[str, object]], out_json: Path) -> 
             ),
             "Native_Mapping_pct": float(row["native_mapping_pct"]),
             "Native_Mapping_Unit": row["native_mapping_unit"],
-            "Duplicate_Pair_Rate_pct": (
+            "Duplicate_Pair_Rate_pct": (None if row.get("protocol") == "droplet" else
                 100.0 * duplicate_pairs / accepted_pairs if accepted_pairs else 0.0
             ),
+            "Dedup_Policy": row["dedup_policy"],
+            **{key: row[key] for key in ("cpg_read_observations", "cpg_umi_observations", "cpg_ambiguous_umi_sites") if key in row},
             "PostDedup_Retention_pct": (
                 100.0 * postdedup_pairs / accepted_pairs if accepted_pairs else 0.0
             ),
@@ -7693,6 +7844,17 @@ def _metrics_for_cell(job: Mapping[str, object]) -> tuple[str, dict[str, object]
             paths["cph_table"]
         )
         canonical["non_cpg_metric_source"] = "biscuit_cph_retention_by_read_position"
+    elif record["protocol"] == "droplet":
+        umi_qc = metrics["umi_qc"]
+        context_counts = umi_qc["contexts"]
+        cph_m = sum(context_counts[k]["methyl"] for k in ("CHG", "CHH"))
+        cph_total = cph_m + sum(context_counts[k]["unmethyl"] for k in ("CHG", "CHH"))
+        canonical["non_cpg_methylation_pct"] = 100.0 * cph_m / cph_total if cph_total else float("nan")
+        canonical["non_cpg_metric_source"] = "droplet_umi_consensus_chg_chh"
+        canonical.update({"molecule_qc_metric_unit": "cytosine_umi_consensus",
+                          "cpg_read_observations": context_counts["CpG"]["read_observations"],
+                          "cpg_umi_observations": context_counts["CpG"]["methyl"] + context_counts["CpG"]["unmethyl"],
+                          "cpg_ambiguous_umi_sites": context_counts["CpG"]["ambiguous_umis"]})
     else:
         canonical["non_cpg_methylation_pct"] = (
             _parse_bismark_non_cpg_methylation_pct(paths["bismark_extract_report"])
@@ -7789,7 +7951,7 @@ def _apply_cell_metrics(
                     "high_cph_summary": paths.high_cph_summary,
                     "bismark_align_report": paths.bismark_align_report,
                     "bismark_dedup_report": paths.droplet_umi_qc if record["protocol"] == "droplet" else paths.bismark_dedup_report,
-                    "bismark_extract_report": paths.bismark_extract_report,
+                    "bismark_extract_report": paths.droplet_umi_qc if record["protocol"] == "droplet" else paths.bismark_extract_report,
                     "bismark_mbias": paths.bismark_mbias,
                     "cpg": paths.cpg,
                     "snp": paths.snp,
@@ -8917,8 +9079,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     write_initial.add_argument("--species", required=True)
     write_initial.add_argument("--protocol", required=True)
     write_initial.add_argument("--called-cells", action="append", type=lambda value: value.split(":", 1), default=[])
-    umi = commands.add_parser("dedup-droplet-bam", help="按物理 R1 与 UMI 去重并恢复 Bismark 标志。")
-    for field in ("bam", "output", "qc", "scratch", "umi-tools", "sample"):
+    umi = commands.add_parser("call-droplet-cpg", help="按胞嘧啶位点与 UMI 调用分子共识。")
+    for field in ("bam", "reference", "coverage", "qc", "mbias", "scratch", "samtools", "sample"):
         umi.add_argument("--" + field, required=True)
     umi.add_argument("--threads", type=int, default=1)
     calling = commands.add_parser("call-droplet-cells", help="按双峰谷底调用 Droplet 细胞。")
@@ -9149,8 +9311,8 @@ def main(argv: list[str] | None = None) -> int:
                 samtools=args.samtools,
             )
 
-        elif command == "dedup-droplet-bam":
-            deduplicate_droplet_bam(args.bam, args.output, args.qc, sample=args.sample, scratch=args.scratch, umi_tools=args.umi_tools, threads=args.threads)
+        elif command == "call-droplet-cpg":
+            call_droplet_cpg(args.bam, args.reference, args.coverage, args.qc, args.mbias, sample=args.sample, scratch=args.scratch, samtools=args.samtools, threads=args.threads)
         elif command == "call-droplet-cells":
             call_droplet_cells(args.counts, args.output, args.metrics, r1=args.r1, demux_binary=args.demux_binary, threads=args.threads)
         elif command == "index-demux-fastq":

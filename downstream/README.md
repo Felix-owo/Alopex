@@ -1,4 +1,4 @@
-# Alopex v14.2 下游 QC 与可视化
+# Alopex v14.3 下游 QC 与可视化
 
 这套下游分析以当前 `Alopex` 的 sealed delivery 为输入，通过
 `03_results/run_manifest.json` 解析 immutable config snapshot、reference FAI、
@@ -151,7 +151,9 @@ TSS profile 只记录有覆盖的 bins。有 CpG 的 cell 也可能没有 TSS �
   `Signal_Host_Rate%`、`Signal_Lambda_Rate%`、`Signal_pUC19_Rate%`、
   `Signal_mtDNA_Rate%`、`Gini_Index`、`Duplicate_Pair_Rate%`、`Trim_Retention%`、
   `Final_Pair_Yield%`。完整 read-pair funnel 与 backend policy/unit 诊断不复制进
-  本表，保留在主 Pipeline 的 MultiQC 报告。
+  本表，保留在主 Pipeline 的 MultiQC 报告。Droplet 的 `Duplicate_Pair_Rate%` 为 NaN，
+  `Non_CpG_Methylation%` 来自过滤后 CHG/CHH 的胞嘧啶/UMI 共识；分子观测数保留在
+  final manifest 与 MultiQC，不与 read-pair 数混算。默认 HQ 判定不使用 pair 去重率。
 - `TSS_Profile_Information.csv`（仅未跳过 TSS 时）
 - `RawAdata.h5ad`
 - `SingleCpG_Adata.h5ad` 与 `SingleCpG_Adata.input_schema.json`（运行 Notebook 最后一格后）

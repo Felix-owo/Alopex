@@ -1,4 +1,4 @@
-# Alopex v14.2
+# Alopex v14.3
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -6,7 +6,7 @@ Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报
 |---|---|---|
 | Cabernet | BISCUIT / Bismark | 孔板解复用、trimming、位置去重、high-CpH/non-conversion 过滤 |
 | SRD | BISCUIT / Bismark | DNA/RNA tube 解复用、DNA 分析，并保留 RNA FASTQ 与被筛除 BAM |
-| Droplet DD-MET5 | Bismark non-directional | DNA 独立谷底 calling、官方设计白名单、物理 R1＋UMI 去重 |
+| Droplet DD-MET5 | Bismark non-directional | DNA 独立谷底 calling、官方设计白名单、逐胞嘧啶 UMI 共识 |
 | Cabernet–TAPS+ | BWA-MEM + Rastair | 标记重复、调用 5mC+5hmC；不执行 CpH/cDNA 筛除 |
 
 用户入口只有 `core/doctor.sh`（构建与维护）和 `core/run_pipeline.sh`（项目运行）。
@@ -157,6 +157,9 @@ analysis:
 完整模板、默认值、可调参数及计数单位见初始化生成的 config 行内注释。
 Droplet 使用 `protocol: droplet`、Bismark `non_directional`，不需要 Barcode Map，
 `rna_sample` 留空；若在初始化前写好 Droplet config，初始化会直接跳过 Barcode Map。
+Droplet 在 non-conversion 过滤后按胞嘧啶位点/UMI 汇集分子共识，保留不同 read pairs 的联合覆盖。
+固定 MAPQ≥10、baseQ≥20；未解决的共识平票不调用。保留 BAM 时其中仍有 PCR 复制，
+独立分子计数以 CpG 输出为准；QC 的 pair 去重率为空，位点分子统计见 MultiQC 与 final manifest。
 TAPS 使用 `protocol: taps`、`methylation_backend: rastair`。
 
 孔板 Barcode Map 至少含 `DNA_Barcode,PlateID,Cell_Order`，SRD 还需 `RNA_Barcode`。

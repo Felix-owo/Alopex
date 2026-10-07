@@ -463,14 +463,14 @@ def read_active_cells(
         cell["native_mapping_pct"] = native_pct
         expected_dedup_policy = {
             "biscuit": "dupsifter_wgbs_signature_remove_dups",
-            "bismark": "umi_tools_directional_physical_r1_ignore_tlen" if row["protocol"] == "droplet" else "bismark_paired_endpoint_orientation",
+            "bismark": "per_cytosine_umi_consensus_hamming1" if row["protocol"] == "droplet" else "bismark_paired_endpoint_orientation",
             "rastair": "samtools_markdup_flag_exclude_in_rastair",
         }[backend]
         if cell["dedup_policy"] != expected_dedup_policy:
             raise ValueError(f"Cell {sample_id!r} has an invalid dedup_policy")
         expected_non_cpg_source = {
             "biscuit": "biscuit_cph_retention_by_read_position",
-            "bismark": "bismark_extraction_chg_chh",
+            "bismark": "droplet_umi_consensus_chg_chh" if row["protocol"] == "droplet" else "bismark_extraction_chg_chh",
             "rastair": "not_measured_taps_cpg_only",
         }[backend]
         if cell["non_cpg_metric_source"] != expected_non_cpg_source:
@@ -510,6 +510,15 @@ def read_active_cells(
             rejection_total = cell["unmapped_pairs"] + cell["no_primary_pairs"]
         if rejection_total != cell["backend_rejected_pairs"]:
             raise ValueError(f"Cell {sample_id!r} rejection categories do not close")
+        if row["protocol"] == "droplet":
+            if cell["duplicate_pairs"] != 0 or row.get("molecule_qc_metric_unit") != "cytosine_umi_consensus":
+                raise ValueError(f"Cell {sample_id!r} mixes Droplet pair and molecule counts")
+            read_count, umi_count, ambiguous_count = (
+                _required_nonnegative_int(row, key, sample_id) for key in
+                ("cpg_read_observations", "cpg_umi_observations", "cpg_ambiguous_umi_sites")
+            )
+            if umi_count + ambiguous_count > read_count:
+                raise ValueError(f"Cell {sample_id!r} has inconsistent Droplet molecule counts")
         if cell["duplicate_pairs"] > cell["backend_accepted_pairs"]:
             raise ValueError(f"Cell {sample_id!r} duplicate pairs exceed accepted pairs")
         if (
@@ -2435,6 +2444,7 @@ def _merge_pipeline_qc(
     source_qc["Duplicate_Pair_Rate%"] = percentage(
         "duplicate_pairs", "backend_accepted_pairs"
     )
+    source_qc.loc[source_qc["dedup_policy"] == "per_cytosine_umi_consensus_hamming1", "Duplicate_Pair_Rate%"] = float("nan")
     source_qc["Final_Pair_Yield%"] = percentage(
         "final_retained_pairs", "cutadapt_input_pairs"
     )
