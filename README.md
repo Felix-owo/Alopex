@@ -1,4 +1,4 @@
-# Alopex v14.5
+# Alopex v14.6
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -252,6 +252,10 @@ CpG 唯一格式为 `chrom, pos, methyl, unmethyl`，tab 分隔、pos 为 0-base
 
 MultiQC 汇总原生 mapping、pair funnel、重复、过滤、对照和适用的 M-bias；不同 backend
 的 mapping 分母不同。科学解释与空结果的判定以 `00_config/config.yaml` 模板注释及上文协议说明为准；已验证数据范围见本版 Release 说明。
+超过 1,000 个活跃 DNA 细胞时，MultiQC 固定抽取 1,000 个细胞，所有逐细胞模块使用同一集合；
+较小项目保留全部输入。报告首页标明抽样范围，文库级解复用概要仍为全库计数。
+抽样只用于报告展示，最终样本清单、全部细胞的科学结果及 BAM 保留策略不变。
+Bismark 原生报告的工具后缀仅在展示时去除，使总表按同一个细胞 ID 汇合。
 
 ## 8. 下游
 

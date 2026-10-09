@@ -53,6 +53,8 @@ from dna_pipeline import (
     validate_barcode_map_for_protocol,
     DROPLET_DESIGN_SHA256,
     prepare_high_cph_multiqc_sources,
+    prepare_sampled_multiqc_sources,
+    select_multiqc_samples,
     write_multiqc_file_list,
 )
 
@@ -2696,13 +2698,13 @@ FINAL_SAMPLE_CUTADAPT_QC = (
 )
 
 
-def current_multiqc_source_inputs(wildcards):
+def current_multiqc_source_inputs(wildcards, samples=None):
     sources = []
     for run_id in DEMUX_RUN_IDS:
         checkpoint_output = checkpoints.demux.get(sample=run_id).output
         sources.append(str(checkpoint_output.json_mqc))
 
-    active_samples = get_demuxed_samples()
+    active_samples = get_demuxed_samples() if samples is None else samples
     for sample in active_samples:
         paths = PROJECT_LAYOUT.cell(sample)
         sources.append(str(paths.cutadapt_json))
@@ -2783,7 +2785,7 @@ def current_rna_fastq_inputs(wildcards):
 
 
 rule multiqc:
-    """生成 MultiQC 文件清单，并基于 --file-list 运行 MultiQC，把 HTML 报告以同文件系统原子 rename 发布到 staged QC 目录。"""
+    """统一抽取最多 1000 个细胞生成 MultiQC，保留全量 DAG 依赖并原子提交标明抽样范围的 HTML。"""
     input:
         sources = current_multiqc_source_inputs,
         pair_qc = FINAL_SAMPLE_PAIR_QC,
@@ -2792,6 +2794,7 @@ rule multiqc:
         report = STAGED_RESULTS_DIR / "QC_Results" / "multiqc_report.html",
         file_list = temp(INTERMEDIATE_DIR / "multiqc" / "multiqc_sources.txt"),
         high_cph = temp(INTERMEDIATE_DIR / "multiqc" / "high_cph_rebuilt_mqc.json"),
+        sampled_sources = temp(directory(INTERMEDIATE_DIR / "multiqc" / "sampled_sources")),
     log:
         LOGS_DIR / "rules/multiqc.log"
     threads: multiqc_resource_request(0).threads
@@ -2801,7 +2804,7 @@ rule multiqc:
         runtime = lambda wildcards, input, attempt: multiqc_resource_request(len(input), attempt).runtime_min,
         attempt_no = lambda wildcards, attempt: int(attempt)
     params:
-        scientific_identity = scientific_code_identity(('prepare_high_cph_multiqc_sources', 'write_multiqc_file_list'), ()),
+        scientific_identity = scientific_code_identity(('prepare_high_cph_multiqc_sources', 'prepare_sampled_multiqc_sources', 'select_multiqc_samples', 'write_multiqc_file_list'), ()),
         outdir = STAGED_RESULTS_DIR / "QC_Results",
         tmpout = INTERMEDIATE_DIR / "multiqc" / "output_tmp",
         multiqc = MULTIQC
@@ -2809,15 +2812,21 @@ rule multiqc:
         shell("source {JOB_RUNTIME:q}; dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}")
         request = multiqc_resource_request(len(input), resources.attempt_no)
         resource_log = f"policy={request.policy} rule={request.rule_key} tier={request.tier}"
-        count, skipped = write_multiqc_file_list(
+        active_samples = get_demuxed_samples()
+        selected_samples = select_multiqc_samples(active_samples)
+        selected_sources, report_comment = prepare_sampled_multiqc_sources(
             prepare_high_cph_multiqc_sources(
-                list(input.sources) + [str(input.pair_qc), str(input.cutadapt_qc)],
+                current_multiqc_source_inputs(wildcards, selected_samples) + [str(input.pair_qc), str(input.cutadapt_qc)],
                 Path(output.high_cph),
             ),
-            str(output.file_list),
+            selected_samples, len(active_samples), Path(output.sampled_sources),
         )
+        count, skipped = write_multiqc_file_list(selected_sources, str(output.file_list))
+        multiqc_config = str(Path(output.sampled_sources) / "multiqc_config.json")
         with open(str(log), "a", encoding="utf-8") as handle:
             handle.write(f"INFO: multiqc_declared_sources={len(input)} multiqc_file_list_sources={count}\n")
+            handle.write(f"INFO: multiqc_cells={len(selected_samples)}/{len(active_samples)} selection=sha256_sample_id\n")
+            handle.write("INFO: multiqc_selected_cells=" + json.dumps(selected_samples) + "\n")
             for item in skipped:
                 handle.write(f"WARNING: skipped_multiqc_source={item}\n")
         shell(
@@ -2842,6 +2851,8 @@ rule multiqc:
                 -o "$tmpout" \
                 -n multiqc_report.html \
                 --file-list {output.file_list:q} \
+                --config {multiqc_config:q} \
+                --comment {report_comment:q} \
                 >> {log:q} 2>&1
 
             test -s "$tmpout/multiqc_report.html"

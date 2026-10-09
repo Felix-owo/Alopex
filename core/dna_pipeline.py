@@ -973,13 +973,11 @@ def demux_resource_request(total_bytes: object, attempt: int = 1, count_only: bo
     )
 
 
-def multiqc_resource_request(source_count: object, attempt: int = 1) -> ResourceRequest:
-    """按 MultiQC 声明依赖数缩放资源，两次重试仅把内存提高至首次的 1.5 倍、2 倍。
+MULTIQC_MAX_CELLS = 1000
 
-    实测锚点（F-real-2609SG）：52,816 个源、13,203 样本，峰值 RSS 4.35 GiB、
-    file-list 模式 14 min / 目录发现模式 17 min。请求内存 = 1.5×(512 MiB + 0.075 MiB/源)；
-    runtime = max(60, ceil(源数/600)) min。
-    """
+
+def multiqc_resource_request(source_count: object, attempt: int = 1) -> ResourceRequest:
+    """按全量声明依赖数为报告及 Snakemake worker 分配资源，重试仅提高内存。"""
 
     attempt_no = _attempt_number(attempt)
     count = _read_count(source_count) or 0
@@ -8523,6 +8521,52 @@ def write_multiqc_file_list(
         len(skipped),
     )
     return len(unique_sources), skipped
+
+
+def select_multiqc_samples(samples: Iterable[str]) -> list[str]:
+    """按细胞 ID 的 SHA256 固定选取最多 1000 个细胞，不依赖输入顺序或 Python 随机种子。"""
+    ranked = sorted(set(samples), key=lambda sample: (hashlib.sha256(sample.encode("utf-8")).digest(), sample))
+    return sorted(ranked[:MULTIQC_MAX_CELLS])
+
+
+def prepare_sampled_multiqc_sources(
+    inputs: Iterable[str | Path], selected_samples: Sequence[str], total_cells: int,
+    out_dir: Path,
+) -> tuple[list[str], str]:
+    """统一展示子集及 Bismark 报告后缀；原生源须已按集合选定，不修改任何源文件。"""
+    selected = set(selected_samples)
+    sampled = total_cells > len(selected)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(out_dir / "multiqc_config.json", {
+        "fn_clean_trim": [],
+        "extra_fn_clean_exts": [{
+            "type": "regex", "module": "bismark",
+            "pattern": r"(?:_PE_report|_splitting_report|\.deduplication_report|\.M-bias)\.txt$",
+        }],
+    })
+    sources = []
+    for raw in inputs:
+        path = Path(raw)
+        if sampled and path.name.endswith("_mqc.json"):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            data = payload["data"]
+            if set(data) - selected:
+                payload["data"] = {sample: values for sample, values in data.items() if sample in selected}
+                payload["description"] = (
+                    str(payload.get("description", ""))
+                    + " 细胞表仅展示本报告抽样集合；文库级 Run summary 仍为全库计数。"
+                )
+                projected = out_dir / (hashlib.sha256(str(path).encode("utf-8")).hexdigest() + "_mqc.json")
+                atomic_write_json(projected, payload)
+                path = projected
+        sources.append(str(path))
+    scope = (
+        f"MultiQC 逐细胞质控范围：{len(selected):,} / {total_cells:,} 个活跃 DNA 细胞。"
+        + ("超过 1,000 个细胞时，按细胞 ID 的 SHA256 固定抽样 1,000 个；各逐细胞模块使用同一集合。"
+           if sampled else "未抽样，保留全部细胞的质控输入。")
+        + "文库级解复用概要使用全库计数。完整科学结果和最终 sample manifest 保留全部细胞。"
+    )
+    return sources, scope
 
 
 def prepare_high_cph_multiqc_sources(
