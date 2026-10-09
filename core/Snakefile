@@ -251,7 +251,7 @@ BISCUIT_LIBRARY_MODE = biscuit_library_mode(config)
 BISCUIT_HIGH_CPH_RETENTION_THRESHOLD = float(
     BISCUIT_CONFIG["high_cph_retention_threshold"]
 )
-GENERATE_SNP = BISCUIT_CONFIG["generate_snp"]
+GENERATE_SNP = METHYLATION_BACKEND == "rastair" or BISCUIT_CONFIG["generate_snp"]
 
 BISMARK_LIBRARY_FLAG = bismark_library_flag(config)
 BISMARK_ALIGNMENT_INSTANCES = bismark_alignment_instance_count(config)
@@ -736,7 +736,7 @@ def get_staged_delivery_targets():
     backend = get_backend(config)
     layout = ProjectLayout(INTERMEDIATE_DIR, STAGED_RESULTS_DIR, backend.name)
     targets = [str(layout.cell(sample).cpg) for sample in samples]
-    if biscuit["generate_snp"]:
+    if backend.name == "rastair" or biscuit["generate_snp"]:
         if not backend.supports_snp:
             raise ValueError("generate_snp=true is currently supported only by the Biscuit backend")
         for sample in samples:
@@ -2168,7 +2168,7 @@ elif METHYLATION_BACKEND == "rastair":
             """
 
     rule taps_call_cpg:
-        """调用 TAPS 的 5mC＋5hmC，按参考基因型导出 canonical 整数 CpG 及对照 QC。"""
+        """调用 TAPS 的 CpG 与 SNP，统计可判链宿主 CHG/CHH，并原子提交结果和 QC。"""
         input:
             bam = CELL_PATH_PATTERN.marked_bam,
             bai = CELL_PATH_PATTERN.marked_bam_index,
@@ -2178,10 +2178,12 @@ elif METHYLATION_BACKEND == "rastair":
             fai = str(REFERENCE_FAI),
         output:
             cpg = CELL_PATH_PATTERN.cpg,
+            snp = CELL_PATH_PATTERN.snp,
+            snp_index = CELL_PATH_PATTERN.snp_index,
             qc = CELL_PATH_PATTERN.rastair_qc,
         log:
             LOGS_DIR / "rules/rastair/{demux_sample}_call.log"
-        threads: 1
+        threads: 4
         resources:
             mem_mb = lambda wc, attempt: static_resource_mem_mb("pileup", wc.demux_sample, attempt),
             runtime = lambda wc, attempt: static_resource_runtime_min("pileup", wc.demux_sample, attempt),
@@ -2206,14 +2208,19 @@ elif METHYLATION_BACKEND == "rastair":
             tmpdir="$DNA_PIPELINE_SCRATCH_DIR"
             {RASTAIR:q} call -@ {threads} -r {input.reference:q} --guess-read-orientation \
                 -q {TAPS_MIN_MAPQ} -Q {TAPS_MIN_BASEQ} -f {TAPS_INCLUDE_FLAGS} -F {TAPS_EXCLUDE_FLAGS} \
-                --cpgs-only --all --m-min-depth 1 --nOT 0,0,0,0 --nOB 0,0,0,0 \
-                --bed "$tmpdir/native.bed" {input.bam:q}
+                --all --m-min-depth 1 --nOT 0,0,0,0 --nOB 0,0,0,0 \
+                --vcf-info-fields AS_SB,AS_SS_BQ,AS_SS_MQ,PIR,AF \
+                --bed "$tmpdir/native.bed" --vcf "$tmpdir/native.vcf.gz" {input.bam:q}
             {RULE_PYTHON:q} -m dna_pipeline rastair-cpg --bed "$tmpdir/native.bed" --reference {input.reference:q} \
-                --alignment-qc {input.qc:q} --output-qc "$tmpdir/qc.json" | \
+                --alignment-qc {input.qc:q} --output-qc "$tmpdir/qc.json" \
+                --bam {input.bam:q} --samtools {SAMTOOLS:q} --scratch "$tmpdir" \
+                --vcf "$tmpdir/native.vcf.gz" --output-snp "$tmpdir/snps.vcf.gz" --sample={wildcards.demux_sample:q} | \
                 dna_pipeline_emit_canonical_cpg {ZSTD:q} 0 "$tmpdir/cpg.tsv.zst" "$tmpdir/native.bed"
             {ZSTD:q} -q -t "$tmpdir/cpg.tsv.zst"
             {RULE_PYTHON:q} -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
-                --file "$tmpdir/cpg.tsv.zst" {output.cpg:q} --file "$tmpdir/qc.json" {output.qc:q}
+                --file "$tmpdir/cpg.tsv.zst" {output.cpg:q} \
+                --file "$tmpdir/snps.vcf.gz" {output.snp:q} --file "$tmpdir/snps.vcf.gz.tbi" {output.snp_index:q} \
+                --file "$tmpdir/qc.json" {output.qc:q}
             dna_pipeline_release_scratch
             """
 

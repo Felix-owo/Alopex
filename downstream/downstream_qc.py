@@ -471,7 +471,7 @@ def read_active_cells(
         expected_non_cpg_source = {
             "biscuit": "biscuit_cph_retention_by_read_position",
             "bismark": "droplet_umi_consensus_chg_chh" if row["protocol"] == "droplet" else "bismark_extraction_chg_chh",
-            "rastair": "not_measured_taps_cpg_only",
+            "rastair": "taps_oriented_host_chg_chh_conversion",
         }[backend]
         if cell["non_cpg_metric_source"] != expected_non_cpg_source:
             raise ValueError(f"Cell {sample_id!r} has an invalid non-CpG metric source")
@@ -496,8 +496,15 @@ def read_active_cells(
                 _required_nonnegative_int(row, key, sample_id)
                 for key in ("discordant_pairs", "quality_rejected_pairs")
             )
-            if row.get("high_cph_role") != "not_applicable" or not np.isnan(cell["non_cpg_methylation_pct"]):
-                raise ValueError(f"Cell {sample_id!r} must declare unmeasured TAPS CpH")
+            if row.get("high_cph_role") != "not_applicable":
+                raise ValueError(f"Cell {sample_id!r} has an invalid TAPS high-CpH role")
+            modified = sum(_required_nonnegative_int(row, f"non_cpg_{ctx}_mod", sample_id) for ctx in ("chg", "chh"))
+            total = modified + sum(_required_nonnegative_int(row, f"non_cpg_{ctx}_unmod", sample_id) for ctx in ("chg", "chh"))
+            if total != _required_nonnegative_int(row, "non_cpg_observations", sample_id):
+                raise ValueError(f"Cell {sample_id!r} has inconsistent TAPS non-CpG counts")
+            expected_pct = 100.0 * modified / total if total else float("nan")
+            if not (np.isnan(expected_pct) and np.isnan(cell["non_cpg_methylation_pct"])) and not np.isclose(expected_pct, cell["non_cpg_methylation_pct"], rtol=1e-12, atol=1e-12):
+                raise ValueError(f"Cell {sample_id!r} has inconsistent TAPS non-CpG percentage")
             if any(cell[key] for key in ("high_cph_assessed_pairs", "high_cph_flagged_pairs", "high_cph_removed_pairs")):
                 raise ValueError(f"Cell {sample_id!r} must not claim TAPS high-CpH filtering")
         elif backend == "bismark":

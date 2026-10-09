@@ -532,7 +532,7 @@ properties:
         type: string
         enum: [srd, cabernet, taps, droplet]
       methylation_backend:
-        description: 甲基化分析后端（biscuit / bismark / rastair），决定 alignment 与 CpG 生产路线。
+        description: 甲基化分析后端（biscuit / bismark / rastair）；taps 仅用 rastair，默认产出 CpG、SNP VCF 和可判链 CHG/CHH QC。
         type: string
         enum: [biscuit, bismark, rastair]
 
@@ -730,7 +730,7 @@ references:
 
 analysis:
   protocol: cabernet              # cabernet / srd / taps / droplet；manifest 的 rna_sample 在 srd 为本地输入，cabernet/taps 为外部 RNA raw 关联，droplet 必须留空
-  methylation_backend: bismark    # cabernet/srd 选 biscuit/bismark；droplet 仅 bismark；taps 仅 rastair
+  methylation_backend: bismark    # cabernet/srd 选 biscuit/bismark；droplet 仅 bismark；taps 仅 rastair，默认含 SNP VCF 与可判链 Non-CpG QC
 
 demux:
   min_matched_read_pairs: 10   # 单 cell barcode 匹配 read pairs 低于该值时不产出结果；0 关闭门槛
@@ -739,7 +739,7 @@ demux:
 biscuit:
   library_type: non_directional   # directional / non_directional
   high_cph_retention_threshold: 0.7   # read pair CpH retention 严格大于该值判为 high-CpH；越低越严格
-  generate_snp: false             # BISCUIT-only SNP 输出开关；true 时额外发布 snps.bed.gz，非 BISCUIT 后端禁止开启
+  generate_snp: false             # BISCUIT-only SNP 输出开关；true 时发布 snps.bed.gz；TAPS 默认发布 VCF，不使用此开关
 
 bismark:
   library_type: non_directional   # directional / non_directional / pbat
@@ -1194,7 +1194,8 @@ class CellOutputPaths:
 
     @property
     def snp(self) -> Path:
-        return self.result_root / "SNP" / f"{self.sample_id}.snps.bed.gz"
+        suffix = "vcf.gz" if self.backend == "rastair" else "bed.gz"
+        return self.result_root / "SNP" / f"{self.sample_id}.snps.{suffix}"
 
     @property
     def snp_index(self) -> Path:
@@ -2907,7 +2908,7 @@ class BackendPolicy:
 _BACKEND_POLICIES = {
     "biscuit": BackendPolicy("biscuit", supports_snp=True, uses_dupsifter=True),
     "bismark": BackendPolicy("bismark", supports_snp=False, uses_dupsifter=False),
-    "rastair": BackendPolicy("rastair", supports_snp=False, uses_dupsifter=False),
+    "rastair": BackendPolicy("rastair", supports_snp=True, uses_dupsifter=False),
 }
 
 
@@ -2925,7 +2926,7 @@ def get_backend(config: dict[str, Any]) -> BackendPolicy:
         raise ValueError("protocol taps requires rastair; Cabernet/SRD require biscuit or bismark")
     policy = _BACKEND_POLICIES[name]
     biscuit = config.get("biscuit") or {}
-    if bool(biscuit.get("generate_snp")) and not policy.supports_snp:
+    if bool(biscuit.get("generate_snp")) and name != "biscuit":
         raise ValueError(
             "biscuit.generate_snp=true is currently supported only by the Biscuit backend"
         )
@@ -3589,8 +3590,10 @@ def verify_taps_truth(project: Path) -> None:
         raise ValueError("TAPS control truth mismatch")
     if min(int(row["lambda_cpg_observations"]), int(row["pUC19_cpg_observations"])) <= 0:
         raise ValueError("TAPS controls have no observations")
-    if row["high_cph_role"] != "not_applicable" or not math.isnan(float(row["non_cpg_methylation_pct"])):
-        raise ValueError("TAPS CpH must be unmeasured")
+    if row["high_cph_role"] != "not_applicable" or float(row["non_cpg_methylation_pct"]) != 0.0 or int(row["non_cpg_observations"]) <= 0:
+        raise ValueError("TAPS truth requires measured zero host CHG/CHH conversion")
+    if not row["snp_path"] or not (project / row["snp_path"]).is_file() or not Path(str(project / row["snp_path"]) + ".tbi").is_file():
+        raise ValueError("TAPS truth SNP VCF/index is missing")
     for key in ("retained_bam_path", "retained_bam_index"):
         if not row[key] or not (project / row[key]).is_file():
             raise ValueError("TAPS retained BAM/index is missing")
@@ -4234,7 +4237,7 @@ def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
         for row in reader:
             for field, directory, suffix in (
                 ("cpg_path", "CpG", ".cpg.tsv.zst"),
-                ("snp_path", "SNP", ".snps.bed.gz"),
+                ("snp_path", "SNP", ".snps.vcf.gz" if row.get("methylation_backend") == "rastair" else ".snps.bed.gz"),
             ):
                 value = str(row.get(field) or "").strip()
                 if not value:
@@ -7212,6 +7215,7 @@ def _write_pair_level_multiqc(rows: list[dict[str, object]], out_json: Path) -> 
             "High_CpH_Status": row["high_cph_role"],
             **{key: row[key] for key in ("lambda_cpg_observations", "lambda_false_positive_pct", "pUC19_cpg_observations", "pUC19_conversion_pct", "bam_primary_records") if key in row},
             "Non_CpG_Methylation_pct": non_cpg if math.isfinite(non_cpg) else None,
+            **{key: row[key] for key in ("non_cpg_observations", "non_cpg_candidate_pairs", "non_cpg_oriented_pairs", "non_cpg_ambiguous_pairs", "snp_sites") if key in row},
         }
     payload = {
         "id": "dna_pipeline_pair_level_qc",
@@ -7222,6 +7226,8 @@ def _write_pair_level_multiqc(rows: list[dict[str, object]], out_json: Path) -> 
             "unique concordant read pairs. These mapping percentages use declared units "
             "and must not be treated as the same numerator definition. TAPS uses proper primary pairs "
             "with at least one MAPQ>=20 non-QC-failed mate; duplicate flags are excluded only during calling. "
+            "TAPS Non-CpG is uncorrected CHG/CHH conversion in host pairs with unambiguous CpG-based orientation; "
+            "SNPs/errors may contribute and unorientable pairs are excluded. "
             "TAPS high-CpH filtering is not applicable; cDNA is not excluded. Lambda assumes unmethylated "
             "DNA (CpG false positives); pUC19 assumes CpG-methylated DNA (conversion); missing coverage is not assessed."
         ),
@@ -7591,11 +7597,199 @@ def write_taps_alignment_qc(bam: str, samtools: str, scratch: str, sample: str, 
                                "reference_sequences": header["SQ"], **counts})
 
 
-def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str, stream: TextIO) -> None:
+def _taps_pair_bases(reads: list, reference) -> tuple[str, dict[int, tuple[str, int]], str, int, str]:
+    eligible = [r for r in reads if r.flag & TAPS_INCLUDE_FLAGS == TAPS_INCLUDE_FLAGS
+                and not r.flag & TAPS_EXCLUDE_FLAGS and r.mapping_quality >= TAPS_MIN_MAPQ]
+    if not eligible:
+        return "", {}, "", 0, ""
+    chroms = {r.reference_name for r in eligible}
+    if len(chroms) != 1:
+        raise ValueError("TAPS proper pair spans different reference contigs")
+    chrom = eligible[0].reference_name
+    start = max(0, min(r.reference_start for r in eligible) - 2)
+    end = min(reference.get_reference_length(chrom), max(r.reference_end for r in eligible) + 2)
+    seq = reference.fetch(chrom, start, end).upper()
+    bases: dict[int, tuple[str, int]] = {}
+    evidence = 0
+    aligned_reads = []
+    candidate = False
+    for read in eligible:
+        observed = read.query_sequence
+        qualities = read.query_qualities
+        if observed is None or qualities is None:
+            raise ValueError("TAPS QC requires BAM sequence and base qualities")
+        positions = read.get_reference_positions(full_length=True)
+        observed = observed.upper()
+        aligned_reads.append((observed, qualities, positions))
+        if not candidate:
+            candidate = any(pos is not None and quality >= TAPS_MIN_BASEQ
+                            for pos, quality in zip(positions, qualities))
+        for motif, flag in (("TG", 1), ("CA", 2)):
+            if evidence & flag:
+                continue
+            qpos = observed.find(motif)
+            while qpos >= 0:
+                pos = positions[qpos]
+                if (pos is not None and positions[qpos + 1] == pos + 1
+                        and qualities[qpos] >= TAPS_MIN_BASEQ and qualities[qpos + 1] >= TAPS_MIN_BASEQ
+                        and seq[pos - start:pos - start + 2] == "CG"):
+                    evidence |= flag
+                    break
+                qpos = observed.find(motif, qpos + 1)
+    orientation = "OT" if evidence == 1 else "OB" if evidence == 2 else ""
+    if not candidate:
+        return "", {}, "", 0, ""
+    if orientation:
+        target = "C" if orientation == "OT" else "G"
+        context_positions = set()
+        offset = seq.find(target)
+        while offset >= 0:
+            if orientation == "OT":
+                valid = offset + 2 < len(seq) and seq[offset + 1] in "ACT" and seq[offset + 2] in "ACGT"
+            else:
+                valid = offset >= 2 and seq[offset - 1] in "AGT" and seq[offset - 2] in "ACGT"
+            if valid:
+                context_positions.add(start + offset)
+            offset = seq.find(target, offset + 1)
+        for observed, qualities, positions in aligned_reads:
+            for qpos, pos in enumerate(positions):
+                if pos not in context_positions:
+                    continue
+                quality = qualities[qpos]
+                if quality < TAPS_MIN_BASEQ:
+                    continue
+                base = observed[qpos]
+                previous = bases.get(pos)
+                if previous is None or quality > previous[1]:
+                    bases[pos] = base, quality
+                elif quality == previous[1] and base != previous[0]:
+                    bases[pos] = "N", quality
+    return chrom, bases, orientation, start, seq
+
+
+def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str) -> dict[str, object]:
+    """统计可判链分子的宿主 CHG/CHH 转换率；未知或冲突链不随机分配，重叠 mate 每位置只计一次。
+
+    这是未经 SNP/测序错误校正的原始修饰信号 QC；只用高质量 CpG 转换证据判链，
+    指标只代表可判链子集，不能直接作为全基因组真实 mCH 或 cDNA 污染率。
+    """
+    import itertools
+    import pysam
+
+    counts = dict.fromkeys(("non_cpg_candidate_pairs", "non_cpg_oriented_pairs", "non_cpg_ambiguous_pairs",
+                           "non_cpg_chg_mod", "non_cpg_chg_unmod", "non_cpg_chh_mod", "non_cpg_chh_unmod"), 0)
+    process = subprocess.Popen([samtools, "collate", "-O", "-u", "-T", str(Path(scratch) / "non_cpg_collate"), bam], stdout=subprocess.PIPE)
+    try:
+        with pysam.FastaFile(reference) as ref, pysam.AlignmentFile(process.stdout, "rb") as source:
+            for name, group in itertools.groupby(source, key=lambda r: r.query_name):
+                primary = [r for r in group if not r.is_secondary and not r.is_supplementary]
+                if len(primary) != 2 or {r.is_read1 for r in primary} != {True, False} or any(
+                    not r.is_paired or r.is_read1 == r.is_read2 for r in primary
+                ):
+                    raise ValueError(f"TAPS non-CpG QC requires a complete pair: {name}")
+                chrom, bases, orientation, start, seq = _taps_pair_bases(primary, ref)
+                if not chrom.startswith("chr") or re.fullmatch(r"(?i)(chrM|chrMT)", chrom):
+                    continue
+                counts["non_cpg_candidate_pairs"] += 1
+                if not orientation:
+                    counts["non_cpg_ambiguous_pairs"] += 1
+                    continue
+                counts["non_cpg_oriented_pairs"] += 1
+                chg_mod = chg_unmod = chh_mod = chh_unmod = 0
+                if orientation == "OT":
+                    limit = len(seq) - 2
+                    for pos, (base, _) in bases.items():
+                        if base not in "CT":
+                            continue
+                        offset = pos - start
+                        if offset >= limit or seq[offset] != "C" or seq[offset + 1] not in "ACT":
+                            continue
+                        third = seq[offset + 2]
+                        if third == "G":
+                            if base == "T":
+                                chg_mod += 1
+                            else:
+                                chg_unmod += 1
+                        elif third in "ACT":
+                            if base == "T":
+                                chh_mod += 1
+                            else:
+                                chh_unmod += 1
+                else:
+                    for pos, (base, _) in bases.items():
+                        if base not in "GA":
+                            continue
+                        offset = pos - start
+                        if offset < 2 or seq[offset] != "G" or seq[offset - 1] not in "AGT":
+                            continue
+                        third = seq[offset - 2]
+                        if third == "C":
+                            if base == "A":
+                                chg_mod += 1
+                            else:
+                                chg_unmod += 1
+                        elif third in "AGT":
+                            if base == "A":
+                                chh_mod += 1
+                            else:
+                                chh_unmod += 1
+                counts["non_cpg_chg_mod"] += chg_mod
+                counts["non_cpg_chg_unmod"] += chg_unmod
+                counts["non_cpg_chh_mod"] += chh_mod
+                counts["non_cpg_chh_unmod"] += chh_unmod
+        if process.wait() != 0:
+            raise RuntimeError("samtools collate failed during TAPS non-CpG QC")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait()
+    modified = counts["non_cpg_chg_mod"] + counts["non_cpg_chh_mod"]
+    total = modified + counts["non_cpg_chg_unmod"] + counts["non_cpg_chh_unmod"]
+    return {**counts, "non_cpg_observations": total,
+            "non_cpg_methylation_pct": 100.0 * modified / total if total else float("nan"),
+            "non_cpg_metric_source": "taps_oriented_host_chg_chh_conversion"}
+
+
+def emit_taps_snps(vcf: str, output: str, sample: str, *, reference: str) -> int:
+    """保留原生 PASS 非参考单碱基变异及注释，按调用参考校正 VCF contig 长度并建立索引。"""
+    import pysam
+    import pysam.bcftools
+
+    count = 0
+    with pysam.VariantFile(vcf) as source:
+        if len(source.header.samples) != 1:
+            raise ValueError("TAPS SNP VCF requires exactly one sample")
+        old_sample = next(iter(source.header.samples))
+        header_text = str(source.header).rsplit("\t", 1)[0] + "\t" + sample + "\n"
+        with pysam.BGZFile(output, "w") as target:
+            target.write(header_text.encode())
+            for row in source:
+                alleles = row.alleles or ()
+                genotype = row.samples[old_sample].get("GT") or ()
+                if (set(row.filter) != {"PASS"} or len(alleles) < 2
+                        or any(len(a) != 1 or a not in "ACGT" for a in alleles)
+                        or not any(a is not None and a > 0 for a in genotype)):
+                    continue
+                target.write(str(row).encode())
+                count += 1
+    with tempfile.TemporaryDirectory(prefix=".taps_snp.", dir=Path(output).parent) as scratch:
+        corrected = str(Path(scratch) / "snps.vcf.gz")
+        pysam.bcftools.reheader("--fai", f"{reference}.fai", "--output", corrected, output, catch_stdout=False)
+        os.replace(corrected, output)
+    pysam.tabix_index(output, preset="vcf", force=True)
+    return count
+
+
+def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str, stream: TextIO,
+                     *, bam: str, samtools: str, scratch: str, vcf: str, output_snp: str, sample: str) -> None:
     """输出共用 CpG writer 的整数计数输入；CpG 任一端已调用为变异时排除两端，不使用 beta。"""
     import pysam
 
     qc = json.loads(Path(alignment_qc).read_text())
+    if qc["sample"] != sample:
+        raise ValueError("TAPS caller sample differs from alignment QC")
+    qc.update(taps_non_cpg_metrics(bam, reference, samtools, scratch))
+    qc["snp_sites"] = emit_taps_snps(vcf, output_snp, sample, reference=reference)
     counts = {"native_cpg_rows": 0, "canonical_cpg_rows": 0, "excluded_variant_or_denovo_rows": 0,
               "zero_observation_rows": 0}
     controls = {name: {"mod": 0, "unmod": 0, "sites": 0} for name in ("lambda", "pUC19")}
@@ -7608,6 +7802,9 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
         contigs = {name: i for i, name in enumerate(ref.references)}
         pending_key = None
         pending = []
+        reference_chrom = ""
+        reference_start = reference_end = 0
+        reference_sequence = ""
 
         def flush_cpg() -> None:
             if any(gt != base + "/" + base for _, _, _, _, _, gt, base in pending):
@@ -7645,9 +7842,17 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
             if row["cpg"] != "REF":
                 counts["excluded_variant_or_denovo_rows"] += 1
                 continue
-            base = ref.fetch(chrom, pos, pos + 1).upper()
+            if chrom != reference_chrom or not reference_start < pos < reference_end - 1:
+                reference_chrom = chrom
+                reference_start = max(0, pos - 1)
+                reference_end = min(ref.get_reference_length(chrom), pos + 1048577)
+                reference_sequence = ref.fetch(chrom, reference_start, reference_end).upper()
+            offset = pos - reference_start
+            base = reference_sequence[offset:offset + 1]
             start = pos if base == "C" else pos - 1
-            if base not in {"C", "G"} or start < 0 or ref.fetch(chrom, start, start + 2).upper() != "CG":
+            cpg_offset = start - reference_start
+            if (base not in {"C", "G"} or start < 0
+                    or reference_sequence[cpg_offset:cpg_offset + 2] != "CG"):
                 raise ValueError(f"Rastair reference CpG disagrees with FASTA: {chrom}:{pos}")
             cpg_key = (chrom, start)
             if cpg_key != pending_key:
@@ -7684,8 +7889,26 @@ def _taps_cell_metrics(job: Mapping[str, object], cutadapt: Mapping[str, object]
         raise ValueError("TAPS pair funnel does not close")
     if sum(qc[k] for k in ("unmapped_pairs", "discordant_pairs", "quality_rejected_pairs")) != rejected:
         raise ValueError("TAPS rejection categories do not close")
-    if not Path(paths["cpg"]).is_file():
-        raise FileNotFoundError(paths["cpg"])
+    for key in ("cpg", "snp", "snp_index"):
+        if not Path(paths[key]).is_file():
+            raise FileNotFoundError(paths[key])
+    non_cpg = {k: v for k, v in qc.items() if k.startswith("non_cpg_")}
+    if non_cpg.get("non_cpg_metric_source") != "taps_oriented_host_chg_chh_conversion":
+        raise ValueError("TAPS non-CpG QC source is invalid")
+    for key in ("non_cpg_chg_mod", "non_cpg_chg_unmod", "non_cpg_chh_mod", "non_cpg_chh_unmod",
+                "non_cpg_observations", "non_cpg_candidate_pairs", "non_cpg_oriented_pairs",
+                "non_cpg_ambiguous_pairs", "snp_sites"):
+        if type(qc[key]) is not int or qc[key] < 0:
+            raise ValueError(f"TAPS QC requires a nonnegative integer: {key}")
+    modified = sum(qc[f"non_cpg_{context}_mod"] for context in ("chg", "chh"))
+    total = modified + sum(qc[f"non_cpg_{context}_unmod"] for context in ("chg", "chh"))
+    if (total != qc["non_cpg_observations"]
+            or qc["non_cpg_oriented_pairs"] + qc["non_cpg_ambiguous_pairs"] != qc["non_cpg_candidate_pairs"]
+            or not 0 <= qc["non_cpg_candidate_pairs"] <= postdedup):
+        raise ValueError("TAPS non-CpG accounting does not close")
+    expected_pct = 100.0 * modified / total if total else float("nan")
+    if not (math.isnan(expected_pct) and math.isnan(qc["non_cpg_methylation_pct"])) and not math.isclose(expected_pct, qc["non_cpg_methylation_pct"]):
+        raise ValueError("TAPS non-CpG percentage disagrees with counts")
     keep_bam = bool(job["keep_final_bam"])
     if keep_bam:
         for key in ("marked_bam", "marked_bam_index"):
@@ -7694,7 +7917,8 @@ def _taps_cell_metrics(job: Mapping[str, object], cutadapt: Mapping[str, object]
     return {**cutadapt, **{k: v for k, v in qc.items() if k.startswith(("bam_", "lambda_", "pUC19_"))},
             "methylation_backend": "rastair", "backend_qc_status": "PASS", "analysis_status": "PASS",
             "cpg_path": job["public"]["cpg"], "cpg_representation": CPG_REPRESENTATION,
-            "snp_path": "", "rna_bam_path": "", "methylation_signal": "5mC+5hmC",
+            "snp_path": job["public"]["snp"], "snp_sites": qc["snp_sites"],
+            "rna_bam_path": "", "methylation_signal": "5mC+5hmC",
             "retained_bam_path": job["public"]["marked_bam"] if keep_bam else "",
             "retained_bam_index": job["public"]["marked_bam_index"] if keep_bam else "",
             "retained_bam_role": "taps_all_alignments_marked_duplicates_for_variant_reanalysis" if keep_bam else "",
@@ -7708,7 +7932,7 @@ def _taps_cell_metrics(job: Mapping[str, object], cutadapt: Mapping[str, object]
             "dedup_policy": "samtools_markdup_flag_exclude_in_rastair", "pair_qc_metric_unit": "read_pairs",
             "high_cph_assessed_pairs": 0, "high_cph_flagged_pairs": 0, "high_cph_removed_pairs": 0,
             "high_cph_fraction": "nan", "high_cph_role": "not_applicable",
-            "non_cpg_methylation_pct": "nan", "non_cpg_metric_source": "not_measured_taps_cpg_only"}
+            **non_cpg}
 
 
 def _metrics_for_cell(job: Mapping[str, object]) -> tuple[str, dict[str, object]]:
@@ -7955,6 +8179,7 @@ def _apply_cell_metrics(
                     "bismark_mbias": paths.bismark_mbias,
                     "cpg": paths.cpg,
                     "snp": paths.snp,
+                    "snp_index": paths.snp_index,
                     "rna_bam": paths.rna_bam,
                     "rna_bam_index": paths.rna_bam_index,
                 },
@@ -9069,7 +9294,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     for field in ("bam", "samtools", "scratch", "sample", "output"):
         taps_qc.add_argument("--" + field, required=True)
     taps_cpg = commands.add_parser("rastair-cpg", help="转换原生 Rastair 计数并记录对照 QC。")
-    for field in ("bed", "reference", "alignment-qc", "output-qc"):
+    for field in ("bed", "reference", "alignment-qc", "output-qc", "bam", "samtools", "scratch", "vcf", "output-snp", "sample"):
         taps_cpg.add_argument("--" + field, required=True)
 
     write_initial = commands.add_parser("write-cell-manifest", help="写出初始 cell manifest。")
@@ -9363,7 +9588,9 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "taps-alignment-qc":
             write_taps_alignment_qc(args.bam, args.samtools, args.scratch, args.sample, args.output)
         elif command == "rastair-cpg":
-            emit_rastair_cpg(args.bed, args.reference, args.alignment_qc, args.output_qc, sys.stdout)
+            emit_rastair_cpg(args.bed, args.reference, args.alignment_qc, args.output_qc, sys.stdout,
+                             bam=args.bam, samtools=args.samtools, scratch=args.scratch,
+                             vcf=args.vcf, output_snp=args.output_snp, sample=args.sample)
         elif command == "write-dupsifter-qc":
             write_dupsifter_mqc(
                 args.stat_path, args.out_json, args.sample,

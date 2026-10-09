@@ -1,4 +1,4 @@
-# Alopex v14.3 下游 QC 与可视化
+# Alopex v14.4 下游 QC 与可视化
 
 这套下游分析以当前 `Alopex` 的 sealed delivery 为输入，通过
 `03_results/run_manifest.json` 解析 immutable config snapshot、reference FAI、
@@ -181,12 +181,12 @@ Notebook 的 `FINAL_QC_MODE` 可选 `per_clone_samples` 或 `distribution`；前
 
 20 列 QC 的分母、backend 原生 mapping 单位与 TAPS 控制含义的统一定义保留在开发仓库
 参数表。不同 backend 的
-`Native_Mapping%` 不视为同义指标；TAPS 的 CpH 两列为缺失值，不能补零。
+`Native_Mapping%` 不视为同义指标；TAPS 的 `High_CpH_Flag_Rate%` 为缺失值；`Non_CpG_Methylation%` 默认显示可判链宿主分子的 CHG/CHH 原始转换率，零观测为缺失。该指标未经 SNP/测序错误校正，只代表可判链子集，不能直接解释为真实 mCH 或 cDNA 污染率。分项计数与判链分母见 final manifest/MultiQC。
 Gini 使用有覆盖 bins 的 coverage，不纳入未覆盖 bins；TSS count 为甲基化信号之和。
 
 Notebook 默认 HQ 使用 Lambda methylation `< 10`、pUC19 methylation `> 90`、unique CpG
 sites `> 500000` 且 Gini `< 0.5`；mapping 默认不参与统一 HQ，只有完成对应数据回归后才设置
-`MAPPING_THRESHOLD`。真实数据与合成对照的验证边界保留在开发仓库。
+`MAPPING_THRESHOLD`。真实数据与合成对照的验证边界见本版 Release 说明。
 
 ## 关联 RNA_DARLIN 结果
 
@@ -206,4 +206,4 @@ Droplet 的配套 RNA 独立进行细胞调用与 QC。RNA 项目用
 `00_config/dna_rna_library_map.tsv` 指定 DNA/RNA 文库，再按完整 CB17 关联；DNA manifest 的
 `rna_sample` 留空。RNA 侧输出双方细胞全集 `DNA_RNA_cell_links.csv`，整合 QC 只含共同且双方
 QC 可用的细胞；文库冲突或错误交付代际直接失败。该流程不同于孔板的完整细胞集合对应，
-完整契约保留在开发仓库维护规范。
+完整维护契约保留在开发仓库。

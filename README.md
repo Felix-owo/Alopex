@@ -1,4 +1,4 @@
-# Alopex v14.3
+# Alopex v14.4
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -7,7 +7,7 @@ Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报
 | Cabernet | BISCUIT / Bismark | 孔板解复用、trimming、位置去重、high-CpH/non-conversion 过滤 |
 | SRD | BISCUIT / Bismark | DNA/RNA tube 解复用、DNA 分析，并保留 RNA FASTQ 与被筛除 BAM |
 | Droplet DD-MET5 | Bismark non-directional | DNA 独立谷底 calling、官方设计白名单、逐胞嘧啶 UMI 共识 |
-| Cabernet–TAPS+ | BWA-MEM + Rastair | 标记重复、调用 5mC+5hmC；不执行 CpH/cDNA 筛除 |
+| Cabernet–TAPS+ | BWA-MEM + Rastair | 标记重复、调用 CpG 和 SNP，统计 Non-CpG；不执行 CpH/cDNA 筛除 |
 
 用户入口只有 `core/doctor.sh`（构建与维护）和 `core/run_pipeline.sh`（项目运行）。
 各参数的含义与默认值见初始化项目生成的 `00_config/config.yaml` 模板行内注释。
@@ -102,7 +102,7 @@ Doctor 检查或修复环境、Rust demultiplexer、hg38/mm10 reference 与三�
 然后运行 A（hg38/Cabernet/Bismark）、B（mm10/SRD/BISCUIT）和 C（TAPS/Rastair）三条隔离路线。
 登录节点的 A/B 为独立 Slurm workers，可并行；macOS 或已有 allocation 内串行，避免重复使用
 整份内存预算。每条 route 最多 2 CPU，Bismark 16 GiB、BISCUIT/Rastair 24 GiB、20 min。
-C 在 A/B 成功后执行；真实 TAPS 子集已完成生命周期与下游回归；完整 TAPS/SRD 文库仍未完成科学验收。
+C 在 A/B 成功后执行；TAPS 的完整隔离交付及优化子集已有验证；全库链方向真值、SNV 准确度及参数最优性仍未验证，详见本版 Release 说明。
 
 成功结尾必须为 `FINAL STATUS: READY`。详细日志在 `logs/doctor/`，成功清理测试沙箱，
 失败保留沙箱和原生诊断。Doctor 每次都重跑三条路线，READY 只代表本次检查和回归通过。
@@ -160,7 +160,11 @@ Droplet 使用 `protocol: droplet`、Bismark `non_directional`，不需要 Barco
 Droplet 在 non-conversion 过滤后按胞嘧啶位点/UMI 汇集分子共识，保留不同 read pairs 的联合覆盖。
 固定 MAPQ≥10、baseQ≥20；未解决的共识平票不调用。保留 BAM 时其中仍有 PCR 复制，
 独立分子计数以 CpG 输出为准；QC 的 pair 去重率为空，位点分子统计见 MultiQC 与 final manifest。
-TAPS 使用 `protocol: taps`、`methylation_backend: rastair`。
+TAPS 使用 `protocol: taps`、`methylation_backend: rastair`，默认生成 SNP VCF/索引与 Non-CpG QC，无需额外开关。
+调用阶段默认申请 4 CPU，Rastair 并行度受实际分配的 CPU 预算限制；不改变质量或深度阈值。
+Non-CpG 为可判链宿主分子的 CHG/CHH 原始转换率；判链分母保留在 manifest/MultiQC，零观测为缺失。
+SNP 未调用位置不能视为纯合参考；如需保留 BAM 做额外重分析，设置 `retention.keep_final_bam: true`。
+默认 SNP VCF 保留原生 PASS 候选、质量及各等位基因的 OT/OB 链支持注释，参考长度由同一 FASTA 的 FAI 校正；正式遗传分析前须评估深度、置信度和链支持，PASS 本身不保证高置信基因型。
 
 孔板 Barcode Map 至少含 `DNA_Barcode,PlateID,Cell_Order`，SRD 还需 `RNA_Barcode`。
 barcode 为 8 或 10 bp A/C/G/T，同长度序列间 Hamming distance 必须大于 2；PlateID 和
@@ -231,7 +235,7 @@ stage 重试。已完成的快路只读退出；清理失败保留残留与告�
 ├── CpG/<Sample_ID>.cpg.tsv.zst
 ├── QC_Results/multiqc_report.html
 ├── QC_Results/sample_manifest.tsv
-├── SNP/                 仅 BISCUIT 且 generate_snp=true
+├── SNP/                 TAPS 默认 VCF；BISCUIT generate_snp=true 时 BED
 └── run_manifest.json
 ```
 
@@ -246,7 +250,7 @@ CpG 唯一格式为 `chrom, pos, methyl, unmethyl`，tab 分隔、pos 为 0-base
 3. 再次运行 launcher 显示 `Alopex delivery is complete and current`，不启动科学作业。
 
 MultiQC 汇总原生 mapping、pair funnel、重复、过滤、对照和适用的 M-bias；不同 backend
-的 mapping 分母不同。科学解释与空结果的判定以 `00_config/config.yaml` 模板注释为准；已验证数据范围见本版 release 说明。
+的 mapping 分母不同。科学解释与空结果的判定以 `00_config/config.yaml` 模板注释及上文协议说明为准；已验证数据范围见本版 Release 说明。
 
 ## 8. 下游
 
