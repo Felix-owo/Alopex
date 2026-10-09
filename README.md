@@ -1,4 +1,4 @@
-# Alopex v14.4
+# Alopex v14.5
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -161,7 +161,8 @@ Droplet 在 non-conversion 过滤后按胞嘧啶位点/UMI 汇集分子共识，
 固定 MAPQ≥10、baseQ≥20；未解决的共识平票不调用。保留 BAM 时其中仍有 PCR 复制，
 独立分子计数以 CpG 输出为准；QC 的 pair 去重率为空，位点分子统计见 MultiQC 与 final manifest。
 TAPS 使用 `protocol: taps`、`methylation_backend: rastair`，默认生成 SNP VCF/索引与 Non-CpG QC，无需额外开关。
-调用阶段默认申请 4 CPU，Rastair 并行度受实际分配的 CPU 预算限制；不改变质量或深度阈值。
+HPC 每个 cell 的比对和调用合并为 Slurm 作业，S/M/L/XL 统一 16 CPU、16 GiB；最多三次尝试，内存16/24/32 GiB，CPU和时限不变。local调用最多4 CPU；质量/深度阈值保持相同。
+BWA按当前cell的原生FR推断均值/SD，允许插入长度上限至少1000 bp；该先验影响配对和MAPQ，实际效果和验证范围见本版 Release 说明。
 Non-CpG 为可判链宿主分子的 CHG/CHH 原始转换率；判链分母保留在 manifest/MultiQC，零观测为缺失。
 SNP 未调用位置不能视为纯合参考；如需保留 BAM 做额外重分析，设置 `retention.keep_final_bam: true`。
 默认 SNP VCF 保留原生 PASS 候选、质量及各等位基因的 OT/OB 链支持注释，参考长度由同一 FASTA 的 FAI 校正；正式遗传分析前须评估深度、置信度和链支持，PASS 本身不保证高置信基因型。

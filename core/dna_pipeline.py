@@ -31,6 +31,7 @@ import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -830,6 +831,12 @@ STATIC_RESOURCE_REQUESTS: Mapping[str, _StaticRuleRequest] = MappingProxyType(
         ),
 
 
+        "rastair_align_mark": _StaticRuleRequest(
+            (16, 16, 16, 16), (16, 16, 16, 16), (120, 180, 240, 240)
+        ),
+        "rastair_call": _StaticRuleRequest(
+            (16, 16, 16, 16), (4, 8, 12, 16), (60, 120, 180, 240)
+        ),
         "bismark_align_dedup": _StaticRuleRequest(
             (8, 12, 12, 16), (16, 16, 16, 16), (120, 180, 270, 900)
         ),
@@ -1088,7 +1095,8 @@ def combined_runtime_min(
 _BACKEND_STAGE_RULES: Mapping[tuple[str, str], str] = MappingProxyType(
     {
         ("biscuit", "align"): "align_sort_dedup",
-        ("rastair", "align"): "align_sort_dedup",
+        ("rastair", "align"): "rastair_align_mark",
+        ("rastair", "call"): "rastair_call",
         ("bismark", "align"): "bismark_align_dedup",
         ("bismark", "extract"): "bismark_extract",
     }
@@ -1097,6 +1105,8 @@ _BACKEND_STAGE_RULES: Mapping[tuple[str, str], str] = MappingProxyType(
 _LOCAL_BACKEND_THREADS: Mapping[str, tuple[int, int, int, int]] = MappingProxyType(
     {
         "align_sort_dedup": (8, 12, 16, 16),
+        "rastair_align_mark": (8, 12, 16, 16),
+        "rastair_call": (4, 4, 4, 4),
         "bismark_align_dedup": (8, 12, 16, 16),
         "bismark_align_dedup_local": (12, 12, 16, 16),
         "bismark_extract": (8, 8, 8, 8),
@@ -1145,7 +1155,7 @@ def backend_resource_request(
     if cores is None or cores < 1:
         return base
     preferred = _LOCAL_BACKEND_THREADS[rule_key][_TIER_ORDER.index(base.tier)]
-    local_job_cap = max(1, min(16, cores // 2 if cores > 1 else 1))
+    local_job_cap = cores if pair == ("rastair", "call") else max(1, min(16, cores // 2 if cores > 1 else 1))
     threads = max(1, min(preferred, local_job_cap, cores))
     return ResourceRequest(
         policy=f"{STATIC_POLICY}:{backend_key}:{mode}",
@@ -7531,6 +7541,53 @@ def _bismark_version_text(bismark: str | None) -> str:
     return (version.stdout + version.stderr).strip()
 
 
+TAPS_BWA_INSERT_UPPER_FLOOR = 1000
+TAPS_BWA_INSERT_PROBE_PAIRS = 10000
+TAPS_BWA_BATCH_BASES = 150000000
+
+
+def taps_bwa_insert_model(r1: str, r2: str, bwa: str, prefix: str, scratch: str, threads: int) -> str:
+    """用 BWA 原生 FR 推断均值与标准差，将上限至少放宽至 1000 bp；证据不足时沿用自动推断。"""
+    import pysam
+
+    sampled = 0
+    root = Path(scratch)
+    paths = [root / "insert_probe_R1.fastq", root / "insert_probe_R2.fastq"]
+    log = root / "insert_probe.log"
+    try:
+        with pysam.FastxFile(r1) as left, pysam.FastxFile(r2) as right, paths[0].open("w") as one, paths[1].open("w") as two:
+            for a, b in zip(left, right, strict=True):
+                if a.name.removesuffix("/1") != b.name.removesuffix("/2"):
+                    raise ValueError("TAPS insert probe requires matching paired FASTQ names")
+                one.write(str(a) + "\n")
+                two.write(str(b) + "\n")
+                sampled += 1
+                if sampled == TAPS_BWA_INSERT_PROBE_PAIRS:
+                    break
+        model = ""
+        if sampled:
+            with log.open("w") as handle:
+                subprocess.run([bwa, "mem", "-Y", "-t", str(max(1, min(4, threads))), prefix, *map(str, paths)],
+                               stdout=subprocess.DEVNULL, stderr=handle, check=True)
+            native = log.read_text()
+            block = re.search(r"analyzing insert size distribution for orientation FR\.\.\.(.*?)(?:analyzing insert size distribution for orientation RF|skip orientation RF|skip orientation RR)", native, re.S)
+            if block:
+                location = re.search(r"\] mean and std.dev: \(([^,]+), ([^)]+)\)", block[1])
+                bounds = re.search(r"proper pairs: \((\d+), (\d+)\)", block[1])
+                if location and bounds:
+                    mean, deviation = map(float, location.groups())
+                    lower, upper = map(int, bounds.groups())
+                    if math.isfinite(mean) and math.isfinite(deviation) and mean > 0 and deviation > 0 and lower <= upper:
+                        model = f"{location[1]},{location[2]},{max(TAPS_BWA_INSERT_UPPER_FLOOR, upper)},{lower}"
+        print(f"TAPS insert probe: pairs={sampled} FR model={model or 'native automatic'}", file=sys.stderr)
+        return model
+    finally:
+        if log.is_file():
+            print(log.read_text(), file=sys.stderr, end="")
+        for path in [*paths, log]:
+            path.unlink(missing_ok=True)
+
+
 TAPS_MIN_MAPQ = 20
 TAPS_MIN_BASEQ = 30
 TAPS_INCLUDE_FLAGS = 3
@@ -7598,18 +7655,17 @@ def write_taps_alignment_qc(bam: str, samtools: str, scratch: str, sample: str, 
 
 
 def _taps_pair_bases(reads: list, reference) -> tuple[str, dict[int, tuple[str, int]], str, int, str]:
-    eligible = [r for r in reads if r.flag & TAPS_INCLUDE_FLAGS == TAPS_INCLUDE_FLAGS
-                and not r.flag & TAPS_EXCLUDE_FLAGS and r.mapping_quality >= TAPS_MIN_MAPQ]
+    eligible = [r for r in reads if r.flag & TAPS_INCLUDE_FLAGS == TAPS_INCLUDE_FLAGS and (not r.flag & TAPS_EXCLUDE_FLAGS) and (r.mapping_quality >= TAPS_MIN_MAPQ)]
     if not eligible:
-        return "", {}, "", 0, ""
+        return ('', {}, '', 0, '')
     chroms = {r.reference_name for r in eligible}
     if len(chroms) != 1:
-        raise ValueError("TAPS proper pair spans different reference contigs")
+        raise ValueError('TAPS proper pair spans different reference contigs')
     chrom = eligible[0].reference_name
-    start = max(0, min(r.reference_start for r in eligible) - 2)
-    end = min(reference.get_reference_length(chrom), max(r.reference_end for r in eligible) + 2)
+    start = max(0, min((r.reference_start for r in eligible)) - 2)
+    end = min(reference.get_reference_length(chrom), max((r.reference_end for r in eligible)) + 2)
     seq = reference.fetch(chrom, start, end).upper()
-    bases: dict[int, tuple[str, int]] = {}
+    bases = {}
     evidence = 0
     aligned_reads = []
     candidate = False
@@ -7617,57 +7673,95 @@ def _taps_pair_bases(reads: list, reference) -> tuple[str, dict[int, tuple[str, 
         observed = read.query_sequence
         qualities = read.query_qualities
         if observed is None or qualities is None:
-            raise ValueError("TAPS QC requires BAM sequence and base qualities")
-        positions = read.get_reference_positions(full_length=True)
+            raise ValueError('TAPS QC requires BAM sequence and base qualities')
         observed = observed.upper()
-        aligned_reads.append((observed, qualities, positions))
-        if not candidate:
-            candidate = any(pos is not None and quality >= TAPS_MIN_BASEQ
-                            for pos, quality in zip(positions, qualities))
-        for motif, flag in (("TG", 1), ("CA", 2)):
+        cigar = read.cigartuples or []
+        body = [(i, op, n) for i, (op, n) in enumerate(cigar) if op not in (4, 5)]
+        linear = len(body) == 1 and body[0][1] in (0, 7, 8) and all((i in (0, len(cigar) - 1) for i, (op, _) in enumerate(cigar) if op in (4, 5)))
+        if linear:
+            qstart, qend = (read.query_alignment_start, read.query_alignment_end)
+            rstart, rend = (read.reference_start, read.reference_end)
+            positions = None
+            if not candidate:
+                candidate = any((q >= TAPS_MIN_BASEQ for q in qualities[qstart:qend]))
+        else:
+            positions = read.get_reference_positions(full_length=True)
+            qstart = qend = rstart = rend = 0
+            if not candidate:
+                candidate = any((pos is not None and quality >= TAPS_MIN_BASEQ for pos, quality in zip(positions, qualities)))
+        aligned_reads.append((observed, qualities, positions, qstart, qend, rstart, rend))
+        for motif, flag in (('TG', 1), ('CA', 2)):
             if evidence & flag:
                 continue
             qpos = observed.find(motif)
             while qpos >= 0:
-                pos = positions[qpos]
-                if (pos is not None and positions[qpos + 1] == pos + 1
-                        and qualities[qpos] >= TAPS_MIN_BASEQ and qualities[qpos + 1] >= TAPS_MIN_BASEQ
-                        and seq[pos - start:pos - start + 2] == "CG"):
+                if linear:
+                    contiguous = qstart <= qpos and qpos + 1 < qend
+                    pos = rstart + qpos - qstart
+                else:
+                    pos = positions[qpos]
+                    contiguous = pos is not None and positions[qpos + 1] == pos + 1
+                if contiguous and qualities[qpos] >= TAPS_MIN_BASEQ and (qualities[qpos + 1] >= TAPS_MIN_BASEQ) and (seq[pos - start:pos - start + 2] == 'CG'):
                     evidence |= flag
                     break
                 qpos = observed.find(motif, qpos + 1)
-    orientation = "OT" if evidence == 1 else "OB" if evidence == 2 else ""
+    orientation = 'OT' if evidence == 1 else 'OB' if evidence == 2 else ''
     if not candidate:
-        return "", {}, "", 0, ""
+        return ('', {}, '', 0, '')
     if orientation:
-        target = "C" if orientation == "OT" else "G"
+        target = 'C' if orientation == 'OT' else 'G'
         context_positions = set()
         offset = seq.find(target)
         while offset >= 0:
-            if orientation == "OT":
-                valid = offset + 2 < len(seq) and seq[offset + 1] in "ACT" and seq[offset + 2] in "ACGT"
+            if orientation == 'OT':
+                valid = offset + 2 < len(seq) and seq[offset + 1] in 'ACT' and (seq[offset + 2] in 'ACGT')
             else:
-                valid = offset >= 2 and seq[offset - 1] in "AGT" and seq[offset - 2] in "ACGT"
+                valid = offset >= 2 and seq[offset - 1] in 'AGT' and (seq[offset - 2] in 'ACGT')
             if valid:
                 context_positions.add(start + offset)
             offset = seq.find(target, offset + 1)
-        for observed, qualities, positions in aligned_reads:
-            for qpos, pos in enumerate(positions):
-                if pos not in context_positions:
-                    continue
+        for observed, qualities, positions, qstart, qend, rstart, rend in aligned_reads:
+            if positions is None:
+                selected = ((qstart + pos - rstart, pos) for pos in context_positions if rstart <= pos < rend)
+            else:
+                selected = ((qpos, pos) for qpos, pos in enumerate(positions) if pos in context_positions)
+            for qpos, pos in selected:
                 quality = qualities[qpos]
                 if quality < TAPS_MIN_BASEQ:
                     continue
                 base = observed[qpos]
                 previous = bases.get(pos)
                 if previous is None or quality > previous[1]:
-                    bases[pos] = base, quality
+                    bases[pos] = (base, quality)
                 elif quality == previous[1] and base != previous[0]:
-                    bases[pos] = "N", quality
-    return chrom, bases, orientation, start, seq
+                    bases[pos] = ('N', quality)
+    return (chrom, bases, orientation, start, seq)
 
 
-def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str) -> dict[str, object]:
+class _TapsReferenceWindow:
+    def __init__(self, reference):
+        self.reference = reference
+        self.blocks = OrderedDict()
+
+    def get_reference_length(self, chrom):
+        return self.reference.get_reference_length(chrom)
+
+    def fetch(self, chrom, start, end):
+        block = start // 262144 * 262144
+        bound = min(self.reference.get_reference_length(chrom), block + 262144)
+        if end > bound:
+            return self.reference.fetch(chrom, start, end)
+        key = chrom, block
+        if key not in self.blocks:
+            self.blocks[key] = self.reference.fetch(chrom, block, bound)
+            if len(self.blocks) > 16:
+                self.blocks.popitem(last=False)
+        else:
+            self.blocks.move_to_end(key)
+        return self.blocks[key][start - block:end - block]
+
+
+def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str, *, expected_pairs: int) -> dict[str, object]:
     """统计可判链分子的宿主 CHG/CHH 转换率；未知或冲突链不随机分配，重叠 mate 每位置只计一次。
 
     这是未经 SNP/测序错误校正的原始修饰信号 QC；只用高质量 CpG 转换证据判链，
@@ -7678,15 +7772,20 @@ def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str) 
 
     counts = dict.fromkeys(("non_cpg_candidate_pairs", "non_cpg_oriented_pairs", "non_cpg_ambiguous_pairs",
                            "non_cpg_chg_mod", "non_cpg_chg_unmod", "non_cpg_chh_mod", "non_cpg_chh_unmod"), 0)
-    process = subprocess.Popen([samtools, "collate", "-O", "-u", "-T", str(Path(scratch) / "non_cpg_collate"), bam], stdout=subprocess.PIPE)
+    if type(expected_pairs) is not int or expected_pairs < 0:
+        raise ValueError("TAPS non-CpG QC requires a nonnegative complete pair count")
+    primary_pairs = 0
+    process = subprocess.Popen([samtools, "collate", "-f", "-O", "-u", "-T", str(Path(scratch) / "non_cpg_collate"), bam], stdout=subprocess.PIPE)
     try:
-        with pysam.FastaFile(reference) as ref, pysam.AlignmentFile(process.stdout, "rb") as source:
+        with pysam.FastaFile(reference) as fasta, pysam.AlignmentFile(process.stdout, "rb") as source:
+            ref = _TapsReferenceWindow(fasta)
             for name, group in itertools.groupby(source, key=lambda r: r.query_name):
                 primary = [r for r in group if not r.is_secondary and not r.is_supplementary]
                 if len(primary) != 2 or {r.is_read1 for r in primary} != {True, False} or any(
                     not r.is_paired or r.is_read1 == r.is_read2 for r in primary
                 ):
                     raise ValueError(f"TAPS non-CpG QC requires a complete pair: {name}")
+                primary_pairs += 1
                 chrom, bases, orientation, start, seq = _taps_pair_bases(primary, ref)
                 if not chrom.startswith("chr") or re.fullmatch(r"(?i)(chrM|chrMT)", chrom):
                     continue
@@ -7739,6 +7838,8 @@ def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str) 
                 counts["non_cpg_chh_unmod"] += chh_unmod
         if process.wait() != 0:
             raise RuntimeError("samtools collate failed during TAPS non-CpG QC")
+        if primary_pairs != expected_pairs:
+            raise ValueError("TAPS non-CpG primary pair count disagrees with alignment QC")
     finally:
         if process.poll() is None:
             process.terminate()
@@ -7756,22 +7857,26 @@ def emit_taps_snps(vcf: str, output: str, sample: str, *, reference: str) -> int
     import pysam.bcftools
 
     count = 0
-    with pysam.VariantFile(vcf) as source:
-        if len(source.header.samples) != 1:
-            raise ValueError("TAPS SNP VCF requires exactly one sample")
-        old_sample = next(iter(source.header.samples))
-        header_text = str(source.header).rsplit("\t", 1)[0] + "\t" + sample + "\n"
-        with pysam.BGZFile(output, "w") as target:
-            target.write(header_text.encode())
-            for row in source:
-                alleles = row.alleles or ()
-                genotype = row.samples[old_sample].get("GT") or ()
-                if (set(row.filter) != {"PASS"} or len(alleles) < 2
-                        or any(len(a) != 1 or a not in "ACGT" for a in alleles)
-                        or not any(a is not None and a > 0 for a in genotype)):
-                    continue
-                target.write(str(row).encode())
-                count += 1
+    with tempfile.TemporaryDirectory(prefix=".taps_select.", dir=Path(output).parent) as selected:
+        selected_vcf = str(Path(selected) / "variants.vcf")
+        pysam.bcftools.view("--no-version", "--no-update", "--include", 'FILTER="PASS" && (GT="alt" || GT="mis")',
+                            "--output-type", "v", "--output", selected_vcf, vcf, catch_stdout=False)
+        with pysam.VariantFile(selected_vcf) as source:
+            if len(source.header.samples) != 1:
+                raise ValueError("TAPS SNP VCF requires exactly one sample")
+            old_sample = next(iter(source.header.samples))
+            header_text = str(source.header).rsplit("\t", 1)[0] + "\t" + sample + "\n"
+            with pysam.BGZFile(output, "w") as target:
+                target.write(header_text.encode())
+                for row in source:
+                    alleles = row.alleles or ()
+                    genotype = row.samples[old_sample].get("GT") or ()
+                    if (set(row.filter) != {"PASS"} or len(alleles) < 2
+                            or any(len(a) != 1 or a not in "ACGT" for a in alleles)
+                            or not any(a is not None and a > 0 for a in genotype)):
+                        continue
+                    target.write(str(row).encode())
+                    count += 1
     with tempfile.TemporaryDirectory(prefix=".taps_snp.", dir=Path(output).parent) as scratch:
         corrected = str(Path(scratch) / "snps.vcf.gz")
         pysam.bcftools.reheader("--fai", f"{reference}.fai", "--output", corrected, output, catch_stdout=False)
@@ -7788,15 +7893,17 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
     qc = json.loads(Path(alignment_qc).read_text())
     if qc["sample"] != sample:
         raise ValueError("TAPS caller sample differs from alignment QC")
-    qc.update(taps_non_cpg_metrics(bam, reference, samtools, scratch))
+    qc.update(taps_non_cpg_metrics(bam, reference, samtools, scratch, expected_pairs=qc["trimmed_pairs"]))
     qc["snp_sites"] = emit_taps_snps(vcf, output_snp, sample, reference=reference)
     counts = {"native_cpg_rows": 0, "canonical_cpg_rows": 0, "excluded_variant_or_denovo_rows": 0,
               "zero_observation_rows": 0}
     controls = {name: {"mod": 0, "unmod": 0, "sites": 0} for name in ("lambda", "pUC19")}
     required = {"#chr", "start", "end", "unmod", "mod", "coverage", "genotype", "cpg"}
     with pysam.FastaFile(reference) as ref, Path(bed).open() as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        if not required.issubset(reader.fieldnames or ()) or len(reader.fieldnames) != len(set(reader.fieldnames)):
+        reader = csv.reader(handle, delimiter="\t")
+        fieldnames = next(reader, [])
+        column = {name: i for i, name in enumerate(fieldnames)}
+        if not required.issubset(fieldnames) or len(fieldnames) != len(set(fieldnames)):
             raise ValueError("Rastair BED lacks the native 2.2 header")
         previous = None
         contigs = {name: i for i, name in enumerate(ref.references)}
@@ -7824,13 +7931,13 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
         for row in reader:
             counts["native_cpg_rows"] += 1
             label = f"Rastair BED {bed} line {reader.line_num}"
-            if None in row or any(row.get(key) in (None, "") for key in required):
+            if len(row) != len(fieldnames) or any(row[column[key]] == "" for key in required):
                 raise ValueError(f"{label} has missing or extra fields")
-            chrom = row["#chr"]
+            chrom = row[column["#chr"]]
             if chrom not in contigs:
                 raise ValueError(f"{label} contig {chrom!r} is absent from the reference FASTA")
             try:
-                pos, end, mod, unmod, depth = (int(row[k]) for k in ("start", "end", "mod", "unmod", "coverage"))
+                pos, end, mod, unmod, depth = (int(row[column[k]]) for k in ("start", "end", "mod", "unmod", "coverage"))
             except ValueError as exc:
                 raise ValueError(f"{label} has non-integer coordinates/counts") from exc
             if min(pos, mod, unmod, depth) < 0 or end != pos + 1 or mod + unmod > depth:
@@ -7839,7 +7946,7 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
             if previous is not None and key <= previous:
                 raise ValueError("Rastair BED is not ordered or contains duplicate positions")
             previous = key
-            if row["cpg"] != "REF":
+            if row[column["cpg"]] != "REF":
                 counts["excluded_variant_or_denovo_rows"] += 1
                 continue
             if chrom != reference_chrom or not reference_start < pos < reference_end - 1:
@@ -7859,7 +7966,7 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
                 flush_cpg()
                 pending = []
                 pending_key = cpg_key
-            pending.append((chrom, pos, mod, unmod, depth, row["genotype"], base))
+            pending.append((chrom, pos, mod, unmod, depth, row[column["genotype"]], base))
         flush_cpg()
     qc.update(counts)
     qc.update({"signal": "5mC+5hmC", "high_cph_status": "not_applicable",
@@ -9290,6 +9397,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     atomic.add_argument("--samtools", default="samtools")
 
 
+    taps_insert = commands.add_parser("taps-bwa-insert-model", help="推断 TAPS BWA 插入分布并保留长片段。")
+    for field in ("r1", "r2", "bwa", "prefix", "scratch"):
+        taps_insert.add_argument("--" + field, required=True)
+    taps_insert.add_argument("--threads", type=int, required=True)
+
     taps_qc = commands.add_parser("taps-alignment-qc", help="核算 TAPS BAM 保留与调用集合。")
     for field in ("bam", "samtools", "scratch", "sample", "output"):
         taps_qc.add_argument("--" + field, required=True)
@@ -9585,6 +9697,8 @@ def main(argv: list[str] | None = None) -> int:
                 cutadapt_qc_multiqc_json=args.cutadapt_qc_json,
                 workers=args.workers,
             )
+        elif command == "taps-bwa-insert-model":
+            print(taps_bwa_insert_model(args.r1, args.r2, args.bwa, args.prefix, args.scratch, args.threads))
         elif command == "taps-alignment-qc":
             write_taps_alignment_qc(args.bam, args.samtools, args.scratch, args.sample, args.output)
         elif command == "rastair-cpg":

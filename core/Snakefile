@@ -13,7 +13,7 @@ if str(src_path.resolve()) not in sys.path:
 
 from dna_pipeline import (
     MANAGED_SPECIES,
-    TAPS_MIN_MAPQ, TAPS_MIN_BASEQ, TAPS_INCLUDE_FLAGS, TAPS_EXCLUDE_FLAGS,
+    TAPS_MIN_MAPQ, TAPS_MIN_BASEQ, TAPS_INCLUDE_FLAGS, TAPS_EXCLUDE_FLAGS, TAPS_BWA_BATCH_BASES,
     BISMARK_CELL_RULE_RUNTIME_MIN,
     MULTIQC_BISCUIT_SOURCE_SUFFIXES,
     ProjectLayout,
@@ -2091,6 +2091,7 @@ EOF_DUP
 elif METHYLATION_BACKEND == "rastair":
     rule taps_align_mark:
         """复用 Cabernet trimming，以 BWA 比对并标记重复，保留全部原始测得的比对记录。"""
+        group: "taps_cell"
         input:
             r1 = lambda wc: current_demux_fastq(wc.demux_sample, 1),
             r2 = lambda wc: current_demux_fastq(wc.demux_sample, 2),
@@ -2112,11 +2113,12 @@ elif METHYLATION_BACKEND == "rastair":
             disk_mb = lambda wc: static_scratch_mb("preprocess_alignment", wc.demux_sample),
             attempt_no = lambda wc, attempt: int(attempt),
         params:
-            scientific_identity = scientific_code_identity(('write_taps_alignment_qc',), ('dna_pipeline_run_cutadapt',)),
+            scientific_identity = scientific_code_identity(('write_taps_alignment_qc', 'taps_bwa_insert_model', 'TAPS_BWA_BATCH_BASES'), ('dna_pipeline_run_cutadapt',)),
             demux_spacer_len = DNA_W_SPACER_LEN,
             calling_identity = DROPLET_CALLING_IDENTITY,
             demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
             bwa_prefix = f"{REFERENCE_GENOME}.bwa/genome",
+            bwa_batch_bases = TAPS_BWA_BATCH_BASES,
             rg = lambda wc: "@RG\\tID:{0}\\tSM:{0}\\tPL:ILLUMINA".format(wc.demux_sample),
             trim_threads = CUTADAPT_THREADS,
             quality = CUTADAPT_QUALITY_CUTOFF,
@@ -2145,7 +2147,12 @@ elif METHYLATION_BACKEND == "rastair":
             bwa_threads=$(({threads} > 1 ? {threads} - 1 : 1))
             io_threads=$(({threads} - 1))
             sort_mem=$(({resources.mem_mb} / ({threads} + 1)))
-            {BWA:q} mem -Y -t "$bwa_threads" -R {params.rg:q} {params.bwa_prefix:q} "$tmpdir/R1.fastq.gz" "$tmpdir/R2.fastq.gz" | \
+            insert_model=$({RULE_PYTHON:q} -m dna_pipeline taps-bwa-insert-model \
+                --r1 "$tmpdir/R1.fastq.gz" --r2 "$tmpdir/R2.fastq.gz" --bwa {BWA:q} \
+                --prefix {params.bwa_prefix:q} --scratch "$tmpdir" --threads "$bwa_threads")
+            if [[ -n "$insert_model" ]]; then set -- -I "$insert_model"; else set --; fi
+            {BWA:q} mem -Y -t "$bwa_threads" -K {params.bwa_batch_bases} "$@" \
+                -R {params.rg:q} {params.bwa_prefix:q} "$tmpdir/R1.fastq.gz" "$tmpdir/R2.fastq.gz" | \
                 {SAMTOOLS:q} view -u -o "$tmpdir/aligned.bam" -
             rm -f -- "$tmpdir/R1.fastq.gz" "$tmpdir/R2.fastq.gz"
             {SAMTOOLS:q} collate -@ "$io_threads" -o "$tmpdir/names.bam" -T "$tmpdir/collate" "$tmpdir/aligned.bam"
@@ -2169,6 +2176,7 @@ elif METHYLATION_BACKEND == "rastair":
 
     rule taps_call_cpg:
         """调用 TAPS 的 CpG 与 SNP，统计可判链宿主 CHG/CHH，并原子提交结果和 QC。"""
+        group: "taps_cell"
         input:
             bam = CELL_PATH_PATTERN.marked_bam,
             bai = CELL_PATH_PATTERN.marked_bam_index,
@@ -2183,10 +2191,10 @@ elif METHYLATION_BACKEND == "rastair":
             qc = CELL_PATH_PATTERN.rastair_qc,
         log:
             LOGS_DIR / "rules/rastair/{demux_sample}_call.log"
-        threads: 4
+        threads: lambda wc: backend_stage_threads("rastair", "call", wc)
         resources:
-            mem_mb = lambda wc, attempt: static_resource_mem_mb("pileup", wc.demux_sample, attempt),
-            runtime = lambda wc, attempt: static_resource_runtime_min("pileup", wc.demux_sample, attempt),
+            mem_mb = lambda wc, attempt: backend_stage_mem_mb("rastair", "call", wc.demux_sample, attempt),
+            runtime = lambda wc, attempt: backend_stage_runtime_min("rastair", "call", wc.demux_sample, attempt),
             disk_mb = lambda wc: static_scratch_mb("preprocess_alignment", wc.demux_sample),
             attempt_no = lambda wc, attempt: int(attempt),
         conda: ENVIRONMENT_YAML
@@ -2208,7 +2216,7 @@ elif METHYLATION_BACKEND == "rastair":
             tmpdir="$DNA_PIPELINE_SCRATCH_DIR"
             {RASTAIR:q} call -@ {threads} -r {input.reference:q} --guess-read-orientation \
                 -q {TAPS_MIN_MAPQ} -Q {TAPS_MIN_BASEQ} -f {TAPS_INCLUDE_FLAGS} -F {TAPS_EXCLUDE_FLAGS} \
-                --all --m-min-depth 1 --nOT 0,0,0,0 --nOB 0,0,0,0 \
+                --segment-max-length 100000 --all --m-min-depth 1 --nOT 0,0,0,0 --nOB 0,0,0,0 \
                 --vcf-info-fields AS_SB,AS_SS_BQ,AS_SS_MQ,PIR,AF \
                 --bed "$tmpdir/native.bed" --vcf "$tmpdir/native.vcf.gz" {input.bam:q}
             {RULE_PYTHON:q} -m dna_pipeline rastair-cpg --bed "$tmpdir/native.bed" --reference {input.reference:q} \
