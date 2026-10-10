@@ -1,4 +1,4 @@
-# Alopex v14.6
+# Alopex v14.7
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -138,7 +138,7 @@ cd /path/to/Patient001
 03_results/    已发布科学结果
 04_logs/       controller、规则、Slurm 日志及 provenance
 05_tmp/        临时文件
-06_downstream/ 下游按 delivery_id 创建
+06_downstream/ 下游 QC_Results_年月日_时分秒 目录
 run_pipeline.sh
 ```
 
@@ -158,6 +158,7 @@ analysis:
 Droplet 使用 `protocol: droplet`、Bismark `non_directional`，不需要 Barcode Map，
 `rna_sample` 留空；若在初始化前写好 Droplet config，初始化会直接跳过 Barcode Map。
 Droplet 在 non-conversion 过滤后按胞嘧啶位点/UMI 汇集分子共识，保留不同 read pairs 的联合覆盖。
+下游 QC 表的 `Duplicate_Pair_Rate%` 不适用，保留为空值；它不表示 QC 计算失败。
 固定 MAPQ≥10、baseQ≥20；未解决的共识平票不调用。保留 BAM 时其中仍有 PCR 复制，
 独立分子计数以 CpG 输出为准；QC 的 pair 去重率为空，位点分子统计见 MultiQC 与 final manifest。
 TAPS 使用 `protocol: taps`、`methylation_backend: rastair`，默认生成 SNP VCF/索引与 Non-CpG QC，无需额外开关。
@@ -260,7 +261,7 @@ Bismark 原生报告的工具后缀仅在展示时去除，使总表按同一个
 ## 8. 下游
 
 使用 `conda/current/notebook` 环境打开 `downstream/DNA_QC_Visualization.ipynb`，填写
-`DNA_PROJECT_ROOT`、`DNA_PIPELINE_ROOT`。输出固定在当前交付的 `06_downstream/<delivery_id>/`。
+`DNA_PROJECT_ROOT`、`DNA_PIPELINE_ROOT`。输出固定在当前交付的 `06_downstream/QC_Results_<生成时间>/`。
 Notebook 启动、20 列 QC、RawAdata/single-CpG、缓存重算和 RNA 关联均见
 [下游 README](downstream/README.md)。
 

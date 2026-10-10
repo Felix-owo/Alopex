@@ -2,7 +2,7 @@
 
 Notebook 经 resolve_notebook_paths / run_qc_processor / load_notebook_qc_frame
 引导：解析项目与 Pipeline 根、以独立子进程运行 main、加载 QC 表并初始化
-绘图主题；计算结果写入项目的 06_downstream/<delivery_id>，输入与公开科学
+绘图主题；计算结果写入项目的 06_downstream/QC_Results_<生成时间>，输入与公开科学
 结果保持只读。
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ import json
 import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -852,6 +853,43 @@ def _has_file(path: Path) -> bool:
     return path.exists() and path.stat().st_size > 0
 
 
+def resolve_qc_results_dir(project_dir: Path, delivery_id: str) -> Path:
+    """按内部交付记录复用 QC 目录；首次创建使用本地生成时间，同秒重名追加微秒。"""
+    project_dir = project_dir.resolve()
+    root = _project_directory(project_dir, Path("06_downstream"), create=True)
+    matches = []
+    for candidate in sorted(root.glob("QC_Results_*")):
+        candidate = _project_directory(
+            project_dir, candidate.relative_to(project_dir), create=False
+        )
+        marker = candidate / ".delivery.json"
+        if marker.is_symlink():
+            raise ValueError(f"QC delivery record must not be a symlink: {marker}")
+        if not marker.is_file():
+            continue
+        identity = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(identity, dict):
+            raise ValueError(f"Invalid QC delivery record: {marker}")
+        if identity.get("delivery_id") == delivery_id:
+            matches.append(candidate)
+    if len(matches) > 1:
+        raise ValueError(f"Multiple QC directories for the current delivery: {matches}")
+    if matches:
+        return matches[0]
+    now = datetime.now().astimezone()
+    directory = root / now.strftime("QC_Results_%Y%m%d_%H%M%S")
+    try:
+        directory.mkdir()
+    except FileExistsError:
+        directory = root / now.strftime("QC_Results_%Y%m%d_%H%M%S_%f")
+        directory.mkdir()
+    _atomic_write_json(
+        {"delivery_id": delivery_id, "created_at": now.isoformat()},
+        directory / ".delivery.json",
+    )
+    return directory
+
+
 def build_paths(
     project_dir: Path,
     delivery_id: str,
@@ -860,14 +898,10 @@ def build_paths(
     cpg_dir = _project_directory(
         project_dir, Path("03_results/CpG"), create=False
     )
-    qc_results_dir = _project_directory(
-        project_dir,
-        Path("06_downstream") / delivery_id / "QC_Results",
-        create=True,
-    )
+    qc_results_dir = resolve_qc_results_dir(project_dir, delivery_id)
 
     cache_dir = _project_directory(
-        project_dir, Path("06_downstream") / delivery_id / ".cache", create=True
+        project_dir, qc_results_dir.relative_to(project_dir) / ".cache", create=True
     )
 
     return RunPaths(
@@ -2494,6 +2528,82 @@ def _merge_pipeline_qc(
     return out
 
 
+def _export_qc(
+    paths: RunPaths,
+    df_qc: pd.DataFrame,
+    pipeline_qc: pd.DataFrame,
+    manifest_sample_ids: list[str],
+    empty_cpg_sample_ids: set[str],
+    identity: Mapping[str, object],
+    sealed: SealedQCContext,
+) -> None:
+    if not df_qc.empty:
+        computed_columns = [
+            "Sample_ID",
+            "CloneID",
+            "Native_Mapping%",
+            "Duplicate_Pair_Rate%",
+            "Final_Pair_Yield%",
+            "Gini_Index",
+        ]
+        missing_computed_columns = [
+            column for column in computed_columns if column not in df_qc.columns
+        ]
+        if missing_computed_columns:
+            raise ValueError(
+                "Final QC computation is missing required field(s): "
+                + ", ".join(missing_computed_columns)
+            )
+        sample_id_values = df_qc["Sample_ID"].astype(str)
+        empty_cpg_mask = sample_id_values.isin(empty_cpg_sample_ids)
+        umi_consensus_sample_ids = set(
+            pipeline_qc.loc[
+                pipeline_qc["dedup_policy"] == "per_cytosine_umi_consensus_hamming1",
+                "sample_id",
+            ].astype(str)
+        )
+        for column in computed_columns[2:]:
+            values = pd.to_numeric(df_qc[column], errors="raise").to_numpy(dtype=float)
+            nan_mask = None
+            if column == "Gini_Index":
+                nan_mask = empty_cpg_mask
+            elif column == "Duplicate_Pair_Rate%":
+                nan_mask = sample_id_values.isin(umi_consensus_sample_ids)
+            if (
+                np.isinf(values).any()
+                or (values[np.isfinite(values)] < 0).any()
+                or (nan_mask is None and not np.isfinite(values).all())
+                or (
+                    nan_mask is not None
+                    and (
+                        not np.isnan(values[nan_mask]).all()
+                        or not np.isfinite(values[~nan_mask]).all()
+                    )
+                )
+            ):
+                raise ValueError(f"Final QC output contains invalid {column}")
+        clone_ids = df_qc["CloneID"].astype("string").str.strip()
+        if clone_ids.isna().any() or clone_ids.eq("").any():
+            raise ValueError("Final QC output contains an empty CloneID")
+
+        missing_qc_info_columns = [
+            column for column in QC_INFO_COLUMNS if column not in df_qc.columns
+        ]
+        if missing_qc_info_columns:
+            raise ValueError(
+                "DNAme QC information is missing column(s): "
+                + ", ".join(missing_qc_info_columns)
+            )
+        df_qc = df_qc[list(QC_INFO_COLUMNS)]
+
+        df_qc = _require_exact_sample_ids(
+            df_qc, manifest_sample_ids, "Final QC output"
+        )
+        sealed.assert_current()
+        _atomic_write_csv(df_qc, paths.qc_info)
+        _atomic_write_json(identity, paths.input_identity)
+
+
 def _run_pipeline_impl(
     paths: RunPaths,
     cfg: RunConfig,
@@ -2715,63 +2825,10 @@ def _run_pipeline_impl(
 
     timer.start("export")
     _log("Export: write CSVs")
-    if not df_qc.empty:
-        computed_columns = [
-            "Sample_ID",
-            "CloneID",
-            "Native_Mapping%",
-            "Duplicate_Pair_Rate%",
-            "Final_Pair_Yield%",
-            "Gini_Index",
-        ]
-        missing_computed_columns = [
-            column for column in computed_columns if column not in df_qc.columns
-        ]
-        if missing_computed_columns:
-            raise ValueError(
-                "Final QC computation is missing required field(s): "
-                + ", ".join(missing_computed_columns)
-            )
-        sample_id_values = df_qc["Sample_ID"].astype(str)
-        empty_cpg_mask = sample_id_values.isin(empty_cpg_sample_ids)
-        for column in computed_columns[2:]:
-            values = pd.to_numeric(df_qc[column], errors="raise").to_numpy(dtype=float)
-            nan_mask = (
-                empty_cpg_mask if column == "Gini_Index" else None
-            )
-            if (
-                np.isinf(values).any()
-                or (values[np.isfinite(values)] < 0).any()
-                or (nan_mask is None and not np.isfinite(values).all())
-                or (
-                    nan_mask is not None
-                    and (
-                        not np.isnan(values[nan_mask]).all()
-                        or not np.isfinite(values[~nan_mask]).all()
-                    )
-                )
-            ):
-                raise ValueError(f"Final QC output contains invalid {column}")
-        clone_ids = df_qc["CloneID"].astype("string").str.strip()
-        if clone_ids.isna().any() or clone_ids.eq("").any():
-            raise ValueError("Final QC output contains an empty CloneID")
-
-        missing_qc_info_columns = [
-            column for column in QC_INFO_COLUMNS if column not in df_qc.columns
-        ]
-        if missing_qc_info_columns:
-            raise ValueError(
-                "DNAme QC information is missing column(s): "
-                + ", ".join(missing_qc_info_columns)
-            )
-        df_qc = df_qc[list(QC_INFO_COLUMNS)]
-
-        df_qc = _require_exact_sample_ids(
-            df_qc, manifest_sample_ids, "Final QC output"
-        )
-        sealed.assert_current()
-        _atomic_write_csv(df_qc, paths.qc_info)
-        _atomic_write_json(identity, paths.input_identity)
+    _export_qc(
+        paths, df_qc, pipeline_qc, manifest_sample_ids,
+        empty_cpg_sample_ids, identity, sealed,
+    )
     dt = timer.stop("export")
     if dt is not None:
         _log(f"  done: {dt:.2f}s")
@@ -4766,7 +4823,7 @@ def resolve_notebook_paths(
     manifest = load_run_manifest(project_dir, validate_outputs=False)
     pipeline_root = _notebook_pipeline_root(dna_pipeline_root, manifest)
     delivery_id = _manifest_delivery_id(manifest)
-    qc_results_dir = project_dir / "06_downstream" / delivery_id / "QC_Results"
+    qc_results_dir = resolve_qc_results_dir(project_dir, delivery_id)
     return NotebookPaths(
         project_dir=project_dir,
         pipeline_root=pipeline_root,
@@ -4775,7 +4832,7 @@ def resolve_notebook_paths(
         plots_dir=qc_results_dir / "plots",
         qc_info=qc_results_dir / "DNAme_QC_Information.csv",
         tss_info=qc_results_dir / "TSS_Profile_Information.csv",
-        composition_cache=qc_results_dir.parent / ".cache" / "CpG_Signal_Composition.csv",
+        composition_cache=qc_results_dir / ".cache" / "CpG_Signal_Composition.csv",
     )
 
 

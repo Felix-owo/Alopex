@@ -1,4 +1,4 @@
-# Alopex v14.6 下游 QC 与可视化
+# Alopex v14.7 下游 QC 与可视化
 
 这套下游分析以当前 `Alopex` 的 sealed delivery 为输入，通过
 `03_results/run_manifest.json` 解析 immutable config snapshot、reference FAI、
@@ -140,8 +140,12 @@ TSS profile 只记录有覆盖的 bins。有 CpG 的 cell 也可能没有 TSS �
 ## 输出
 
 输出写入与当前交付绑定的
-`<project>/06_downstream/<delivery_id>/QC_Results/`，不会修改 sealed
-`03_results/`：
+`<project>/06_downstream/QC_Results_YYYYMMDD_HHMMSS/`（例如 `QC_Results_20261010_153000`），不会修改 sealed
+`03_results/`。
+
+QC 目录的时间为首次创建时的本地时间；同秒重名追加微秒。同一交付再次运行会复用该目录，缓存位于目录内 `.cache/`。内部 `.delivery.json` 用于匹配交付，Notebook 与 RNA 整合自动定位，无需手动填写长哈希目录。
+
+目录内容：
 
 - `DNAme_QC_Information.csv`：下游与 adata 合并的唯一 QC 表，固定 20 列且
   列序唯一出自 `downstream_qc.QC_INFO_COLUMNS`：`Sample_ID`、`CloneID`、`PlateID`、
