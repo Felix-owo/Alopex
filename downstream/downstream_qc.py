@@ -20,15 +20,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 _PIPELINE_ROOT = Path(__file__).resolve().parents[1]
 _CORE_ROOT = _PIPELINE_ROOT / "core"
 if str(_CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(_CORE_ROOT))
 
 from dna_pipeline import (
-    CPG_REPRESENTATION,
+    CPG_REPRESENTATIONS,
+    load_project_config,
+    get_backend,
     load_run_manifest,
     load_run_snapshot,
     sha256_file,
@@ -249,16 +249,14 @@ def load_sealed_qc_context(
     input_copies = _mapping(snapshot.get("input_copies"), "snapshot input copies")
     config_copy = _mapping(input_copies.get("config"), "snapshot config copy")
     snapshot_config_path = snapshot_input_path(snapshot_path, "config")
-    config = yaml.safe_load(snapshot_config_path.read_text(encoding="utf-8")) or {}
-    if not isinstance(config, Mapping):
-        raise ValueError(f"Sealed config root must be a mapping: {snapshot_config_path}")
+    config = load_project_config(snapshot_config_path)
 
     analysis = _mapping(config.get("analysis"), "snapshot config analysis")
     run_species = str(run.get("species", "")).strip()
     run_protocol = str(run.get("protocol", "")).strip().lower()
     config_species = str(config.get("species", "")).strip()
     config_protocol = str(analysis.get("protocol", "")).strip().lower()
-    config_backend = str(analysis.get("methylation_backend", "")).strip().lower()
+    config_backend = get_backend(config)
     if not run_species or config_species != run_species:
         raise ValueError("Sealed config species disagrees with the run manifest")
     if run_protocol not in {"cabernet", "srd", "taps", "droplet"} or config_protocol != run_protocol:
@@ -271,7 +269,9 @@ def load_sealed_qc_context(
 
     run_config = _mapping(run, "run metadata")
     cpg_representation = str(run_config.get("cpg_representation", ""))
-    if cpg_representation != CPG_REPRESENTATION:
+    coordinate_base = analysis["cpg_coordinate_base"]
+    expected_representation = CPG_REPRESENTATIONS[coordinate_base]
+    if cpg_representation != expected_representation:
         raise ValueError(
             "Unsupported sealed CpG representation: " f"{cpg_representation!r}"
         )
@@ -1046,7 +1046,7 @@ QC_INFO_COLUMNS = (
 )
 RAW_ADATA_SCHEMA_VERSION = 4
 RAW_ADATA_SCHEMA_MODE = "strand_resolved_headered_empty_safe"
-RAW_ADATA_ALGORITHM_VERSION = "snapatac2_import_values_0based_v5"
+RAW_ADATA_ALGORITHM_VERSION = "snapatac2_import_values_0based_v6"
 EMPTY_CPG_SENTINEL_CONTIG = "__DNA_PIPELINE_EMPTY__"
 
 MAX_CPG_PROCESS_WORKERS = 32
@@ -1397,7 +1397,7 @@ def load_or_create_raw_adata(
     sealed_context: SealedQCContext,
     cpg_output_identities: Mapping[str, Mapping[str, object]],
 ):
-    """绑定 sealed inventory 复用 RawAdata 与空表集合，仅缓存失配时解码并创建导入链接。"""
+    """绑定 sealed inventory 复用 RawAdata；重建时将 1-based 输入临时流式转为 0-based。"""
     sealed_context.assert_current()
     expected = [str(value) for value in expected_sample_ids]
     zero_mapped = {str(value) for value in zero_mapped_sample_ids}
@@ -1447,6 +1447,7 @@ def load_or_create_raw_adata(
         "delivery_id": sealed_context.delivery_id,
         "snapshot_id": sealed_context.snapshot_id,
         "cpg_header": "snapatac2_import_values_0based",
+        "source_cpg_representation": sealed_context.cpg_representation,
         "empty_cpg_sentinel": f"{EMPTY_CPG_SENTINEL_CONTIG}:0:0:1",
         "sample_ids": sorted(expected),
         "reference_fai": _content_binding(fai_path) if fai_path is not None else None,
@@ -1519,7 +1520,12 @@ def load_or_create_raw_adata(
             name = sample_id + ".tsv.zst"
             target = import_dir / name
             if sample_id not in empty_cpg:
-                os.symlink(source.resolve(), target)
+                if sealed_context.cpg_representation == CPG_REPRESENTATIONS[0]:
+                    os.symlink(source.resolve(), target)
+                elif sealed_context.cpg_representation == CPG_REPRESENTATIONS[1]:
+                    _write_zero_based_cpg_input(source, target, chrom_sizes)
+                else:
+                    raise ValueError("Unsupported sealed CpG representation")
                 continue
 
 
@@ -1647,6 +1653,61 @@ def _cache_identities(identity: Mapping[str, object], cfg, algorithms: Mapping[s
     }
     return {key: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
             for key, value in payloads.items()}
+
+
+def _write_zero_based_cpg_input(source: Path, target: Path, chrom_sizes: Mapping[str, int]) -> None:
+    executable = shutil.which("zstd")
+    if executable is None:
+        raise FileNotFoundError("zstd is required to normalize 1-based CpG inputs")
+    decoder, handle = _open_cpg_text(source)
+    encoder = None
+    stream_error = None
+    try:
+        with target.open("wb") as output:
+            encoder = subprocess.Popen(
+                [executable, "-q", "-T1", "-c"], stdin=subprocess.PIPE,
+                stdout=output, stderr=subprocess.PIPE, text=True,
+            )
+            if encoder.stdin is None:
+                raise RuntimeError("Cannot open normalized CpG compression stream")
+            if handle.readline().rstrip("\n") != "chrom\tpos\tmethyl\tunmethyl":
+                raise ValueError(f"CpG input has an invalid header: {source}")
+            encoder.stdin.write("chrom\tpos\tmethyl\tunmethyl\n")
+            for line_no, line in enumerate(handle, 2):
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) != 4 or any(re.fullmatch(r"[0-9]+", value) is None for value in fields[1:]):
+                    raise ValueError(f"{source}:{line_no}: invalid CpG fields")
+                pos, methyl, unmethyl = map(int, fields[1:])
+                if (fields[0] not in chrom_sizes or not 1 <= pos <= chrom_sizes[fields[0]]
+                        or methyl + unmethyl <= 0 or methyl + unmethyl > 65535):
+                    raise ValueError(f"{source}:{line_no}: invalid CpG coordinate/counts")
+                encoder.stdin.write(f"{fields[0]}\t{pos - 1}\t{fields[2]}\t{fields[3]}\n")
+            encoder.stdin.close()
+            stderr = encoder.stderr.read() if encoder.stderr is not None else ""
+            if encoder.wait():
+                raise RuntimeError(f"zstd failed for {source}: {stderr.strip()}")
+    except BaseException as exc:
+        stream_error = exc
+        if decoder.poll() is None:
+            decoder.terminate()
+        if encoder is not None and encoder.poll() is None:
+            encoder.terminate()
+        raise
+    finally:
+        handle.close()
+        try:
+            _finish_cpg_process(decoder, source, stream_error)
+        finally:
+            if encoder is not None:
+                if encoder.stdin is not None and not encoder.stdin.closed:
+                    try:
+                        encoder.stdin.close()
+                    except BrokenPipeError:
+                        if stream_error is None:
+                            raise
+                if encoder.stderr is not None:
+                    encoder.stderr.close()
+                encoder.wait()
 
 
 def _open_cpg_text(path: Path):

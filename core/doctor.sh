@@ -8,6 +8,7 @@ fi
 export DNA_PIPELINE_ROOT="$PIPELINE_ROOT"
 
 
+# 共享事务锁与进程收尾
 TXN_LOCK_HELD=0
 
 # 从两列 TSV（key\tvalue）读取首个匹配键的值；文件缺失返回非零。
@@ -191,6 +192,7 @@ txn_terminate_pid_bounded() {
     fi
 }
 
+# 环境角色与必需工具
 CONTROL_RUNTIME_REQUIRED=(
     bin/python
     bin/snakemake
@@ -255,9 +257,7 @@ EOF
 }
 
 
-
-
-
+# Conda 环境构建与 release 发布
 CONDA_ROOT="$PIPELINE_ROOT/conda"
 
 RELEASE_STORE="$CONDA_ROOT/releases"
@@ -356,8 +356,6 @@ USAGE
 CHECK_ONLY=0
 
 HOST_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-
-
 
 
 run_in_sanitized_environment() {
@@ -951,141 +949,137 @@ prune_superseded_releases() {
 }
 
 
-
 # conda 段入口：分派的唯一调用目标；flow 首行自带 set 严格模式。
 run_conda_section() {
-set -euo pipefail
-CHECK_ONLY=0
-NEW_RELEASE_PATH=""
-CONTROL_TARGET=""
-BISCUIT_TARGET=""
-BISMARK_TARGET=""
-RASTAIR_TARGET=""
-NOTEBOOK_TARGET=""
-CONTROL_CONDA=""
-CONTROL_CONDA_DIR=""
-CONDA_PYTHON_BIN=""
-while (( $# > 0 )); do
-    case "$1" in
-        --check)
-            CHECK_ONLY=1
-            ;;
-        -h|--help|help)
-            usage_conda
-            return 0
-            ;;
-        *)
-            echo "ERROR: core/doctor.sh conda 不接受参数：$1" >&2
-            echo "Seed Conda 路径由脚本自动寻找；跨组件检查/修复请使用 core/doctor.sh。" >&2
-            usage_conda >&2
-            return 2
-            ;;
-    esac
-    shift
-done
-if [[ "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" && "$CHECK_ONLY" != 1 ]]; then
-    echo "ERROR: core/doctor.sh conda 构建/发布不应在 SLURM 计算作业中运行；只允许 --check。" >&2
-    echo "请退出当前计算节点/SLURM job，在 HPC 登录节点重新执行：" >&2
-    echo "  bash core/doctor.sh conda" >&2
-    return 2
-fi
-unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE VIRTUAL_ENV || true
-unset LD_LIBRARY_PATH LD_PRELOAD LIBRARY_PATH PKG_CONFIG_PATH || true
-unset DYLD_LIBRARY_PATH CMAKE_PREFIX_PATH || true
-export PYTHONNOUSERSITE=1
-require_specification "$ENVS_SPEC"
-if (( CHECK_ONLY == 1 )); then
-    if check_current_release; then
-        return 0
-    else
-        rc=$?
-        exit "$rc"
+    set -euo pipefail
+    CHECK_ONLY=0
+    NEW_RELEASE_PATH=""
+    CONTROL_TARGET=""
+    BISCUIT_TARGET=""
+    BISMARK_TARGET=""
+    RASTAIR_TARGET=""
+    NOTEBOOK_TARGET=""
+    CONTROL_CONDA=""
+    CONTROL_CONDA_DIR=""
+    CONDA_PYTHON_BIN=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --check)
+                CHECK_ONLY=1
+                ;;
+            -h|--help|help)
+                usage_conda
+                return 0
+                ;;
+            *)
+                echo "ERROR: core/doctor.sh conda 不接受参数：$1" >&2
+                echo "Seed Conda 路径由脚本自动寻找；跨组件检查/修复请使用 core/doctor.sh。" >&2
+                usage_conda >&2
+                return 2
+                ;;
+        esac
+        shift
+    done
+    if [[ "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" && "$CHECK_ONLY" != 1 ]]; then
+        echo "ERROR: core/doctor.sh conda 构建/发布不应在 SLURM 计算作业中运行；只允许 --check。" >&2
+        echo "请退出当前计算节点/SLURM job，在 HPC 登录节点重新执行：" >&2
+        echo "  bash core/doctor.sh conda" >&2
+        return 2
     fi
-fi
-mkdir -p \
-    "$CONDA_ROOT" \
-    "$PACKAGE_CACHE" \
-    "$SETUP_HOME" \
-    "$SETUP_ENVS" \
-    "$SETUP_CACHE" \
-    "$SETUP_CONFIG"
-SEED_CONDA="$(resolve_seed_conda)"
-SEED_CONDA_DIR="$(cd "$(dirname "$SEED_CONDA")" && pwd -P)"
-export PATH="$SEED_CONDA_DIR:$HOST_PATH"
-validate_seed_context
-txn_acquire_lock "$ENVIRONMENT_LOCK" "setup_conda transaction"
-trap cleanup_setup_transaction EXIT
-if [[ -e "$CURRENT_RELEASE" && ! -L "$CURRENT_RELEASE" ]]; then
-    echo "ERROR: conda/current 存在但不是 symlink，拒绝继续。" >&2
-    return 1
-fi
-mkdir -p "$RELEASE_STORE"
-RELEASE_ID="$(new_release_id)"
-NEW_RELEASE_PATH="$RELEASE_STORE/$RELEASE_ID"
-set_conda_release_targets
-if [[ -e "$NEW_RELEASE_PATH" || -L "$NEW_RELEASE_PATH" ]]; then
-    echo "ERROR: release 路径已经存在：$NEW_RELEASE_PATH" >&2
-    return 1
-fi
-mkdir "$NEW_RELEASE_PATH"
-echo "创建增量 release：$NEW_RELEASE_PATH"
-if [[ -L "$CURRENT_RELEASE" && -x "$CURRENT_RELEASE/control/bin/python" ]] \
-    && run_conda_state_cli "$CURRENT_RELEASE/control/bin/python" env-reusable \
-        "$CURRENT_RELEASE/control" --envs "$ENVS_SPEC" --role control >/dev/null 2>&1 \
-    && smoke_control "$CURRENT_RELEASE/control" >/dev/null 2>&1; then
-    CURRENT_CONTROL_RESOLVED="$(cd "$CURRENT_RELEASE/control" && pwd -P)"
-    ln -s "$CURRENT_CONTROL_RESOLVED" "$CONTROL_TARGET"
-    echo "复用未变化的 control 环境：$CURRENT_CONTROL_RESOLVED"
-else
-    echo "创建/更新 control：$CONTROL_TARGET"
-    retry_transient_create control "$CONTROL_TARGET" create_control_from_seed "$CONTROL_TARGET" control
-    smoke_control "$CONTROL_TARGET" || {
-        echo "ERROR: 新 control 环境未通过 smoke test：$CONTROL_TARGET" >&2
+    unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE VIRTUAL_ENV || true
+    unset LD_LIBRARY_PATH LD_PRELOAD LIBRARY_PATH PKG_CONFIG_PATH || true
+    unset DYLD_LIBRARY_PATH CMAKE_PREFIX_PATH || true
+    export PYTHONNOUSERSITE=1
+    require_specification "$ENVS_SPEC"
+    if (( CHECK_ONLY == 1 )); then
+        if check_current_release; then
+            return 0
+        else
+            rc=$?
+            exit "$rc"
+        fi
+    fi
+    mkdir -p \
+        "$CONDA_ROOT" \
+        "$PACKAGE_CACHE" \
+        "$SETUP_HOME" \
+        "$SETUP_ENVS" \
+        "$SETUP_CACHE" \
+        "$SETUP_CONFIG"
+    SEED_CONDA="$(resolve_seed_conda)"
+    SEED_CONDA_DIR="$(cd "$(dirname "$SEED_CONDA")" && pwd -P)"
+    export PATH="$SEED_CONDA_DIR:$HOST_PATH"
+    validate_seed_context
+    txn_acquire_lock "$ENVIRONMENT_LOCK" "setup_conda transaction"
+    trap cleanup_setup_transaction EXIT
+    if [[ -e "$CURRENT_RELEASE" && ! -L "$CURRENT_RELEASE" ]]; then
+        echo "ERROR: conda/current 存在但不是 symlink，拒绝继续。" >&2
+        return 1
+    fi
+    mkdir -p "$RELEASE_STORE"
+    RELEASE_ID="$(new_release_id)"
+    NEW_RELEASE_PATH="$RELEASE_STORE/$RELEASE_ID"
+    set_conda_release_targets
+    if [[ -e "$NEW_RELEASE_PATH" || -L "$NEW_RELEASE_PATH" ]]; then
+        echo "ERROR: release 路径已经存在：$NEW_RELEASE_PATH" >&2
+        return 1
+    fi
+    mkdir "$NEW_RELEASE_PATH"
+    echo "创建增量 release：$NEW_RELEASE_PATH"
+    if [[ -L "$CURRENT_RELEASE" && -x "$CURRENT_RELEASE/control/bin/python" ]] \
+        && run_conda_state_cli "$CURRENT_RELEASE/control/bin/python" env-reusable \
+            "$CURRENT_RELEASE/control" --envs "$ENVS_SPEC" --role control >/dev/null 2>&1 \
+        && smoke_control "$CURRENT_RELEASE/control" >/dev/null 2>&1; then
+        CURRENT_CONTROL_RESOLVED="$(cd "$CURRENT_RELEASE/control" && pwd -P)"
+        ln -s "$CURRENT_CONTROL_RESOLVED" "$CONTROL_TARGET"
+        echo "复用未变化的 control 环境：$CURRENT_CONTROL_RESOLVED"
+    else
+        echo "创建/更新 control：$CONTROL_TARGET"
+        retry_transient_create control "$CONTROL_TARGET" create_control_from_seed "$CONTROL_TARGET" control
+        smoke_control "$CONTROL_TARGET" || {
+            echo "ERROR: 新 control 环境未通过 smoke test：$CONTROL_TARGET" >&2
+            return 1
+        }
+    fi
+    echo "control smoke test：PASS"
+    echo "正式环境管理器已切换为：$CONTROL_CONDA"
+    create_all_other_envs || {
+        echo "ERROR: 其它 Conda 环境未全部创建成功。" >&2
         return 1
     }
-fi
-echo "control smoke test：PASS"
-echo "正式环境管理器已切换为：$CONTROL_CONDA"
-create_all_other_envs || {
-    echo "ERROR: 其它 Conda 环境未全部创建成功。" >&2
-    return 1
-}
-echo "其它 Conda 环境统一创建：PASS"
-smoke_all_other_envs || exit 1
-echo "其它 Conda 环境统一检查：PASS"
-[[ -L "$CONTROL_TARGET" ]] || record_new_environment "$CONTROL_TARGET" control
-[[ -L "$BISCUIT_TARGET" ]] || record_new_environment "$BISCUIT_TARGET" biscuit
-[[ -L "$BISMARK_TARGET" ]] || record_new_environment "$BISMARK_TARGET" bismark
-[[ -L "$RASTAIR_TARGET" ]] || record_new_environment "$RASTAIR_TARGET" rastair
-[[ -L "$NOTEBOOK_TARGET" ]] || record_new_environment "$NOTEBOOK_TARGET" notebook
-finalize_release
-publish_release
-echo "已原子发布 Conda release：$NEW_RELEASE_PATH"
-prune_superseded_releases
-txn_release_lock "$ENVIRONMENT_LOCK"
-trap - EXIT
-echo
-echo "Alopex Conda release 构建并激活成功："
-echo "  platform     : $NATIVE_SUBDIR"
-echo "  seed         : $SEED_CONDA"
-echo "  control conda: $CONTROL_CONDA"
-echo "  release      : $NEW_RELEASE_PATH"
-echo "  current      : $CURRENT_RELEASE -> $NEW_RELEASE_PATH"
-echo "  control      : $CONTROL_TARGET"
-echo "  biscuit      : $BISCUIT_TARGET"
-echo "  bismark      : $BISMARK_TARGET"
-echo "  rastair      : $RASTAIR_TARGET"
-echo "  notebook     : $NOTEBOOK_TARGET"
-echo
-echo "后续状态检查 / 自动修复请统一执行："
-echo "  bash $PIPELINE_ROOT/core/doctor.sh"
+    echo "其它 Conda 环境统一创建：PASS"
+    smoke_all_other_envs || exit 1
+    echo "其它 Conda 环境统一检查：PASS"
+    [[ -L "$CONTROL_TARGET" ]] || record_new_environment "$CONTROL_TARGET" control
+    [[ -L "$BISCUIT_TARGET" ]] || record_new_environment "$BISCUIT_TARGET" biscuit
+    [[ -L "$BISMARK_TARGET" ]] || record_new_environment "$BISMARK_TARGET" bismark
+    [[ -L "$RASTAIR_TARGET" ]] || record_new_environment "$RASTAIR_TARGET" rastair
+    [[ -L "$NOTEBOOK_TARGET" ]] || record_new_environment "$NOTEBOOK_TARGET" notebook
+    finalize_release
+    publish_release
+    echo "已原子发布 Conda release：$NEW_RELEASE_PATH"
+    prune_superseded_releases
+    txn_release_lock "$ENVIRONMENT_LOCK"
+    trap - EXIT
+    echo
+    echo "Alopex Conda release 构建并激活成功："
+    echo "  platform     : $NATIVE_SUBDIR"
+    echo "  seed         : $SEED_CONDA"
+    echo "  control conda: $CONTROL_CONDA"
+    echo "  release      : $NEW_RELEASE_PATH"
+    echo "  current      : $CURRENT_RELEASE -> $NEW_RELEASE_PATH"
+    echo "  control      : $CONTROL_TARGET"
+    echo "  biscuit      : $BISCUIT_TARGET"
+    echo "  bismark      : $BISMARK_TARGET"
+    echo "  rastair      : $RASTAIR_TARGET"
+    echo "  notebook     : $NOTEBOOK_TARGET"
+    echo
+    echo "后续状态检查 / 自动修复请统一执行："
+    echo "  bash $PIPELINE_ROOT/core/doctor.sh"
 }
 
 
-
-
-
-
+# Reference 构建、验证与事务恢复
 CONTROL_ENV="$CURRENT_RELEASE/control"
 BISCUIT_ENV="$CURRENT_RELEASE/biscuit"
 BISMARK_ENV="$CURRENT_RELEASE/bismark"
@@ -1211,7 +1205,6 @@ HG38_BWA_READY=0
 HG38_BISCUIT_READY=0
 HG38_BISMARK_STANDARD_READY=0
 HG38_BISMARK_COMBINED_READY=0
-HG38_BISMARK_READY=0
 HG38_DOWNSTREAM_READY=0
 HG38_BUNDLE_READY=0
 MM10_ASSEMBLED_READY=0
@@ -1219,7 +1212,6 @@ MM10_BWA_READY=0
 MM10_BISCUIT_READY=0
 MM10_BISMARK_STANDARD_READY=0
 MM10_BISMARK_COMBINED_READY=0
-MM10_BISMARK_READY=0
 MM10_DOWNSTREAM_READY=0
 MM10_BUNDLE_READY=0
 
@@ -1280,7 +1272,6 @@ Linux/HPC 行为：
   FAIL、Ctrl-C、TERM 或 HUP 只清理未提交临时目录；运行前已存在的正式 reference/index 不作为 rollback workspace。
 USAGE
 }
-
 
 
 check_prerequisites_reference() {
@@ -1883,7 +1874,7 @@ reference_bundle_ready() {
 
 evaluate_reference_state() {
     local species="$1" fasta="$2" prefix
-    local bwa_ready=0 assembled_ready=0 biscuit_ready=0 bismark_standard_ready=0 bismark_combined_ready=0 bismark_ready=0 downstream_ready=0 bundle_ready=0
+    local bwa_ready=0 assembled_ready=0 biscuit_ready=0 bismark_standard_ready=0 bismark_combined_ready=0 downstream_ready=0 bundle_ready=0
 
     case "$species" in
         hg38) prefix="HG38" ;;
@@ -1899,10 +1890,9 @@ evaluate_reference_state() {
     biscuit_index_ready "$fasta" && biscuit_ready=1 || true
     bismark_standard_index_ready "$fasta" && bismark_standard_ready=1 || true
     bismark_combined_index_ready "$fasta" && bismark_combined_ready=1 || true
-    if (( bismark_standard_ready == 1 && bismark_combined_ready == 1 )); then bismark_ready=1; fi
     downstream_references_ready "$species" "$fasta" && downstream_ready=1 || true
 
-    if (( assembled_ready == 1 && bwa_ready == 1 && biscuit_ready == 1 && bismark_ready == 1 && downstream_ready == 1 )); then
+    if (( assembled_ready == 1 && bwa_ready == 1 && biscuit_ready == 1 && bismark_standard_ready == 1 && bismark_combined_ready == 1 && downstream_ready == 1 )); then
         bundle_ready=1
     fi
 
@@ -1911,7 +1901,6 @@ evaluate_reference_state() {
     printf -v "${prefix}_BISCUIT_READY" '%d' "$biscuit_ready"
     printf -v "${prefix}_BISMARK_STANDARD_READY" '%d' "$bismark_standard_ready"
     printf -v "${prefix}_BISMARK_COMBINED_READY" '%d' "$bismark_combined_ready"
-    printf -v "${prefix}_BISMARK_READY" '%d' "$bismark_ready"
     printf -v "${prefix}_DOWNSTREAM_READY" '%d' "$downstream_ready"
     printf -v "${prefix}_BUNDLE_READY" '%d' "$bundle_ready"
 }
@@ -2014,7 +2003,6 @@ setup_reference() {
         printf -v "${prefix}_BISCUIT_READY" '%d' 0
         printf -v "${prefix}_BISMARK_STANDARD_READY" '%d' 0
         printf -v "${prefix}_BISMARK_COMBINED_READY" '%d' 0
-        printf -v "${prefix}_BISMARK_READY" '%d' 0
         printf -v "${prefix}_DOWNSTREAM_READY" '%d' 0
     fi
 
@@ -2058,7 +2046,6 @@ build_species_bismark() {
         echo "复用标准 Bismark CT/GA indexes： $fasta.bismark"
     else
         build_bismark_standard_index "$fasta" || return $?
-        standard_ready=1
         printf -v "${prefix}_BISMARK_STANDARD_READY" '%d' 1
     fi
 
@@ -2066,10 +2053,8 @@ build_species_bismark() {
         echo "复用 Bismark Combined index： $fasta.bismark/Bisulfite_Genome/Combined"
     else
         build_bismark_combined_index "$fasta" || return $?
-        combined_ready=1
         printf -v "${prefix}_BISMARK_COMBINED_READY" '%d' 1
     fi
-    printf -v "${prefix}_BISMARK_READY" '%d' 1
 }
 
 run_bismark_phase() {
@@ -2122,6 +2107,7 @@ finalize_reference_species() {
 }
 
 
+# Reference 的 Slurm 调度与阶段入口
 slurm_resources_sufficient() {
     local cpus mem_mib
 
@@ -2402,37 +2388,35 @@ main_reference() {
 
 # reference 段入口：分派的唯一调用目标；flow 首行自带 set 严格模式。
 run_reference_section() {
-set -euo pipefail
-CHECK_ONLY=0
-if (( $# > 1 )); then
-    echo "ERROR: core/doctor.sh reference 只接受 --check 或 --help。" >&2
-    usage_reference >&2
-    return 2
-fi
-if (( $# == 1 )); then
-    case "$1" in
-        --check)
-            CHECK_ONLY=1
-            ;;
-        -h|--help|help)
-            usage_reference
-            return 0
-            ;;
-        *)
-            echo "ERROR: core/doctor.sh reference 不接受参数：$1" >&2
-            echo "hg38/mm10 由脚本统一管理；其它物种由用户自行构建。" >&2
-            usage_reference >&2
-            return 2
-            ;;
-    esac
-fi
-main_reference
+    set -euo pipefail
+    CHECK_ONLY=0
+    if (( $# > 1 )); then
+        echo "ERROR: core/doctor.sh reference 只接受 --check 或 --help。" >&2
+        usage_reference >&2
+        return 2
+    fi
+    if (( $# == 1 )); then
+        case "$1" in
+            --check)
+                CHECK_ONLY=1
+                ;;
+            -h|--help|help)
+                usage_reference
+                return 0
+                ;;
+            *)
+                echo "ERROR: core/doctor.sh reference 不接受参数：$1" >&2
+                echo "hg38/mm10 由脚本统一管理；其它物种由用户自行构建。" >&2
+                usage_reference >&2
+                return 2
+                ;;
+        esac
+    fi
+    main_reference
 }
 
 
-
-
-
+# Rust 解复用器构建与原子发布
 DEMUX_ROOT="$PIPELINE_ROOT/core/demux_rs"
 RUST_STATE_ROOT="$PIPELINE_ROOT/conda/rust"
 RUST_LOG_ROOT="$RUST_STATE_ROOT/logs"
@@ -2771,101 +2755,102 @@ main_demux() {
 }
 
 
+# 依赖缓存维护
 # 下载段入口：只预热 conda package_cache 与 cargo 依赖缓存；不创建/发布环境、不编译、不提交作业。
 run_download_section() {
-set -euo pipefail
-CHECK_ONLY=0
-export CARGO_HOME
-if (( $# > 0 )); then
-    echo "ERROR: core/doctor.sh download 不接受参数。" >&2
-    doctor_usage >&2
-    return 2
-fi
-local conda_bin conda_dir role specification warm_root help_text
-local -a specifier_args=()
-require_specification "$ENVS_SPEC"
-mkdir -p "$CONDA_ROOT" "$PACKAGE_CACHE" "$SETUP_HOME" "$SETUP_ENVS" "$SETUP_CACHE" "$SETUP_CONFIG" "$ENVS_BUILD_DIR"
-warm_root="$CONDA_ROOT/.build/warm"
-mkdir -p "$warm_root"
-SEED_CONDA="$(resolve_seed_conda)"
-SEED_CONDA_DIR="$(cd "$(dirname "$SEED_CONDA")" && pwd -P)"
-if [[ -x "$CONDA_ROOT/current/control/bin/conda" ]]; then
-    conda_bin="$CONDA_ROOT/current/control/bin/conda"
-else
-    conda_bin="$SEED_CONDA"
-fi
-conda_dir="$(cd "$(dirname "$conda_bin")" && pwd -P)"
-help_text="$(run_conda_probe "$conda_bin" create --help)" || return $?
-[[ "$help_text" == *"--download-only"* ]] || {
-    echo "ERROR: $conda_bin 不支持 conda create --download-only，无法预热包缓存。" >&2
-    return 127
-}
-if [[ "$help_text" == *"--environment-specifier"* ]]; then
-    specifier_args=(--environment-specifier environment-yaml)
-fi
-export PATH="$conda_dir:$HOST_PATH"
-validate_seed_context
-txn_acquire_lock "$ENVIRONMENT_LOCK" "conda cache warm" || return $?
-trap cleanup_setup_transaction EXIT
-for role in control biscuit bismark rastair notebook; do
-    specification="$(extract_env_spec "$role")" || return $?
-    echo "预热 Conda 包缓存： $role"
-    env \
-        "${CLEAN_ENVIRONMENT[@]}" \
-        CONDA_ALWAYS_YES=true \
-        CONDA_DEFAULT_THREADS=1 \
-        CONDA_EXECUTE_THREADS=1 \
-        CONDA_FETCH_THREADS=1 \
-        CONDA_REMOTE_MAX_RETRIES=5 \
-        CONDA_REPODATA_THREADS=1 \
-        CONDA_VERIFY_THREADS=1 \
-        PYTHONNOUSERSITE=1 \
-        "$conda_bin" create \
-            --download-only \
-            "${specifier_args[@]}" \
-            --prefix "$warm_root/$role" \
-            --file "$specification"
-done
-txn_release_lock "$ENVIRONMENT_LOCK"
-trap - EXIT
-echo "预热 Rust 依赖缓存： cargo fetch"
-with_transaction_lock_demux demux_fetch_only
-echo "缓存预热完成： $PACKAGE_CACHE 与 ${CARGO_HOME}；后续 conda/demux 段可直接离线复用。"
+    set -euo pipefail
+    CHECK_ONLY=0
+    export CARGO_HOME
+    if (( $# > 0 )); then
+        echo "ERROR: core/doctor.sh download 不接受参数。" >&2
+        doctor_usage >&2
+        return 2
+    fi
+    local conda_bin conda_dir role specification warm_root help_text
+    local -a specifier_args=()
+    require_specification "$ENVS_SPEC"
+    mkdir -p "$CONDA_ROOT" "$PACKAGE_CACHE" "$SETUP_HOME" "$SETUP_ENVS" "$SETUP_CACHE" "$SETUP_CONFIG" "$ENVS_BUILD_DIR"
+    warm_root="$CONDA_ROOT/.build/warm"
+    mkdir -p "$warm_root"
+    SEED_CONDA="$(resolve_seed_conda)"
+    SEED_CONDA_DIR="$(cd "$(dirname "$SEED_CONDA")" && pwd -P)"
+    if [[ -x "$CONDA_ROOT/current/control/bin/conda" ]]; then
+        conda_bin="$CONDA_ROOT/current/control/bin/conda"
+    else
+        conda_bin="$SEED_CONDA"
+    fi
+    conda_dir="$(cd "$(dirname "$conda_bin")" && pwd -P)"
+    help_text="$(run_conda_probe "$conda_bin" create --help)" || return $?
+    [[ "$help_text" == *"--download-only"* ]] || {
+        echo "ERROR: $conda_bin 不支持 conda create --download-only，无法预热包缓存。" >&2
+        return 127
+    }
+    if [[ "$help_text" == *"--environment-specifier"* ]]; then
+        specifier_args=(--environment-specifier environment-yaml)
+    fi
+    export PATH="$conda_dir:$HOST_PATH"
+    validate_seed_context
+    txn_acquire_lock "$ENVIRONMENT_LOCK" "conda cache warm" || return $?
+    trap cleanup_setup_transaction EXIT
+    for role in control biscuit bismark rastair notebook; do
+        specification="$(extract_env_spec "$role")" || return $?
+        echo "预热 Conda 包缓存： $role"
+        env \
+            "${CLEAN_ENVIRONMENT[@]}" \
+            CONDA_ALWAYS_YES=true \
+            CONDA_DEFAULT_THREADS=1 \
+            CONDA_EXECUTE_THREADS=1 \
+            CONDA_FETCH_THREADS=1 \
+            CONDA_REMOTE_MAX_RETRIES=5 \
+            CONDA_REPODATA_THREADS=1 \
+            CONDA_VERIFY_THREADS=1 \
+            PYTHONNOUSERSITE=1 \
+            "$conda_bin" create \
+                --download-only \
+                "${specifier_args[@]}" \
+                --prefix "$warm_root/$role" \
+                --file "$specification"
+    done
+    txn_release_lock "$ENVIRONMENT_LOCK"
+    trap - EXIT
+    echo "预热 Rust 依赖缓存： cargo fetch"
+    with_transaction_lock_demux demux_fetch_only
+    echo "缓存预热完成： $PACKAGE_CACHE 与 ${CARGO_HOME}；后续 conda/demux 段可直接离线复用。"
 }
 
 
 # demux 段入口：分派的唯一调用目标；flow 首行自带 set 严格模式。
 run_demux_section() {
-set -euo pipefail
-CHECK_ONLY=0
-export CARGO_HOME
-if (( $# > 1 )); then
-    echo "ERROR: core/doctor.sh demux 只接受 --check 或 --help。" >&2
-    usage_demux >&2
-    return 2
-fi
-if (( $# == 1 )); then
-    case "$1" in
-        --check)
-            CHECK_ONLY=1
-            ;;
-        -h|--help|help)
-            usage_demux
-            return 0
-            ;;
-        *)
-            echo "ERROR: 未知参数： $1" >&2
-            usage_demux >&2
-            return 2
-            ;;
-    esac
-fi
-export RUSTC="$RUSTC_BIN"
-main_demux
+    set -euo pipefail
+    CHECK_ONLY=0
+    export CARGO_HOME
+    if (( $# > 1 )); then
+        echo "ERROR: core/doctor.sh demux 只接受 --check 或 --help。" >&2
+        usage_demux >&2
+        return 2
+    fi
+    if (( $# == 1 )); then
+        case "$1" in
+            --check)
+                CHECK_ONLY=1
+                ;;
+            -h|--help|help)
+                usage_demux
+                return 0
+                ;;
+            *)
+                echo "ERROR: 未知参数： $1" >&2
+                usage_demux >&2
+                return 2
+                ;;
+        esac
+    fi
+    export RUSTC="$RUSTC_BIN"
+    main_demux
 }
 
 
-
+# Doctor fixture、日志与路线回归
 RUN_PIPELINE="$PIPELINE_ROOT/core/run_pipeline.sh"
 
 BENCHMARK_ROOT="$PIPELINE_ROOT/resources/doctor_benchmark"
@@ -3024,6 +3009,20 @@ doctor_step_ok() {
     summary "Step $DOCTOR_STEP/$DOCTOR_TOTAL_STEPS OK: $CURRENT_STEP ($(( $(date +%s) - DOCTOR_STEP_STARTED ))s$note)"
 }
 
+# 汇集失败路线的 controller 日志末尾，未生成日志时明确记录。
+append_controller_failure_tail() {
+    local project="$1" route_label="$2" controller_log found=0
+    for controller_log in "$project"/04_logs/controller/*.log; do
+        [[ -f "$controller_log" ]] || continue
+        found=1
+        {
+            printf '\n--- %s controller 失败日志末尾：%s ---\n' "$route_label" "$controller_log"
+            tail -n 160 "$controller_log" 2>/dev/null || true
+        } >> "$DETAIL_LOG"
+    done
+    (( found == 1 )) || printf '\n--- %s controller 未生成失败日志 ---\n' "$route_label" >> "$DETAIL_LOG"
+}
+
 # 内部命令的原生输出与退出码仅进 detail；保留活动 PID 以便中断时收尾。
 run_logged() {
     local label="$1" rc started; shift
@@ -3112,221 +3111,210 @@ verify_route_outputs() {
 
 # doctor 段入口：分派的唯一调用目标；flow 首行自带 set 严格模式。
 run_doctor_section() {
-set -uo pipefail
-DOCTOR_RUN_ID="$(date '+%Y%m%dT%H%M%S').$$"
-DOCTOR_LOG_ROOT="${DNA_PIPELINE_DOCTOR_LOG_DIR:-$PIPELINE_ROOT/logs/doctor}"
-mkdir -p "$DOCTOR_LOG_ROOT" "$DOCTOR_TMP_PARENT"
-find "$DOCTOR_TMP_PARENT" -mindepth 1 -maxdepth 1 -type d -name 'doctor.*' \
-    -mtime "+$DOCTOR_SANDBOX_RETENTION_DAYS" \
-    -exec rm -rf -- {} + 2>/dev/null || true
-TMP_ROOT="$(mktemp -d "$DOCTOR_TMP_PARENT/doctor.${DOCTOR_RUN_ID}.XXXXXX")" || exit 1
-DETAIL_LOG="$DOCTOR_LOG_ROOT/doctor.${DOCTOR_RUN_ID}.detail.log"
-FINAL_LOG="$DOCTOR_LOG_ROOT/doctor.${DOCTOR_RUN_ID}.summary.log"
-LATEST_DETAIL_LOG="$DOCTOR_LOG_ROOT/latest.detail.log"
-LATEST_SUMMARY_LOG="$DOCTOR_LOG_ROOT/latest.summary.log"
-SMOKE_HG38="$TMP_ROOT/smoke_hg38_cabernet_bismark"
-SMOKE_MM10="$TMP_ROOT/smoke_mm10_srd_biscuit"
-: > "$DETAIL_LOG"; : > "$FINAL_LOG"
-ln -sfn "$(basename "$DETAIL_LOG")" "$LATEST_DETAIL_LOG"
-ln -sfn "$(basename "$FINAL_LOG")" "$LATEST_SUMMARY_LOG"
-summary "Alopex Doctor"
-summary "Pipeline : $PIPELINE_ROOT"
-summary "Detail log : $DETAIL_LOG"
-summary "Summary log: $FINAL_LOG"
-trap doctor_early_cleanup EXIT
-trap 'exit 130' INT TERM HUP
-SYSTEM_NAME="$(uname -s)"
-MACHINE_NAME="$(uname -m)"
-HOST_NAME="$(hostname 2>/dev/null || uname -n)"
-DOCTOR_TERMINATION_GRACE_SECONDS="${DNA_PIPELINE_TERMINATION_GRACE_SECONDS:-15}"
-[[ "$DOCTOR_TERMINATION_GRACE_SECONDS" =~ ^[1-9][0-9]*$ ]] || DOCTOR_TERMINATION_GRACE_SECONDS=15
-trap finish_doctor EXIT
-printf 'Host: %s\nPlatform: %s/%s\n' "$HOST_NAME" "$SYSTEM_NAME" "$MACHINE_NAME" >> "$DETAIL_LOG"
-summary "Route A  : hg38 / Cabernet / Bismark / 真实 hg38_cabernet raw + 合成对照"
-summary "Route B  : mm10 / SRD / BISCUIT / 真实 mm10_srd Cabernet DNA + 合成 RNA 布局/对照"
-summary "Route C  : hg38 / Cabernet-TAPS+ / Rastair / 独立合成真值"
-summary ""
-doctor_step_start "平台 / executor 检测"
-case "$SYSTEM_NAME" in
-    Darwin)
-        EXECUTOR="local"
-        ;;
-    Linux)
-        if ! command -v sbatch >/dev/null 2>&1 || ! command -v squeue >/dev/null 2>&1 || ! command -v scancel >/dev/null 2>&1; then
-            summary "[FAIL] Linux Doctor 需要 HPC Slurm 命令（sbatch + squeue + scancel）。"
-            return 1
-        fi
-        EXECUTOR="slurm"
-        ;;
-    *)
-        summary "[FAIL] 不支持的操作系统： $SYSTEM_NAME"
-        return 1
-        ;;
-esac
-doctor_step_ok "$SYSTEM_NAME/${MACHINE_NAME}；生产 executor=$EXECUTOR"
-ensure_builder_ready "Conda release" conda || exit 1
-ensure_builder_ready "Rust demux_rs" demux || exit 1
-ensure_builder_ready "hg38/mm10 reference bundle" reference || exit 1
-doctor_step_start "benchmark 输入 / raw FASTQ 完整性"
-for required in "$CONTROL_PYTHON" "$BISMARK_SAMTOOLS" "$BISCUIT_SAMTOOLS" "$RUN_PIPELINE"; do
-    [[ -e "$required" ]] || {
-        summary "[FAIL] 修复后仍缺少必需运行组件： $required"
-        return 1
-    }
-done
-for reference in "$HG38_REFERENCE" "$MM10_REFERENCE"; do
-    [[ -s "$reference" && -s "$reference.fai" ]] || {
-        summary "[FAIL] Doctor smoke reference 尚未 READY： $reference"
-        return 1
-    }
-done
-[[ -d "$BENCHMARK_ROOT" && -s "$BENCHMARK_JSON" ]] || {
-    summary "[FAIL] 缺少固定 Doctor benchmark： $BENCHMARK_ROOT"
-    return 1
-}
-PYTHONPATH="$PIPELINE_ROOT/core" "$CONTROL_PYTHON" -m dna_pipeline benchmark-validate \
-    --root "$BENCHMARK_ROOT" --manifest "$BENCHMARK_JSON" >> "$DETAIL_LOG" 2>&1 || {
-    summary "[FAIL] 固定 Doctor benchmark 完整性校验失败"
-    return 1
-}
-doctor_step_ok "2100 对真实 reads / 4 个 barcode；SHA256 与配对校验通过"
-doctor_step_start "Route A/B 项目准备与 manifest 刷新"
-stage_smoke_project "$SMOKE_HG38" hg38-cabernet-bismark "$HG38_REFERENCE" >> "$DETAIL_LOG" 2>&1 || {
-    summary "[FAIL] 无法准备 hg38/Cabernet/Bismark smoke 项目"
-    return 1
-}
-stage_smoke_project "$SMOKE_MM10" mm10-srd-biscuit "$MM10_REFERENCE" >> "$DETAIL_LOG" 2>&1 || {
-    summary "[FAIL] 无法准备 mm10/SRD/BISCUIT smoke 项目"
-    return 1
-}
-run_logged "Route A manifest refresh" run_manifest_refresh "$SMOKE_HG38" || {
-    summary "[FAIL] hg38/Cabernet/Bismark manifest 刷新失败"
-    return 1
-}
-run_logged "Route B manifest refresh" run_manifest_refresh "$SMOKE_MM10" || {
-    summary "[FAIL] mm10/SRD/BISCUIT manifest 刷新失败"
-    return 1
-}
-doctor_step_ok
-doctor_step_start "Route A/B workflow"
-ROUTE_A_LOG="$TMP_ROOT/route_a.hg38-cabernet-bismark.log"
-ROUTE_B_LOG="$TMP_ROOT/route_b.mm10-srd-biscuit.log"
-HG38_START_EPOCH="$(date +%s)"
-MM10_START_EPOCH="$HG38_START_EPOCH"
-printf '+ route A: hg38/Cabernet/Bismark\n' >> "$DETAIL_LOG"
-ROUTE_A_JOB_ID=""
-start_doctor_route hg38-cabernet-bismark "$SMOKE_HG38" "$ROUTE_A_LOG" ROUTE_A_JOB_ID ROUTE_A_PID || {
-    summary "[FAIL] 无法启动 Route A"
-    return 1
-}
-ROUTE_B_JOB_ID=""; ROUTE_B_PID=""
-: > "$ROUTE_B_LOG"
-DOCTOR_ACTIVE_ROUTE_PIDS="$ROUTE_A_PID"
-DOCTOR_ACTIVE_ROUTE_JOB_IDS="$ROUTE_A_JOB_ID"
-DOCTOR_PARALLEL_ROUTES=0
-if [[ "$SYSTEM_NAME" == Linux && -z "${SLURM_JOB_ID:-}" ]]; then
-    DOCTOR_PARALLEL_ROUTES=1
-    DOCTOR_ROUTE_EXECUTION_LABEL="two Slurm workers (2 CPU each; Bismark 16 GiB / BISCUIT 24 GiB; local Snakemake with mem-budgeted scheduling)"
-elif [[ "$SYSTEM_NAME" == Linux ]]; then
-    DOCTOR_ROUTE_EXECUTION_LABEL="current allocation (sequential routes; up to 2 local cores)"
-else
-    DOCTOR_ROUTE_EXECUTION_LABEL="local (sequential routes; up to 2 cores)"
-fi
-ROUTE_A_RC=""; ROUTE_B_RC=""; ROUTE_A_FINISHED=""; ROUTE_B_FINISHED=""
-ROUTE_A_CANCELLED=0; ROUTE_B_CANCELLED=0
-while [[ -z "$ROUTE_A_RC" || -z "$ROUTE_B_RC" ]]; do
-    if [[ -z "$ROUTE_B_PID" && -z "$ROUTE_B_RC" ]] && { (( DOCTOR_PARALLEL_ROUTES == 1 )) || [[ "$ROUTE_A_RC" == 0 ]]; }; then
-        MM10_START_EPOCH="$(date +%s)"
-        printf '+ route B: mm10/SRD/BISCUIT\n' >> "$DETAIL_LOG"
-        if ! start_doctor_route mm10-srd-biscuit "$SMOKE_MM10" "$ROUTE_B_LOG" ROUTE_B_JOB_ID ROUTE_B_PID; then
-            if [[ -z "$ROUTE_A_RC" ]]; then
-                [[ "$ROUTE_A_JOB_ID" =~ ^[0-9]+$ ]] && scancel "$ROUTE_A_JOB_ID" >> "$DETAIL_LOG" 2>&1 || true
-                doctor_terminate_pid_bounded "$ROUTE_A_PID" "Route A after Route B launch failure"
+    set -uo pipefail
+    DOCTOR_RUN_ID="$(date '+%Y%m%dT%H%M%S').$$"
+    DOCTOR_LOG_ROOT="${DNA_PIPELINE_DOCTOR_LOG_DIR:-$PIPELINE_ROOT/logs/doctor}"
+    mkdir -p "$DOCTOR_LOG_ROOT" "$DOCTOR_TMP_PARENT"
+    find "$DOCTOR_TMP_PARENT" -mindepth 1 -maxdepth 1 -type d -name 'doctor.*' \
+        -mtime "+$DOCTOR_SANDBOX_RETENTION_DAYS" \
+        -exec rm -rf -- {} + 2>/dev/null || true
+    TMP_ROOT="$(mktemp -d "$DOCTOR_TMP_PARENT/doctor.${DOCTOR_RUN_ID}.XXXXXX")" || exit 1
+    DETAIL_LOG="$DOCTOR_LOG_ROOT/doctor.${DOCTOR_RUN_ID}.detail.log"
+    FINAL_LOG="$DOCTOR_LOG_ROOT/doctor.${DOCTOR_RUN_ID}.summary.log"
+    LATEST_DETAIL_LOG="$DOCTOR_LOG_ROOT/latest.detail.log"
+    LATEST_SUMMARY_LOG="$DOCTOR_LOG_ROOT/latest.summary.log"
+    SMOKE_HG38="$TMP_ROOT/smoke_hg38_cabernet_bismark"
+    SMOKE_MM10="$TMP_ROOT/smoke_mm10_srd_biscuit"
+    : > "$DETAIL_LOG"; : > "$FINAL_LOG"
+    ln -sfn "$(basename "$DETAIL_LOG")" "$LATEST_DETAIL_LOG"
+    ln -sfn "$(basename "$FINAL_LOG")" "$LATEST_SUMMARY_LOG"
+    summary "Alopex Doctor"
+    summary "Pipeline : $PIPELINE_ROOT"
+    summary "Detail log : $DETAIL_LOG"
+    summary "Summary log: $FINAL_LOG"
+    trap doctor_early_cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    SYSTEM_NAME="$(uname -s)"
+    MACHINE_NAME="$(uname -m)"
+    HOST_NAME="$(hostname 2>/dev/null || uname -n)"
+    DOCTOR_TERMINATION_GRACE_SECONDS="${DNA_PIPELINE_TERMINATION_GRACE_SECONDS:-15}"
+    [[ "$DOCTOR_TERMINATION_GRACE_SECONDS" =~ ^[1-9][0-9]*$ ]] || DOCTOR_TERMINATION_GRACE_SECONDS=15
+    trap finish_doctor EXIT
+    printf 'Host: %s\nPlatform: %s/%s\n' "$HOST_NAME" "$SYSTEM_NAME" "$MACHINE_NAME" >> "$DETAIL_LOG"
+    summary "Route A  : hg38 / Cabernet / Bismark / 真实 hg38_cabernet raw + 合成对照"
+    summary "Route B  : mm10 / SRD / BISCUIT / 真实 mm10_srd Cabernet DNA + 合成 RNA 布局/对照"
+    summary "Route C  : hg38 / Cabernet-TAPS+ / Rastair / 独立合成真值"
+    summary ""
+    doctor_step_start "平台 / executor 检测"
+    case "$SYSTEM_NAME" in
+        Darwin)
+            EXECUTOR="local"
+            ;;
+        Linux)
+            if ! command -v sbatch >/dev/null 2>&1 || ! command -v squeue >/dev/null 2>&1 || ! command -v scancel >/dev/null 2>&1; then
+                summary "[FAIL] Linux Doctor 需要 HPC Slurm 命令（sbatch + squeue + scancel）。"
+                return 1
             fi
-            summary "[FAIL] 无法启动 Route B"
+            EXECUTOR="slurm"
+            ;;
+        *)
+            summary "[FAIL] 不支持的操作系统： $SYSTEM_NAME"
             return 1
-        fi
-        DOCTOR_ACTIVE_ROUTE_JOB_IDS="${ROUTE_A_JOB_ID:+$ROUTE_A_JOB_ID }${ROUTE_B_JOB_ID:-}"
-        doctor_refresh_active_route_pids
-    fi
-    ROUTE_NOW="$(date +%s)"
-    if [[ -z "$ROUTE_A_RC" ]] && ! kill -0 "$ROUTE_A_PID" 2>/dev/null; then
-        wait "$ROUTE_A_PID"; ROUTE_A_RC=$?; ROUTE_A_FINISHED="$ROUTE_NOW"
-        printf 'Route A（hg38/Cabernet/Bismark）结束，rc=%s\n' "$ROUTE_A_RC" >> "$DETAIL_LOG"
-    fi
-    if [[ -z "$ROUTE_B_RC" && -n "$ROUTE_B_PID" ]] && ! kill -0 "$ROUTE_B_PID" 2>/dev/null; then
-        wait "$ROUTE_B_PID"; ROUTE_B_RC=$?; ROUTE_B_FINISHED="$ROUTE_NOW"
-        printf 'Route B（mm10/SRD/BISCUIT）结束，rc=%s\n' "$ROUTE_B_RC" >> "$DETAIL_LOG"
-    fi
-    doctor_fail_fast_routes
-    [[ -n "$ROUTE_A_RC" && -n "$ROUTE_B_RC" ]] || sleep 2
-done
-DOCTOR_ACTIVE_ROUTE_JOB_IDS=""
-HG38_WALL_SECONDS=$((ROUTE_A_FINISHED-HG38_START_EPOCH))
-MM10_WALL_SECONDS=$((ROUTE_B_FINISHED-MM10_START_EPOCH))
-{
-    printf '\n===== Route A: hg38/Cabernet/Bismark =====\n'
-    cat "$ROUTE_A_LOG"
-    printf '\n===== Route B: mm10/SRD/BISCUIT =====\n'
-    cat "$ROUTE_B_LOG"
-} >> "$DETAIL_LOG"
-if (( ROUTE_A_RC != 0 || ROUTE_B_RC != 0 )); then
-    append_controller_failure_tail() {
-        local project="$1" route_label="$2" controller_log found=0
-        for controller_log in "$project"/04_logs/controller/*.log; do
-            [[ -f "$controller_log" ]] || continue
-            found=1
-            {
-                printf '\n--- %s controller 失败日志末尾：%s ---\n' "$route_label" "$controller_log"
-                tail -n 160 "$controller_log" 2>/dev/null || true
-            } >> "$DETAIL_LOG"
-        done
-        (( found == 1 )) || printf '\n--- %s controller 未生成失败日志 ---\n' "$route_label" >> "$DETAIL_LOG"
+            ;;
+    esac
+    doctor_step_ok "$SYSTEM_NAME/${MACHINE_NAME}；生产 executor=$EXECUTOR"
+    ensure_builder_ready "Conda release" conda || exit 1
+    ensure_builder_ready "Rust demux_rs" demux || exit 1
+    ensure_builder_ready "hg38/mm10 reference bundle" reference || exit 1
+    doctor_step_start "benchmark 输入 / raw FASTQ 完整性"
+    for required in "$CONTROL_PYTHON" "$BISMARK_SAMTOOLS" "$BISCUIT_SAMTOOLS" "$RUN_PIPELINE"; do
+        [[ -e "$required" ]] || {
+            summary "[FAIL] 修复后仍缺少必需运行组件： $required"
+            return 1
+        }
+    done
+    for reference in "$HG38_REFERENCE" "$MM10_REFERENCE"; do
+        [[ -s "$reference" && -s "$reference.fai" ]] || {
+            summary "[FAIL] Doctor smoke reference 尚未 READY： $reference"
+            return 1
+        }
+    done
+    [[ -d "$BENCHMARK_ROOT" && -s "$BENCHMARK_JSON" ]] || {
+        summary "[FAIL] 缺少固定 Doctor benchmark： $BENCHMARK_ROOT"
+        return 1
     }
-    (( ROUTE_A_RC == 0 )) || append_controller_failure_tail "$SMOKE_HG38" "Route A"
-    (( ROUTE_B_RC == 0 )) || append_controller_failure_tail "$SMOKE_MM10" "Route B"
-    if (( ROUTE_A_CANCELLED == 1 )); then
-        summary "[CANCELLED] Route B 失败后已请求取消 Route A"
-    elif (( ROUTE_A_RC != 0 )); then
-        summary "[FAIL] Route A hg38/Cabernet/Bismark workflow 失败（rc=${ROUTE_A_RC}）"
+    PYTHONPATH="$PIPELINE_ROOT/core" "$CONTROL_PYTHON" -m dna_pipeline benchmark-validate \
+        --root "$BENCHMARK_ROOT" --manifest "$BENCHMARK_JSON" >> "$DETAIL_LOG" 2>&1 || {
+        summary "[FAIL] 固定 Doctor benchmark 完整性校验失败"
+        return 1
+    }
+    doctor_step_ok "2100 对真实 reads / 4 个 barcode；SHA256 与配对校验通过"
+    doctor_step_start "Route A/B 项目准备与 manifest 刷新"
+    stage_smoke_project "$SMOKE_HG38" hg38-cabernet-bismark "$HG38_REFERENCE" >> "$DETAIL_LOG" 2>&1 || {
+        summary "[FAIL] 无法准备 hg38/Cabernet/Bismark smoke 项目"
+        return 1
+    }
+    stage_smoke_project "$SMOKE_MM10" mm10-srd-biscuit "$MM10_REFERENCE" >> "$DETAIL_LOG" 2>&1 || {
+        summary "[FAIL] 无法准备 mm10/SRD/BISCUIT smoke 项目"
+        return 1
+    }
+    run_logged "Route A manifest refresh" run_manifest_refresh "$SMOKE_HG38" || {
+        summary "[FAIL] hg38/Cabernet/Bismark manifest 刷新失败"
+        return 1
+    }
+    run_logged "Route B manifest refresh" run_manifest_refresh "$SMOKE_MM10" || {
+        summary "[FAIL] mm10/SRD/BISCUIT manifest 刷新失败"
+        return 1
+    }
+    doctor_step_ok
+    doctor_step_start "Route A/B workflow"
+    ROUTE_A_LOG="$TMP_ROOT/route_a.hg38-cabernet-bismark.log"
+    ROUTE_B_LOG="$TMP_ROOT/route_b.mm10-srd-biscuit.log"
+    HG38_START_EPOCH="$(date +%s)"
+    MM10_START_EPOCH="$HG38_START_EPOCH"
+    printf '+ route A: hg38/Cabernet/Bismark\n' >> "$DETAIL_LOG"
+    ROUTE_A_JOB_ID=""
+    start_doctor_route hg38-cabernet-bismark "$SMOKE_HG38" "$ROUTE_A_LOG" ROUTE_A_JOB_ID ROUTE_A_PID || {
+        summary "[FAIL] 无法启动 Route A"
+        return 1
+    }
+    ROUTE_B_JOB_ID=""; ROUTE_B_PID=""
+    : > "$ROUTE_B_LOG"
+    DOCTOR_ACTIVE_ROUTE_PIDS="$ROUTE_A_PID"
+    DOCTOR_ACTIVE_ROUTE_JOB_IDS="$ROUTE_A_JOB_ID"
+    DOCTOR_PARALLEL_ROUTES=0
+    if [[ "$SYSTEM_NAME" == Linux && -z "${SLURM_JOB_ID:-}" ]]; then
+        DOCTOR_PARALLEL_ROUTES=1
+        DOCTOR_ROUTE_EXECUTION_LABEL="two Slurm workers (2 CPU each; Bismark 16 GiB / BISCUIT 24 GiB; local Snakemake with mem-budgeted scheduling)"
+    elif [[ "$SYSTEM_NAME" == Linux ]]; then
+        DOCTOR_ROUTE_EXECUTION_LABEL="current allocation (sequential routes; up to 2 local cores)"
+    else
+        DOCTOR_ROUTE_EXECUTION_LABEL="local (sequential routes; up to 2 cores)"
     fi
-    if (( ROUTE_B_CANCELLED == 1 )); then
-        summary "[CANCELLED] Route A 失败后已请求取消 Route B"
-    elif (( ROUTE_B_RC != 0 )); then
-        summary "[FAIL] Route B mm10/SRD/BISCUIT workflow 失败（rc=${ROUTE_B_RC}）"
+    ROUTE_A_RC=""; ROUTE_B_RC=""; ROUTE_A_FINISHED=""; ROUTE_B_FINISHED=""
+    ROUTE_A_CANCELLED=0; ROUTE_B_CANCELLED=0
+    while [[ -z "$ROUTE_A_RC" || -z "$ROUTE_B_RC" ]]; do
+        if [[ -z "$ROUTE_B_PID" && -z "$ROUTE_B_RC" ]] && { (( DOCTOR_PARALLEL_ROUTES == 1 )) || [[ "$ROUTE_A_RC" == 0 ]]; }; then
+            MM10_START_EPOCH="$(date +%s)"
+            printf '+ route B: mm10/SRD/BISCUIT\n' >> "$DETAIL_LOG"
+            if ! start_doctor_route mm10-srd-biscuit "$SMOKE_MM10" "$ROUTE_B_LOG" ROUTE_B_JOB_ID ROUTE_B_PID; then
+                if [[ -z "$ROUTE_A_RC" ]]; then
+                    [[ "$ROUTE_A_JOB_ID" =~ ^[0-9]+$ ]] && scancel "$ROUTE_A_JOB_ID" >> "$DETAIL_LOG" 2>&1 || true
+                    doctor_terminate_pid_bounded "$ROUTE_A_PID" "Route A after Route B launch failure"
+                fi
+                summary "[FAIL] 无法启动 Route B"
+                return 1
+            fi
+            DOCTOR_ACTIVE_ROUTE_JOB_IDS="${ROUTE_A_JOB_ID:+$ROUTE_A_JOB_ID }${ROUTE_B_JOB_ID:-}"
+            doctor_refresh_active_route_pids
+        fi
+        ROUTE_NOW="$(date +%s)"
+        if [[ -z "$ROUTE_A_RC" ]] && ! kill -0 "$ROUTE_A_PID" 2>/dev/null; then
+            wait "$ROUTE_A_PID"; ROUTE_A_RC=$?; ROUTE_A_FINISHED="$ROUTE_NOW"
+            printf 'Route A（hg38/Cabernet/Bismark）结束，rc=%s\n' "$ROUTE_A_RC" >> "$DETAIL_LOG"
+        fi
+        if [[ -z "$ROUTE_B_RC" && -n "$ROUTE_B_PID" ]] && ! kill -0 "$ROUTE_B_PID" 2>/dev/null; then
+            wait "$ROUTE_B_PID"; ROUTE_B_RC=$?; ROUTE_B_FINISHED="$ROUTE_NOW"
+            printf 'Route B（mm10/SRD/BISCUIT）结束，rc=%s\n' "$ROUTE_B_RC" >> "$DETAIL_LOG"
+        fi
+        doctor_fail_fast_routes
+        [[ -n "$ROUTE_A_RC" && -n "$ROUTE_B_RC" ]] || sleep 2
+    done
+    DOCTOR_ACTIVE_ROUTE_JOB_IDS=""
+    HG38_WALL_SECONDS=$((ROUTE_A_FINISHED-HG38_START_EPOCH))
+    MM10_WALL_SECONDS=$((ROUTE_B_FINISHED-MM10_START_EPOCH))
+    {
+        printf '\n===== Route A: hg38/Cabernet/Bismark =====\n'
+        cat "$ROUTE_A_LOG"
+        printf '\n===== Route B: mm10/SRD/BISCUIT =====\n'
+        cat "$ROUTE_B_LOG"
+    } >> "$DETAIL_LOG"
+    if (( ROUTE_A_RC != 0 || ROUTE_B_RC != 0 )); then
+        (( ROUTE_A_RC == 0 )) || append_controller_failure_tail "$SMOKE_HG38" "Route A"
+        (( ROUTE_B_RC == 0 )) || append_controller_failure_tail "$SMOKE_MM10" "Route B"
+        if (( ROUTE_A_CANCELLED == 1 )); then
+            summary "[CANCELLED] Route B 失败后已请求取消 Route A"
+        elif (( ROUTE_A_RC != 0 )); then
+            summary "[FAIL] Route A hg38/Cabernet/Bismark workflow 失败（rc=${ROUTE_A_RC}）"
+        fi
+        if (( ROUTE_B_CANCELLED == 1 )); then
+            summary "[CANCELLED] Route A 失败后已请求取消 Route B"
+        elif (( ROUTE_B_RC != 0 )); then
+            summary "[FAIL] Route B mm10/SRD/BISCUIT workflow 失败（rc=${ROUTE_B_RC}）"
+        fi
+        return 1
     fi
-    return 1
-fi
-doctor_step_ok "A=${HG38_WALL_SECONDS}s; B=${MM10_WALL_SECONDS}s; $DOCTOR_ROUTE_EXECUTION_LABEL"
-doctor_step_start "Route A/B 输出 / mapping 校验"
-verify_route_outputs "$SMOKE_HG38" hg38-cabernet-bismark >> "$DETAIL_LOG" 2>&1 || {
-    summary "[FAIL] Route A 输出/demux 校验失败"
-    return 1
-}
-verify_route_outputs "$SMOKE_MM10" mm10-srd-biscuit >> "$DETAIL_LOG" 2>&1 || {
-    summary "[FAIL] Route B 输出/demux 校验失败"
-    return 1
-}
-doctor_step_ok
-doctor_step_start "Route C TAPS / Rastair 项目准备、workflow 与合成真值校验"
-SMOKE_TAPS="$TMP_ROOT/taps"
-ROUTE_TAPS_LOG="$TMP_ROOT/route_c.hg38-taps-rastair.log"
-stage_smoke_project "$SMOKE_TAPS" hg38-taps-rastair "$HG38_REFERENCE" >> "$DETAIL_LOG" 2>&1 || { summary "[FAIL] 无法准备 Route C"; return 1; }
-run_logged "Route C manifest refresh" run_manifest_refresh "$SMOKE_TAPS" || { summary "[FAIL] Route C manifest 刷新失败"; return 1; }
-start_doctor_route hg38-taps-rastair "$SMOKE_TAPS" "$ROUTE_TAPS_LOG" ROUTE_TAPS_JOB_ID ROUTE_TAPS_PID || { summary "[FAIL] 无法启动 Route C"; return 1; }
-DOCTOR_ACTIVE_ROUTE_PIDS="$ROUTE_TAPS_PID"
-DOCTOR_ACTIVE_ROUTE_JOB_IDS="${ROUTE_TAPS_JOB_ID:-}"
-wait "$ROUTE_TAPS_PID"; ROUTE_TAPS_RC=$?
-DOCTOR_ACTIVE_ROUTE_PIDS=""
-DOCTOR_ACTIVE_ROUTE_JOB_IDS=""
-cat "$ROUTE_TAPS_LOG" >> "$DETAIL_LOG"
-(( ROUTE_TAPS_RC == 0 )) || { summary "[FAIL] TAPS workflow 失败： $ROUTE_TAPS_LOG"; return 1; }
-verify_route_outputs "$SMOKE_TAPS" hg38-taps-rastair >> "$DETAIL_LOG" 2>&1 || { summary "[FAIL] TAPS 真值校验失败"; return 1; }
-doctor_step_ok
-CURRENT_STEP="complete"
-return 0
+    doctor_step_ok "A=${HG38_WALL_SECONDS}s; B=${MM10_WALL_SECONDS}s; $DOCTOR_ROUTE_EXECUTION_LABEL"
+    doctor_step_start "Route A/B 输出 / mapping 校验"
+    verify_route_outputs "$SMOKE_HG38" hg38-cabernet-bismark >> "$DETAIL_LOG" 2>&1 || {
+        summary "[FAIL] Route A 输出/demux 校验失败"
+        return 1
+    }
+    verify_route_outputs "$SMOKE_MM10" mm10-srd-biscuit >> "$DETAIL_LOG" 2>&1 || {
+        summary "[FAIL] Route B 输出/demux 校验失败"
+        return 1
+    }
+    doctor_step_ok
+    doctor_step_start "Route C TAPS / Rastair 项目准备、workflow 与合成真值校验"
+    SMOKE_TAPS="$TMP_ROOT/taps"
+    ROUTE_TAPS_LOG="$TMP_ROOT/route_c.hg38-taps-rastair.log"
+    stage_smoke_project "$SMOKE_TAPS" hg38-taps-rastair "$HG38_REFERENCE" >> "$DETAIL_LOG" 2>&1 || { summary "[FAIL] 无法准备 Route C"; return 1; }
+    run_logged "Route C manifest refresh" run_manifest_refresh "$SMOKE_TAPS" || { summary "[FAIL] Route C manifest 刷新失败"; return 1; }
+    start_doctor_route hg38-taps-rastair "$SMOKE_TAPS" "$ROUTE_TAPS_LOG" ROUTE_TAPS_JOB_ID ROUTE_TAPS_PID || { summary "[FAIL] 无法启动 Route C"; return 1; }
+    DOCTOR_ACTIVE_ROUTE_PIDS="$ROUTE_TAPS_PID"
+    DOCTOR_ACTIVE_ROUTE_JOB_IDS="${ROUTE_TAPS_JOB_ID:-}"
+    wait "$ROUTE_TAPS_PID"; ROUTE_TAPS_RC=$?
+    DOCTOR_ACTIVE_ROUTE_PIDS=""
+    DOCTOR_ACTIVE_ROUTE_JOB_IDS=""
+    cat "$ROUTE_TAPS_LOG" >> "$DETAIL_LOG"
+    (( ROUTE_TAPS_RC == 0 )) || { summary "[FAIL] TAPS workflow 失败： $ROUTE_TAPS_LOG"; return 1; }
+    verify_route_outputs "$SMOKE_TAPS" hg38-taps-rastair >> "$DETAIL_LOG" 2>&1 || { summary "[FAIL] TAPS 真值校验失败"; return 1; }
+    doctor_step_ok
+    CURRENT_STEP="complete"
+    return 0
 }
 
+# 库模式与唯一分派入口
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     return 0
 fi

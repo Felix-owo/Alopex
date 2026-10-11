@@ -1,4 +1,4 @@
-# Alopex v14.7 下游 QC 与可视化
+# Alopex v14.8 下游 QC 与可视化
 
 这套下游分析以当前 `Alopex` 的 sealed delivery 为输入，通过
 `03_results/run_manifest.json` 解析 immutable config snapshot、reference FAI、
@@ -6,7 +6,7 @@
 主 Pipeline 已把下游需要的 normalized QC 指标写入 final manifest，因此 Downstream
 只依赖 sealed `03_results/` 与 reference；`02_work/` 是否保留不影响下游结果。
 
-Processor 接受 `analysis.methylation_backend: biscuit`、`bismark` 与 `rastair`。三条链都从
+Processor 复用统一配置加载链与 `get_backend`，按 sealed `analysis.protocol` 选择 backend；TAPS/Droplet 的固定 backend 由内部协议策略提供。三条链都从
 final manifest 的 canonical read-pair funnel 进入相同计算；backend 原生 MAPQ、比对
 报告和 M-bias 等诊断仍保留在主 Pipeline 的 backend-specific MultiQC section，分别标注其原生口径。
 
@@ -44,7 +44,7 @@ Notebook 第二格的 `RECOMPUTE_RAW_ADATA`、`RECOMPUTE_METHYL_STATS`、
 CpG 输入身份复用 sealed inventory 中的 size/hash，不重复读取所有 CpG 计算哈希。需要强制重建 AnnData 时将 `RECOMPUTE_RAW_ADATA`
 设为 `True`；它从 sealed CpG 重建 `RawAdata.h5ad`，结果仍只写入 `06_downstream/`。
 
-RawAdata 的 schema、文件身份、样本集合及当前 sealed 输入全部匹配时，直接复用其空 CpG 集合，不逐细胞启动解压或创建临时链接。失配时重新检查表头和空表，确认 zero-mapped cells 为空后再导入；临时链接只在重建时创建。导入算法更新仍触发正常重建，不复用旧算法身份。
+RawAdata 的 schema、文件身份、样本集合及当前 sealed 输入全部匹配时，直接复用其空 CpG 集合，不逐细胞启动解压或创建临时链接。失配时重新检查表头和空表，确认 zero-mapped cells 为空后再导入；临时导入链接或 1-based 归一化文件只在重建时创建，源坐标身份参与缓存绑定。导入算法更新仍触发正常重建，不复用旧算法身份。
 命令行对应 `--recompute-raw-adata`；其余开关对应 `--recompute-methyl-stats`、
 `--recompute-composition`、`--recompute-gini`、`--recompute-tss`。
 
@@ -114,7 +114,7 @@ TSS BED（链方向一致的 `±2000 bp / 20 bp` bins，第 9 列为 offset）�
 按需 `make_peak_matrix(..., peak_file=...)` 使用的 BED3：0-based、half-open，每条记录覆盖一个
 CpG 二核苷酸 `[C, G+1)`，不含 lambda/pUC19。Notebook 最后一格从已导入 values 生成 single-CpG matrix；命令行 QC Processor 不执行这一步。Pipeline 的 `03_results/CpG/*.cpg.tsv.zst`
 则直接采用 SnapATAC2 `pp.import_values` 四列输入：`chrom, pos, methyl, unmethyl`，其中
-`pos` 为 0-based；Downstream 直接读取 CpG 文件。
+`pos` 按 `analysis.cpg_coordinate_base` 输出，默认 1-based，可设为 0-based。Downstream 核对 sealed config/run/final manifest 的坐标身份；RawAdata 恒为 0-based。重建时 0-based 文件直接链接导入，1-based 文件在临时目录流式减 1 并压缩后导入；不改公开输入，成功/失败均回收。缓存命中不转换。
 
 `resources/*_reference/` 是体积很大的 HPC 本地 reference，受仓库 `.gitignore`
 保护，不进入源代码包，也不应使用 `git add -f` 提交。普通 clone 在按根

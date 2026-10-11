@@ -1,3 +1,5 @@
+# 初始化与配置契约
+
 import hashlib
 import functools
 import json
@@ -15,7 +17,7 @@ from dna_pipeline import (
     MANAGED_SPECIES,
     TAPS_MIN_MAPQ, TAPS_MIN_BASEQ, TAPS_INCLUDE_FLAGS, TAPS_EXCLUDE_FLAGS, TAPS_BWA_BATCH_BASES,
     BISMARK_CELL_RULE_RUNTIME_MIN,
-    MULTIQC_BISCUIT_SOURCE_SUFFIXES,
+    cell_artifacts,
     ProjectLayout,
     STATIC_FUSED_RULES,
     backend_active_index_paths,
@@ -38,6 +40,7 @@ from dna_pipeline import (
     finalize_project_config,
     get_backend,
     get_protocol_policy,
+    get_protocol_config,
     get_raw_route,
     load_run_snapshot,
     map_discovered_samples_to_manifest,
@@ -60,22 +63,16 @@ from dna_pipeline import (
 
 disable_snakemake_output_mtime_gate()
 
-_workflow_pipeline_root = Path(workflow.basedir).parent.resolve()
-PIPELINE_ROOT = _workflow_pipeline_root
-
-def _internal_helper(relative_path):
-    helper = (PIPELINE_ROOT / relative_path).resolve()
-    if not helper.is_file():
-        raise FileNotFoundError(f"Pipeline helper is missing: {helper}")
-    return helper
-
-JOB_RUNTIME = _internal_helper("core/job_runtime.sh")
+PIPELINE_ROOT = Path(workflow.basedir).parent.resolve()
+JOB_RUNTIME = (PIPELINE_ROOT / "core/job_runtime.sh").resolve()
+if not JOB_RUNTIME.is_file():
+    raise FileNotFoundError(f"Pipeline helper is missing: {JOB_RUNTIME}")
 config = finalize_project_config(config)
 PROTOCOL_POLICY = get_protocol_policy(config)
 DROPLET_CALLING_IDENTITY = hashlib.sha256((DROPLET_DESIGN_SHA256 + demux_source_revision(PIPELINE_ROOT / "core/demux_rs", count_only=True) + scientific_code_identity(("call_droplet_cells",))).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
 DROPLET_UMI_IDENTITY = scientific_code_identity(("call_droplet_cpg",)) if PROTOCOL_POLICY.name == "droplet" else ""
-BACKEND_POLICY = get_backend(config)
-METHYLATION_BACKEND = BACKEND_POLICY.name
+METHYLATION_BACKEND = get_backend(config)
+CPG_COORDINATE_BASE = config["analysis"]["cpg_coordinate_base"]
 
 _RULE_ENVIRONMENT_PREFIX_RAW = str(
     os.environ.get("DNA_PIPELINE_RULE_ENV", "") or ""
@@ -239,9 +236,11 @@ CUTADAPT_ADAPTER_R2_SPEC = f"{CUTADAPT_ADAPTER_R2};min_overlap={CUTADAPT_R2_MIN_
 CUTADAPT_QUALITY_CUTOFF = "20,20"
 CUTADAPT_MIN_LENGTH = 20
 
-DEMUX_CONFIG = config["demux"]
-HIGH_CPH_CONFIG = config["high_cph"]
-BISCUIT_CONFIG = config["biscuit"]
+PROTOCOL_CONFIG = get_protocol_config(config)
+DEMUX_CONFIG = PROTOCOL_CONFIG["demux"]
+HIGH_CPH_CONFIG = PROTOCOL_CONFIG.get("high_cph", {})
+BISCUIT_CONFIG = PROTOCOL_CONFIG.get("biscuit", {})
+BISMARK_CONFIG = PROTOCOL_CONFIG.get("bismark", {})
 
 DEMUX_MIN_MATCHED_READ_PAIRS = int(DEMUX_CONFIG["min_matched_read_pairs"])
 DNA_W_SPACER_LEN = int(DEMUX_CONFIG["dna_w_spacer_len"])
@@ -249,15 +248,13 @@ DNA_W_SPACER_LEN = int(DEMUX_CONFIG["dna_w_spacer_len"])
 PUBLISH_RNA_BAM = PROTOCOL_POLICY.publishes_rna_bam
 KEEP_FINAL_BAM = bool(config["retention"]["keep_final_bam"])
 
-BISCUIT_LIBRARY_MODE = biscuit_library_mode(config)
-BISCUIT_HIGH_CPH_RETENTION_THRESHOLD = float(
-    BISCUIT_CONFIG["high_cph_retention_threshold"]
-)
-GENERATE_SNP = METHYLATION_BACKEND == "rastair" or BISCUIT_CONFIG["generate_snp"]
+BISCUIT_LIBRARY_MODE = biscuit_library_mode(config) if METHYLATION_BACKEND == "biscuit" else None
+BISCUIT_HIGH_CPH_RETENTION_THRESHOLD = float(BISCUIT_CONFIG["high_cph_retention_threshold"]) if METHYLATION_BACKEND == "biscuit" else None
+GENERATE_SNP = METHYLATION_BACKEND == "rastair" or (METHYLATION_BACKEND == "biscuit" and BISCUIT_CONFIG["generate_snp"])
 
-BISMARK_LIBRARY_FLAG = bismark_library_flag(config)
-BISMARK_ALIGNMENT_INSTANCES = bismark_alignment_instance_count(config)
-BISMARK_LOCAL_ALIGNMENT = bool(config["bismark"]["local_alignment"])
+BISMARK_LIBRARY_FLAG = bismark_library_flag(config) if METHYLATION_BACKEND == "bismark" else ""
+BISMARK_ALIGNMENT_INSTANCES = bismark_alignment_instance_count(config) if METHYLATION_BACKEND == "bismark" else None
+BISMARK_LOCAL_ALIGNMENT = bool(BISMARK_CONFIG.get("local_alignment", False))
 BISMARK_LOCAL_ALIGNMENT_FLAG = "--local" if BISMARK_LOCAL_ALIGNMENT else ""
 BISMARK_ALIGNMENT_FLAG = "" if BISMARK_LOCAL_ALIGNMENT else "--combined_index"
 BISMARK_SCORE_MIN = "G,20,8" if BISMARK_LOCAL_ALIGNMENT else "L,0,-0.2"
@@ -267,12 +264,8 @@ BISMARK_EFFORT_D = 15
 BISMARK_RESEED_R = 2
 BISMARK_MAX_INSERT = 1000
 BISMARK_ANALYSIS_BAM = CELL_PATH_PATTERN.processed_bam
-BISMARK_NONCONVERSION_PERCENTAGE_CUTOFF = int(
-    config["bismark"]["non_conversion_percentage_cutoff"]
-)
-BISMARK_NONCONVERSION_MIN_COUNT = int(
-    config["bismark"]["non_conversion_minimum_count"]
-)
+BISMARK_NONCONVERSION_PERCENTAGE_CUTOFF = int(BISMARK_CONFIG["non_conversion_percentage_cutoff"]) if METHYLATION_BACKEND == "bismark" else None
+BISMARK_NONCONVERSION_MIN_COUNT = int(BISMARK_CONFIG["non_conversion_minimum_count"]) if METHYLATION_BACKEND == "bismark" else None
 
 if BARCODE_MAP is not None:
     validate_barcode_map_for_protocol(BARCODE_MAP, PROTOCOL_POLICY)
@@ -383,26 +376,19 @@ else:
 def repeated_cli_flag(flag, values):
     return " ".join(f"{flag} {shlex.quote(str(value))}" for value in values)
 
+# 动态输入与 checkpoint 查询
+
 @functools.lru_cache(maxsize=1)
 def current_demux_manifest_index():
     for run_id in DEMUX_RUN_IDS:
-        checkpoints.demux.get(sample=run_id)
-    return demux_manifest_index(DEMUX_STATE_DIR, tuple(DEMUX_RUN_IDS))
-
-@functools.lru_cache(maxsize=1)
-def current_demux_rows_by_manifest():
-    rows_by_path = {}
-    for entries in current_demux_manifest_index().values():
-        for manifest, row in entries:
-            rows_by_path.setdefault(manifest, []).append(row)
-    resolved = {}
-    for manifest, rows in rows_by_path.items():
-        resolved.setdefault(manifest.resolve(), []).extend(rows)
-    return resolved
+        output = checkpoints.demux.get(sample=run_id).output
+        expected = (DEMUX_STATE_DIR / run_id / "manifest.tsv").resolve()
+        if Path(str(output.manifest)).resolve() != expected:
+            raise ValueError(f"Demux checkpoint {run_id!r} returned an unexpected manifest: {output.manifest} != {expected}")
+    return demux_manifest_index(DEMUX_STATE_DIR, tuple(DEMUX_RUN_IDS), protocol=PROTOCOL_POLICY.name)
 
 def current_demux_fastq(demux_sample, read_pair):
     return ancient(resolve_demux_fastq_from_manifest(
-        INTERMEDIATE_DIR,
         demux_sample,
         read_pair,
         manifest_index=current_demux_manifest_index(),
@@ -413,26 +399,11 @@ def current_demux_source_inputs(wildcards):
     raw = RAW_SAMPLES_MAP[manifest.parent.name]
     return [*raw["r1"], *raw["r2"], SAMPLE_MANIFEST, *([] if BARCODE_MAP is None else [BARCODE_MAP]), str(DEMUX_BINARY)]
 
-@functools.lru_cache(maxsize=None)
 def current_demux_match(demux_sample):
     if demux_sample is None:
         return None
     sample = Path(str(demux_sample)).name.strip()
-    if not sample:
-        return None
-    matches = [
-        (manifest, row)
-        for manifest, row in current_demux_manifest_index().get(sample, [])
-        if str(row.get("downstream_dna", "") or "").strip().lower() == "true"
-    ]
-    if len(matches) > 1:
-        locations = ", ".join(str(manifest) for manifest, _row in matches)
-        raise ValueError(
-            f"Cell {sample!r} occurs in more than one downstream-DNA demux manifest: {locations}"
-        )
-    if not matches:
-        return None
-    return matches[0]
+    return current_demux_manifest_index().by_cell.get(sample) if sample else None
 
 def current_demux_row(demux_sample):
     match = current_demux_match(demux_sample)
@@ -446,15 +417,7 @@ def current_demux_completion(wildcards):
             f"No committed downstream-DNA demux row for {sample!r}"
         )
     manifest, _row = match
-    if manifest.parent.parent != DEMUX_STATE_DIR:
-        raise ValueError(f"Unexpected demux manifest path: {manifest}")
-    run_id = manifest.parent.name
-    checkpoint_output = checkpoints.demux.get(sample=run_id).output
-    if Path(str(checkpoint_output.manifest)).resolve() != manifest.resolve():
-        raise ValueError(
-            f"Checkpoint {run_id!r} returned the wrong manifest: "
-            f"{checkpoint_output.manifest} != {manifest}"
-        )
+    checkpoint_output = checkpoints.demux.get(sample=manifest.parent.name).output
     return ancient(str(checkpoint_output.completion))
 
 def current_run_demux_manifest(wildcards):
@@ -660,91 +623,24 @@ SNP_THREADS = resource_threads("generate_snp_input")
 BISCUIT_QC_THREADS = resource_threads("biscuit_qc")
 HIGH_CPH_FILTER_RULES = STATIC_FUSED_RULES["high_cph_filter"]
 
-def passing_dna_rows(checkpoints_obj, run_id, workflow_config):
-    policy = get_protocol_policy(workflow_config)
-    checkpoint_job = checkpoints_obj.demux.get(sample=run_id)
-    chk_output = checkpoint_job.output
-    expected_manifest = (DEMUX_STATE_DIR / run_id / "manifest.tsv").resolve()
-    if Path(chk_output.manifest).resolve() != expected_manifest:
-        raise ValueError(
-            f"Demux checkpoint {run_id!r} returned an unexpected manifest: "
-            f"{chk_output.manifest} != {expected_manifest}"
-        )
-    rows = current_demux_rows_by_manifest().get(expected_manifest, [])
-    passing = []
-    for row in rows:
-        demux_sample = row.get("demux_sample", "")
-        manifest_protocol = (row.get("pipeline_mode") or "").strip().lower()
-        manifest_route = (row.get("route_id") or "").strip().lower()
-        manifest_demux_mode = (row.get("demux_mode") or "").strip().lower()
-        manifest_rna_role = (row.get("rna_output_role") or "").strip().lower()
-        manifest_high_cph_role = (row.get("high_cph_role") or "").strip().lower()
-        manifest_downstream = (row.get("downstream_dna") or "").strip().lower()
-        try:
-            route = get_raw_route(manifest_route, policy.name)
-        except Exception as exc:
-            raise ValueError(
-                f"Demux manifest contains an invalid route {manifest_route!r}: {expected_manifest}"
-            ) from exc
-        if (
-            manifest_protocol != policy.name
-            or manifest_demux_mode != route.demux_mode
-            or manifest_rna_role != route.rna_output_role
-            or manifest_high_cph_role != route.high_cph_role
-            or manifest_downstream != ("true" if route.downstream_dna else "false")
-        ):
-            raise ValueError(
-                "Demux manifest was produced under a different protocol/raw-route policy: "
-                f"manifest={expected_manifest}, protocol={manifest_protocol!r}, route={manifest_route!r}, "
-                f"demux_mode={manifest_demux_mode!r}, downstream_dna={manifest_downstream!r}; "
-                f"current policy={policy.name!r}/{route.route_id!r}/{route.demux_mode!r}/"
-                f"downstream_dna={route.downstream_dna}. Remove this run's demux outputs and rerun."
-            )
-        if not route.downstream_dna or row.get("dna_status") != "Pass":
-            continue
-        if not str(demux_sample or "").strip():
-            raise ValueError(
-                f"Demux manifest marks a DNA library as Pass without a sample id: {expected_manifest}"
-            )
-        passing.append(row)
-    return passing
-
-@functools.lru_cache(maxsize=1)
-def _cached_demuxed_samples(run_ids_key):
-    samples = []
-    for run_id in run_ids_key:
-        samples.extend(
-            row["demux_sample"]
-            for row in passing_dna_rows(checkpoints, run_id, config)
-        )
-    seen, duplicates = set(), set()
-    for sample in samples:
-        if sample in seen:
-            duplicates.add(sample)
-        seen.add(sample)
-    if duplicates:
-        raise ValueError(
-            "Canonical DNA cell(s) appear in more than one committed demux run: "
-            + ", ".join(sorted(duplicates))
-        )
-    return tuple(samples)
-
 def get_demuxed_samples():
-    return list(_cached_demuxed_samples(tuple(DEMUX_RUN_IDS)))
+    return list(current_demux_manifest_index().passing_cells)
+
+
+def current_cell_artifacts(sample):
+    return cell_artifacts(PROJECT_LAYOUT.cell(sample), PROTOCOL_POLICY.name,
+                          generate_snp=GENERATE_SNP, keep_final_bam=KEEP_FINAL_BAM)
+
 
 def get_staged_delivery_targets():
-    samples = get_demuxed_samples()
-    biscuit = config["biscuit"]
-    backend = get_backend(config)
-    layout = ProjectLayout(INTERMEDIATE_DIR, STAGED_RESULTS_DIR, backend.name)
-    targets = [str(layout.cell(sample).cpg) for sample in samples]
-    if backend.name == "rastair" or biscuit["generate_snp"]:
-        if not backend.supports_snp:
-            raise ValueError("generate_snp=true is currently supported only by the Biscuit backend")
-        for sample in samples:
-            paths = layout.cell(sample)
-            targets.extend([str(paths.snp), str(paths.snp_index)])
-    return targets
+    artifacts = [current_cell_artifacts(sample) for sample in get_demuxed_samples()]
+    return [str(item.deliverables[0]) for item in artifacts] + [
+        str(path) for item in artifacts for path in item.deliverables[1:]
+    ]
+
+
+# 默认交付目标与输入解复用规则
+
 rule all:
     """聚合唯一交付边界 DELIVERY_READY 作为整个 workflow 的终点。"""
     input:
@@ -1169,6 +1065,8 @@ if PROTOCOL_POLICY.requires_rna_barcode:
                 --marker {output.marker:q} \
                 --run-id={wildcards.sample:q} > {log:q} 2>&1
             """
+# 科学处理：BISCUIT
+
 if METHYLATION_BACKEND == "biscuit":
     rule align_sort_dedup:
         """在单个节点 scratch 作业内完成一个细胞的 Cutadapt trimming、BISCUIT 比对、Dupsifter 去重与坐标排序。"""
@@ -1352,7 +1250,6 @@ if METHYLATION_BACKEND == "biscuit":
             echo "INFO: stage=publish status=OK" >&2
             dna_pipeline_release_scratch
             """
-    MERGE_BSCONV_FILTER = not PUBLISH_RNA_BAM
 
     DNA_BAM_OUTPUT = temp(CELL_PATH_PATTERN.dna_bam) if not KEEP_FINAL_BAM else CELL_PATH_PATTERN.dna_bam
     DNA_BAI_OUTPUT = temp(CELL_PATH_PATTERN.dna_bam_index) if not KEEP_FINAL_BAM else CELL_PATH_PATTERN.dna_bam_index
@@ -1368,7 +1265,7 @@ if METHYLATION_BACKEND == "biscuit":
         return PROJECT_LAYOUT.cell(wildcards.demux_sample).dna_bam_index
 
 
-    if MERGE_BSCONV_FILTER:
+    if not PUBLISH_RNA_BAM:
         rule bsconv_filter_dna:
             """在同一 scratch 作业内识别 high-CpH reads 并发布过滤后的 DNA BAM。"""
             input:
@@ -1491,7 +1388,7 @@ if METHYLATION_BACKEND == "biscuit":
                 """
 
 
-    if not MERGE_BSCONV_FILTER:
+    if PUBLISH_RNA_BAM:
         rule high_cph_read_names:
             """识别 high-CpH reads，写出 read names、守恒摘要与 MultiQC 输入。"""
             input:
@@ -1570,7 +1467,7 @@ if METHYLATION_BACKEND == "biscuit":
                 """
 
 
-    if not MERGE_BSCONV_FILTER:
+    if PUBLISH_RNA_BAM:
         rule bsconv_dna:
             """按 high-CpH read names 过滤并原子发布 DNA BAM。"""
             input:
@@ -1593,7 +1490,6 @@ if METHYLATION_BACKEND == "biscuit":
                 ),
                 attempt_no = lambda wildcards, attempt: int(attempt)
             params:
-                scientific_identity = scientific_code_identity((), ('dna_pipeline_coordinate_sort_and_stage',)),
                 samtools = SAMTOOLS,
                 resource_log = lambda wc: static_resource_log("bsconv_dna", wc.demux_sample)
             conda: ENVIRONMENT_YAML
@@ -1647,7 +1543,6 @@ if METHYLATION_BACKEND == "biscuit":
                 """
 
 
-    if PUBLISH_RNA_BAM:
         rule bsconv_rna_bam:
             """SRD 恒定发布被 high-CpH 筛出的 BAM，作为 RNA 部分原始数据保留在 02_work/RNA。"""
             input:
@@ -1782,7 +1677,7 @@ if METHYLATION_BACKEND == "biscuit":
             trap - EXIT
             """
     rule generate_cpg_input:
-        """将 BISCUIT pileup VCF 的 CpG calls 直接转换为 SnapATAC2 import_values 四列格式；零变体 cell 发布合法空表。"""
+        """将 BISCUIT CpG calls 按配置坐标写成四列表；零变体 cell 发布合法空表。"""
         input:
             demux_completion = current_demux_completion,
             vcf = rules.pileup.output.vcf,
@@ -1802,6 +1697,7 @@ if METHYLATION_BACKEND == "biscuit":
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
             scientific_identity = scientific_code_identity((), ('dna_pipeline_emit_canonical_cpg', 'dna_pipeline_pileup_stat')),
+            cpg_offset = CPG_COORDINATE_BASE,
             biscuit = BISCUIT,
             zstd = ZSTD,
             resource_log = lambda wc: static_resource_log("generate_cpg_input", wc.demux_sample)
@@ -1823,11 +1719,11 @@ if METHYLATION_BACKEND == "biscuit":
             trap cleanup_cpg_tmp EXIT
             variant_rows=$(dna_pipeline_pileup_stat {input.stats:q} variant_records)
             if [ "$variant_rows" -eq 0 ]; then
-                dna_pipeline_emit_canonical_cpg {params.zstd:q} 0 "$tmp_cpg" {input.vcf:q} < /dev/null
+                dna_pipeline_emit_canonical_cpg {params.zstd:q} {params.cpg_offset} "$tmp_cpg" {input.vcf:q} < /dev/null
                 echo "WARNING: pileup VCF has no records; publishing a header-only SnapATAC2 CpG table." >> {log:q}
             else
                 {params.biscuit:q} vcf2bed -t cg -k 1 -c {input.vcf:q} 2>> {log:q} | \
-                    dna_pipeline_emit_canonical_cpg {params.zstd:q} 0 "$tmp_cpg" {input.vcf:q}
+                    dna_pipeline_emit_canonical_cpg {params.zstd:q} {params.cpg_offset} "$tmp_cpg" {input.vcf:q}
             fi
             {params.zstd:q} -q -t "$tmp_cpg" >> {log:q} 2>&1
             {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
@@ -2090,6 +1986,8 @@ EOF_DUP
             rm -f -- "$qc_absent"
             trap - EXIT
             """
+# 科学处理：TAPS / Rastair
+
 elif METHYLATION_BACKEND == "rastair":
     rule taps_align_mark:
         """复用 Cabernet trimming，以 BWA 比对并标记重复，保留全部原始测得的比对记录。"""
@@ -2201,7 +2099,8 @@ elif METHYLATION_BACKEND == "rastair":
             attempt_no = lambda wc, attempt: int(attempt),
         conda: ENVIRONMENT_YAML
         params:
-            scientific_identity = scientific_code_identity(('emit_rastair_cpg', 'TAPS_MIN_MAPQ', 'TAPS_MIN_BASEQ', 'TAPS_INCLUDE_FLAGS', 'TAPS_EXCLUDE_FLAGS'), ('dna_pipeline_emit_canonical_cpg',))
+            scientific_identity = scientific_code_identity(('emit_rastair_cpg', 'TAPS_MIN_MAPQ', 'TAPS_MIN_BASEQ', 'TAPS_INCLUDE_FLAGS', 'TAPS_EXCLUDE_FLAGS'), ('dna_pipeline_emit_canonical_cpg',)),
+            cpg_offset = CPG_COORDINATE_BASE
         shell:
             r"""
             set -euo pipefail
@@ -2225,7 +2124,7 @@ elif METHYLATION_BACKEND == "rastair":
                 --alignment-qc {input.qc:q} --output-qc "$tmpdir/qc.json" \
                 --bam {input.bam:q} --samtools {SAMTOOLS:q} --scratch "$tmpdir" \
                 --vcf "$tmpdir/native.vcf.gz" --output-snp "$tmpdir/snps.vcf.gz" --sample={wildcards.demux_sample:q} | \
-                dna_pipeline_emit_canonical_cpg {ZSTD:q} 0 "$tmpdir/cpg.tsv.zst" "$tmpdir/native.bed"
+                dna_pipeline_emit_canonical_cpg {ZSTD:q} {params.cpg_offset} "$tmpdir/cpg.tsv.zst" "$tmpdir/native.bed"
             {ZSTD:q} -q -t "$tmpdir/cpg.tsv.zst"
             {RULE_PYTHON:q} -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
                 --file "$tmpdir/cpg.tsv.zst" {output.cpg:q} \
@@ -2233,6 +2132,8 @@ elif METHYLATION_BACKEND == "rastair":
                 --file "$tmpdir/qc.json" {output.qc:q}
             dna_pipeline_release_scratch
             """
+
+# 科学处理：Bismark / Droplet
 
 else:
     rule bismark_align_dedup:
@@ -2626,7 +2527,7 @@ else:
             dna_pipeline_release_scratch
             """
     rule bismark_cpg:
-        """将 Bismark observed coverage 直接流式转换为 SnapATAC2 import_values 四列 CpG 格式。"""
+        """将 Bismark observed coverage 按配置坐标流式写成四列 CpG 表。"""
         group: "bismark_cell" if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else None
         input:
             demux_completion = current_demux_completion,
@@ -2646,6 +2547,7 @@ else:
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
             scientific_identity = scientific_code_identity((), ('dna_pipeline_emit_canonical_cpg',)),
+            cpg_offset = CPG_COORDINATE_BASE - 1,
             zstd = ZSTD,
             gzip = GZIP,
             resource_log = lambda wc: static_resource_log(
@@ -2668,7 +2570,7 @@ else:
             trap cleanup_cpg_tmp EXIT
             {params.gzip:q} -t {input.cov:q}
             {params.gzip:q} -dc {input.cov:q} | \
-                dna_pipeline_emit_canonical_cpg {params.zstd:q} -1 "$tmp_cpg" {input.cov:q}
+                dna_pipeline_emit_canonical_cpg {params.zstd:q} {params.cpg_offset} "$tmp_cpg" {input.cov:q}
             {params.zstd:q} -q -t "$tmp_cpg"
             {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
                 --commit-last {output.cpg:q} \
@@ -2677,6 +2579,8 @@ else:
             rm -f -- "$tmp_cpg"
             trap - EXIT
             """
+# 汇总、交付与持锁发布
+
 localrules: initial_cell_manifest, demux_completion_barrier, final_sample_manifest, delivery_ready
 
 DEMUX_COMPLETION_TARGETS = expand(
@@ -2687,8 +2591,6 @@ DEMUX_COMPLETION_BARRIER = INTERMEDIATE_DIR / "markers" / "demux_completions.don
 
 
 def current_pipeline_output_targets(wildcards):
-    for run_id in DEMUX_RUN_IDS:
-        checkpoints.demux.get(sample=run_id)
     return get_staged_delivery_targets()
 
 
@@ -2700,79 +2602,26 @@ FINAL_SAMPLE_CUTADAPT_QC = (
 
 def current_multiqc_source_inputs(wildcards, samples=None):
     sources = []
-    for run_id in DEMUX_RUN_IDS:
+    for run_id in current_demux_manifest_index().run_ids:
         checkpoint_output = checkpoints.demux.get(sample=run_id).output
         sources.append(str(checkpoint_output.json_mqc))
 
     active_samples = get_demuxed_samples() if samples is None else samples
     for sample in active_samples:
-        paths = PROJECT_LAYOUT.cell(sample)
-        sources.append(str(paths.cutadapt_json))
-        if METHYLATION_BACKEND == "biscuit":
-            sources.append(str(paths.dupsifter_multiqc))
-            sources.append(str(paths.high_cph_multiqc if paths.high_cph_multiqc.is_file() else paths.high_cph_summary))
-            sources.extend(
-                str(path)
-                for path in paths.biscuit_qc_sources(
-                    MULTIQC_BISCUIT_SOURCE_SUFFIXES
-                )
-            )
-        elif METHYLATION_BACKEND == "bismark":
-            sources.extend(
-                [
-                    str(paths.bismark_align_report),
-                    str(paths.droplet_umi_qc if PROTOCOL_POLICY.name == "droplet" else paths.bismark_extract_report),
-                    str(paths.bismark_mbias),
-                ]
-            )
-            sources.append(str(paths.high_cph_multiqc if paths.high_cph_multiqc.is_file() else paths.high_cph_summary))
-            if PROTOCOL_POLICY.name != "droplet":
-                sources.append(str(paths.bismark_dedup_report))
+        sources.extend(map(str, current_cell_artifacts(sample).multiqc_sources()))
     return sources
 
 
 def current_final_manifest_qc_inputs(wildcards):
-    for run_id in DEMUX_RUN_IDS:
-        checkpoints.demux.get(sample=run_id)
-    active_samples = get_demuxed_samples()
-    inputs = []
-    for sample in active_samples:
-        paths = PROJECT_LAYOUT.cell(sample)
-        inputs.append(str(paths.cutadapt_json))
-        if KEEP_FINAL_BAM:
-            inputs.extend(map(str, paths.retained_bam_files))
-        if METHYLATION_BACKEND == "rastair":
-            inputs.append(str(paths.rastair_qc))
-            continue
-        inputs.append(str(paths.high_cph_summary))
-        if METHYLATION_BACKEND == "biscuit":
-            inputs.extend(
-                [
-                    str(paths.dupsifter_multiqc),
-                    str(paths.biscuit_qc_source("CpHRetentionByReadPos.txt")),
-                ]
-            )
-        else:
-            inputs.extend(
-                [
-                    str(paths.bismark_align_report),
-                    str(paths.droplet_umi_qc if PROTOCOL_POLICY.name == "droplet" else paths.bismark_extract_report),
-                    str(paths.bismark_mbias),
-                ]
-            )
-            if PROTOCOL_POLICY.name != "droplet":
-                inputs.append(str(paths.bismark_dedup_report))
-    return inputs
+    return [str(path) for sample in get_demuxed_samples()
+            for path in current_cell_artifacts(sample).final_qc]
 
 
 def current_rna_bam_inputs(wildcards):
     if not PUBLISH_RNA_BAM:
         return []
-    inputs = []
-    for sample in get_demuxed_samples():
-        paths = PROJECT_LAYOUT.cell(sample)
-        inputs.extend([str(paths.rna_bam), str(paths.rna_bam_index)])
-    return inputs
+    return [str(path) for sample in get_demuxed_samples()
+            for path in current_cell_artifacts(sample).rna_bams]
 
 
 def current_rna_fastq_inputs(wildcards):
@@ -2900,6 +2749,7 @@ rule final_sample_manifest:
         options_json = json.dumps(
             {
                 "methylation_backend": METHYLATION_BACKEND,
+                "cpg_coordinate_base": CPG_COORDINATE_BASE,
                 "generate_snp": GENERATE_SNP,
                 "keep_final_bam": KEEP_FINAL_BAM,
                 "publish_rna_bam": PUBLISH_RNA_BAM,

@@ -1,12 +1,17 @@
-"""Alopex 核心 Python 单模块：config 唯一加载链、协议/backend 策略、
-manifest 家族、run snapshot 与发布事务、reference/FASTQ 身份、Droplet 全库计数与分块解复用、静态资源与路径契约、
-Snakemake bootstrap mtime 策略、环境身份与 Conda release 状态机，以及统一内部 CLI。
+"""Alopex 单文件核心；Shell / Snakefile 共用 ``python -m dna_pipeline <子命令>``。
 
-Shell / Snakefile 经 ``python -m dna_pipeline <子命令>`` 调用；子命令按
-项目/运行状态/阶段写出/Doctor benchmark/环境/reference 分组。
+职责导航（各区内常量、类型与函数连续排列）：
+基础原语：scientific_code_identity、resource_request、publish。
+配置与契约：load_project_config、get_protocol_policy、ProjectLayout。
+输入与解复用：refresh_manifest、call_droplet_cells、demux_manifest_index。
+科学处理：run_bsconv_extraction、call_droplet_cpg、emit_rastair_cpg。
+汇总与交付：write_final_sample_manifest、create_run_snapshot、publish_delivery。
+Doctor 维护：finalize_release、build_downstream_references、stage_route_config。
+内部 CLI：build_arg_parser、main。
+
+协议声明产物需求，backend 实现科学计算；完成边界与恢复共用生产 DAG。
 """
 from __future__ import annotations
-
 import argparse
 import ast
 import bisect
@@ -39,32 +44,256 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TextIO, TypedDict, cast
 
-DROPLET_DESIGN_RESOURCE = "resources/droplet_ME5_U3CB_methylation.txt.gz"
-DROPLET_DESIGN_SHA256 = "67981bee6acda8db275257a54e727d1e0a0bf4b884c10d8e761d04eaa9b53588"
 
+# 基础原语
 
-def disable_snakemake_output_mtime_gate() -> None:
-    """禁用 Snakemake 跨节点 output/input mtime 硬失败，保留其余输出与完整性检查。"""
-
-    from snakemake.dag import DAG
-
-    current = getattr(DAG, "check_output_mtime", None)
-    if current is None:
-        raise RuntimeError("Snakemake DAG.check_output_mtime is unavailable")
-    if getattr(current, "_dna_pipeline_nonfatal_output_mtime", False):
-        return
-
-    async def accept_output_mtime(_dag: object, _job: object, _outputs: object) -> None:
-        return None
-
-    setattr(accept_output_mtime, "_dna_pipeline_nonfatal_output_mtime", True)
-    DAG.check_output_mtime = accept_output_mtime
+logger = logging.getLogger("dna_pipeline")
 
 
 def sha256_bytes(data: bytes) -> str:
     """返回内存字节串的 SHA-256 摘要。"""
 
     return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: str | Path, *, chunk_size: int = 4 * 1024 * 1024) -> str:
+    """流式计算单个文件的 SHA-256。"""
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_json_bytes(value: object) -> bytes:
+    """用于稳定内容身份的 canonical JSON 编码（排序键、紧凑分隔符）。"""
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def stable_file_identity(
+    path: str | Path, *, hash_content: bool = True
+) -> dict[str, object]:
+    """记录 path/stat 身份；hash_content 时附带内容 SHA-256，并在录制期间侦测文件变化。"""
+
+    source = Path(path)
+    before = source.stat()
+    identity: dict[str, object] = {
+        "path": str(source.resolve()),
+        "size_bytes": before.st_size,
+        "mtime_ns": before.st_mtime_ns,
+    }
+    if hash_content:
+        identity["sha256"] = sha256_file(source)
+        after = source.stat()
+        if (before.st_size, before.st_mtime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise RuntimeError(f"file changed while recording identity: {source}")
+    return identity
+
+
+def atomic_write_bytes(path: str | Path, data: bytes, *, mode: int | None = None) -> None:
+    """在目标路径旁写临时文件，再以一次原子 rename 发布。"""
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(temporary, mode)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def atomic_write_json(
+    path: str | Path,
+    payload: Mapping[str, object],
+    *,
+    mode: int | None = None,
+) -> None:
+    """以确定性序列化（排序键、ensure_ascii=False）写出 JSON 并原子发布。"""
+
+    data = (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    atomic_write_bytes(path, data, mode=mode)
+
+
+def _read_json(path: Path, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid {label} JSON: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must contain a JSON object: {path}")
+    return value
+
+
+def _utc_now() -> str:
+    return dt.datetime.now(dt.UTC).isoformat()
+
+
+def _safe_relative(text: object, *, label: str) -> Path:
+    relative = Path(str(text))
+    if (
+        not relative.parts
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or relative == Path(".")
+    ):
+        raise ValueError(f"unsafe {label}: {text!r}")
+    return relative
+
+
+def _remove_path(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_dir() and not path.is_symlink():
+        _make_writable(path)
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _validate_copy(source: Path, partial: Path, *, is_bam: bool, samtools: str) -> None:
+    if source.stat().st_size != partial.stat().st_size:
+        raise OSError(f"partial-copy size mismatch: {source} -> {partial}")
+    if is_bam:
+        subprocess.run(
+            [samtools, "quickcheck", "-v", str(partial)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+    if source.suffix == ".json":
+        with partial.open("r", encoding="utf-8") as handle:
+            json.load(handle)
+
+
+def publish(
+    pairs: list[tuple[Path, Path]],
+    *,
+    commit_last: Path | None,
+    bam_destination: Path | None,
+    samtools: str,
+) -> None:
+    """将文件组 staged 为 .partial 并校验；替换前撤销旧 commit_last，全部完成后最后提交它。"""
+    destinations = [destination for _source, destination in pairs]
+    if len(destinations) != len(set(destinations)):
+        raise ValueError("duplicate destination in atomic publish bundle")
+    if commit_last is not None and commit_last not in destinations:
+        raise ValueError("--commit-last must match one --file destination")
+    if bam_destination is not None and bam_destination not in destinations:
+        raise ValueError("--bam-destination must match one --file destination")
+
+    job_token = os.environ.get("SLURM_JOB_ID", "local")
+    partials: dict[Path, Path] = {}
+    try:
+        for source, destination in pairs:
+            if not source.is_file():
+                raise FileNotFoundError(f"publish source is missing: {source}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+
+
+            for orphan in destination.parent.glob(f"{destination.name}.partial.*"):
+                if orphan.is_file() or orphan.is_symlink():
+                    orphan.unlink()
+
+            partial = destination.with_name(
+                f"{destination.name}.partial.{job_token}.{os.getpid()}"
+            )
+            with source.open("rb") as reader, partial.open("xb") as writer:
+                partials[destination] = partial
+                shutil.copyfileobj(reader, writer, length=8 * 1024 * 1024)
+                writer.flush()
+                os.fsync(writer.fileno())
+            _validate_copy(
+                source,
+                partial,
+                is_bam=bam_destination is not None and destination == bam_destination,
+                samtools=samtools,
+            )
+
+        ordered = [destination for destination in destinations if destination != commit_last]
+        if commit_last is not None:
+            if commit_last.exists() or commit_last.is_symlink():
+                commit_last.unlink()
+            ordered.append(commit_last)
+
+        for destination in ordered:
+            os.replace(partials[destination], destination)
+            _fsync_directory(destination.parent)
+            del partials[destination]
+    finally:
+        for partial in partials.values():
+            try:
+                partial.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def render_tsv(
+    rows: Sequence[Mapping[str, object]], fieldnames: Sequence[str]
+) -> str:
+    """按当前 schema 序列化 TSV；固定 Unix 换行与确定性输出。"""
+
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=list(fieldnames),
+        delimiter="\t",
+        lineterminator="\n",
+        extrasaction="raise",
+    )
+    writer.writeheader()
+    supported = set(fieldnames)
+    for row in rows:
+        unsupported = sorted(set(row) - supported)
+        if unsupported:
+            raise ValueError(
+                "Manifest row contains unsupported field(s): "
+                + ", ".join(str(field) for field in unsupported)
+            )
+        writer.writerow(
+            {
+                field: "" if row.get(field) is None else str(row.get(field, ""))
+                for field in fieldnames
+            }
+        )
+    return buffer.getvalue()
+
+
+def write_tsv_atomic(
+    path: str | Path,
+    rows: Sequence[Mapping[str, object]],
+    fieldnames: Sequence[str],
+) -> None:
+    """先在最终路径旁写临时文件，再以一次原子 rename 发布小体积 manifest。"""
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(output.name + ".tmp")
+    temporary.write_text(render_tsv(rows, fieldnames), encoding="utf-8")
+    temporary.replace(output)
 
 
 def effective_cpu_count(requested: int = 0) -> int:
@@ -155,621 +384,32 @@ def scientific_code_identity(python: tuple[str, ...] = (), shell: tuple[str, ...
     return sha256_bytes(json.dumps({"python": selected, "shell": shell_code}, sort_keys=True).encode())
 
 
-def sha256_file(path: str | Path, *, chunk_size: int = 4 * 1024 * 1024) -> str:
-    """流式计算单个文件的 SHA-256。"""
+def disable_snakemake_output_mtime_gate() -> None:
+    """禁用 Snakemake 跨节点 output/input mtime 硬失败，保留其余输出与完整性检查。"""
 
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(chunk_size), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    from snakemake.dag import DAG
 
+    current = getattr(DAG, "check_output_mtime", None)
+    if current is None:
+        raise RuntimeError("Snakemake DAG.check_output_mtime is unavailable")
+    if getattr(current, "_dna_pipeline_nonfatal_output_mtime", False):
+        return
 
-def demux_source_revision(source_root: str | Path, *, count_only: bool = False) -> str:
-    """计算 Rust 身份；calling 身份排除不参与计数和分子复核的配对输出模块。"""
-    root = Path(source_root).expanduser().resolve()
-    main_rs = root / "src" / "main.rs"
-    paths = [root / "Cargo.toml", root / "Cargo.lock", main_rs,
-             root.parent.parent / DROPLET_DESIGN_RESOURCE]
-    missing = [path for path in paths if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(
-            "missing Rust source identity file(s): " + ", ".join(map(str, missing))
-        )
-    rust_sources = sorted((root / "src").rglob("*.rs"))
-    if rust_sources != [main_rs]:
-        raise ValueError(
-            "demux_rs source tree must contain only src/main.rs: "
-            + ", ".join(str(path) for path in rust_sources)
-        )
-    digest = hashlib.sha256()
-    for path in sorted(paths, key=lambda item: Path(os.path.relpath(item, root)).as_posix()):
-        relative = Path(os.path.relpath(path, root)).as_posix().encode()
-        data = path.read_bytes()
-        if count_only and path == main_rs:
-            before, output_marker, output_and_rest = data.partition(b"\nmod output {\n")
-            _, droplet_marker, after = output_and_rest.partition(b"\nmod droplet {\n")
-            if not output_marker or not droplet_marker:
-                raise ValueError("cannot locate Rust output and droplet module boundaries")
-            data = before + droplet_marker + after
-        digest.update(len(relative).to_bytes(4, "big"))
-        digest.update(relative)
-        digest.update(len(data).to_bytes(8, "big"))
-        digest.update(data)
-    return "sha256:" + digest.hexdigest()
+    async def accept_output_mtime(_dag: object, _job: object, _outputs: object) -> None:
+        return None
 
+    setattr(accept_output_mtime, "_dna_pipeline_nonfatal_output_mtime", True)
+    DAG.check_output_mtime = accept_output_mtime
 
-def verify_demux_binary_revision(binary_path: str | Path, expected_revision: str) -> None:
-    """校验 demux_rs --build-info 内嵌的源码指纹与当前源码完全一致。"""
-    binary = Path(binary_path).expanduser().resolve()
-    if not binary.is_file():
-        raise FileNotFoundError(f"demux binary missing: {binary}")
-    completed = subprocess.run(
-        [str(binary), "--build-info"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    payload = json.loads(completed.stdout)
-    if not isinstance(payload, dict):
-        raise ValueError("demux --build-info did not return a JSON object")
-    actual = payload.get("source_revision")
-    if actual != expected_revision:
-        raise ValueError(
-            f"demux binary source revision mismatch: {actual!r} != {expected_revision!r}"
-        )
 
-
-def stable_file_identity(
-    path: str | Path, *, hash_content: bool = True
-) -> dict[str, object]:
-    """记录 path/stat 身份；hash_content 时附带内容 SHA-256，并在录制期间侦测文件变化。"""
-
-    source = Path(path)
-    before = source.stat()
-    identity: dict[str, object] = {
-        "path": str(source.resolve()),
-        "size_bytes": before.st_size,
-        "mtime_ns": before.st_mtime_ns,
-    }
-    if hash_content:
-        identity["sha256"] = sha256_file(source)
-        after = source.stat()
-        if (before.st_size, before.st_mtime_ns) != (
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            raise RuntimeError(f"file changed while recording identity: {source}")
-    return identity
-
-
-def atomic_write_bytes(path: str | Path, data: bytes, *, mode: int | None = None) -> None:
-    """在目标路径旁写临时文件，再以一次原子 rename 发布。"""
-
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
-    try:
-        with temporary.open("wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if mode is not None:
-            os.chmod(temporary, mode)
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def atomic_write_json(
-    path: str | Path,
-    payload: Mapping[str, object],
-    *,
-    mode: int | None = None,
-) -> None:
-    """以确定性序列化（排序键、ensure_ascii=False）写出 JSON 并原子发布。"""
-
-    data = (
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
-    atomic_write_bytes(path, data, mode=mode)
-
-
-ENVIRONMENT_IDENTITY_SCHEMA = 8
-IDENTITY_NAME = ".dna_pipeline_identity.json"
-ENVS_SPEC_NAME = "envs.yaml"
-
-
-def envs_section(envs_path: str | Path, role: str) -> dict[str, object]:
-    """用 Conda 自带的 ruamel.yaml 读取角色 spec，支持未安装 PyYAML 的 Seed。"""
-    from ruamel.yaml import YAML
-
-    payload = YAML(typ="safe", pure=True).load(Path(envs_path).read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get(role) is None:
-        raise ValueError(f"envs.yaml has no section for role {role!r}: {envs_path}")
-    section = payload[role]
-    if not isinstance(section, dict):
-        raise ValueError(f"envs.yaml section {role!r} must be a mapping")
-    return section
-
-
-def envs_section_sha256(envs_path: str | Path, role: str) -> str:
-    """角色 section 的 canonical SHA256（环境身份与复用判定的唯一口径）。"""
-    section = envs_section(envs_path, role)
-    return sha256_bytes(canonical_json_bytes(section))
-
-
-def envs_spec_logical_name(role: str) -> str:
-    """返回环境 spec 的逻辑名，与环境安装位置无关。"""
-    return f"{ENVS_SPEC_NAME}#{role}"
-
-
-def write_envs_section_spec(envs_path: str | Path, role: str, destination: str | Path) -> Path:
-    """把角色 section 抽取为独立 conda spec 文件（conda env create 的输入）。"""
-    from ruamel.yaml import YAML
-
-    section = envs_section(envs_path, role)
-    target = Path(destination)
-    parser = YAML(typ="safe", pure=True)
-    parser.default_flow_style = False
-    parser.sort_base_mapping_type_on_output = False
-    stream = io.StringIO()
-    parser.dump(section, stream)
-    atomic_write_bytes(target, stream.getvalue().encode("utf-8"))
-    return target
-
-
-def record_environment_identity(
-    *,
-    prefix: str | Path,
-    role: str,
-    spec_name: str,
-    spec_sha256: str,
-) -> Mapping[str, object]:
-    """为一个 Conda prefix 记录最小的受管环境契约（spec 身份为逻辑名+section SHA）。"""
-
-    prefix_path = Path(prefix).expanduser().resolve()
-    if not prefix_path.is_dir():
-        raise FileNotFoundError(f"environment prefix is missing: {prefix_path}")
-    if not str(spec_sha256).strip():
-        raise ValueError("spec_sha256 must be a non-empty digest")
-
-    payload: dict[str, object] = {
-        "schema_version": ENVIRONMENT_IDENTITY_SCHEMA,
-        "complete": True,
-        "role": str(role),
-        "prefix": str(prefix_path),
-        "specification": {
-            "path": str(spec_name),
-            "sha256": str(spec_sha256),
-        },
-    }
-    atomic_write_json(prefix_path / IDENTITY_NAME, payload, mode=0o444)
-    return payload
-
-
-def read_environment_identity(prefix: str | Path) -> Mapping[str, object]:
-    """读取并校验一笔已记录的受管环境身份。"""
-
-    prefix_path = Path(prefix).expanduser().resolve()
-    identity_path = prefix_path / IDENTITY_NAME
-    try:
-        payload = json.loads(identity_path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"environment record is missing: {identity_path}") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid environment record JSON: {identity_path}: {exc}") from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != ENVIRONMENT_IDENTITY_SCHEMA:
-        raise ValueError(f"unsupported environment record: {identity_path}")
-    if payload.get("complete") is not True:
-        raise ValueError(f"environment record is incomplete: {identity_path}")
-    if Path(str(payload.get("prefix", ""))).resolve() != prefix_path:
-        raise ValueError(f"environment record prefix mismatch: {identity_path}")
-    if not str(payload.get("role", "")).strip():
-        raise ValueError(f"environment record role is missing: {identity_path}")
-    specification = payload.get("specification")
-    if not isinstance(specification, Mapping) or not str(specification.get("sha256", "")).strip():
-        raise ValueError(f"environment specification identity is missing: {identity_path}")
-    return payload
-
-
-def canonical_json_bytes(value: object) -> bytes:
-    """用于稳定内容身份的 canonical JSON 编码（排序键、紧凑分隔符）。"""
-    return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-
-
-RELEASE_SCHEMA = 5
-RELEASE_NAME = ".dna_pipeline_release.json"
-RELEASE_ROLES = ("control", "biscuit", "bismark", "rastair", "notebook")
-
-
-def finalize_release(release_s: str, release_id: str, expected_subdir: str) -> None:
-    """为一个完整构建的 release 写出 0o444 的 release manifest（提交前最后一步）。"""
-    release_path = Path(release_s).expanduser().absolute()
-    if release_path.name != release_id:
-        raise ValueError(f"release id/path mismatch: {release_id} != {release_path.name}")
-    release = release_path.resolve(strict=True)
-    records: dict[str, dict[str, object]] = {}
-    for role in RELEASE_ROLES:
-        role_path = release_path / role
-        prefix = role_path.resolve(strict=True)
-        if release.parent not in prefix.parents:
-            raise ValueError(f"release role escaped managed release store: {role} -> {prefix}")
-        identity = read_environment_identity(prefix)
-        if identity.get("role") != role:
-            raise ValueError(f"environment role mismatch: {role}")
-        records[role] = {
-            "relative_path": role,
-            "resolved_prefix": str(prefix),
-            "reused": role_path.is_symlink(),
-        }
-    payload: dict[str, object] = {
-        "schema_version": RELEASE_SCHEMA,
-        "complete": True,
-        "release_id": release_id,
-        "created_at_utc": dt.datetime.now(dt.UTC).isoformat(),
-        "release_path": str(release),
-        "platform": {"conda_subdir": expected_subdir},
-        "roles": records,
-    }
-    atomic_write_json(release / RELEASE_NAME, payload, mode=0o444)
-
-
-def publish_release(current_s: str, target_s: str) -> None:
-    """以临时 symlink + 一次 os.replace 原子切换 conda/current（唯一 COMMIT 点）。"""
-    current = Path(current_s).expanduser().absolute()
-    target = Path(target_s).expanduser().resolve(strict=True)
-    if not target.is_dir():
-        raise FileNotFoundError(f"release directory missing: {target}")
-    if current.exists() and not current.is_symlink():
-        raise ValueError(f"current path is not a symlink: {current}")
-    current.parent.mkdir(parents=True, exist_ok=True)
-    temporary = current.with_name(f".{current.name}.publish.{os.getpid()}")
-    try:
-        temporary.unlink(missing_ok=True)
-        os.symlink(str(target), temporary)
-        os.replace(temporary, current)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def validate_release(current_s: str, expected_subdir: str, envs_path: str) -> None:
-    """只读校验 current 指针、release manifest、role prefix 与 envs section SHA 契约。"""
-    current = Path(current_s).expanduser().absolute()
-    if not current.is_symlink():
-        raise ValueError(f"current is not a symlink: {current}")
-    release = current.resolve(strict=True)
-    payload = json.loads((release / RELEASE_NAME).read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get("schema_version") != RELEASE_SCHEMA or payload.get("complete") is not True:
-        raise ValueError("release identity is incomplete or unsupported")
-    if payload.get("release_id") != release.name:
-        raise ValueError("release id/path mismatch")
-    if Path(str(payload.get("release_path", ""))).resolve() != release:
-        raise ValueError("release path drift")
-    platform = payload.get("platform") or {}
-    if platform.get("conda_subdir") != expected_subdir:
-        raise ValueError(f"release platform mismatch: {platform.get('conda_subdir')} != {expected_subdir}")
-    records = payload.get("roles")
-    if not isinstance(records, dict) or set(records) != set(RELEASE_ROLES):
-        raise ValueError("release roles are invalid")
-
-    for role in RELEASE_ROLES:
-        role_path = release / role
-        prefix = role_path.resolve(strict=True)
-        if release.parent not in prefix.parents:
-            raise ValueError(f"{role} prefix escaped managed release store")
-        record = records[role]
-        if not isinstance(record, dict) or record.get("relative_path") != role:
-            raise ValueError(f"{role} release record is invalid")
-        recorded_resolved = str(record.get("resolved_prefix", "")).strip()
-        if recorded_resolved and Path(recorded_resolved).resolve() != prefix:
-            raise ValueError(f"{role} resolved prefix drift")
-        environment = read_environment_identity(prefix)
-        if environment.get("role") != role:
-            raise ValueError(f"{role} environment identity role mismatch")
-        recorded = (environment.get("specification") or {}).get("sha256")
-        if recorded != envs_section_sha256(envs_path, role):
-            raise ValueError(f"{role} specification changed; rebuild required")
-
-
-def environment_is_reusable(prefix_s: str, role: str, envs_path: str) -> None:
-    """判断既有 prefix 可否复用：身份记录存在、role 匹配且 envs section SHA 未变。"""
-    environment = read_environment_identity(prefix_s)
-    if environment.get("role") != role:
-        raise ValueError(f"{role} environment identity role mismatch")
-    if (environment.get("specification") or {}).get("sha256") != envs_section_sha256(
-        envs_path, role
-    ):
-        raise ValueError(f"{role} specification changed")
-
-
-CONFIG_SCHEMA_YAML = """$schema: "https://json-schema.org/draft/2020-12/schema"
-type: object
-additionalProperties: false
-required:
-  - schema_version
-  - species
-  - references
-  - analysis
-  - demux
-  - biscuit
-  - bismark
-  - runtime
-  - slurm
-  - retention
-properties:
-  schema_version:
-    description: 配置 schema 版本号，当前固定为 2。
-    type: integer
-    const: 2
-
-  species:
-    description: 当前项目的物种标识，决定默认 reference 选择与结果目录命名。
-    type: string
-    minLength: 1
-    pattern: '^[A-Za-z0-9_.-]+$'
-
-  references:
-    description: 物种 -> 标准 reference FASTA 路径映射；由 core/doctor.sh reference 构建与校验。
-    type: object
-    minProperties: 1
-    propertyNames:
-      pattern: '^[A-Za-z0-9_.-]+$'
-    additionalProperties:
-      type: string
-      minLength: 1
-
-  analysis:
-    description: 实验协议与甲基化分析后端的全局选择。
-    type: object
-    additionalProperties: false
-    required: [protocol, methylation_backend]
-    properties:
-      protocol:
-        description: 建库协议（srd / cabernet / taps / droplet）；manifest 的 rna_sample 在 srd 为本地 RNA tube，在 cabernet/taps 为可选外部 RNA raw 关联，在 droplet 必须留空。
-        type: string
-        enum: [srd, cabernet, taps, droplet]
-      methylation_backend:
-        description: 甲基化分析后端（biscuit / bismark / rastair）；taps 仅用 rastair，默认产出 CpG、SNP VCF 和可判链 CHG/CHH QC。
-        type: string
-        enum: [biscuit, bismark, rastair]
-
-
-  demux:
-    description: Rust 解复用器（demux_rs）参数；省略时使用内置默认。
-    type: object
-    additionalProperties: false
-    required: [min_matched_read_pairs, dna_w_spacer_len]
-    properties:
-      min_matched_read_pairs:
-        description: 单 cell barcode 匹配 read pairs 的最低门槛，低于该值的 cell 不产出结果。
-        type: integer
-        minimum: 0
-      dna_w_spacer_len:
-        description: DNA 读段布局中 barcode 与 ME motif 间 W spacer 碱基数，须与实际建库一致。
-        type: integer
-        minimum: 0
-        maximum: 20
-
-
-
-  high_cph:
-    description: Cabernet/SRD/Droplet 的 high-CpH / non-conversion 处理参数，固定统计并剔除；TAPS 不适用，无用户开关；省略时使用内置默认。
-    type: object
-    additionalProperties: false
-    required:
-      - excluded_contigs
-    properties:
-      excluded_contigs:
-        description: 不参与 conversion 判断的 control/线粒体 contig 名称列表。
-        type: array
-        minItems: 0
-        uniqueItems: true
-        items:
-          type: string
-          pattern: '^[^,\\s]+$'
-
-  biscuit:
-    description: BISCUIT 后端专属参数；仅 methylation_backend=biscuit 时生效。
-    type: object
-    additionalProperties: false
-    required:
-      - library_type
-      - high_cph_retention_threshold
-      - generate_snp
-    properties:
-      library_type:
-        description: BISCUIT 建库方向模式，决定允许的 strand model。
-        type: string
-        enum: [directional, non_directional]
-      high_cph_retention_threshold:
-        description: read pair CpH retention 严格大于该值时判为 high-CpH；越低越严格。
-        type: number
-        minimum: 0
-        maximum: 1
-      generate_snp:
-        description: BISCUIT-only SNP 输出开关；非 BISCUIT 后端必须保持 false。
-        type: boolean
-
-  bismark:
-    description: Bismark 后端专属参数；仅 methylation_backend=bismark 时生效。
-    type: object
-    additionalProperties: false
-    required:
-      - library_type
-      - local_alignment
-      - non_conversion_percentage_cutoff
-      - non_conversion_minimum_count
-    properties:
-      library_type:
-        description: Bismark 建库方向模式，决定搜索的 bisulfite strand space。
-        type: string
-        enum: [directional, non_directional, pbat]
-      local_alignment:
-        description: false 用 combined-index end-to-end（默认）、true 用 faithful CT/GA + --local；两模式互斥。
-        type: boolean
-      non_conversion_percentage_cutoff:
-        description: 任一 mate 的 non-CG retention 达到该百分比且满足 minimum_count 时移除整对；越低越严格。
-        type: integer
-        minimum: 0
-        maximum: 100
-      non_conversion_minimum_count:
-        description: 启用百分比判断所需的最低 informative non-CG C 数量。
-        type: integer
-        minimum: 1
-
-  runtime:
-    description: 与生物学结果无关的执行器运行时容错参数。
-    type: object
-    additionalProperties: false
-    required: [local_executor_cores, latency_wait_seconds]
-    properties:
-      local_executor_cores:
-        description: local executor 的总 CPU 数（snakemake --cores），只影响吞吐不改变结果。
-        type: integer
-        minimum: 1
-      latency_wait_seconds:
-        description: snakemake --latency-wait 值，等待输出文件在文件系统可见的秒数。
-        type: integer
-        minimum: 0
-
-  slurm:
-    description: Slurm executor 调度参数；仅 Linux/HPC 使用。
-    type: object
-    additionalProperties: false
-    required: [jobs, controller_cores, account, partition, qos, node_tmpdir]
-    properties:
-      jobs:
-        description: 同时占用的最大 SLURM 作业数，含 Droplet 全库 calling、demux 块和后续 cell 作业。
-        type: integer
-        minimum: 1
-      controller_cores:
-        description: Snakemake controller 本地进程核数（--local-cores）。
-        type: integer
-        minimum: 1
-      account:
-        description: SLURM 记账账户；null 表示不指定账户。
-        oneOf:
-          - {type: string, minLength: 1}
-          - {type: 'null'}
-      partition:
-        description: 提交作业的默认分区；null 沿用集群默认分区。
-        oneOf:
-          - {type: string, minLength: 1}
-          - {type: 'null'}
-      qos:
-        description: 提交作业的 QoS；字符串随作业提交，null 沿用集群默认 QoS。
-        oneOf:
-          - {type: string, minLength: 1}
-          - {type: 'null'}
-      node_tmpdir:
-        description: 计算节点本地 scratch 目录；null 表示优先使用作业自带的 $SLURM_TMPDIR。
-        oneOf:
-          - type: string
-            pattern: '^/.*'
-            not: {const: '/'}
-            allOf:
-              - not: {pattern: '(^|/)\\.\\.?(/|$)'}
-          - type: 'null'
-
-  retention:
-    description: 恢复边界策略；控制昂贵中间文件的保留面。
-    type: object
-    additionalProperties: false
-    required: [keep_final_bam]
-    properties:
-      keep_final_bam:
-        description: true 保留 02_work/ 最终 BAM；false 在持锁成功发布后回收活跃 cell 的最终 BAM/索引，SRD RNA BAM 除外；默认 false。
-        type: boolean
-
-allOf:
-  - if:
-      properties:
-        analysis:
-          properties:
-            methylation_backend: {enum: [bismark, rastair]}
-          required: [methylation_backend]
-        biscuit:
-          properties:
-            generate_snp: {const: true}
-          required: [generate_snp]
-      required: [analysis, biscuit]
-    then: false
-  - if:
-      properties:
-        analysis:
-          properties:
-            protocol: {const: taps}
-    then:
-      properties:
-        analysis:
-          properties:
-            methylation_backend: {const: rastair}
-  - if:
-      properties:
-        analysis:
-          properties:
-            methylation_backend: {const: rastair}
-    then:
-      properties:
-        analysis:
-          properties:
-            protocol: {const: taps}
-"""
-
-
-CONFIG_TEMPLATE_YAML = """schema_version: 2
-
-species: hg38                    # 标准 hg38/mm10 reference 由 Doctor 构建
-
-references:
-  hg38: resources/hg38_reference/hg38.primary.lambda.puc19.fa  # primary genome + lambda + pUC19；相对 Pipeline 根目录
-  mm10: resources/mm10_reference/mm10.primary.lambda.puc19.fa  # primary genome + lambda + pUC19；也接受绝对路径
-
-analysis:
-  protocol: cabernet              # cabernet / srd / taps / droplet；manifest 的 rna_sample 在 srd 为本地输入，cabernet/taps 为外部 RNA raw 关联，droplet 必须留空
-  methylation_backend: bismark    # cabernet/srd 选 biscuit/bismark；droplet 仅 bismark；taps 仅 rastair，默认含 SNP VCF 与可判链 Non-CpG QC
-
-demux:
-  min_matched_read_pairs: 10   # 单 cell barcode 匹配 read pairs 低于该值时不产出结果；0 关闭门槛
-  dna_w_spacer_len: 0          # DNA 建库布局中 barcode 与 ME motif 间 W spacer 碱基数，须与实际建库一致
-
-biscuit:
-  library_type: non_directional   # directional / non_directional
-  high_cph_retention_threshold: 0.7   # read pair CpH retention 严格大于该值判为 high-CpH；越低越严格
-  generate_snp: false             # BISCUIT-only SNP 输出开关；true 时发布 snps.bed.gz；TAPS 默认发布 VCF，不使用此开关
-
-bismark:
-  library_type: non_directional   # directional / non_directional / pbat
-  local_alignment: false          # false: combined-index end-to-end（默认）；true: faithful CT/GA + --local
-  non_conversion_percentage_cutoff: 70    # 任一 mate 的 non-CG retention 达标且满足 minimum_count 时移除整对；越低越严格
-  non_conversion_minimum_count: 5         # 至少这么多个 informative non-CG C 才启用百分比判断，防短 CpH 误杀
-
-high_cph:
-  excluded_contigs: [pUC19, lambda, chrM]  # 这些对照不参与 high-CpH 筛除；名称须匹配参考 contig，TAPS 不适用
-
-runtime:
-  local_executor_cores: 32        # local executor 的总 CPU 数（snakemake --cores）；影响吞吐不改变结果
-  latency_wait_seconds: 120       # snakemake --latency-wait：等待输出文件在文件系统可见的秒数
-
-retention:
-  keep_final_bam: false          # true 保留最终 BAM/索引；false 在持锁成功发布后回收，SRD RNA BAM 除外
-
-slurm:
-  jobs: 30                        # SLURM 全局并发上限，含 Droplet 全库 calling、demux 块和后续 cell 作业
-  controller_cores: 2             # Snakemake controller 本地进程的 CPU 数（--local-cores）
-  account: null                  # 仅在集群要求时填写账户
-  partition: null                 # 提交作业的默认分区；null 沿用集群默认分区
-  qos: huge                       # 提交作业的默认 QoS；设为 null 时沿用集群默认 QoS
-  node_tmpdir: /tmp               # 优先 SLURM_TMPDIR；此路径不可写时回退项目 05_tmp/
-"""
-
+# 基础原语：调度资源
 
 STATIC_POLICY = "static_reads"
+
+
 _TIER_ORDER = ("S", "M", "L", "XL")
+
+
 STATIC_TIER_MAX_READS = (1_000_000, 4_000_000, 6_000_000, None)
 
 
@@ -779,9 +419,17 @@ STATIC_TIER_MAX_DEMUX_BYTES = (
     300 * 1024 ** 3,
     None,
 )
+
+
 STATIC_MAX_ATTEMPTS = 3
+
+
 STATIC_RETRY_MEMORY_RATIOS = ((3, 2), (2, 1))
+
+
 BISMARK_CELL_RULE_RUNTIME_MIN = 150
+
+
 _INTEGER_TEXT = re.compile(r"^[0-9]+$")
 
 
@@ -876,6 +524,7 @@ STATIC_SCRATCH_GIB: Mapping[str, tuple[int, int, int, int]] = MappingProxyType(
         "demux_chunk": (24, 24, 24, 24),
     }
 )
+
 
 STATIC_FUSED_RULES: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
@@ -1100,6 +749,7 @@ _BACKEND_STAGE_RULES: Mapping[tuple[str, str], str] = MappingProxyType(
     }
 )
 
+
 _LOCAL_BACKEND_THREADS: Mapping[str, tuple[int, int, int, int]] = MappingProxyType(
     {
         "align_sort_dedup": (8, 12, 16, 16),
@@ -1165,6 +815,7 @@ def backend_resource_request(
         runtime_min=base.runtime_min,
     )
 
+
 def scratch_mb(scratch_group: str, dna_reads: object) -> int:
     """返回 fused job 固定的 node scratch 容量（MiB）。"""
 
@@ -1177,6 +828,882 @@ def scratch_mb(scratch_group: str, dna_reads: object) -> int:
             f"unsupported scratch resource group {key!r}; expected one of: {supported}"
         ) from exc
     return int(values[_TIER_ORDER.index(size_tier(dna_reads))] * 1024)
+
+
+# 配置与契约
+
+DROPLET_DESIGN_RESOURCE = "resources/droplet_ME5_U3CB_methylation.txt.gz"
+
+
+DROPLET_DESIGN_SHA256 = "67981bee6acda8db275257a54e727d1e0a0bf4b884c10d8e761d04eaa9b53588"
+
+
+SAMPLE_ID_RE = re.compile(r"^(?!\.{1,2}$)[A-Za-z0-9_.-]+$")
+
+
+ENVIRONMENT_IDENTITY_SCHEMA = 8
+
+
+IDENTITY_NAME = ".dna_pipeline_identity.json"
+
+
+def read_environment_identity(prefix: str | Path) -> Mapping[str, object]:
+    """读取并校验一笔已记录的受管环境身份。"""
+
+    prefix_path = Path(prefix).expanduser().resolve()
+    identity_path = prefix_path / IDENTITY_NAME
+    try:
+        payload = json.loads(identity_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"environment record is missing: {identity_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid environment record JSON: {identity_path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != ENVIRONMENT_IDENTITY_SCHEMA:
+        raise ValueError(f"unsupported environment record: {identity_path}")
+    if payload.get("complete") is not True:
+        raise ValueError(f"environment record is incomplete: {identity_path}")
+    if Path(str(payload.get("prefix", ""))).resolve() != prefix_path:
+        raise ValueError(f"environment record prefix mismatch: {identity_path}")
+    if not str(payload.get("role", "")).strip():
+        raise ValueError(f"environment record role is missing: {identity_path}")
+    specification = payload.get("specification")
+    if not isinstance(specification, Mapping) or not str(specification.get("sha256", "")).strip():
+        raise ValueError(f"environment specification identity is missing: {identity_path}")
+    return payload
+
+
+CONFIG_SCHEMA_YAML = r"""$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required:
+- schema_version
+- species
+- references
+- analysis
+- runtime
+- slurm
+- retention
+- common
+- cabernet
+- srd
+- taps
+- droplet
+properties:
+  schema_version:
+    description: 配置 schema 版本号，当前固定为 3。
+    type: integer
+    const: 3
+  species:
+    description: 当前项目的物种标识，决定默认 reference 选择与结果目录命名。
+    type: string
+    minLength: 1
+    pattern: ^[A-Za-z0-9_.-]+$
+  references:
+    description: 物种 -> 标准 reference FASTA 路径映射；由 core/doctor.sh reference 构建与校验。
+    type: object
+    minProperties: 1
+    propertyNames:
+      pattern: ^[A-Za-z0-9_.-]+$
+    additionalProperties:
+      type: string
+      minLength: 1
+  analysis:
+    description: 公共协议选择与 CpG 输出坐标。
+    type: object
+    additionalProperties: false
+    required:
+    - protocol
+    - cpg_coordinate_base
+    properties:
+      protocol:
+        description: 建库协议（srd / cabernet / taps / droplet）；manifest 的 rna_sample 在 srd 为本地 RNA tube，在 cabernet/taps
+          为可选外部 RNA raw 关联，在 droplet 必须留空。
+        type: string
+        enum:
+        - srd
+        - cabernet
+        - taps
+        - droplet
+      cpg_coordinate_base:
+        description: 四列 CpG 输出的位点坐标起点；默认 1，设为 0 输出 0-based；不改变 BED、VCF 或 BAM 的原生坐标。
+        type: integer
+        enum:
+        - 0
+        - 1
+  runtime:
+    description: 与生物学结果无关的执行器运行时容错参数。
+    type: object
+    additionalProperties: false
+    required:
+    - local_executor_cores
+    - latency_wait_seconds
+    properties:
+      local_executor_cores:
+        description: local executor 的总 CPU 数（snakemake --cores），只影响吞吐不改变结果。
+        type: integer
+        minimum: 1
+      latency_wait_seconds:
+        description: snakemake --latency-wait 值，等待输出文件在文件系统可见的秒数。
+        type: integer
+        minimum: 0
+  slurm:
+    description: Slurm executor 调度参数；仅 Linux/HPC 使用。
+    type: object
+    additionalProperties: false
+    required:
+    - jobs
+    - controller_cores
+    - account
+    - partition
+    - qos
+    - node_tmpdir
+    properties:
+      jobs:
+        description: 同时占用的最大 SLURM 作业数，含 Droplet 全库 calling、demux 块和后续 cell 作业。
+        type: integer
+        minimum: 1
+      controller_cores:
+        description: Snakemake controller 本地进程核数（--local-cores）。
+        type: integer
+        minimum: 1
+      account:
+        description: SLURM 记账账户；null 表示不指定账户。
+        oneOf:
+        - type: string
+          minLength: 1
+        - type: 'null'
+      partition:
+        description: 提交作业的默认分区；null 沿用集群默认分区。
+        oneOf:
+        - type: string
+          minLength: 1
+        - type: 'null'
+      qos:
+        description: 提交作业的 QoS；字符串随作业提交，null 沿用集群默认 QoS。
+        oneOf:
+        - type: string
+          minLength: 1
+        - type: 'null'
+      node_tmpdir:
+        description: 计算节点本地 scratch 目录；null 表示优先使用作业自带的 $SLURM_TMPDIR。
+        oneOf:
+        - type: string
+          pattern: ^/.*
+          not:
+            const: /
+          allOf:
+          - not:
+              pattern: (^|/)\.\.?(/|$)
+        - type: 'null'
+  retention:
+    description: 恢复边界策略；控制昂贵中间文件的保留面。
+    type: object
+    additionalProperties: false
+    required:
+    - keep_final_bam
+    properties:
+      keep_final_bam:
+        description: true 保留 02_work/ 最终 BAM；false 在持锁成功发布后回收活跃 cell 的最终 BAM/索引，SRD RNA BAM 除外；默认 false。
+        type: boolean
+  cabernet:
+    type: object
+    additionalProperties: false
+    required:
+    - methylation_backend
+    properties:
+      methylation_backend:
+        description: 本协议使用的甲基化后端。
+        type: string
+        enum:
+        - biscuit
+        - bismark
+      demux:
+        $ref: '#/$defs/demux_override'
+      high_cph:
+        $ref: '#/$defs/high_cph_override'
+      bismark:
+        $ref: '#/$defs/bismark_override'
+      biscuit:
+        $ref: '#/$defs/biscuit_override'
+  srd:
+    type: object
+    additionalProperties: false
+    required:
+    - methylation_backend
+    properties:
+      methylation_backend:
+        description: 本协议使用的甲基化后端。
+        type: string
+        enum:
+        - biscuit
+        - bismark
+      demux:
+        $ref: '#/$defs/demux_override'
+      high_cph:
+        $ref: '#/$defs/high_cph_override'
+      bismark:
+        $ref: '#/$defs/bismark_override'
+      biscuit:
+        $ref: '#/$defs/biscuit_override'
+  taps:
+    type: object
+    additionalProperties: false
+    properties:
+      demux:
+        $ref: '#/$defs/demux_override'
+  droplet:
+    type: object
+    additionalProperties: false
+    properties:
+      demux:
+        description: Rust 解复用器（demux_rs）参数；省略时使用内置默认。
+        type: object
+        additionalProperties: false
+        properties:
+          min_matched_read_pairs:
+            description: 单 cell barcode 匹配 read pairs 的最低门槛，低于该值的 cell 不产出结果。
+            type: integer
+            minimum: 0
+      high_cph:
+        $ref: '#/$defs/high_cph_override'
+      bismark:
+        description: Bismark 后端专属参数；仅 methylation_backend=bismark 时生效。
+        type: object
+        additionalProperties: false
+        properties:
+          local_alignment:
+            description: false 用 combined-index end-to-end（默认）、true 用 faithful CT/GA + --local；两模式互斥。
+            type: boolean
+          non_conversion_percentage_cutoff:
+            description: 任一 mate 的 non-CG retention 达到该百分比且满足 minimum_count 时移除整对；越低越严格。
+            type: integer
+            minimum: 0
+            maximum: 100
+          non_conversion_minimum_count:
+            description: 启用百分比判断所需的最低 informative non-CG C 数量。
+            type: integer
+            minimum: 1
+  common:
+    type: object
+    additionalProperties: false
+    required:
+    - demux
+    - high_cph
+    - bismark
+    - biscuit
+    properties:
+      demux:
+        $ref: '#/$defs/demux'
+      high_cph:
+        $ref: '#/$defs/high_cph'
+      bismark:
+        $ref: '#/$defs/bismark'
+      biscuit:
+        $ref: '#/$defs/biscuit'
+$defs:
+  demux:
+    description: Rust 解复用器（demux_rs）参数；省略时使用内置默认。
+    type: object
+    additionalProperties: false
+    required:
+    - min_matched_read_pairs
+    - dna_w_spacer_len
+    properties:
+      min_matched_read_pairs:
+        description: 单 cell barcode 匹配 read pairs 的最低门槛，低于该值的 cell 不产出结果。
+        type: integer
+        minimum: 0
+      dna_w_spacer_len:
+        description: DNA 读段布局中 barcode 与 ME motif 间 W spacer 碱基数，须与实际建库一致。
+        type: integer
+        minimum: 0
+        maximum: 20
+  high_cph:
+    description: Cabernet/SRD/Droplet 的 high-CpH / non-conversion 处理参数，固定统计并剔除；TAPS 不适用，无用户开关；省略时使用内置默认。
+    type: object
+    additionalProperties: false
+    required:
+    - excluded_contigs
+    properties:
+      excluded_contigs:
+        description: 不参与 conversion 判断的 control/线粒体 contig 名称列表。
+        type: array
+        minItems: 0
+        uniqueItems: true
+        items:
+          type: string
+          pattern: ^[^,\s]+$
+  biscuit:
+    description: BISCUIT 后端专属参数；仅 methylation_backend=biscuit 时生效。
+    type: object
+    additionalProperties: false
+    required:
+    - library_type
+    - high_cph_retention_threshold
+    - generate_snp
+    properties:
+      library_type:
+        description: BISCUIT 建库方向模式，决定允许的 strand model。
+        type: string
+        enum:
+        - directional
+        - non_directional
+      high_cph_retention_threshold:
+        description: read pair CpH retention 严格大于该值时判为 high-CpH；越低越严格。
+        type: number
+        minimum: 0
+        maximum: 1
+      generate_snp:
+        description: 选定 BISCUIT 后端时发布 SNP；同一协议选择 Bismark 时必须为 false。
+        type: boolean
+  bismark:
+    description: Bismark 后端专属参数；仅 methylation_backend=bismark 时生效。
+    type: object
+    additionalProperties: false
+    required:
+    - library_type
+    - local_alignment
+    - non_conversion_percentage_cutoff
+    - non_conversion_minimum_count
+    properties:
+      library_type:
+        description: Bismark 建库方向模式，决定搜索的 bisulfite strand space。
+        type: string
+        enum:
+        - directional
+        - non_directional
+        - pbat
+      local_alignment:
+        description: false 用 combined-index end-to-end（默认）、true 用 faithful CT/GA + --local；两模式互斥。
+        type: boolean
+      non_conversion_percentage_cutoff:
+        description: 任一 mate 的 non-CG retention 达到该百分比且满足 minimum_count 时移除整对；越低越严格。
+        type: integer
+        minimum: 0
+        maximum: 100
+      non_conversion_minimum_count:
+        description: 启用百分比判断所需的最低 informative non-CG C 数量。
+        type: integer
+        minimum: 1
+  demux_override:
+    description: Rust 解复用器（demux_rs）参数；省略时使用内置默认。
+    type: object
+    additionalProperties: false
+    properties:
+      min_matched_read_pairs:
+        description: 单 cell barcode 匹配 read pairs 的最低门槛，低于该值的 cell 不产出结果。
+        type: integer
+        minimum: 0
+      dna_w_spacer_len:
+        description: DNA 读段布局中 barcode 与 ME motif 间 W spacer 碱基数，须与实际建库一致。
+        type: integer
+        minimum: 0
+        maximum: 20
+  high_cph_override:
+    description: Cabernet/SRD/Droplet 的 high-CpH / non-conversion 处理参数，固定统计并剔除；TAPS 不适用，无用户开关；省略时使用内置默认。
+    type: object
+    additionalProperties: false
+    properties:
+      excluded_contigs:
+        description: 不参与 conversion 判断的 control/线粒体 contig 名称列表。
+        type: array
+        minItems: 0
+        uniqueItems: true
+        items:
+          type: string
+          pattern: ^[^,\s]+$
+  bismark_override:
+    description: Bismark 后端专属参数；仅 methylation_backend=bismark 时生效。
+    type: object
+    additionalProperties: false
+    properties:
+      library_type:
+        description: Bismark 建库方向模式，决定搜索的 bisulfite strand space。
+        type: string
+        enum:
+        - directional
+        - non_directional
+        - pbat
+      local_alignment:
+        description: false 用 combined-index end-to-end（默认）、true 用 faithful CT/GA + --local；两模式互斥。
+        type: boolean
+      non_conversion_percentage_cutoff:
+        description: 任一 mate 的 non-CG retention 达到该百分比且满足 minimum_count 时移除整对；越低越严格。
+        type: integer
+        minimum: 0
+        maximum: 100
+      non_conversion_minimum_count:
+        description: 启用百分比判断所需的最低 informative non-CG C 数量。
+        type: integer
+        minimum: 1
+  biscuit_override:
+    description: BISCUIT 后端专属参数；仅 methylation_backend=biscuit 时生效。
+    type: object
+    additionalProperties: false
+    properties:
+      library_type:
+        description: BISCUIT 建库方向模式，决定允许的 strand model。
+        type: string
+        enum:
+        - directional
+        - non_directional
+      high_cph_retention_threshold:
+        description: read pair CpH retention 严格大于该值时判为 high-CpH；越低越严格。
+        type: number
+        minimum: 0
+        maximum: 1
+      generate_snp:
+        description: 选定 BISCUIT 后端时发布 SNP；同一协议选择 Bismark 时必须为 false。
+        type: boolean
+"""
+
+
+CONFIG_TEMPLATE_YAML = """schema_version: 3
+
+species: hg38                    # 标准 hg38/mm10 reference 由 Doctor 构建
+
+references:
+  hg38: resources/hg38_reference/hg38.primary.lambda.puc19.fa  # primary genome + lambda + pUC19；相对 Pipeline 根目录
+  mm10: resources/mm10_reference/mm10.primary.lambda.puc19.fa  # primary genome + lambda + pUC19；也接受绝对路径
+
+analysis:
+  protocol: cabernet              # cabernet / srd / taps / droplet；manifest 的 rna_sample 在 srd 为本地输入，cabernet/taps 为外部 RNA raw 关联，droplet 必须留空
+  cpg_coordinate_base: 1         # CpG pos 默认 1-based；设为 0 输出 0-based，不改变 BED/VCF/BAM
+
+runtime:
+  local_executor_cores: 32        # local executor 的总 CPU 数（snakemake --cores）；影响吞吐不改变结果
+  latency_wait_seconds: 120       # snakemake --latency-wait：等待输出文件在文件系统可见的秒数
+
+retention:
+  keep_final_bam: false          # true 保留最终 BAM/索引；false 在持锁成功发布后回收，SRD RNA BAM 除外
+
+slurm:
+  jobs: 30                        # SLURM 全局并发上限，含 Droplet 全库 calling、demux 块和后续 cell 作业
+  controller_cores: 2             # Snakemake controller 本地进程的 CPU 数（--local-cores）
+  account: null                  # 仅在集群要求时填写账户
+  partition: null                 # 提交作业的默认分区；null 沿用集群默认分区
+  qos: huge                       # 提交作业的默认 QoS；设为 null 时沿用集群默认 QoS
+  node_tmpdir: /tmp               # 优先 SLURM_TMPDIR；此路径不可写时回退项目 05_tmp/
+
+common:
+  demux:
+    min_matched_read_pairs: 10   # 单 cell barcode 匹配 read pairs 低于该值时不产出结果；0 关闭门槛
+    dna_w_spacer_len: 0          # DNA 建库布局中 barcode 与 ME motif 间 W spacer 碱基数，须与实际建库一致
+  high_cph:
+    excluded_contigs: [pUC19, lambda, chrM]  # 这些对照不参与 high-CpH 筛除；名称须匹配参考 contig，TAPS 不适用
+  bismark:
+    library_type: non_directional   # directional / non_directional / pbat
+    local_alignment: false          # false: combined-index end-to-end（默认）；true: faithful CT/GA + --local
+    non_conversion_percentage_cutoff: 70    # 任一 mate 的 non-CG retention 达标且满足 minimum_count 时移除整对；越低越严格
+    non_conversion_minimum_count: 5         # 至少这么多个 informative non-CG C 才启用百分比判断，防短 CpH 误杀
+  biscuit:
+    library_type: non_directional   # directional / non_directional
+    high_cph_retention_threshold: 0.7   # read pair CpH retention 严格大于该值判为 high-CpH；越低越严格
+    generate_snp: false             # BISCUIT-only SNP 输出开关；true 时发布 snps.bed.gz；TAPS 默认发布 VCF，不使用此开关
+
+cabernet:
+  methylation_backend: bismark  # biscuit / bismark；需要差异参数时在本模块覆盖 common 的同名叶子
+
+srd:
+  methylation_backend: bismark  # biscuit / bismark；需要差异参数时在本模块覆盖 common 的同名叶子
+
+taps: {}
+
+droplet: {}
+"""
+
+
+SUPPORTED_BISMARK_LIBRARY_TYPES = ("directional", "non_directional", "pbat")
+
+
+SUPPORTED_BISCUIT_LIBRARY_TYPES = ("directional", "non_directional")
+
+
+CONFIG_SECTION_DEFAULTS: dict[str, dict[str, object]] = {
+    "analysis": {
+        "cpg_coordinate_base": 1,
+    },
+    "runtime": {
+        "local_executor_cores": 32,
+        "latency_wait_seconds": 120,
+    },
+    "slurm": {
+        "jobs": 30,
+        "controller_cores": 2,
+        "account": None,
+        "partition": None,
+        "qos": "huge",
+        "node_tmpdir": "/tmp",
+    },
+    "retention": {
+        "keep_final_bam": False,
+    },
+    "common": {
+        "demux": {
+            "min_matched_read_pairs": 10,
+            "dna_w_spacer_len": 0,
+        },
+        "high_cph": {
+            "excluded_contigs": ["pUC19", "lambda", "chrM"],
+        },
+        "bismark": {
+            "library_type": "non_directional",
+            "local_alignment": False,
+            "non_conversion_percentage_cutoff": 70,
+            "non_conversion_minimum_count": 5,
+        },
+        "biscuit": {
+            "library_type": "non_directional",
+            "high_cph_retention_threshold": 0.7,
+            "generate_snp": False,
+        },
+    },
+    "cabernet": {
+        "methylation_backend": "bismark",
+    },
+    "srd": {
+        "methylation_backend": "bismark",
+    },
+    "taps": {},
+    "droplet": {},
+}
+
+
+_PROTOCOL_FIXED_CONFIG = {
+    "taps": {"methylation_backend": "rastair"},
+    "droplet": {
+        "methylation_backend": "bismark",
+        "demux": {"dna_w_spacer_len": 0},
+        "bismark": {"library_type": "non_directional"},
+    },
+}
+
+
+def apply_config_defaults(config: dict[str, object]) -> dict[str, object]:
+    """递归补齐公共与协议模块的省略项；保留显式值并隔离各模块的可变默认。"""
+    def merge(current, defaults, path):
+        if not isinstance(current, dict):
+            raise ValueError(f"config section {path!r} must be a mapping")
+        for key, value in defaults.items():
+            if key not in current:
+                current[key] = copy.deepcopy(value)
+            elif isinstance(value, dict):
+                merge(current[key], value, f"{path}.{key}" if path else key)
+    merge(config, CONFIG_SECTION_DEFAULTS, "")
+    for protocol in ("cabernet", "srd", "taps", "droplet"):
+        for key, value in config[protocol].items():
+            if key in ("demux", "high_cph", "bismark", "biscuit") and not isinstance(value, dict):
+                raise ValueError(f"config section {protocol}.{key!s} must be a mapping")
+    return config
+
+
+def get_protocol_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """合并 common 与协议差异并注入固定协议值；结果与配置独立深拷贝。"""
+    analysis = config.get("analysis")
+    if not isinstance(analysis, Mapping):
+        raise ValueError("analysis must be a mapping")
+    protocol = analysis.get("protocol")
+    if protocol not in ("cabernet", "srd", "taps", "droplet"):
+        raise ValueError(f"Unsupported protocol: {protocol!r}")
+    module = config.get(protocol)
+    if not isinstance(module, dict) or not isinstance(config.get("common"), dict):
+        raise ValueError("common and selected protocol must be mappings")
+    groups = ("demux",) if protocol == "taps" else ("demux", "high_cph", "bismark")
+    if protocol in ("cabernet", "srd"):
+        groups += ("biscuit",)
+    effective = {key: copy.deepcopy(value) for key, value in config["common"].items() if key in groups}
+    for values in (module, _PROTOCOL_FIXED_CONFIG.get(protocol, {})):
+        for key, value in values.items():
+            if isinstance(value, dict):
+                effective.setdefault(key, {}).update(copy.deepcopy(value))
+            else:
+                effective[key] = copy.deepcopy(value)
+    return effective
+
+
+def finalize_project_config(config: Mapping[str, object]) -> dict[str, object]:
+    """合并内置默认并完成 schema 与跨字段语义校验（项目 config 的唯一加载链）。"""
+    import yaml
+    from jsonschema import validate as validate_jsonschema
+
+    merged = apply_config_defaults(copy.deepcopy(dict(config)))
+    schema = yaml.safe_load(CONFIG_SCHEMA_YAML)
+    validate_jsonschema(instance=merged, schema=schema)
+    validate_config_semantics(merged)
+    return merged
+
+
+def load_project_config(path: Path | str) -> dict[str, object]:
+    """读取项目 config YAML 并走唯一 finalize 加载链。"""
+    import yaml
+
+    config = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"project config root must be a mapping: {path}")
+    return finalize_project_config(config)
+
+
+def get_backend(config: dict[str, Any]) -> str:
+    """返回选定的 backend，并拒绝该 backend 不支持的功能组合。"""
+    analysis = config.get("analysis")
+    if not isinstance(analysis, dict):
+        raise ValueError("analysis must be a mapping")
+    module = get_protocol_config(config)
+    name = str(module.get("methylation_backend", "")).strip().lower()
+    if name not in ("biscuit", "bismark", "rastair"):
+        raise ValueError(
+            f"Unsupported methylation backend {name!r}; choose biscuit, bismark or rastair"
+        )
+    if (analysis.get("protocol") == "taps") != (name == "rastair"):
+        raise ValueError("protocol taps requires rastair; Cabernet/SRD require biscuit or bismark")
+    biscuit = module.get("biscuit") or {}
+    if bool(biscuit.get("generate_snp")) and name != "biscuit":
+        raise ValueError(
+            "biscuit.generate_snp=true is currently supported only by the Biscuit backend"
+        )
+    return name
+
+
+def bismark_library_flag(config: dict[str, Any]) -> str:
+    """把配置的 library type 翻译为 Bismark CLI flag。"""
+    bismark = get_protocol_config(config).get("bismark")
+    if not isinstance(bismark, dict):
+        raise ValueError("bismark must be a mapping")
+    value = str(bismark.get("library_type", "")).strip().lower()
+    if value not in SUPPORTED_BISMARK_LIBRARY_TYPES:
+        raise ValueError(
+            "bismark.library_type must be directional, non_directional, or pbat"
+        )
+    return {
+        "directional": "",
+        "non_directional": "--non_directional",
+        "pbat": "--pbat",
+    }[value]
+
+
+def bismark_alignment_instance_count(config: Mapping[str, object]) -> int:
+    """返回当前 Bismark 模式使用的 Bowtie2 instance 数，用于划分 rule 总 CPU。"""
+    bismark = get_protocol_config(config).get("bismark")
+    if not isinstance(bismark, Mapping):
+        raise ValueError("bismark must be a mapping")
+    value = str(bismark.get("library_type", "")).strip().lower()
+    if value not in SUPPORTED_BISMARK_LIBRARY_TYPES:
+        raise ValueError(
+            "bismark.library_type must be directional, non_directional, or pbat"
+        )
+    if not bool(bismark.get("local_alignment", False)):
+        return 1
+    return 4 if value == "non_directional" else 2
+
+
+def biscuit_library_mode(config: Mapping[str, object]) -> int:
+    """把命名的 paired-end BISCUIT library type 翻译为 ``align -b`` 的取值。"""
+    biscuit = get_protocol_config(config).get("biscuit")
+    if not isinstance(biscuit, Mapping):
+        raise ValueError("biscuit must be a mapping")
+    value = str(biscuit.get("library_type", "")).strip().lower()
+    if value not in SUPPORTED_BISCUIT_LIBRARY_TYPES:
+        raise ValueError("biscuit.library_type must be directional or non_directional")
+    return {"non_directional": 0, "directional": 1}[value]
+
+
+def validate_config_semantics(config: Mapping[str, object]) -> None:
+    """校验 JSON Schema 无法表达的跨字段约束。"""
+    cpg_representation(config["analysis"]["cpg_coordinate_base"])
+    backend = get_backend(dict(config))
+    slurm = config["slurm"]
+
+    node_tmpdir = slurm.get("node_tmpdir")
+    if node_tmpdir is not None:
+        if not isinstance(node_tmpdir, str) or not str(node_tmpdir).strip():
+            raise ValueError("slurm.node_tmpdir must be a non-empty path or null")
+        if Path(str(node_tmpdir)).expanduser().resolve(strict=False) == Path(
+            Path(str(node_tmpdir)).expanduser().resolve(strict=False).anchor
+        ):
+            raise ValueError("slurm.node_tmpdir must not resolve to the filesystem root")
+    for section in ("common", "cabernet", "srd"):
+        biscuit = config[section].get("biscuit", {})
+        if "high_cph_retention_threshold" not in biscuit:
+            continue
+        value = biscuit["high_cph_retention_threshold"]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value)) or not 0 <= value <= 1):
+            raise ValueError(f"{section}.biscuit.high_cph_retention_threshold must be a finite number within [0, 1]")
+    if backend == "biscuit":
+        biscuit_library_mode(config)
+    elif backend == "bismark":
+        bismark_library_flag(dict(config))
+
+
+@dataclass(frozen=True)
+class ProtocolPolicy:
+    name: str
+    demux_mode: str
+    requires_rna_barcode: bool
+    rna_output_role: str
+    high_cph_role: str
+
+    publishes_rna_bam: bool
+
+    @property
+    def raw_input_columns(self) -> tuple[str, ...]:
+        """返回本项目需要 FASTQ 的 manifest 列；外部 RNA 关联不参与拆分。"""
+        return ("dna_raw_sample", "rna_sample") if self.name == "srd" else ("dna_raw_sample",)
+
+
+@dataclass(frozen=True)
+class RawRoutePolicy:
+    route_id: str
+    protocol: str
+    demux_mode: str
+    downstream_dna: bool
+    rna_output_role: str
+    high_cph_role: str
+
+
+_PROTOCOLS = {
+    "droplet": ProtocolPolicy(
+        name="droplet", demux_mode="dna-only-droplet", requires_rna_barcode=False,
+        rna_output_role="not_used", high_cph_role="cdna_contamination", publishes_rna_bam=False,
+    ),
+    "taps": ProtocolPolicy(
+        name="taps", demux_mode="dna-only-taps", requires_rna_barcode=False,
+        rna_output_role="not_used", high_cph_role="not_applicable",
+        publishes_rna_bam=False,
+    ),
+    "cabernet": ProtocolPolicy(
+        name="cabernet", demux_mode="dna-only", requires_rna_barcode=False,
+        rna_output_role="not_used", high_cph_role="cdna_contamination",
+        publishes_rna_bam=False,
+    ),
+    "srd": ProtocolPolicy(
+        name="srd", demux_mode="dna-rna", requires_rna_barcode=True,
+        rna_output_role="audit_only", high_cph_role="residual_high_cph",
+        publishes_rna_bam=True,
+    ),
+}
+
+
+def _raw_route(
+    route_id: str,
+    protocol: str,
+    downstream_dna: bool,
+    *,
+    rna_output_role: str | None = None,
+    high_cph_role: str | None = None,
+) -> RawRoutePolicy:
+    policy = _PROTOCOLS[protocol]
+    return RawRoutePolicy(
+        route_id=route_id,
+        protocol=protocol,
+        downstream_dna=downstream_dna,
+        demux_mode=policy.demux_mode,
+        rna_output_role=rna_output_role or policy.rna_output_role,
+        high_cph_role=high_cph_role or policy.high_cph_role,
+    )
+
+
+_RAW_ROUTES = {
+    "droplet_dna": _raw_route("droplet_dna", "droplet", True),
+    "taps_dna_nucleus": _raw_route("taps_dna_nucleus", "taps", True),
+    "cabernet_dna_nucleus": _raw_route("cabernet_dna_nucleus", "cabernet", True),
+    "srd_dna_tube": _raw_route("srd_dna_tube", "srd", True),
+    "srd_rna_enrichment_tube": _raw_route(
+        "srd_rna_enrichment_tube",
+        "srd",
+        False,
+        rna_output_role="audit_only",
+        high_cph_role="not_applicable",
+    ),
+}
+
+
+def _canonical_protocol_name(name: str) -> str:
+    protocol = str(name or "").strip().lower()
+    if protocol not in _PROTOCOLS:
+        raise ValueError(
+            f"Unsupported pipeline protocol={protocol!r}; expected one of: "
+            + ", ".join(sorted(_PROTOCOLS))
+        )
+    return protocol
+
+
+def get_protocol_policy(config: Mapping[str, object]) -> ProtocolPolicy:
+    protocol = _canonical_protocol_name(str(config["analysis"]["protocol"]))
+    return _PROTOCOLS[protocol]
+
+
+def get_protocol(name: str) -> ProtocolPolicy:
+    return _PROTOCOLS[_canonical_protocol_name(name)]
+
+
+def default_dna_route(protocol: str) -> str:
+    """返回协议唯一的下游 DNA 原始样本路线。"""
+    return next(r.route_id for r in _RAW_ROUTES.values() if r.protocol == _canonical_protocol_name(protocol) and r.downstream_dna)
+
+
+def canonical_raw_route_id(route_name: str) -> str:
+    return str(route_name or "").strip().lower()
+
+
+def get_raw_route(route_name: str, protocol_name: str) -> RawRoutePolicy:
+    protocol = _canonical_protocol_name(protocol_name)
+    route_id = canonical_raw_route_id(route_name)
+    route = _RAW_ROUTES.get(route_id)
+    if route is None or route.protocol != protocol:
+        valid = sorted(r.route_id for r in _RAW_ROUTES.values() if r.protocol == protocol)
+        raise ValueError(
+            f"Unsupported raw-sample route={route_name!r} for protocol={protocol!r}; "
+            f"expected one of: {', '.join(valid)}"
+        )
+    return route
+
+
+_EXPORTED_SCALARS = {
+    "CFG_LOCAL_CORES": "runtime.local_executor_cores",
+    "CFG_LATENCY_WAIT": "runtime.latency_wait_seconds",
+    "CFG_PROTOCOL": "analysis.protocol",
+    "CFG_SPECIES": "species",
+    "CFG_SLURM_JOBS": "slurm.jobs",
+    "CFG_SLURM_CONTROLLER_CORES": "slurm.controller_cores",
+    "CFG_SLURM_ACCOUNT": "slurm.account",
+    "CFG_SLURM_PARTITION": "slurm.partition",
+    "CFG_SLURM_QOS": "slurm.qos",
+    "CFG_SLURM_NODE_TMPDIR": "slurm.node_tmpdir",
+}
+
+
+def export_config_scalars(config: Mapping[str, object]) -> dict[str, str]:
+    """提取平台路由所需的 config 叶子标量（None 渲染为空串，bool 渲染为 true/false）。"""
+    rendered: dict[str, str] = {"CFG_METHYLATION_BACKEND": get_backend(dict(config))}
+    for var, dotted in _EXPORTED_SCALARS.items():
+        value: object = config
+        for key in dotted.split("."):
+            if not isinstance(value, Mapping) or key not in value:
+                raise ValueError(f"required config field is missing: {dotted}")
+            value = value[key]
+        if value is None:
+            rendered[var] = ""
+        elif isinstance(value, bool):
+            rendered[var] = "true" if value else "false"
+        elif isinstance(value, (str, int, float)):
+            rendered[var] = str(value)
+        else:
+            raise ValueError(f"config field must be a scalar: {dotted}")
+    return rendered
+
+
+CPG_REPRESENTATIONS = {
+    0: "snapatac2_import_values_0based_v1",
+    1: "cpg_four_column_1based_v1",
+}
+
+
+def cpg_representation(coordinate_base: int) -> str:
+    """返回四列 CpG 的坐标身份；只接受整数 0 或 1。"""
+    if type(coordinate_base) is not int or coordinate_base not in CPG_REPRESENTATIONS:
+        raise ValueError("cpg_coordinate_base must be integer 0 or 1")
+    return CPG_REPRESENTATIONS[coordinate_base]
 
 
 PUBLIC_RESULT_DIR_NAMES: tuple[str, ...] = ("CpG", "QC_Results", "SNP")
@@ -1197,7 +1724,7 @@ class CellOutputPaths:
 
     @property
     def cpg(self) -> Path:
-        """SnapATAC2 import_values 消费的公开 CpG 输入（pos 为 0-based）。"""
+        """公开四列 CpG 输入；pos 按 analysis.cpg_coordinate_base 写出。"""
         return self.result_root / "CpG" / f"{self.sample_id}.cpg.tsv.zst"
 
     @property
@@ -1369,10 +1896,215 @@ class ProjectLayout:
         )
 
 
-_COUNT = r"([0-9][0-9,]*)"
+MULTIQC_BISCUIT_SOURCE_SUFFIXES = (
+    "strand_table.txt",
+    "totalReadConversionRate.txt",
+    "CpGRetentionByReadPos.txt",
+    "mapq_table.txt",
+    "totalBaseConversionRate.txt",
+    "CpHRetentionByReadPos.txt",
+    "isize_table.txt",
+    "dup_report.txt",
+)
+
+
+@dataclass(frozen=True)
+class CellArtifacts:
+    """按消费用途列出所选路线的产物；路径来自 CellOutputPaths，展示文件允许从持久摘要重建。"""
+
+    metrics: Mapping[str, Path]
+    deliverables: tuple[Path, ...]
+    final_qc: tuple[Path, ...]
+    multiqc: tuple[Path, ...]
+    retained_bams: tuple[Path, ...]
+    rna_bams: tuple[Path, ...]
+    high_cph_display: Path | None
+
+    def multiqc_sources(self) -> tuple[Path, ...]:
+        """展示 JSON 已回收时只依赖保留的 summary，不回溯 BAM 规则。"""
+        display = self.high_cph_display
+        if display is not None and not display.is_file():
+            return tuple(self.metrics["high_cph_summary"] if source == display else source
+                         for source in self.multiqc)
+        return self.multiqc
+
+
+def cell_artifacts(
+    paths: CellOutputPaths, protocol: str, *, generate_snp: bool, keep_final_bam: bool,
+) -> CellArtifacts:
+    """统一提供 DAG、final manifest 与 MultiQC 的逐细胞文件清单，不改变阶段完成边界。"""
+    policy = get_protocol(protocol)
+    metrics = {"cutadapt_json": paths.cutadapt_json, "cpg": paths.cpg}
+    deliverables = [paths.cpg]
+    final_qc = [paths.cutadapt_json]
+    multiqc = [paths.cutadapt_json]
+    retained = paths.retained_bam_files if keep_final_bam else ()
+    final_qc.extend(retained)
+    rna = (paths.rna_bam, paths.rna_bam_index) if policy.publishes_rna_bam else ()
+    if rna:
+        metrics.update(rna_bam=paths.rna_bam, rna_bam_index=paths.rna_bam_index)
+    if generate_snp:
+        deliverables.extend((paths.snp, paths.snp_index))
+        metrics.update(snp=paths.snp, snp_index=paths.snp_index)
+    if paths.backend == "rastair":
+        metrics.update(rastair_qc=paths.rastair_qc, marked_bam=paths.marked_bam,
+                       marked_bam_index=paths.marked_bam_index)
+        final_qc.append(paths.rastair_qc)
+    else:
+        metrics["high_cph_summary"] = paths.high_cph_summary
+        final_qc.append(paths.high_cph_summary)
+        high_cph_source = paths.high_cph_multiqc
+        if paths.backend == "biscuit":
+            metrics.update(dupsifter_multiqc=paths.dupsifter_multiqc,
+                           mapq_table=paths.biscuit_qc_source("mapq_table.txt"),
+                           cph_table=paths.biscuit_qc_source("CpHRetentionByReadPos.txt"),
+                           biscuit_qc_dir=paths.biscuit_qc_dir)
+            final_qc.extend((metrics["dupsifter_multiqc"], metrics["cph_table"]))
+            multiqc.extend((metrics["dupsifter_multiqc"], high_cph_source,
+                            *paths.biscuit_qc_sources(MULTIQC_BISCUIT_SOURCE_SUFFIXES)))
+        else:
+            metrics.update(bismark_align_report=paths.bismark_align_report,
+                           bismark_extract_report=paths.droplet_umi_qc if policy.name == "droplet" else paths.bismark_extract_report,
+                           bismark_dedup_report=paths.droplet_umi_qc if policy.name == "droplet" else paths.bismark_dedup_report,
+                           bismark_mbias=paths.bismark_mbias)
+            reports = [metrics[key] for key in ("bismark_align_report", "bismark_extract_report", "bismark_mbias")]
+            final_qc.extend(reports)
+            multiqc.extend((*reports, high_cph_source))
+            if policy.name != "droplet":
+                final_qc.append(metrics["bismark_dedup_report"])
+                multiqc.append(metrics["bismark_dedup_report"])
+    return CellArtifacts(MappingProxyType(metrics), tuple(deliverables), tuple(final_qc),
+                         tuple(multiqc), retained, rna,
+                         paths.high_cph_multiqc if paths.backend != "rastair" else None)
+
+
+class DemuxRow(TypedDict):
+    demux_sample: str
+    project_sample_id: str
+    raw_sample: str
+    pipeline_mode: str
+    route_id: str
+    demux_mode: str
+    downstream_dna: str
+    demux_report_schema_version: str
+    demux_build_version: str
+    demux_source_revision: str
+    retention_policy: str
+    retention_threshold: str
+    rna_output_role: str
+    high_cph_role: str
+    plate_id: str
+    cell_order: str
+    dna_barcode: str
+    rna_barcode: str
+    dna_reads: str
+    rna_reads: str
+    input_fastq_pairs: str
+    input_read_pairs: str
+    usable_read_pairs: str
+    matched_reads: str
+    unmatched_reads: str
+    ambiguous_reads: str
+    short_reads: str
+    unassigned_rate: str
+    dna_r1: str
+    dna_r2: str
+    rna_r1: str
+    rna_r2: str
+    dna_status: str
+    rna_status: str
+
+
+class ProjectSampleRow(TypedDict):
+    sample_id: str
+    dna_raw_sample: str
+    rna_sample: str
+    species: str
+    protocol: str
+    notes: str
+
+
+class CellIdentityRow(ProjectSampleRow):
+    project_sample_id: str
+    plate_id: str
+    cell_order: str
+    dna_barcode: str
+    rna_barcode: str
+
+
+class BarcodeRow(TypedDict):
+    dna_barcode: str
+    rna_barcode: str
+    plate_id: str
+    cell_order: str
+
+
+class FileIdentity(TypedDict):
+    path: str
+    size_bytes: int
+    sha256: str
+
+
+class DemuxCompletion(TypedDict, total=False):
+    schema_version: int
+    status: str
+    generation_id: str
+    run_id: str
+    project_sample_id: str
+    cell_count: int
+    cell_ids_sha256: str
+    manifest: FileIdentity
+    report: FileIdentity
+    multiqc: FileIdentity
+    initial_cell_manifest: FileIdentity
+    dna_dir: str
+    rna_dir: str
+    _manifest_path: str
+    _cell_manifest_path: str
+    _rows: list[DemuxRow]
+
+
+@dataclass(frozen=True)
+class DemuxIndex:
+    """同一次 completion 校验产生的 run/cell 索引与有序通过名单；缓存由 checkpoint 调用方管理。"""
+
+    state_dir: Path
+    run_ids: tuple[str, ...]
+    by_cell: Mapping[str, tuple[Path, DemuxRow]]
+    passing_cells: tuple[str, ...]
+
+
+class FastqPairFiles(TypedDict):
+    r1: list[str]
+    r2: list[str]
+
+
+class MappedDemuxRun(FastqPairFiles):
+    raw_sample: str
+    sample_id: str
+    route_id: str
+
+
+DiscoveredSamples = dict[str, FastqPairFiles]
+
+
+MappedDemuxRuns = dict[str, MappedDemuxRun]
+
+
+def file_identity(path: str | Path) -> FileIdentity:
+    source = Path(path).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Committed demux file is missing: {source}")
+    return {
+        "path": str(source),
+        "size_bytes": source.stat().st_size,
+        "sha256": sha256_file(source),
+    }
 
 
 FILTER_SUMMARY_SCHEMA_VERSION = 3
+
+
 FILTER_SUMMARY_FIELDS = frozenset(
     {
         "schema_version",
@@ -1393,610 +2125,76 @@ FILTER_SUMMARY_FIELDS = frozenset(
 )
 
 
-def _required_count(text: str, label: str, patterns: Sequence[str]) -> int:
-    matches: list[int] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
-            matches.append(int(match.group(1).replace(",", "")))
-    if not matches:
-        raise ValueError(f"Bismark report is missing required field: {label}")
-    if len(set(matches)) != 1:
-        raise ValueError(f"Bismark report has conflicting values for {label}: {matches}")
-    return matches[0]
+# 配置与契约：参考输入
+
+MANAGED_SPECIES = frozenset({"hg38", "mm10"})
 
 
-def _optional_count(text: str, label: str, patterns: Sequence[str], *, default: int = 0) -> int:
-    matches: list[int] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
-            matches.append(int(match.group(1).replace(",", "")))
-    if not matches:
-        return default
-    if len(set(matches)) != 1:
-        raise ValueError(f"Bismark report has conflicting values for {label}: {matches}")
-    return matches[0]
+_PRIMARY_CONTIGS: Mapping[str, tuple[tuple[str, int], ...]] = {
+    "hg38": (
+        ("chr1", 248956422), ("chr2", 242193529), ("chr3", 198295559),
+        ("chr4", 190214555), ("chr5", 181538259), ("chr6", 170805979),
+        ("chr7", 159345973), ("chr8", 145138636), ("chr9", 138394717),
+        ("chr10", 133797422), ("chr11", 135086622), ("chr12", 133275309),
+        ("chr13", 114364328), ("chr14", 107043718), ("chr15", 101991189),
+        ("chr16", 90338345), ("chr17", 83257441), ("chr18", 80373285),
+        ("chr19", 58617616), ("chr20", 64444167), ("chr21", 46709983),
+        ("chr22", 50818468), ("chrX", 156040895), ("chrY", 57227415),
+        ("chrM", 16569),
+    ),
+    "mm10": (
+        ("chr1", 195471971), ("chr2", 182113224), ("chr3", 160039680),
+        ("chr4", 156508116), ("chr5", 151834684), ("chr6", 149736546),
+        ("chr7", 145441459), ("chr8", 129401213), ("chr9", 124595110),
+        ("chr10", 130694993), ("chr11", 122082543), ("chr12", 120129022),
+        ("chr13", 120421639), ("chr14", 124902244), ("chr15", 104043685),
+        ("chr16", 98207768), ("chr17", 94987271), ("chr18", 90702639),
+        ("chr19", 61431566), ("chrX", 171031299), ("chrY", 91744698),
+        ("chrM", 16299),
+    ),
+}
 
 
-def _required_float(text: str, label: str, pattern: str) -> float:
-    matches = [
-        float(match.group(1))
-        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
-    ]
-    if not matches:
-        raise ValueError(f"Bismark report is missing required field: {label}")
-    if any(not math.isclose(matches[0], value, abs_tol=1e-9) for value in matches[1:]):
-        raise ValueError(f"Bismark report has conflicting values for {label}: {matches}")
-    return matches[0]
+SPIKE_CONTIGS: Mapping[str, int] = {"lambda": 48502, "pUC19": 2686}
 
 
-def parse_alignment_report(path: Path) -> dict[str, int | float]:
-    text = path.read_text(encoding="utf-8", errors="strict")
-    total = _required_count(
-        text,
-        "sequence_pairs_total",
-        [rf"^Sequence pairs analysed in total:\s*{_COUNT}\s*$"],
-    )
-    unique = _required_count(
-        text,
-        "unique_best_pairs",
-        [rf"^Number of paired-end alignments with a unique best hit:\s*{_COUNT}\s*$"],
-    )
-    no_alignment = _required_count(
-        text,
-        "pairs_without_alignment",
-        [rf"^Sequence pairs with no alignments under any condition:\s*{_COUNT}\s*$"],
-    )
-    non_unique = _required_count(
-        text,
-        "pairs_not_unique",
-        [rf"^Sequence pairs did not map uniquely:\s*{_COUNT}\s*$"],
-    )
-    discarded = _optional_count(
-        text,
-        "pairs_discarded_no_genomic_sequence",
-        [
-            rf"^Sequence pairs which were discarded because genomic sequence could not be extracted:\s*{_COUNT}\s*$"
-        ],
-    )
-    mapping_efficiency = _required_float(
-        text, "mapping_efficiency", r"^Mapping efficiency:\s*([0-9]+(?:\.[0-9]+)?)%\s*$"
-    )
-    if unique + no_alignment + non_unique != total:
-        raise ValueError(
-            "Bismark alignment counts are inconsistent: "
-            f"unique({unique}) + unaligned({no_alignment}) + "
-            f"non_unique({non_unique}) != total({total})"
-        )
-    if discarded > unique:
-        raise ValueError(
-            "Bismark discarded-pair count exceeds uniquely aligned pairs: "
-            f"discarded={discarded}, unique={unique}"
-        )
-    expected_efficiency = 0.0 if total == 0 else unique * 100.0 / total
-    if not math.isclose(mapping_efficiency, expected_efficiency, abs_tol=0.11):
-        raise ValueError(
-            "Bismark mapping efficiency disagrees with the exact report counts: "
-            f"reported={mapping_efficiency}, expected={expected_efficiency:.6f}"
-        )
-    return {
-        "total": total,
-        "unique": unique,
-        "no_alignment": no_alignment,
-        "non_unique": non_unique,
-        "discarded": discarded,
-        "mapping_efficiency": mapping_efficiency,
-    }
+MANAGED_CONTIGS = {
+    species: [*(primaries), *SPIKE_CONTIGS.items()]
+    for species, primaries in _PRIMARY_CONTIGS.items()
+}
 
 
-def parse_dedup_report(path: Path) -> dict[str, int]:
-    text = path.read_text(encoding="utf-8", errors="strict")
-    total = _required_count(
-        text,
-        "dedup_pairs_analysed",
-        [rf"^Total number of alignments analysed in .+?:\s*{_COUNT}(?:\s|$)"],
-    )
-    removed = _required_count(
-        text,
-        "duplicate_pairs_removed",
-        [rf"^Total number duplicated alignments removed:\s*{_COUNT}(?:\s|$)"],
-    )
-    leftover = _required_count(
-        text,
-        "deduplicated_pairs_left",
-        [rf"^Total count of deduplicated leftover sequences:\s*{_COUNT}(?:\s|$)"],
-    )
-    if removed > total or leftover != total - removed:
-        raise ValueError(
-            "Bismark deduplication counts are inconsistent: "
-            f"total={total}, removed={removed}, leftover={leftover}"
-        )
-    return {"total": total, "removed": removed, "leftover": leftover}
+def _fai_contigs(path: Path) -> list[tuple[str, int]]:
 
-
-def _read_filter_summary(path: Path, sample: str) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("Bismark non-conversion summary must be an object")
-    if set(payload) != FILTER_SUMMARY_FIELDS:
-        raise ValueError(
-            "Bismark non-conversion summary schema mismatch: "
-            f"expected={sorted(FILTER_SUMMARY_FIELDS)}, observed={sorted(payload)}"
-        )
-    if (
-        type(payload["schema_version"]) is not int
-        or payload["schema_version"] != FILTER_SUMMARY_SCHEMA_VERSION
-        or payload["backend"] != "bismark"
-        or payload["metric_unit"] != "read_pairs"
-    ):
-        raise ValueError("Invalid Bismark non-conversion summary identity")
-    if payload["sample"] != sample:
-        raise ValueError(
-            f"Bismark non-conversion summary sample mismatch: {payload['sample']!r}"
-        )
-    for field in (
-        "candidate_read_pairs",
-        "flagged_read_pairs",
-        "excluded_read_pairs",
-        "final_retained_pairs",
-        "minimum_count",
-    ):
-        if isinstance(payload[field], bool) or not isinstance(payload[field], int):
-            raise ValueError(f"Bismark non-conversion summary {field} must be an integer")
-    for field in ("high_cph_fraction", "threshold"):
-        if isinstance(payload[field], bool) or not isinstance(
-            payload[field], (int, float)
-        ):
-            raise ValueError(f"Bismark non-conversion summary {field} must be numeric")
-    candidate = payload["candidate_read_pairs"]
-    high_cph = payload["flagged_read_pairs"]
-    excluded = payload["excluded_read_pairs"]
-    retained = payload["final_retained_pairs"]
-    fraction = float(payload["high_cph_fraction"])
-    threshold = float(payload["threshold"])
-    minimum_count = payload["minimum_count"]
-    filter_applied = payload["filter_applied"]
-    if candidate < 0 or excluded < 0 or not 0 <= high_cph <= candidate:
-        raise ValueError("Invalid Bismark non-conversion summary counts")
-    if retained != candidate - high_cph + excluded:
-        raise ValueError(
-            "Bismark non-conversion retained pairs disagree with the filter funnel: "
-            f"retained={retained}, expected={candidate - high_cph + excluded} "
-            f"(candidate={candidate}, flagged={high_cph}, excluded={excluded})"
-        )
-    expected_fraction = 0.0 if candidate == 0 else high_cph / candidate
-    if not math.isclose(fraction, expected_fraction, abs_tol=1e-12):
-        raise ValueError("Bismark non-conversion summary fraction is inconsistent")
-    if not 0 <= threshold <= 1:
-        raise ValueError("Bismark non-conversion threshold must be within [0, 1]")
-    if minimum_count < 1:
-        raise ValueError("Bismark non-conversion minimum_count must be >= 1")
-    if not isinstance(filter_applied, bool):
-        raise ValueError("Bismark non-conversion filter_applied must be boolean")
-    if payload["protocol"] not in {"cabernet", "srd", "droplet"}:
-        raise ValueError("Bismark non-conversion protocol is invalid")
-    if payload["high_cph_role"] not in {
-        "cdna_contamination",
-        "residual_high_cph",
-    }:
-        raise ValueError("Bismark non-conversion high_cph_role is invalid")
-    expected_role = {"cabernet": "cdna_contamination", "droplet": "cdna_contamination", "srd": "residual_high_cph"}
-    if payload["high_cph_role"] != expected_role[payload["protocol"]]:
-        raise ValueError("Bismark non-conversion protocol/role contract is invalid")
-    if not filter_applied:
-        raise ValueError("Bismark non-conversion summary must record the fixed filter action")
-    return payload
-
-
-DROPLET_DEDUP_POLICY = "per_cytosine_umi_consensus_hamming1"
-DROPLET_MIN_MAPQ = 10
-DROPLET_MIN_BASEQ = 20
-
-
-def droplet_umi_consensus(groups: Mapping[str, Sequence[int]]) -> tuple[int, int, int, int]:
-    """逐位点按原始丰度合并 Hamming-1 UMI；多数碱基优先，平票比较平均质量，仍平票则不调用。"""
-    counts = {umi: int(v[0]) + int(v[1]) for umi, v in groups.items()}
-    remaining = {umi: list(v) for umi, v in groups.items()}
-    merged = ambiguous = methyl = unmethyl = 0
-    for umi in sorted(counts, key=lambda key: (-counts[key], key)):
-        if umi not in remaining:
-            continue
-        value = remaining[umi]
-        if counts[umi] > 1 and len(remaining) > 1:
-            if len(remaining) < 48:
-                neighbors = [key for key in remaining if counts[key] < counts[umi]
-                             and sum(a != b for a, b in zip(umi, key)) == 1]
-                neighbors.sort(key=lambda key: next((i, "ACGTN".index(b)) for i, (a, b) in enumerate(zip(umi, key)) if a != b))
-            else:
-                neighbors = [umi[:i] + alternate + umi[i + 1:] for i, base in enumerate(umi)
-                             for alternate in "ACGTN" if alternate != base]
-            for neighbor in neighbors:
-                if neighbor in remaining and counts[neighbor] < counts[umi]:
-                    other = remaining.pop(neighbor)
-                    value = [a + b for a, b in zip(value, other)]
-                    merged += 1
-        remaining.pop(umi)
-        m, u, qm, qu = value
-        if m > u or (m == u and qm > qu):
-            methyl += 1
-        elif u > m or (m == u and qu > qm):
-            unmethyl += 1
-        else:
-            ambiguous += 1
-    return methyl, unmethyl, merged, ambiguous
-
-
-def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Path,
-                     qc: str | Path, mbias: str | Path, *, sample: str,
-                     scratch: str | Path, samtools: str, threads: int = 1) -> None:
-    """保留过滤 BAM 的全部 pairs，按参考胞嘧啶/UMI 生成分子共识 coverage、QC 及 read-level M-bias。"""
-    import pysam
-
-    if SAMPLE_ID_RE.fullmatch(sample) is None:
-        raise ValueError("Invalid Droplet sample identity")
-    root = Path(tempfile.mkdtemp(prefix="droplet_consensus_", dir=scratch))
-    proc = None
     try:
-        converted = root / "conversion.bam"
-        ordered = root / "coordinate.bam"
-        pairs = umi_n = 0
-        seen = set()
-        checked_contigs = set()
-        with pysam.FastaFile(str(reference)) as fasta:
-            reference_lengths = dict(zip(fasta.references, fasta.lengths))
-        with pysam.AlignmentFile(str(bam), "rb") as source, pysam.AlignmentFile(str(converted), "wb", template=source) as target:
-            iterator = iter(source)
-            for first in iterator:
-                second = next(iterator, None)
-                if second is None or first.query_name != second.query_name or first.query_name in seen:
-                    raise ValueError("Droplet calling requires unique, adjacent complete read pairs")
-                seen.add(first.query_name)
-                if (first.flag, second.flag) not in {(99, 147), (163, 83), (147, 99), (83, 163)}:
-                    raise ValueError("Unexpected Bismark paired flags")
-                umi = first.query_name.rsplit(":", 1)[-1]
-                if not re.fullmatch(r"[ACGTN]{12}", umi):
-                    raise ValueError("Droplet QNAME must end with a 12 bp UMI")
-                for mate, record in enumerate((first, second), 1):
-                    contig = record.reference_name
-                    if contig not in checked_contigs:
-                        if contig not in reference_lengths or source.get_reference_length(contig) != reference_lengths[contig]:
-                            raise ValueError(f"Droplet BAM/reference contig mismatch: {contig}")
-                        checked_contigs.add(contig)
-                    if any(not record.has_tag(tag) for tag in ("XM", "XR", "XG")):
-                        raise ValueError("Bismark methylation tags missing")
-                    if record.has_tag("UR") and record.get_tag("UR") != umi:
-                        raise ValueError("Droplet UR tag disagrees with QNAME")
-                    conversion = record.get_tag("XG")
-                    if conversion not in {"CT", "GA"}:
-                        raise ValueError("Invalid Bismark genome conversion")
-                    record.set_tag("UR", umi, value_type="Z")
-                    record.set_tag("YI", f"{mate}{'R' if record.is_reverse else 'F'}", value_type="Z")
-                    record.is_reverse = conversion == "GA"
-                    record.mate_is_reverse = conversion == "GA"
-                    target.write(record)
-                pairs += 1
-                umi_n += int("N" in umi)
-        del seen
-        subprocess.run([samtools, "sort", "-@", str(max(0, min(threads, 4) - 1)),
-                        "-m", "512M", "-T", str(root / "sort"), "-o", str(ordered), str(converted)], check=True)
-        converted.unlink()
-        contexts = {key: {"methyl": 0, "unmethyl": 0, "read_observations": 0,
-                          "umi_groups": 0, "merged_umis": 0, "ambiguous_umis": 0,
-                          "strand_sites": 0} for key in ("CpG", "CHG", "CHH")}
-        cycles: dict[tuple[str, str, int], list[int]] = {}
-        command = [samtools, "mpileup", "-Q", str(DROPLET_MIN_BASEQ), "-q", str(DROPLET_MIN_MAPQ),
-                   "-B", "-d", "0", "-f", str(reference), "--output-BP", "--output-extra", "RLEN,UR,YI",
-                   "--no-output-ins-mods", "--no-output-ins", "--no-output-ins",
-                   "--no-output-del", "--no-output-del", "--no-output-ends", str(ordered)]
-        with pysam.FastaFile(str(reference)) as fa, gzip.open(root / "coverage.gz", "wt") as handle:
-            proc = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, bufsize=1024 * 1024)
-            chrom = None
-            sequence = ""
-            for line in proc.stdout:
-                fields = line.rstrip("\n").split("\t")
-                if len(fields) != 10:
-                    raise ValueError("Unexpected samtools mpileup columns")
-                if int(fields[3]) == 0:
-                    continue
-                base = fields[2].upper()
-                if base not in {"C", "G"}:
-                    continue
-                if chrom != fields[0]:
-                    chrom = fields[0]
-                    sequence = fa.fetch(chrom).upper()
-                pos = int(fields[1]) - 1
-                if not 0 <= pos < len(sequence) or sequence[pos] != base:
-                    raise ValueError("Droplet pileup coordinate disagrees with reference")
-                context_seq = sequence[pos:pos + 3] if base == "C" else sequence[max(0, pos - 2):pos + 1][::-1].translate(str.maketrans("ACGT", "TGCA"))
-                if context_seq.startswith("CG"):
-                    context = "CpG"
-                elif len(context_seq) == 3 and context_seq[1] in "ACT" and context_seq[2] in "ACGT":
-                    context = "CHG" if context_seq[2] == "G" else "CHH"
-                else:
-                    continue
-                bases, qualities = fields[4:6]
-                positions, lengths, umis, mates = (value.split(",") for value in fields[6:10])
-                if len({len(bases), len(qualities), len(positions), len(lengths), len(umis), len(mates), int(fields[3])}) != 1:
-                    raise ValueError(f"Unpaired mpileup observations at {chrom}:{pos + 1}")
-                methyl_base, unmethyl_base = (".", "T") if base == "C" else (",", "a")
-                groups: dict[str, list[int]] = {}
-                for observed, quality, position, length, umi, mate in zip(bases, qualities, positions, lengths, umis, mates):
-                    if observed not in (methyl_base, unmethyl_base):
-                        continue
-                    if not re.fullmatch(r"[ACGTN]{12}", umi) or mate not in {"1F", "1R", "2F", "2R"}:
-                        raise ValueError("Invalid Droplet pileup molecule identity")
-                    state = int(observed == unmethyl_base)
-                    values = groups.setdefault(umi, [0, 0, 0, 0])
-                    values[state] += 1
-                    values[state + 2] += ord(quality) - 33
-                    cycle = int(position) if mate[1] == "F" else int(length) - int(position) + 1
-                    if not 1 <= cycle <= int(length):
-                        raise ValueError("Invalid Droplet pileup read position")
-                    cycles.setdefault((context, mate[0], cycle), [0, 0])[state] += 1
-                if not groups:
-                    continue
-                m, u, merged, ambiguous = droplet_umi_consensus(groups)
-                stats = contexts[context]
-                stats["read_observations"] += sum(v[0] + v[1] for v in groups.values())
-                stats["umi_groups"] += len(groups)
-                stats["merged_umis"] += merged
-                stats["ambiguous_umis"] += ambiguous
-                stats["methyl"] += m
-                stats["unmethyl"] += u
-                stats["strand_sites"] += int(m + u > 0)
-                if context == "CpG" and m + u:
-                    handle.write(f"{chrom}\t{pos + 1}\t{pos + 1}\t{100 * m / (m + u):.8f}\t{m}\t{u}\n")
-            proc.stdout.close()
-            if proc.wait() != 0:
-                raise RuntimeError("Droplet samtools mpileup failed")
-            proc = None
-        with (root / "mbias.txt").open("w") as handle:
-            handle.write("Alopex Droplet read-level M-bias; MAPQ>=10, baseQ>=20, before UMI consensus\n\n")
-            for context in contexts:
-                for mate in ("1", "2"):
-                    handle.write(f"{context} context (R{mate})\n====================\nposition\tcount_methylated\tcount_unmethylated\t% methylation\tcoverage\n")
-                    for ctx, read, cycle in sorted(cycles):
-                        if ctx == context and read == mate:
-                            m, u = cycles[(ctx, read, cycle)]
-                            handle.write(f"{cycle}\t{m}\t{u}\t{100 * m / (m + u):.8f}\t{m + u}\n")
-                    handle.write("\n")
-        cpg = contexts["CpG"]
-        payload = {"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY,
-                   "min_mapq": DROPLET_MIN_MAPQ, "min_baseq": DROPLET_MIN_BASEQ,
-                   "metric_unit": "cytosine_umi_consensus", "processed_pairs": pairs,
-                   "umi_with_n_pairs": umi_n, "contexts": contexts,
-                   "id": "alopex_droplet_umi_consensus", "section_name": "Droplet UMI consensus",
-                   "description": "逐胞嘧啶 UMI 共识；read-level 观测及分子计数不等同 read-pair 去重率。M-bias 为质量过滤后、UMI 共识前的 read-level 统计。",
-                   "plot_type": "table", "data": {sample: {"CpG_read_observations": cpg["read_observations"],
-                       "CpG_UMI_observations": cpg["methyl"] + cpg["unmethyl"],
-                       "CpG_ambiguous_UMIs": cpg["ambiguous_umis"], "CpG_strand_sites": cpg["strand_sites"]}}}
-        (root / "qc.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-        read_droplet_umi_qc(root / "qc.json", sample)
-        for name, target in (("coverage.gz", coverage), ("mbias.txt", mbias), ("qc.json", qc)):
-            os.replace(root / name, target)
-    finally:
-        if proc is not None:
-            proc.stdout.close()
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-        shutil.rmtree(root)
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeError as exc:
+        raise ValueError(f"reference FAI is not valid text: {path}") from exc
 
-
-def read_droplet_umi_qc(path: str | Path, sample: str) -> dict[str, Any]:
-    """校验逐胞嘧啶 UMI 共识计数、单位与实际参数，禁止作为 read-pair 去重率解释。"""
-    data = _read_json(Path(path), "Droplet UMI consensus QC")
-    for key, value in {"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY,
-                       "min_mapq": DROPLET_MIN_MAPQ, "min_baseq": DROPLET_MIN_BASEQ,
-                       "metric_unit": "cytosine_umi_consensus"}.items():
-        if data.get(key) != value:
-            raise ValueError(f"Invalid Droplet UMI QC {key}: {path}")
-    for key in ("processed_pairs", "umi_with_n_pairs"):
-        data[key] = _integer(data.get(key), key, Path(path))
-    if not 0 <= data["umi_with_n_pairs"] <= data["processed_pairs"]:
-        raise ValueError("Invalid Droplet UMI pair counts")
-    for context in ("CpG", "CHG", "CHH"):
-        values = data.get("contexts", {}).get(context, {})
-        for key in ("methyl", "unmethyl", "read_observations", "umi_groups", "merged_umis", "ambiguous_umis", "strand_sites"):
-            values[key] = _integer(values.get(key), key, Path(path))
-            if values[key] < 0:
-                raise ValueError("Negative Droplet UMI count")
-        called = values["methyl"] + values["unmethyl"]
-        if not (values["strand_sites"] <= called <= values["umi_groups"] <= values["read_observations"]):
-            raise ValueError("Droplet UMI observation accounting is inconsistent")
-        if values["umi_groups"] != called + values["merged_umis"] + values["ambiguous_umis"]:
-            raise ValueError("Droplet UMI consensus accounting does not close")
-    return data
-
-
-def build_metrics(
-    *,
-    sample: str,
-    version: str,
-    alignment_report: Path,
-    dedup_report: Path,
-    filter_summary: Mapping[str, Any],
-    protocol: str = "cabernet",
-) -> dict[str, Any]:
-    """reconcile 各 pair-level 来源：alignment/dedup 报告与恒定执行的 non-conversion
-    已统一校验的过滤摘要（含 processed BAM 的 retained 实测计数）必须守恒，矛盾即抛错。"""
-    version_lines = [line.strip() for line in version.splitlines() if line.strip()]
-    if not sample or not version_lines:
-        raise ValueError("sample and Bismark version are required")
-    version_label = next(
-        (
-            line
-            for line in version_lines
-            if re.search(
-                r"\bbismark\b.*?(?<![A-Za-z0-9])v?3(?:\.[0-9]+)+\b",
-                line,
-                flags=re.IGNORECASE,
-            )
-        ),
-        "",
-    )
-    if not version_label:
-        raise ValueError(f"Expected a Bismark 3.x version string, observed: {version!r}")
-    alignment = parse_alignment_report(alignment_report)
-    unique_pairs = int(alignment["unique"])
-    discarded_pairs = int(alignment["discarded"])
-    accepted_pairs = unique_pairs - discarded_pairs
-
-    umi_qc = read_droplet_umi_qc(dedup_report, sample) if protocol == "droplet" else None
-    dedup = {"total": accepted_pairs, "removed": 0, "leftover": accepted_pairs} if umi_qc is not None else parse_dedup_report(dedup_report)
-    if dedup["total"] != accepted_pairs:
-        raise ValueError(
-            "Bismark deduplication input disagrees with usable uniquely aligned pairs: "
-            f"analysed={dedup['total']}, expected={accepted_pairs} "
-            f"(unique={unique_pairs}, discarded={discarded_pairs})"
-        )
-    duplicate_pairs = dedup["removed"]
-    postdedup_pairs = dedup["leftover"]
-
-    filtered = filter_summary
-    candidate_pairs = int(filtered["candidate_read_pairs"])
-    excluded_pairs = int(filtered["excluded_read_pairs"])
-    flagged_pairs = int(filtered["flagged_read_pairs"])
-    if candidate_pairs + excluded_pairs != postdedup_pairs:
-        raise ValueError(
-            "Bismark filtering summary disagrees with post-dedup pairs: "
-            f"candidate({candidate_pairs}) + excluded({excluded_pairs}) "
-            f"!= postdedup({postdedup_pairs})"
-        )
-    removed_pairs = flagged_pairs
-
-    final_retained_pairs = int(filtered["final_retained_pairs"])
-    if final_retained_pairs != postdedup_pairs - removed_pairs:
-        raise ValueError(
-            "Bismark processed-BAM retained pairs disagree with the pair funnel: "
-            f"retained={final_retained_pairs}, "
-            f"expected={postdedup_pairs - removed_pairs}"
-        )
-
-    if umi_qc is not None and umi_qc["processed_pairs"] != final_retained_pairs:
-        raise ValueError("Droplet caller input disagrees with non-conversion retained pairs")
-    return {
-        "umi_qc": umi_qc,
-        "total_pairs": int(alignment["total"]),
-        "accepted_pairs": accepted_pairs,
-        "unmapped_pairs": int(alignment["no_alignment"]) + discarded_pairs,
-        "ambiguous_pairs": int(alignment["non_unique"]),
-        "duplicate_pairs": duplicate_pairs,
-        "postdedup_pairs": postdedup_pairs,
-        "final_retained_pairs": final_retained_pairs,
-    }
-
-
-def _count_bam_pairs(bam: Path, samtools: str) -> int:
-    result = subprocess.run(
-        [samtools, "view", "-c", str(bam)],
-        check=True, text=True, stdout=subprocess.PIPE,
-    )
-    records = int(result.stdout.strip())
-    if records < 0 or records % 2:
-        raise ValueError("Bismark processed BAM contains an odd or negative alignment count")
-    return records // 2
-
-
-def write_filter_summary(
-    *,
-    sample: str,
-    candidate_pairs: int,
-    removed_pairs: int,
-    excluded_pairs: int,
-    retained_pairs: int,
-    percentage: float,
-    minimum_count: int,
-    protocol: str,
-    high_cph_role: str,
-    summary: Path,
-    multiqc: Path,
-) -> None:
-    """按规则内实测计数写出 schema v3 filter summary 与 MultiQC table JSON。
-
-    retained 必须等于 candidate - removed + excluded（processed BAM 的实测
-    pair 数）；任何计数矛盾都在写出前失败。
-    """
-    if isinstance(minimum_count, bool) or not isinstance(minimum_count, int) or minimum_count < 1:
-        raise SystemExit("filter summary minimum_count must be an integer >= 1")
-    if (
-        isinstance(percentage, bool)
-        or not isinstance(percentage, (int, float))
-        or not 0 <= percentage <= 100
-    ):
-        raise SystemExit("filter summary percentage must be within [0, 100]")
-    if min(candidate_pairs, removed_pairs, excluded_pairs, retained_pairs) < 0:
-        raise SystemExit("filter summary counts must be non-negative integers")
-    if removed_pairs > candidate_pairs:
-        raise SystemExit("flagged pairs exceed candidate pairs")
-    if retained_pairs != candidate_pairs - removed_pairs + excluded_pairs:
-        raise SystemExit(
-            "retained pairs disagree with the filter funnel: "
-            f"retained={retained_pairs}, "
-            f"expected={candidate_pairs - removed_pairs + excluded_pairs}"
-        )
-    payload = {
-        "schema_version": FILTER_SUMMARY_SCHEMA_VERSION,
-        "backend": "bismark",
-        "sample": sample,
-        "metric_unit": "read_pairs",
-        "candidate_read_pairs": candidate_pairs,
-        "flagged_read_pairs": removed_pairs,
-        "high_cph_fraction": (
-            removed_pairs / candidate_pairs if candidate_pairs else 0.0
-        ),
-        "excluded_read_pairs": excluded_pairs,
-        "final_retained_pairs": retained_pairs,
-        "threshold": percentage / 100.0,
-        "minimum_count": minimum_count,
-        "filter_applied": True,
-        "protocol": protocol,
-        "high_cph_role": high_cph_role,
-    }
-    summary.write_text(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
-    multiqc.write_text(
-        json.dumps(
-            _high_cph_multiqc_payload(sample, payload, protocol, high_cph_role),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-
-logger = logging.getLogger("dna_pipeline")
-SAMPLE_ID_RE = re.compile(r"^(?!\.{1,2}$)[A-Za-z0-9_.-]+$")
-FASTQ_SUFFIXES = (".fastq.gz", ".fq.gz")
-
-
-_FASTQ_PATTERNS = (
-    (
-        re.compile(r"^(?P<sample>.+)\.R(?P<read>[12])\.raw\.f(?:ast)?q\.gz$", re.IGNORECASE),
-        lambda m: "single",
-    ),
-    (
-        re.compile(
-            r"^(?P<sample>.+)[_.-]L(?P<lane>[0-9]{1,3})[_.-]R?(?P<read>[12])(?:[_.-](?P<chunk>[0-9]{3}))?\.f(?:ast)?q\.gz$",
-            re.IGNORECASE,
-        ),
-        lambda m: f"L{int(m.group('lane')):03d}_{m.group('chunk') or '001'}",
-    ),
-    (
-        re.compile(r"^(?P<sample>.+)[_.-]R?(?P<read>[12])[_.-](?P<chunk>[0-9]{3})\.f(?:ast)?q\.gz$", re.IGNORECASE),
-        lambda m: f"part_{m.group('chunk')}",
-    ),
-    (
-        re.compile(r"^(?P<sample>.+)[_.-]R?(?P<read>[12])\.f(?:ast)?q\.gz$", re.IGNORECASE),
-        lambda m: "single",
-    ),
-)
+    records: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) < 5 or not fields[0]:
+            raise ValueError(f"invalid reference FAI line {line_number}: {path}")
+        name = fields[0]
+        if name in seen:
+            raise ValueError(f"duplicate reference FAI contig {name!r}: {path}")
+        try:
+            length, offset, line_bases, line_width = map(int, fields[1:5])
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid numeric reference FAI line {line_number}: {path}"
+            ) from exc
+        if length <= 0 or offset < 0 or line_bases <= 0 or line_width < line_bases:
+            raise ValueError(f"invalid reference FAI geometry on line {line_number}: {path}")
+        seen.add(name)
+        records.append((name, length))
+    if not records:
+        raise ValueError(f"reference FAI contains no contigs: {path}")
+    return records
 
 
 def resolve_fai_contigs(
@@ -2112,6 +2310,107 @@ def resolve_reference(
         f"Configured path: {ref_path}\nChecked:\n{checked}\n\n"
         f"{hint}"
     )
+
+
+def reference_identity(
+    reference: str | Path,
+    *,
+    expected_species: str | None = None,
+) -> Mapping[str, object]:
+    """返回所有 backend 共用的 FASTA + FAI 身份。
+
+    backend 专属 index 单独另行校验记录；未选中的 backend 绝不会成为重算或 run-start gate。
+    """
+    public_ref = Path(reference).expanduser().absolute()
+    if not public_ref.is_file() or public_ref.stat().st_size == 0:
+        raise FileNotFoundError(f"reference FASTA is missing or empty: {public_ref}")
+    resolved_ref = public_ref.resolve()
+    fai = Path(f"{resolved_ref}.fai")
+    if not fai.is_file() or fai.stat().st_size == 0:
+        raise FileNotFoundError(f"reference FAI is missing or empty: {fai}")
+    observed = _fai_contigs(fai)
+    if expected_species in MANAGED_SPECIES and observed != MANAGED_CONTIGS[expected_species]:
+        raise ValueError(
+            f"{expected_species} reference contig/order/length contract mismatch: {resolved_ref}"
+        )
+    ref_stat = resolved_ref.stat()
+    return {
+        "public_path": str(public_ref),
+        "resolved_path": str(resolved_ref),
+        "size_bytes": ref_stat.st_size,
+        "mtime_ns": ref_stat.st_mtime_ns,
+        "fai": stable_file_identity(fai, hash_content=False),
+    }
+
+
+BWA_INDEX_SUFFIXES = (".amb", ".ann", ".bwt", ".pac", ".sa")
+
+
+BISCUIT_INDEX_SUFFIXES = (
+    ".bis.pac", ".bis.amb", ".bis.ann", ".par.bwt", ".par.sa", ".dau.bwt", ".dau.sa",
+)
+
+
+BISCUIT_TRANSIENT_SUFFIXES = (".par.pac", ".dau.pac")
+
+
+def backend_active_index_paths(
+    reference: str | Path,
+    backend: str,
+    *,
+    bismark_local_alignment: bool = False,
+    bismark_root: str | Path | None = None,
+) -> list[Path]:
+    """枚举当前 backend/模式必需的完整 index 家族；构建期可指定候选 Bismark 根目录。
+
+    Bowtie2 以 .1.bt2 优先、其次 .1.bt2l 选择六文件家族；缺失成员也必须进入清单，不能被扫描漏掉。
+    """
+    reference = Path(reference)
+    if backend == "rastair":
+        return [Path(f"{reference}.bwa/genome{suffix}") for suffix in BWA_INDEX_SUFFIXES]
+    if backend == "biscuit":
+        return [Path(f"{reference}{suffix}") for suffix in BISCUIT_INDEX_SUFFIXES]
+    if backend == "bismark":
+        index_dir = Path(bismark_root or f"{reference}.bismark") / "Bisulfite_Genome"
+        prefixes = (
+            [index_dir / "CT_conversion" / "BS_CT", index_dir / "GA_conversion" / "BS_GA"]
+            if bismark_local_alignment
+            else [index_dir / "Combined" / "BS_combined"]
+        )
+        paths = []
+        for prefix in prefixes:
+            extension = "bt2l" if not Path(f"{prefix}.1.bt2").is_file() and Path(f"{prefix}.1.bt2l").is_file() else "bt2"
+            paths.extend(Path(f"{prefix}.{part}.{extension}") for part in ("1", "2", "3", "4", "rev.1", "rev.2"))
+        return paths
+    raise ValueError(f"Unsupported methylation backend: {backend!r}")
+
+
+# 输入与解复用：项目和原始输入
+
+FASTQ_SUFFIXES = (".fastq.gz", ".fq.gz")
+
+
+_FASTQ_PATTERNS = (
+    (
+        re.compile(r"^(?P<sample>.+)\.R(?P<read>[12])\.raw\.f(?:ast)?q\.gz$", re.IGNORECASE),
+        lambda m: "single",
+    ),
+    (
+        re.compile(
+            r"^(?P<sample>.+)[_.-]L(?P<lane>[0-9]{1,3})[_.-]R?(?P<read>[12])(?:[_.-](?P<chunk>[0-9]{3}))?\.f(?:ast)?q\.gz$",
+            re.IGNORECASE,
+        ),
+        lambda m: f"L{int(m.group('lane')):03d}_{m.group('chunk') or '001'}",
+    ),
+    (
+        re.compile(r"^(?P<sample>.+)[_.-]R?(?P<read>[12])[_.-](?P<chunk>[0-9]{3})\.f(?:ast)?q\.gz$", re.IGNORECASE),
+        lambda m: f"part_{m.group('chunk')}",
+    ),
+    (
+        re.compile(r"^(?P<sample>.+)[_.-]R?(?P<read>[12])\.f(?:ast)?q\.gz$", re.IGNORECASE),
+        lambda m: "single",
+    ),
+)
 
 
 def _parse_fastq_inventory_name(path: Path) -> tuple[str, str, str] | None:
@@ -2402,758 +2701,11 @@ def _apply_fastq_renames(dir_raw: Path, plans: Sequence[tuple[Path, Path]]) -> N
     )
 
 
-MANAGED_SPECIES = frozenset({"hg38", "mm10"})
-
-
-_PRIMARY_CONTIGS: Mapping[str, tuple[tuple[str, int], ...]] = {
-    "hg38": (
-        ("chr1", 248956422), ("chr2", 242193529), ("chr3", 198295559),
-        ("chr4", 190214555), ("chr5", 181538259), ("chr6", 170805979),
-        ("chr7", 159345973), ("chr8", 145138636), ("chr9", 138394717),
-        ("chr10", 133797422), ("chr11", 135086622), ("chr12", 133275309),
-        ("chr13", 114364328), ("chr14", 107043718), ("chr15", 101991189),
-        ("chr16", 90338345), ("chr17", 83257441), ("chr18", 80373285),
-        ("chr19", 58617616), ("chr20", 64444167), ("chr21", 46709983),
-        ("chr22", 50818468), ("chrX", 156040895), ("chrY", 57227415),
-        ("chrM", 16569),
-    ),
-    "mm10": (
-        ("chr1", 195471971), ("chr2", 182113224), ("chr3", 160039680),
-        ("chr4", 156508116), ("chr5", 151834684), ("chr6", 149736546),
-        ("chr7", 145441459), ("chr8", 129401213), ("chr9", 124595110),
-        ("chr10", 130694993), ("chr11", 122082543), ("chr12", 120129022),
-        ("chr13", 120421639), ("chr14", 124902244), ("chr15", 104043685),
-        ("chr16", 98207768), ("chr17", 94987271), ("chr18", 90702639),
-        ("chr19", 61431566), ("chrX", 171031299), ("chrY", 91744698),
-        ("chrM", 16299),
-    ),
-}
-SPIKE_CONTIGS: Mapping[str, int] = {"lambda": 48502, "pUC19": 2686}
-MANAGED_CONTIGS = {
-    species: [*(primaries), *SPIKE_CONTIGS.items()]
-    for species, primaries in _PRIMARY_CONTIGS.items()
-}
-
-
-def _fai_contigs(path: Path) -> list[tuple[str, int]]:
-
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except UnicodeError as exc:
-        raise ValueError(f"reference FAI is not valid text: {path}") from exc
-
-    records: list[tuple[str, int]] = []
-    seen: set[str] = set()
-    for line_number, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        fields = line.split("\t")
-        if len(fields) < 5 or not fields[0]:
-            raise ValueError(f"invalid reference FAI line {line_number}: {path}")
-        name = fields[0]
-        if name in seen:
-            raise ValueError(f"duplicate reference FAI contig {name!r}: {path}")
-        try:
-            length, offset, line_bases, line_width = map(int, fields[1:5])
-        except ValueError as exc:
-            raise ValueError(
-                f"invalid numeric reference FAI line {line_number}: {path}"
-            ) from exc
-        if length <= 0 or offset < 0 or line_bases <= 0 or line_width < line_bases:
-            raise ValueError(f"invalid reference FAI geometry on line {line_number}: {path}")
-        seen.add(name)
-        records.append((name, length))
-    if not records:
-        raise ValueError(f"reference FAI contains no contigs: {path}")
-    return records
-
-
-def _atomic_text_path(path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path.with_name(f".{path.name}.tmp.{os.getpid()}")
-
-
-def _gtf_attributes(raw: str) -> dict[str, str]:
-    attributes: dict[str, str] = {}
-    for item in raw.split(";"):
-        key, separator, value = item.strip().partition(" ")
-        if separator:
-            attributes[key] = value.strip().strip('"')
-    return attributes
-
-
-def _annotation_release_signature(species: str) -> tuple[str, str]:
-    if species == "hg38":
-        return "GRCh38", "version 48"
-    if species == "mm10":
-        return "GRCm38", "version M25"
-    raise ValueError(f"unsupported standard species: {species}")
-
-
-def build_downstream_references(
-    *,
-    species: str,
-    fasta: str | Path,
-    annotation_gtf: str | Path,
-    tss_bed: str | Path,
-    single_cpg_bed: str | Path,
-) -> Mapping[str, object]:
-    """构建 TSS bins 与 SnapATAC2 兼容的 single-CpG BED。
-
-    CpG BED 为 BED3、0-based half-open，每条 interval 覆盖 CpG 二核苷酸 ``[C, G+1)``，
-    因此两条链上报出的 base-resolution 值都会落入同一个 SnapATAC2 peak_file feature。
-    """
-
-    reference = Path(fasta).expanduser().resolve()
-    fai = Path(f"{reference}.fai")
-    annotation = Path(annotation_gtf).expanduser().resolve()
-    tss = Path(tss_bed).expanduser().resolve()
-    cpg = Path(single_cpg_bed).expanduser().resolve()
-    if not reference.is_file() or reference.stat().st_size == 0:
-        raise FileNotFoundError(f"reference FASTA is missing or empty: {reference}")
-    if not fai.is_file() or fai.stat().st_size == 0:
-        raise FileNotFoundError(f"reference FAI is missing or empty: {fai}")
-    if not annotation.is_file() or annotation.stat().st_size == 0:
-        raise FileNotFoundError(
-            f"reference annotation GTF is missing or empty: {annotation}"
-        )
-
-    contigs = _fai_contigs(fai)
-    host_contigs = [
-        (name, length)
-        for name, length in contigs
-        if name not in {"lambda", "pUC19"}
-    ]
-    contig_lengths = dict(host_contigs)
-    expected_build, expected_release = _annotation_release_signature(species)
-    header_lines: list[str] = []
-    tss_tmp = _atomic_text_path(tss)
-    cpg_tmp = _atomic_text_path(cpg)
-    tss_count = 0
-    protein_coding_gene_count = 0
-    seen_intervals: set[tuple[str, int, int]] = set()
-
-    try:
-        with annotation.open("rt", encoding="utf-8") as source, tss_tmp.open(
-            "wt", encoding="utf-8", newline=""
-        ) as output:
-            for line_number, raw in enumerate(source, start=1):
-                if raw.startswith("#"):
-                    if len(header_lines) < 100:
-                        header_lines.append(raw.rstrip("\n"))
-                    continue
-                fields = raw.rstrip("\n").split("\t")
-                if len(fields) != 9:
-                    raise ValueError(
-                        f"invalid GTF field count on line {line_number}: {annotation}"
-                    )
-                (
-                    chrom,
-                    _source,
-                    feature,
-                    start_s,
-                    end_s,
-                    _score,
-                    strand,
-                    _frame,
-                    attrs_s,
-                ) = fields
-                if (
-                    feature != "gene"
-                    or chrom not in contig_lengths
-                    or strand not in {"+", "-"}
-                ):
-                    continue
-                attrs = _gtf_attributes(attrs_s)
-                if attrs.get("gene_type") != "protein_coding":
-                    continue
-                gene_id = attrs.get("gene_id", "").strip()
-                if not gene_id:
-                    raise ValueError(
-                        "protein-coding GTF gene lacks gene_id on line "
-                        f"{line_number}: {annotation}"
-                    )
-                try:
-                    gene_start = int(start_s) - 1
-                    gene_end = int(end_s)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"invalid GTF coordinate on line {line_number}: {annotation}"
-                    ) from exc
-                if (
-                    gene_start < 0
-                    or gene_end <= gene_start
-                    or gene_end > contig_lengths[chrom]
-                ):
-                    raise ValueError(
-                        "GTF gene exceeds canonical contig bounds on line "
-                        f"{line_number}: {annotation}"
-                    )
-                protein_coding_gene_count += 1
-                transcription_start = gene_start if strand == "+" else gene_end
-                for offset in range(-2000, 2000, 20):
-                    if strand == "+":
-                        bin_start = transcription_start + offset
-                        bin_end = bin_start + 20
-                    else:
-                        bin_end = transcription_start - offset
-                        bin_start = bin_end - 20
-                    if bin_start < 0 or bin_end > contig_lengths[chrom]:
-                        continue
-                    interval = (chrom, bin_start, bin_end)
-                    if interval in seen_intervals:
-                        continue
-                    seen_intervals.add(interval)
-                    region = f"{chrom}:{bin_start}-{bin_end}"
-                    output.write(
-                        f"{chrom}\t{bin_start}\t{bin_end}\t{region}\t.\t{strand}\t"
-                        f"{gene_id}\t{region}\t{offset}\n"
-                    )
-                    tss_count += 1
-
-        header = "\n".join(header_lines)
-        if expected_build not in header or expected_release not in header:
-            raise ValueError(
-                f"{species} GTF must be GENCODE {expected_release} on "
-                f"{expected_build}: {annotation}"
-            )
-        if protein_coding_gene_count == 0 or tss_count == 0:
-            raise ValueError(f"GTF produced no protein-coding TSS bins: {annotation}")
-
-        cpg_count = 0
-        selected = {name for name, _length in host_contigs}
-        current = ""
-        current_position = 0
-        previous_base = ""
-        cpg_tmp.parent.mkdir(parents=True, exist_ok=True)
-        with reference.open("rt", encoding="utf-8") as source, cpg_tmp.open(
-            "wb"
-        ) as raw_output:
-            with gzip.GzipFile(
-                filename="", mode="wb", fileobj=raw_output, mtime=0
-            ) as compressed:
-                with io.TextIOWrapper(
-                    compressed, encoding="utf-8", newline=""
-                ) as output:
-                    for raw in source:
-                        if raw.startswith(">"):
-                            current = raw[1:].split(None, 1)[0]
-                            current_position = 0
-                            previous_base = ""
-                            continue
-                        sequence = "".join(raw.split()).upper()
-                        if not sequence or current not in selected:
-                            continue
-                        combined = previous_base + sequence
-                        combined_start = current_position - (1 if previous_base else 0)
-                        match = combined.find("CG")
-                        while match >= 0:
-                            start = combined_start + match
-                            end = start + 2
-                            output.write(f"{current}\t{start}\t{end}\n")
-                            cpg_count += 1
-                            match = combined.find("CG", match + 2)
-                        previous_base = sequence[-1]
-                        current_position += len(sequence)
-        if cpg_count == 0:
-            raise ValueError(f"reference produced no CpG sites: {reference}")
-
-        os.replace(tss_tmp, tss)
-        os.replace(cpg_tmp, cpg)
-    finally:
-        for temporary in (tss_tmp, cpg_tmp):
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-
-    return {
-        "species": species,
-        "protein_coding_gene_count": protein_coding_gene_count,
-        "tss_bin_count": tss_count,
-        "single_cpg_count": cpg_count,
-        "tss_bed": str(tss),
-        "single_cpg_bed": str(cpg),
-    }
-
-
-def reference_identity(
-    reference: str | Path,
-    *,
-    expected_species: str | None = None,
-) -> Mapping[str, object]:
-    """返回所有 backend 共用的 FASTA + FAI 身份。
-
-    backend 专属 index 单独另行校验记录；未选中的 backend 绝不会成为重算或 run-start gate。
-    """
-    public_ref = Path(reference).expanduser().absolute()
-    if not public_ref.is_file() or public_ref.stat().st_size == 0:
-        raise FileNotFoundError(f"reference FASTA is missing or empty: {public_ref}")
-    resolved_ref = public_ref.resolve()
-    fai = Path(f"{resolved_ref}.fai")
-    if not fai.is_file() or fai.stat().st_size == 0:
-        raise FileNotFoundError(f"reference FAI is missing or empty: {fai}")
-    observed = _fai_contigs(fai)
-    if expected_species in MANAGED_SPECIES and observed != MANAGED_CONTIGS[expected_species]:
-        raise ValueError(
-            f"{expected_species} reference contig/order/length contract mismatch: {resolved_ref}"
-        )
-    ref_stat = resolved_ref.stat()
-    return {
-        "public_path": str(public_ref),
-        "resolved_path": str(resolved_ref),
-        "size_bytes": ref_stat.st_size,
-        "mtime_ns": ref_stat.st_mtime_ns,
-        "fai": stable_file_identity(fai, hash_content=False),
-    }
-
-
-BWA_INDEX_SUFFIXES = (".amb", ".ann", ".bwt", ".pac", ".sa")
-
-BISCUIT_INDEX_SUFFIXES = (
-    ".bis.pac", ".bis.amb", ".bis.ann", ".par.bwt", ".par.sa", ".dau.bwt", ".dau.sa",
-)
-
-BISCUIT_TRANSIENT_SUFFIXES = (".par.pac", ".dau.pac")
-
-
-def append_spikein_contigs(lambda_fasta: Path, puc19_fasta: Path, target_fasta: Path) -> None:
-    """把 lambda 与 pUC19 spike-in contig 追加到临时 assembled FASTA 末尾。"""
-
-    def spike_sequence(path: Path) -> str:
-        data = "".join(
-            line.strip()
-            for line in path.read_text().splitlines()
-            if line and not line.startswith(">")
-        ).upper()
-        if not data:
-            raise ValueError(f"empty spike FASTA: {path}")
-        return data
-
-    with target_fasta.open("a") as handle:
-        for name, path in (("lambda", lambda_fasta), ("pUC19", puc19_fasta)):
-            sequence = spike_sequence(path)
-            handle.write(f">{name}\n")
-            for offset in range(0, len(sequence), 60):
-                handle.write(sequence[offset : offset + 60] + "\n")
-
-
-def fai_contract_check(mode: str, label: str, fai: Path, fasta: Path) -> bool:
-    """校验 source/assembled FASTA 是否满足标准 contig 长度契约。
-
-    只读取很小的 .fai 并通过 FAI 几何 + FASTA 大小的算术检查排除截断文件，
-    不扫描序列本身。mode=source 允许 UCSC FASTA 中的额外 contig（primary 与
-    spike 必须全部存在且长度精确）；mode=assembled 只允许标准 contig 的精确顺序。
-    """
-
-    records: list[tuple[str, int, int, int, int]] = []
-    seen: set[str] = set()
-    for line in fai.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        fields = line.split("\t")
-        if len(fields) < 5 or not fields[0]:
-            return False
-        name = fields[0]
-        if name in seen:
-            return False
-        seen.add(name)
-        try:
-            length, offset, line_bases, line_width = (int(v) for v in fields[1:5])
-        except ValueError:
-            return False
-        if length <= 0 or offset < 0 or line_bases <= 0 or line_width < line_bases:
-            return False
-        records.append((name, length, offset, line_bases, line_width))
-    if not records:
-        return False
-
-
-    fasta_size = fasta.stat().st_size
-    for _name, length, offset, line_bases, line_width in records:
-        full_rows = (length - 1) // line_bases
-        final_row_start = offset + full_rows * line_width
-        final_row_bases = (length - 1) % line_bases + 1
-        if final_row_start + final_row_bases > fasta_size:
-            return False
-
-    length_records = [(name, length) for name, length, *_ in records]
-    if mode == "source":
-        if label in MANAGED_SPECIES:
-            observed = dict(length_records)
-            return all(
-                observed.get(name) == length
-                for name, length in _PRIMARY_CONTIGS[label]
-            )
-        if label in SPIKE_CONTIGS:
-            return (
-                len(length_records) == 1
-                and length_records[0][1] == SPIKE_CONTIGS[label]
-            )
-        return False
-    if mode == "assembled":
-        return label in MANAGED_CONTIGS and length_records == MANAGED_CONTIGS[label]
-    return False
-
-
-def backend_active_index_paths(
-    reference: str | Path,
-    backend: str,
-    *,
-    bismark_local_alignment: bool = False,
-    bismark_root: str | Path | None = None,
-) -> list[Path]:
-    """枚举当前 backend/模式必需的完整 index 家族；构建期可指定候选 Bismark 根目录。
-
-    Bowtie2 以 .1.bt2 优先、其次 .1.bt2l 选择六文件家族；缺失成员也必须进入清单，不能被扫描漏掉。
-    """
-    reference = Path(reference)
-    if backend == "rastair":
-        return [Path(f"{reference}.bwa/genome{suffix}") for suffix in BWA_INDEX_SUFFIXES]
-    if backend == "biscuit":
-        return [Path(f"{reference}{suffix}") for suffix in BISCUIT_INDEX_SUFFIXES]
-    if backend == "bismark":
-        index_dir = Path(bismark_root or f"{reference}.bismark") / "Bisulfite_Genome"
-        prefixes = (
-            [index_dir / "CT_conversion" / "BS_CT", index_dir / "GA_conversion" / "BS_GA"]
-            if bismark_local_alignment
-            else [index_dir / "Combined" / "BS_combined"]
-        )
-        paths = []
-        for prefix in prefixes:
-            extension = "bt2l" if not Path(f"{prefix}.1.bt2").is_file() and Path(f"{prefix}.1.bt2l").is_file() else "bt2"
-            paths.extend(Path(f"{prefix}.{part}.{extension}") for part in ("1", "2", "3", "4", "rev.1", "rev.2"))
-        return paths
-    raise ValueError(f"Unsupported methylation backend: {backend!r}")
-
-
-SUPPORTED_BISMARK_LIBRARY_TYPES = ("directional", "non_directional", "pbat")
-SUPPORTED_BISCUIT_LIBRARY_TYPES = ("directional", "non_directional")
-
-
-CONFIG_SECTION_DEFAULTS: dict[str, dict[str, object]] = {
-    "demux": {
-        "min_matched_read_pairs": 10,
-        "dna_w_spacer_len": 0,
-    },
-    "high_cph": {
-        "excluded_contigs": ["pUC19", "lambda", "chrM"],
-    },
-    "biscuit": {
-        "library_type": "non_directional",
-        "high_cph_retention_threshold": 0.7,
-        "generate_snp": False,
-    },
-    "bismark": {
-        "library_type": "non_directional",
-        "local_alignment": False,
-        "non_conversion_percentage_cutoff": 70,
-        "non_conversion_minimum_count": 5,
-    },
-    "runtime": {
-        "local_executor_cores": 32,
-        "latency_wait_seconds": 120,
-    },
-    "slurm": {
-        "jobs": 30,
-        "controller_cores": 2,
-        "account": None,
-        "partition": None,
-        "qos": "huge",
-        "node_tmpdir": "/tmp",
-    },
-    "retention": {
-        "keep_final_bam": False,
-    },
-}
-
-
-def apply_config_defaults(config: dict[str, object]) -> dict[str, object]:
-    """把内置默认合并进项目 config；缺 section 补 section，缺键补键，不改显式值。"""
-    for section, defaults in CONFIG_SECTION_DEFAULTS.items():
-        if section not in config:
-            config[section] = copy.deepcopy(defaults)
-            continue
-        current = config[section]
-        if not isinstance(current, dict):
-            raise ValueError(f"config section {section!r} must be a mapping")
-        for key, value in defaults.items():
-            current.setdefault(key, copy.deepcopy(value))
-    return config
-
-
-def finalize_project_config(config: Mapping[str, object]) -> dict[str, object]:
-    """合并内置默认并完成 schema 与跨字段语义校验（项目 config 的唯一加载链）。"""
-    import yaml
-    from jsonschema import validate as validate_jsonschema
-
-    merged = apply_config_defaults(copy.deepcopy(dict(config)))
-    schema = yaml.safe_load(CONFIG_SCHEMA_YAML)
-    validate_jsonschema(instance=merged, schema=schema)
-    validate_config_semantics(merged)
-    return merged
-
-
-def load_project_config(path: Path | str) -> dict[str, object]:
-    """读取项目 config YAML 并走唯一 finalize 加载链。"""
-    import yaml
-
-    config = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    if not isinstance(config, dict):
-        raise ValueError(f"project config root must be a mapping: {path}")
-    return finalize_project_config(config)
-
-
-@dataclass(frozen=True)
-class BackendPolicy:
-    """单一 methylation backend 的静态能力契约。"""
-
-    name: str
-    supports_snp: bool
-    uses_dupsifter: bool
-
-
-_BACKEND_POLICIES = {
-    "biscuit": BackendPolicy("biscuit", supports_snp=True, uses_dupsifter=True),
-    "bismark": BackendPolicy("bismark", supports_snp=False, uses_dupsifter=False),
-    "rastair": BackendPolicy("rastair", supports_snp=True, uses_dupsifter=False),
-}
-
-
-def get_backend(config: dict[str, Any]) -> BackendPolicy:
-    """返回选定的 backend，并拒绝该 backend 不支持的功能组合。"""
-    analysis = config.get("analysis")
-    if not isinstance(analysis, dict):
-        raise ValueError("analysis must be a mapping")
-    name = str(analysis.get("methylation_backend", "")).strip().lower()
-    if name not in _BACKEND_POLICIES:
-        raise ValueError(
-            f"Unsupported methylation backend {name!r}; choose biscuit, bismark or rastair"
-        )
-    if (analysis.get("protocol") == "taps") != (name == "rastair"):
-        raise ValueError("protocol taps requires rastair; Cabernet/SRD require biscuit or bismark")
-    policy = _BACKEND_POLICIES[name]
-    biscuit = config.get("biscuit") or {}
-    if bool(biscuit.get("generate_snp")) and name != "biscuit":
-        raise ValueError(
-            "biscuit.generate_snp=true is currently supported only by the Biscuit backend"
-        )
-    return policy
-
-
-def bismark_library_flag(config: dict[str, Any]) -> str:
-    """把配置的 library type 翻译为 Bismark CLI flag。"""
-    bismark = config.get("bismark")
-    if not isinstance(bismark, dict):
-        raise ValueError("bismark must be a mapping")
-    value = str(bismark.get("library_type", "")).strip().lower()
-    if value not in SUPPORTED_BISMARK_LIBRARY_TYPES:
-        raise ValueError(
-            "bismark.library_type must be directional, non_directional, or pbat"
-        )
-    return {
-        "directional": "",
-        "non_directional": "--non_directional",
-        "pbat": "--pbat",
-    }[value]
-
-
-def bismark_alignment_instance_count(config: Mapping[str, object]) -> int:
-    """返回当前 Bismark 模式使用的 Bowtie2 instance 数，用于划分 rule 总 CPU。"""
-    bismark = config.get("bismark")
-    if not isinstance(bismark, Mapping):
-        raise ValueError("bismark must be a mapping")
-    value = str(bismark.get("library_type", "")).strip().lower()
-    if value not in SUPPORTED_BISMARK_LIBRARY_TYPES:
-        raise ValueError(
-            "bismark.library_type must be directional, non_directional, or pbat"
-        )
-    if not bool(bismark.get("local_alignment", False)):
-        return 1
-    return 4 if value == "non_directional" else 2
-
-
-def biscuit_library_mode(config: Mapping[str, object]) -> int:
-    """把命名的 paired-end BISCUIT library type 翻译为 ``align -b`` 的取值。"""
-    biscuit = config.get("biscuit")
-    if not isinstance(biscuit, Mapping):
-        raise ValueError("biscuit must be a mapping")
-    value = str(biscuit.get("library_type", "")).strip().lower()
-    if value not in SUPPORTED_BISCUIT_LIBRARY_TYPES:
-        raise ValueError("biscuit.library_type must be directional or non_directional")
-    return {"non_directional": 0, "directional": 1}[value]
-
-
-def validate_config_semantics(config: Mapping[str, object]) -> None:
-    """校验 JSON Schema 无法表达的跨字段约束。"""
-    high_cph = config.get("high_cph")
-    if not isinstance(high_cph, Mapping):
-        raise ValueError("high_cph must be a mapping")
-
-    biscuit = config.get("biscuit")
-    runtime = config.get("runtime")
-    slurm = config.get("slurm")
-    if not isinstance(biscuit, Mapping):
-        raise ValueError("biscuit must be a mapping")
-    if not isinstance(runtime, Mapping):
-        raise ValueError("runtime must be a mapping")
-    if not isinstance(slurm, Mapping):
-        raise ValueError("slurm must be a mapping")
-    node_tmpdir = slurm.get("node_tmpdir")
-    if node_tmpdir is not None:
-        if not isinstance(node_tmpdir, str) or not str(node_tmpdir).strip():
-            raise ValueError("slurm.node_tmpdir must be a non-empty path or null")
-        if Path(str(node_tmpdir)).expanduser().resolve(strict=False) == Path(
-            Path(str(node_tmpdir)).expanduser().resolve(strict=False).anchor
-        ):
-            raise ValueError("slurm.node_tmpdir must not resolve to the filesystem root")
-    for section_name, section, field, minimum, maximum in (
-        ("biscuit", biscuit, "high_cph_retention_threshold", 0.0, 1.0),
-    ):
-        value = section.get(field)
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            or float(value) < minimum
-            or (maximum is not None and float(value) > maximum)
-        ):
-            bounds = f"[{minimum:g}, {maximum:g}]" if maximum is not None else f">= {minimum:g}"
-            raise ValueError(f"{section_name}.{field} must be a finite number within {bounds}")
-    get_backend(dict(config))
-    biscuit_library_mode(config)
-    bismark_library_flag(dict(config))
-    if config["analysis"]["protocol"] == "droplet":
-        if config["analysis"]["methylation_backend"] != "bismark" or config["bismark"]["library_type"] != "non_directional":
-            raise ValueError("Droplet requires bismark/non_directional")
-        if config["demux"]["dna_w_spacer_len"] != 0:
-            raise ValueError("Droplet has a fixed structure; dna_w_spacer_len must be 0")
-
-
-@dataclass(frozen=True)
-class ProtocolPolicy:
-    name: str
-    demux_mode: str
-    requires_rna_barcode: bool
-    rna_output_role: str
-    high_cph_role: str
-
-    publishes_rna_bam: bool
-
-    @property
-    def raw_input_columns(self) -> tuple[str, ...]:
-        """返回本项目需要 FASTQ 的 manifest 列；外部 RNA 关联不参与拆分。"""
-        return ("dna_raw_sample", "rna_sample") if self.name == "srd" else ("dna_raw_sample",)
-
-
-@dataclass(frozen=True)
-class RawRoutePolicy:
-    route_id: str
-    protocol: str
-    demux_mode: str
-    downstream_dna: bool
-    rna_output_role: str
-    high_cph_role: str
-
-
-_PROTOCOLS = {
-    "droplet": ProtocolPolicy(
-        name="droplet", demux_mode="dna-only-droplet", requires_rna_barcode=False,
-        rna_output_role="not_used", high_cph_role="cdna_contamination", publishes_rna_bam=False,
-    ),
-    "taps": ProtocolPolicy(
-        name="taps", demux_mode="dna-only-taps", requires_rna_barcode=False,
-        rna_output_role="not_used", high_cph_role="not_applicable",
-        publishes_rna_bam=False,
-    ),
-    "cabernet": ProtocolPolicy(
-        name="cabernet", demux_mode="dna-only", requires_rna_barcode=False,
-        rna_output_role="not_used", high_cph_role="cdna_contamination",
-        publishes_rna_bam=False,
-    ),
-    "srd": ProtocolPolicy(
-        name="srd", demux_mode="dna-rna", requires_rna_barcode=True,
-        rna_output_role="audit_only", high_cph_role="residual_high_cph",
-        publishes_rna_bam=True,
-    ),
-}
-
-def _raw_route(
-    route_id: str,
-    protocol: str,
-    downstream_dna: bool,
-    *,
-    rna_output_role: str | None = None,
-    high_cph_role: str | None = None,
-) -> RawRoutePolicy:
-    policy = _PROTOCOLS[protocol]
-    return RawRoutePolicy(
-        route_id=route_id,
-        protocol=protocol,
-        downstream_dna=downstream_dna,
-        demux_mode=policy.demux_mode,
-        rna_output_role=rna_output_role or policy.rna_output_role,
-        high_cph_role=high_cph_role or policy.high_cph_role,
-    )
-
-
-_RAW_ROUTES = {
-    "droplet_dna": _raw_route("droplet_dna", "droplet", True),
-    "taps_dna_nucleus": _raw_route("taps_dna_nucleus", "taps", True),
-    "cabernet_dna_nucleus": _raw_route("cabernet_dna_nucleus", "cabernet", True),
-    "srd_dna_tube": _raw_route("srd_dna_tube", "srd", True),
-    "srd_rna_enrichment_tube": _raw_route(
-        "srd_rna_enrichment_tube",
-        "srd",
-        False,
-        rna_output_role="audit_only",
-        high_cph_role="not_applicable",
-    ),
-}
-
 _BARCODE_RE = re.compile(r"^[ACGT]+$")
+
+
 _SUPPORTED_BARCODE_LENGTHS = {8, 10}
 
-
-def _canonical_protocol_name(name: str) -> str:
-    protocol = str(name or "").strip().lower()
-    if protocol not in _PROTOCOLS:
-        raise ValueError(
-            f"Unsupported pipeline protocol={protocol!r}; expected one of: "
-            + ", ".join(sorted(_PROTOCOLS))
-        )
-    return protocol
-
-
-def get_protocol_policy(config: Mapping[str, object]) -> ProtocolPolicy:
-    protocol = _canonical_protocol_name(str(config["analysis"]["protocol"]))
-    return _PROTOCOLS[protocol]
-
-
-def get_protocol(name: str) -> ProtocolPolicy:
-    return _PROTOCOLS[_canonical_protocol_name(name)]
-
-
-def default_dna_route(protocol: str) -> str:
-    """返回协议唯一的下游 DNA 原始样本路线。"""
-    return next(r.route_id for r in _RAW_ROUTES.values() if r.protocol == _canonical_protocol_name(protocol) and r.downstream_dna)
-
-
-def canonical_raw_route_id(route_name: str) -> str:
-    return str(route_name or "").strip().lower()
-
-
-def get_raw_route(route_name: str, protocol_name: str) -> RawRoutePolicy:
-    protocol = _canonical_protocol_name(protocol_name)
-    route_id = canonical_raw_route_id(route_name)
-    route = _RAW_ROUTES.get(route_id)
-    if route is None or route.protocol != protocol:
-        valid = sorted(r.route_id for r in _RAW_ROUTES.values() if r.protocol == protocol)
-        raise ValueError(
-            f"Unsupported raw-sample route={route_name!r} for protocol={protocol!r}; "
-            f"expected one of: {', '.join(valid)}"
-        )
-    return route
 
 def _header_map(fieldnames: list[str] | None) -> dict[str, str]:
     headers: dict[str, str] = {}
@@ -3308,1607 +2860,500 @@ def validate_barcode_map_for_protocol(
         return barcode_rows
 
 
-_EXPORTED_SCALARS = {
-    "CFG_LOCAL_CORES": "runtime.local_executor_cores",
-    "CFG_LATENCY_WAIT": "runtime.latency_wait_seconds",
-    "CFG_PROTOCOL": "analysis.protocol",
-    "CFG_SPECIES": "species",
-    "CFG_METHYLATION_BACKEND": "analysis.methylation_backend",
-    "CFG_SLURM_JOBS": "slurm.jobs",
-    "CFG_SLURM_CONTROLLER_CORES": "slurm.controller_cores",
-    "CFG_SLURM_ACCOUNT": "slurm.account",
-    "CFG_SLURM_PARTITION": "slurm.partition",
-    "CFG_SLURM_QOS": "slurm.qos",
-    "CFG_SLURM_NODE_TMPDIR": "slurm.node_tmpdir",
-}
+PROJECT_SAMPLE_MANIFEST_FIELDS = (
+    "sample_id",
+    "dna_raw_sample",
+    "rna_sample",
+    "species",
+    "protocol",
+    "notes",
+)
 
 
-def export_config_scalars(config: Mapping[str, object]) -> dict[str, str]:
-    """提取平台路由所需的 config 叶子标量（None 渲染为空串，bool 渲染为 true/false）。"""
-    rendered: dict[str, str] = {}
-    for var, dotted in _EXPORTED_SCALARS.items():
-        value: object = config
-        for key in dotted.split("."):
-            if not isinstance(value, Mapping) or key not in value:
-                raise ValueError(f"required config field is missing: {dotted}")
-            value = value[key]
-        if value is None:
-            rendered[var] = ""
-        elif isinstance(value, bool):
-            rendered[var] = "true" if value else "false"
-        elif isinstance(value, (str, int, float)):
-            rendered[var] = str(value)
-        else:
-            raise ValueError(f"config field must be a scalar: {dotted}")
-    return rendered
+INITIAL_CELL_MANIFEST_FIELDS = (
+    "sample_id",
+    "project_sample_id",
+    "species",
+    "protocol",
+    "plate_id",
+    "cell_order",
+    "dna_barcode",
+    "rna_barcode",
+    "dna_raw_sample",
+    "rna_sample",
+    "notes",
+)
 
 
-DEFAULT_ROUTE = "hg38-cabernet-bismark"
-
-TEST_ROUTES: dict[str, dict[str, str]] = {
-    "hg38-taps-rastair": {"species": "hg38", "protocol": "taps", "methylation_backend": "rastair", "reference_key": "hg38"},
-    "hg38-cabernet-bismark": {
-        "species": "hg38",
-        "protocol": "cabernet",
-        "methylation_backend": "bismark",
-        "reference_key": "hg38",
-    },
-    "mm10-srd-biscuit": {
-        "species": "mm10",
-        "protocol": "srd",
-        "methylation_backend": "biscuit",
-        "reference_key": "mm10",
-    },
-}
-
-
-def resolve_route(route: str) -> str:
-    """返回具体 route id；空值与 auto 应用隐式默认。"""
-    name = str(route or "").strip()
-    if name == "auto" or not name:
-        return DEFAULT_ROUTE
-    if name not in TEST_ROUTES:
-        raise ValueError(f"unsupported test route: {name}")
-    return name
-
-
-def apply_common_route_config(cfg: dict[str, Any], route_id: str) -> None:
-    """把 route 定义的分析子集应用到目标 config（各消费者共享的唯一实现）。
-
-    写出前合并内置默认，保证合成的项目/运行时 config 总是完整可校验。
-    """
-    meta = TEST_ROUTES[resolve_route(route_id)]
-    cfg["species"] = meta["species"]
-    references = cfg.setdefault("references", {})
-    if not str(references.get(meta["reference_key"], "")).strip():
-        raise SystemExit(
-            f"ERROR: references.{meta['reference_key']} is required for {meta['protocol']} test mode"
+def _require_header(fields: list[str], expected: tuple[str, ...], *, source: Path, label: str) -> None:
+    if fields != list(expected):
+        raise ValueError(
+            f"{label} header/order does not match the current contract: {source}; "
+            f"expected={list(expected)!r}, observed={fields!r}"
         )
-    analysis = cfg.setdefault("analysis", {})
-    analysis["methylation_backend"] = meta["methylation_backend"]
-    analysis["protocol"] = meta["protocol"]
-    cfg.setdefault("biscuit", {})["generate_snp"] = False
-    if meta["methylation_backend"] == "bismark":
-        cfg.setdefault("bismark", {})["library_type"] = "non_directional"
-    apply_config_defaults(cfg)
-
-def synthesize_route_config(source: Path, destination: Path, route: str) -> None:
-    """把项目 config 与 route 覆盖合成为 test 模式 effective config。"""
-    import yaml
-
-    cfg = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
-    apply_common_route_config(cfg, resolve_route(route))
 
 
-    runtime = cfg.setdefault("runtime", {})
-    runtime["local_executor_cores"] = max(8, int(runtime.get("local_executor_cores", 8)))
-    destination.write_text(
-        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8"
-    )
-
-
-BENCHMARK_SCHEMA_VERSION = 2
-BENCHMARK_ID = "doctor_hpc_raw_v2"
-
-
-def _benchmark_fastq_pairs(r1: Path, r2: Path) -> Iterable[tuple[bytes, bytes]]:
-    with gzip.open(r1, "rb") as left, gzip.open(r2, "rb") as right:
-        while True:
-            records = [[handle.readline() for _ in range(4)] for handle in (left, right)]
-            if not records[0][0] and not records[1][0]:
-                return
-            names = []
-            for mate, lines in enumerate(records, 1):
-                if (not all(lines) or not lines[0].startswith(b"@") or not lines[2].startswith(b"+")
-                        or len(lines[1].rstrip()) != len(lines[3].rstrip())):
-                    raise ValueError(f"Malformed Doctor FASTQ: {r1 if mate == 1 else r2}")
-                name = lines[0].split()[0]
-                names.append(re.sub(rb"/[12]$", b"", name))
-            if names[0] != names[1]:
-                raise ValueError(f"Doctor FASTQ mate names disagree: {names}")
-            yield b"".join(records[0]), b"".join(records[1])
-
-
-def validate_benchmark(root: Path, manifest_path: Path) -> None:
-    """核对真实抽样的文件身份、逐记录配对、来源序号与当前 fixture schema；运行时不访问 HPC。"""
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != BENCHMARK_SCHEMA_VERSION or manifest.get("benchmark_id") != BENCHMARK_ID:
-        raise ValueError("Unsupported Doctor benchmark schema/id")
-
-    def verify_entry(entry: dict[str, Any]) -> Path:
-        name = str(entry["path"])
-        path = root / name
-        if Path(name).name != name or not path.is_file() or path.is_symlink():
-            raise ValueError(f"Invalid Doctor benchmark file: {name}")
-        if sha256_file(path) != entry["sha256"]:
-            raise ValueError(f"Doctor benchmark SHA256 mismatch: {name}")
-        return path
-
-    verify_entry(manifest["barcode_map"])
-    total = 0
-    for label, dataset in manifest["datasets"].items():
-        files = {entry["path"]: verify_entry(entry) for entry in dataset["fastq_files"]}
-        r1 = sorted(name for name in files if "_R1_" in name)
-        if not r1 or set(files) != set(r1 + [name.replace("_R1_", "_R2_") for name in r1]):
-            raise ValueError("Doctor benchmark FASTQ mate inventory is invalid")
-        count = 0
-        names = set()
-        for name in r1:
-            for left, _right in _benchmark_fastq_pairs(files[name], files[name.replace("_R1_", "_R2_")]):
-                qname = re.sub(rb"/[12]$", b"", left.splitlines()[0].split()[0])
-                if qname in names:
-                    raise ValueError(f"Repeated source read in Doctor fixture: {label}")
-                names.add(qname)
-                count += 1
-        ordinals = dataset["source_provenance"]["selected_ordinals_1based"]
-        if (count != dataset["read_pairs"] or len(ordinals) != count or ordinals != sorted(set(ordinals))
-                or not ordinals or ordinals[0] < 1 or ordinals[-1] > dataset["source_provenance"]["scanned_pairs"]):
-            raise ValueError(f"Doctor benchmark count/source ordinal mismatch: {label}")
-        if dataset["source_provenance"]["raw_records_modified"] is not False:
-            raise ValueError("Doctor real FASTQ must preserve the source records")
-        total += count
-    print(f"Fixed benchmark verified: {BENCHMARK_ID} | real pairs={total} | datasets={len(manifest['datasets'])}")
-
-
-def _write_benchmark_fastqs(project: Path, stem: str, pairs: Sequence[tuple[str, str, str]]) -> None:
-    for mate in (1, 2):
-        with (project / "01_raw" / f"{stem}_R{mate}_001.fastq.gz").open("wb") as raw:
-            with gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as handle:
-                for name, left, right in pairs:
-                    seq = left if mate == 1 else right
-                    handle.write(f"@{name}/{mate}\n{seq}\n+\n{'I' * len(seq)}\n".encode())
-
-
-def stage_benchmark_supplement(project: Path, reference: Path, label: str, route: str) -> dict[str, object]:
-    """为真实抽样补充明确命名的合成对照、重复/CpH 和 SRD 双管 RNA 布局，原始记录不改写。"""
-    backend = TEST_ROUTES[route]["methylation_backend"]
-    samtools = Path(__file__).resolve().parent.parent / "conda/current" / backend / "bin/samtools"
-    fasta = subprocess.check_output([str(samtools), "faidx", str(reference), "chrM", "lambda", "pUC19"], text=True)
-    sequences: dict[str, str] = {}
-    for line in fasta.splitlines():
-        if line.startswith(">"):
-            chrom = line[1:].split()[0]
-            sequences[chrom] = ""
-        else:
-            sequences[chrom] += line.upper()
-    with (project / "00_config/Barcode_Map.csv").open() as handle:
-        barcodes = list(csv.DictReader(handle))[:2]
-    complement = str.maketrans("ACGT", "TGCA")
-    pairs = []
-    for chrom, seq in sequences.items():
-        for index in range(12):
-            start = 300 + 53 * index
-            fragment = seq[start:start + 180]
-            if len(fragment) != 180 or set(fragment) - set("ACGT"):
-                raise ValueError(f"Doctor control reference is not callable: {chrom}:{start}")
-            molecule = "".join("T" if base == "C" and not (chrom == "pUC19" and seq[start + pos:start + pos + 2] == "CG")
-                               else base for pos, base in enumerate(fragment))
-            barcode = barcodes[index % 2]["DNA_Barcode"]
-            pairs.append((f"synthetic_control_{chrom}_{index}", barcode + "AGATGTGTATAAGAGACAG" + "G" * 9 + molecule[:100],
-                          molecule[-100:].translate(complement)[::-1]))
-    fragment = sequences["chrM"][2000:2180]
-    if len(fragment) != 180 or set(fragment) - set("ACGT"):
-        raise ValueError("Doctor unconverted control reference is not callable")
-    for barcode in barcodes:
-        for duplicate in range(2):
-            pairs.append((f"synthetic_high_cph_{barcode['PlateID']}_{duplicate}",
-                          barcode["DNA_Barcode"] + "AGATGTGTATAAGAGACAG" + "G" * 9 + fragment[:100],
-                          fragment[-100:].translate(complement)[::-1]))
-    dna_pairs = len(pairs)
-    rna = []
-    if TEST_ROUTES[route]["protocol"] == "srd":
-        for barcode in barcodes:
-            for index in range(12):
-                payload = sequences["chrM"][300 + index:400 + index]
-                umi = "ACGT" + "ACGT"[index % 4] * 4
-                rna.append((f"synthetic_srd_{barcode['PlateID']}_{index}",
-                            "GTCTAACGCGTTAC" + barcode["RNA_Barcode"] + umi + "A" * 5 + payload,
-                            payload.translate(complement)[::-1]))
-        pairs.extend((name + "_dna_tube", left, right) for name, left, right in rna)
-        _write_benchmark_fastqs(project, label + "_RNA", rna)
-    _write_benchmark_fastqs(project, label + "_L003", pairs)
-    return {"kind": "synthetic_supplement", "dna_pairs": dna_pairs, "rna_pairs_per_tube": len(rna),
-            "controls": ["chrM", "lambda", "pUC19"], "high_cph_duplicate_pairs": 4,
-            "native_srd_library": False, "reference": str(reference)}
-
-
-def stage_taps_truth(project: Path, reference: Path) -> None:
-    """从固定参考窗口生成独立 TAPS 双链/重叠/重复/9 bp gap 真值 FASTQ，不复用转化文库 fixture。"""
-    samtools = Path(__file__).resolve().parent.parent / "conda/current/rastair/bin/samtools"
-    text = subprocess.check_output([str(samtools), "faidx", str(reference), "chr1:1000001-1006000", "lambda", "pUC19"], text=True)
-    sequences: dict[str, str] = {}
-    for line in text.splitlines():
-        if line.startswith(">"):
-            name = line[1:].split(":")[0]
-            sequences[name] = ""
-        else:
-            sequences[name] += line.upper()
-    barcode = "ACGTACGT"
-    (project / "00_config/Barcode_Map.csv").write_text("DNA_Barcode,PlateID,Cell_Order\nACGTACGT,TAPS,1\n")
-    complement = str.maketrans("ACGTN", "TGCAN")
-    pairs = []
-    for chrom, seq in sequences.items():
-        for index in range(40):
-            start = 300 + 17 * index
-            fragment = seq[start:start + 180]
-            if len(fragment) != 180 or "N" in fragment:
-                raise ValueError(f"TAPS truth reference window is not callable: {chrom}:{start}")
-            converted = list(fragment)
-            modified = chrom == "pUC19" or (chrom == "chr1" and index % 4 < 2)
-            ot = index % 2 == 0
-            if modified:
-                for pos in range(len(fragment)):
-                    context = start + pos if ot else start + pos - 1
-                    if seq[context:context + 2] == "CG":
-                        converted[pos] = "T" if ot else "A"
-            molecule = "".join(converted)
-            pair = (barcode + "AGATGTGTATAAGAGACAG" + "CCCCCCCCC" + molecule[:100],
-                    molecule[-100:].translate(complement)[::-1])
-            pairs.append((f"taps_{chrom}_{index}", *pair))
-            if index % 10 == 0:
-                pairs.append((f"taps_{chrom}_{index}_duplicate", *pair))
-    pairs.append(("taps_unmapped", barcode + "AGATGTGTATAAGAGACAG" + "CCCCCCCCC" + "N" * 100, "N" * 100))
-    for mate in (1, 2):
-        path = project / "01_raw" / f"Taps_R{mate}.fastq.gz"
-        with path.open("wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as gz:
-            for name, r1, r2 in pairs:
-                seq = r1 if mate == 1 else r2
-                gz.write(f"@{name}/{mate}\n{seq}\n+\n{'I' * len(seq)}\n".encode())
-    atomic_write_json(project / "04_logs/taps_truth.json", {"fixture": "taps_native_v1", "pairs": len(pairs),
-                      "sample": "Taps_TAPS", "lambda": "unmodified", "pUC19": "CpG_modified", "host": "mixed",
-                      "fragment_bp": 180, "read_bp": 100, "gap_bp": 9, "duplicate_input_pairs": 12,
-                      "reference": str(reference)})
-
-
-def verify_taps_truth(project: Path) -> None:
-    """核对独立 TAPS FASTQ 真值、BAM 保留、对照分母和 sealed 交付的边界。"""
-    truth = json.loads((project / "04_logs/taps_truth.json").read_text())
-    with (project / "03_results/QC_Results/sample_manifest.tsv").open() as handle:
-        rows = list(csv.DictReader(handle, delimiter="\t"))
-    if len(rows) != 1:
-        raise ValueError("TAPS truth must publish exactly one cell")
-    row = rows[0]
-    if row["protocol"] != "taps" or row["methylation_backend"] != "rastair" or int(row["dna_reads"]) != truth["pairs"]:
-        raise ValueError("TAPS truth protocol/demux mismatch")
-    if int(row["bam_primary_records"]) != 2 * int(row["trimmed_pairs"]) or min(
-        int(row["bam_duplicate_records"]), int(row["duplicate_pairs"])
-    ) <= 0:
-        raise ValueError("TAPS truth BAM retention/duplicate mismatch")
-    if not (float(row["lambda_false_positive_pct"]) == 0.0 and float(row["pUC19_conversion_pct"]) == 100.0):
-        raise ValueError("TAPS control truth mismatch")
-    if min(int(row["lambda_cpg_observations"]), int(row["pUC19_cpg_observations"])) <= 0:
-        raise ValueError("TAPS controls have no observations")
-    if row["high_cph_role"] != "not_applicable" or float(row["non_cpg_methylation_pct"]) != 0.0 or int(row["non_cpg_observations"]) <= 0:
-        raise ValueError("TAPS truth requires measured zero host CHG/CHH conversion")
-    if not row["snp_path"] or not (project / row["snp_path"]).is_file() or not Path(str(project / row["snp_path"]) + ".tbi").is_file():
-        raise ValueError("TAPS truth SNP VCF/index is missing")
-    for key in ("retained_bam_path", "retained_bam_index"):
-        if not row[key] or not (project / row[key]).is_file():
-            raise ValueError("TAPS retained BAM/index is missing")
-    marker = json.loads((project / "03_results/run_manifest.json").read_text())
-    if marker["status"] != "complete" or ".bam" in json.dumps(marker["outputs"]):
-        raise ValueError("TAPS sealed inventory must exclude BAM")
-    if (project / "02_work/demux").exists():
-        raise ValueError("TAPS published demux scratch was not reclaimed")
-    print(f"TAPS synthetic truth PASS: {truth['pairs']} pairs; unmethylated lambda / modified pUC19; marked BAM retained")
-
-
-def stage_route_config(project: Path, reference: Path, route: str) -> None:
-    """由 Doctor 在独立项目内统一配置环境已准备好的路线、真实抽样及显式合成补充。"""
-    import yaml
-
-    route_id = resolve_route(route)
-    project, reference = project.resolve(), reference.resolve()
-    for folder in ("00_config", "01_raw", "02_work", "03_results", "04_logs", "05_tmp"):
-        (project / folder).mkdir(parents=True, exist_ok=True)
-    cfg = yaml.safe_load(CONFIG_TEMPLATE_YAML)
-    cfg["references"][TEST_ROUTES[route_id]["reference_key"]] = str(reference)
-    apply_common_route_config(cfg, route_id)
-    fixture_root = Path(__file__).resolve().parent.parent / "resources/doctor_benchmark"
-    fixture = json.loads((fixture_root / "benchmark.json").read_text())
-    cfg["demux"]["min_matched_read_pairs"] = 10
-    manifest = "sample_id\tdna_raw_sample\trna_sample\tspecies\tprotocol\tnotes\n"
-    if route_id == "hg38-taps-rastair":
-        stage_taps_truth(project, reference)
-        manifest += "Taps\tTaps\tTaps_RNA\thg38\ttaps\tindependent_synthetic_truth_with_external_RNA_link\n"
-        cfg["retention"]["keep_final_bam"] = True
-        provenance = {"kind": "independent_synthetic_chemistry_truth", "real_taps_pairs": 0}
-    else:
-        label = fixture["routes"][route_id]["dataset"]
-        dataset = fixture["datasets"][label]
-        for entry in dataset["fastq_files"]:
-            shutil.copyfile(fixture_root / entry["path"], project / "01_raw" / entry["path"])
-        shutil.copyfile(fixture_root / fixture["barcode_map"]["path"], project / "00_config/Barcode_Map.csv")
-        supplement = stage_benchmark_supplement(project, reference, label, route_id)
-        rna = label + "_RNA"
-        manifest += f"{label}\t{label}\t{rna}\t{cfg['species']}\t{cfg['analysis']['protocol']}\treal_Cabernet_DNA_plus_explicit_synthetic_supplement\n"
-        provenance = {"dataset": label, "real_raw_pairs": dataset["read_pairs"],
-                      "source_provenance": dataset["source_provenance"], "supplement": supplement}
-    cfg["slurm"]["jobs"] = 8
-    cfg["runtime"]["local_executor_cores"] = 2
-    (project / "00_config/config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
-    (project / "00_config/sample_manifest.tsv").write_text(manifest)
-    atomic_write_json(project / "04_logs/doctor_fixture.json", {"benchmark_id": BENCHMARK_ID, "route": route_id,
-                      "benchmark_sha256": sha256_file(fixture_root / "benchmark.json"), **provenance})
-
-
-def _benchmark_cpg_metrics(path: Path) -> dict[str, dict[str, int]]:
-    from compression import zstd
-
-    metrics: dict[str, dict[str, int]] = {}
-    seen = set()
-    with zstd.open(path, "rt", encoding="utf-8") as handle:
-        if handle.readline() != "chrom\tpos\tmethyl\tunmethyl\n":
-            raise ValueError(f"Doctor canonical CpG header mismatch: {path}")
-        for line in handle:
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) != 4:
-                raise ValueError(f"Doctor canonical CpG must have four columns: {path}")
-            chrom, pos, methyl, unmethyl = fields
-            pos, methyl, unmethyl = int(pos), int(methyl), int(unmethyl)
-            if min(pos, methyl, unmethyl) < 0 or methyl + unmethyl <= 0 or (chrom, pos) in seen:
-                raise ValueError(f"Doctor canonical CpG invalid/duplicate observation: {path}")
-            seen.add((chrom, pos))
-            counts = metrics.setdefault(chrom, {"rows": 0, "methyl": 0, "unmethyl": 0})
-            counts["rows"] += 1
-            counts["methyl"] += methyl
-            counts["unmethyl"] += unmethyl
-    return metrics
-
-
-def verify_route_outputs(project: Path, benchmark_path: Path, route: str) -> None:
-    """核对多 cell 的拆分/过滤守恒、实际宿主和对照 CpG、SRD 保留及密封交付，保存可追溯回归报告。"""
-    if route not in TEST_ROUTES:
-        raise ValueError(f"unsupported route: {route}")
-    benchmark = json.loads(benchmark_path.read_text())
-    with (project / "03_results/QC_Results/sample_manifest.tsv").open() as handle:
-        rows = list(csv.DictReader(handle, delimiter="\t"))
-    run_manifest = json.loads((project / "03_results/run_manifest.json").read_text())
-    if run_manifest.get("schema_version") != 8 or run_manifest.get("status") != "complete":
-        raise ValueError(f"{route}: sealed run manifest is not complete schema 8")
-    if TEST_ROUTES[route]["protocol"] in {"cabernet", "taps"}:
-        expected_link = "Taps_RNA" if route == "hg38-taps-rastair" else "hg38_cabernet_RNA"
-        if any(row.get("rna_sample") != expected_link or row.get("rna_enrichment_route_id") for row in rows):
-            raise ValueError(f"{route}: external RNA association was lost or became a local RNA route")
-    if not (project / "03_results/QC_Results/multiqc_report.html").is_file():
-        raise ValueError("Doctor MultiQC report missing")
-    expected = benchmark["routes"][route]
-    cpg_metrics = {}
-    if route == "hg38-taps-rastair":
-        verify_taps_truth(project)
-        for row in rows:
-            cpg_metrics[row["sample_id"]] = _benchmark_cpg_metrics(project / row["cpg_path"])
-    else:
-        if len(rows) != len(expected["cells"]) or {row["sample_id"] for row in rows} != set(expected["cells"]):
-            raise ValueError(f"{route}: unexpected final manifest cell set")
-        active = []
-        for row in rows:
-            sample = row["sample_id"]
-            if (row["protocol"] != TEST_ROUTES[route]["protocol"] or row["species"] != TEST_ROUTES[route]["species"]
-                    or row["methylation_backend"] != TEST_ROUTES[route]["methylation_backend"]):
-                raise ValueError(f"{sample}: route identity mismatch")
-            wanted = {**expected["cells"][sample], **{key: expected[key] for key in ("dna_input_read_pairs", "dna_matched_read_pairs")}}
-            for field, value in wanted.items():
-                if row.get(field) != str(value):
-                    raise ValueError(f"{sample}: demux {field}={row.get(field)!r}, expected {value!r}")
-            if row["dna_status"] != "Pass":
-                if row["analysis_status"] != "NOT_ANALYZED" or row["cpg_path"]:
-                    raise ValueError(f"{sample}: low/zero barcode was analyzed")
-                continue
-            active.append(row)
-            for field, minimum in (("backend_accepted_pairs", expected["minimum_accepted_pairs_per_active_cell"]),
-                                   ("final_retained_pairs", expected["minimum_final_pairs_per_active_cell"])):
-                if int(row[field]) < minimum:
-                    raise ValueError(f"{sample}: {field} below {minimum}")
-            trimmed, accepted, rejected, duplicate, postdedup, removed, final = (int(row[field]) for field in
-                ("trimmed_pairs", "backend_accepted_pairs", "backend_rejected_pairs", "duplicate_pairs", "postdedup_pairs",
-                 "high_cph_removed_pairs", "final_retained_pairs"))
-            if trimmed != accepted + rejected or accepted != duplicate + postdedup or postdedup != removed + final:
-                raise ValueError(f"{sample}: pair funnel does not close")
-            counts = _benchmark_cpg_metrics(project / row["cpg_path"])
-            cpg_metrics[sample] = counts
-            if sum(value["rows"] for chrom, value in counts.items() if chrom not in {"chrM", "lambda", "pUC19"}) < expected["minimum_host_cpg_rows_per_active_cell"]:
-                raise ValueError(f"{sample}: real host genome CpG coverage missing")
-            if any(counts.get(chrom, {}).get("rows", 0) == 0 for chrom in ("chrM", "lambda", "pUC19")):
-                raise ValueError(f"{sample}: synthetic control CpG coverage missing")
-            if route == "mm10-srd-biscuit":
-                for field in ("dna_tube_rna_reads", "rna_enrichment_rna_reads"):
-                    if int(row[field]) != 12:
-                        raise ValueError(f"{sample}: SRD synthetic RNA count mismatch")
-                for field in ("dna_tube_rna_fastq_r1", "dna_tube_rna_fastq_r2", "rna_enrichment_rna_fastq_r1", "rna_enrichment_rna_fastq_r2", "rna_bam_path"):
-                    if not row[field] or not (project / row[field]).is_file():
-                        raise ValueError(f"{sample}: retained SRD {field} missing")
-                for prefix in ("dna_tube_rna_fastq", "rna_enrichment_rna_fastq"):
-                    if sum(1 for _ in _benchmark_fastq_pairs(project / row[prefix + "_r1"], project / row[prefix + "_r2"])) != 12:
-                        raise ValueError(f"{sample}: collected RNA FASTQ pair count mismatch")
-                if not (project / (row["rna_bam_path"] + ".bai")).is_file():
-                    raise ValueError(f"{sample}: SRD retained BAM index missing")
-        for field, minimum in (("duplicate_pairs", expected["minimum_duplicate_pairs_total"]),
-                               ("high_cph_removed_pairs", expected["minimum_high_cph_pairs_total"])):
-            if sum(int(row[field]) for row in active) < minimum:
-                raise ValueError(f"{route}: {field} regression branch was not exercised")
-    declared = {row["cpg_path"].removeprefix("03_results/") for row in rows if row["cpg_path"]}
-    public = {str(path.relative_to(project / "03_results")) for path in (project / "03_results/CpG").glob("*")}
-    if public != declared or ".bam" in json.dumps(run_manifest["outputs"]):
-        raise ValueError("Doctor public inventory contains unexpected scientific output/BAM")
-    if (project / "02_work/demux").exists():
-        raise ValueError("Doctor published demux scratch was not reclaimed")
-    report = {"status": "PASS", "route": route, "fixture": json.loads((project / "04_logs/doctor_fixture.json").read_text()),
-              "run": run_manifest["run"], "snapshot": json.loads(Path(run_manifest["run"]["snapshot_path"]).read_text()),
-              "cells": rows, "cpg_counts": cpg_metrics, "inventory": run_manifest["outputs"]}
-    atomic_write_json(project / "04_logs/doctor_verification.json", report)
-    print(f"{route}: PASS; {len(declared)} active / {len(rows)} total cells; exact demux, native mapping/filter funnel, CpG and retention verified")
-
-
-SNAPSHOT_SCHEMA_VERSION = 10
-
-_SOURCE_ROOTS = ("core",)
-_SOURCE_SUFFIXES = {".py", ".sh", ".yaml", ".toml", ".rs", ".lock"}
-_SOURCE_EXCLUDED_PARTS = {
-    ".git", ".pytest_cache", ".snakemake", "__pycache__", "conda", "target", "vendor"
-}
-
-
-def _pipeline_source_identity(root: Path) -> Mapping[str, object]:
-    records: list[dict[str, object]] = []
-    for top in _SOURCE_ROOTS:
-        base = root / top
-        if not base.exists():
-            continue
-        for path in sorted(base.rglob("*")):
-            if not path.is_file() or any(part in _SOURCE_EXCLUDED_PARTS for part in path.parts):
-                continue
-            if path.suffix.lower() not in _SOURCE_SUFFIXES and path.name != "Snakefile":
-                continue
-            records.append({
-                "path": str(path.relative_to(root)),
-                "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
-            })
-    design = root / DROPLET_DESIGN_RESOURCE
-    if design.is_file():
-        records.append({"path": DROPLET_DESIGN_RESOURCE, "size_bytes": design.stat().st_size,
-                        "sha256": sha256_file(design)})
-    return {
-        "method": "production-source-tree-v1",
-        "sha256": sha256_bytes(canonical_json_bytes(records)),
-        "file_count": len(records),
-    }
-
-
-def _environment_observation(label: str, prefix: Path) -> Mapping[str, object]:
-    resolved = prefix.expanduser().resolve()
-    warnings: list[str] = []
-    try:
-        record: Mapping[str, object] | None = read_environment_identity(resolved)
-    except (FileNotFoundError, ValueError, OSError) as exc:
-        record = None
-        warnings.append(str(exc))
-    return {
-        "label": label,
-        "resolved_prefix": str(resolved),
-        "record": record,
-        "capture_warnings": warnings,
-    }
-
-
-def _fastq_inventory(
-    raw_dir: Path, manifest_rows: list[ProjectSampleRow], *, protocol: str,
-) -> list[Mapping[str, object]]:
-    discovered = discover_samples(raw_dir, selected_samples=manifest_raw_samples(manifest_rows, protocol))
-    map_discovered_samples_to_manifest(discovered, manifest_rows, protocol=protocol)
-    if not discovered:
-        raise ValueError(f"no paired FASTQ samples found under: {raw_dir}")
-    result: list[Mapping[str, object]] = []
-    for sample, mates in sorted(discovered.items()):
-        r1s, r2s = list(mates["r1"]), list(mates["r2"])
-        if len(r1s) != len(r2s):
-            raise ValueError(f"FASTQ inventory became unpaired for sample {sample!r}")
-        for segment, (r1, r2) in enumerate(zip(r1s, r2s, strict=True), start=1):
-            result.append({
-                "raw_sample": sample,
-                "segment": segment,
-                "r1": stable_file_identity(Path(r1), hash_content=False),
-                "r2": stable_file_identity(Path(r2), hash_content=False),
-            })
-    return result
-
-
-def _executable_identity(path: Path) -> Mapping[str, object]:
-    if not path.is_file():
-        return {"path": str(path), "present": False}
-    observation: dict[str, object] = {
-        "present": True,
-        **stable_file_identity(path, hash_content=True),
-    }
-    if path.name == "demux_rs":
-        try:
-            completed = subprocess.run(
-                [str(path), "--build-info"], check=False, capture_output=True,
-                text=True, timeout=20,
-            )
-            observation["build_info_exit_code"] = completed.returncode
-            if completed.returncode == 0:
-                observation["build_info"] = json.loads(completed.stdout)
-            else:
-                observation["build_info_error"] = completed.stderr.strip()
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            observation["build_info_error"] = str(exc)
-    return observation
-
-
-def _backend_reference_observation(
-    config: Mapping[str, object], reference: Path
-) -> Mapping[str, object]:
-    policy = get_backend(dict(config))
-    if policy.name == "bismark":
-        public = Path(f"{reference}.bismark")
-        if not public.is_dir():
-            raise FileNotFoundError(f"Bismark reference directory is missing or invalid: {public}")
-        resolved = public.resolve(strict=True)
-        genome = resolved / "genome.fa"
-        if not genome.is_file() or genome.stat().st_size == 0:
-            raise FileNotFoundError(f"Incomplete Bismark reference generation: {resolved}")
-        local_alignment = bool(config["bismark"]["local_alignment"])
-        indexes = backend_active_index_paths(
-            reference, "bismark", bismark_local_alignment=local_alignment
-        )
-        missing = [path for path in indexes if not path.is_file() or path.stat().st_size == 0]
-        if missing:
-            raise FileNotFoundError(
-                "Incomplete Bismark index generation: "
-                + ", ".join(str(path) for path in missing[:8])
-            )
-        return {
-            "backend": "bismark",
-            "alignment_mode": "local-faithful" if local_alignment else "end-to-end-combined",
-            "public_path": str(public.absolute()),
-            "resolved_path": str(resolved),
-            "genome": stable_file_identity(genome, hash_content=False),
-            "indexes": [stable_file_identity(path, hash_content=False) for path in indexes],
-        }
-
-    indexes = backend_active_index_paths(reference, policy.name)
-    missing = [path for path in indexes if not path.is_file() or path.stat().st_size == 0]
-    if missing:
-        raise FileNotFoundError(
-            f"Incomplete {policy.name} reference generation: "
-            + ", ".join(str(path) for path in missing)
-        )
-    return {
-        "backend": policy.name,
-        "indexes": [stable_file_identity(path, hash_content=False) for path in indexes],
-    }
-def _snapshot_basis(
+def read_project_sample_manifest(
+    path: Path,
     *,
-    pipeline_root: Path,
-    project_dir: Path,
-    config_path: Path,
-    control_env: Path,
-    biscuit_env: Path,
-    bismark_env: Path,
-    rastair_env: Path,
-    allow_external_config: bool = False,
-) -> Mapping[str, object]:
-    config = load_project_config(config_path)
-    expected_project = config_path.parent.parent.resolve()
-    if not allow_external_config and project_dir.resolve() != expected_project:
-        raise ValueError(f"project/config mismatch: {project_dir} != {expected_project}")
+    species: str,
+    protocol: str,
+) -> list[ProjectSampleRow]:
+    """读取并校验用户维护的项目 sample manifest。"""
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return _parse_project_sample_manifest(handle, path=path, species=species, protocol=protocol)
 
-    sample_manifest = project_dir / "00_config" / "sample_manifest.tsv"
-    barcode_map = project_dir / "00_config" / "Barcode_Map.csv"
-    for path in (config_path, sample_manifest, *([] if config["analysis"]["protocol"] == "droplet" else [barcode_map])):
-        if not path.is_file():
-            raise FileNotFoundError(f"run-start input is missing: {path}")
 
-    species = str(config.get("species", "")).strip()
-    reference = Path(resolve_reference(config, species, project_dir, pipeline_root=pipeline_root))
-    reference_record = reference_identity(
-        reference,
-        expected_species=species or None,
-    )
-    control_observation = _environment_observation("control", control_env)
-    backend = get_backend(config)
-    active_backend_observation = _environment_observation(
-        backend.name, {"biscuit": biscuit_env, "bismark": bismark_env,
-                       "rastair": rastair_env}[backend.name]
-    )
-    protocol = str(config.get("analysis", {}).get("protocol", "")).strip().lower()
-    return {
-        "pipeline": {
-            "root": str(pipeline_root.resolve()),
-            "source": _pipeline_source_identity(pipeline_root),
-        },
-        "analysis": {
+def _parse_project_sample_manifest(
+    handle: TextIO, *, path: Path, species: str, protocol: str
+) -> list[ProjectSampleRow]:
+    input_columns = get_protocol(protocol).raw_input_columns
+    reader = csv.DictReader(handle, delimiter="\t")
+    fields = list(reader.fieldnames or [])
+    _require_header(fields, PROJECT_SAMPLE_MANIFEST_FIELDS, source=path, label="sample manifest")
+    rows: list[ProjectSampleRow] = []
+    seen_ids: dict[str, int] = {}
+    seen_raw: dict[tuple[str, str], tuple[str, str, int]] = {}
+    for raw in reader:
+        line_no = reader.line_num
+        if None in raw:
+            raise ValueError(
+                f"sample_manifest.tsv line {line_no} has more fields than its header"
+            )
+        row = {key: str(raw.get(key, "") or "").strip() for key in PROJECT_SAMPLE_MANIFEST_FIELDS}
+        if not any(row.values()):
+            continue
+        sample_id = row["sample_id"]
+        if not sample_id:
+            raise ValueError(f"sample_manifest.tsv line {line_no} has empty sample_id")
+        if SAMPLE_ID_RE.fullmatch(sample_id) is None:
+            raise ValueError(
+                f"sample_manifest.tsv line {line_no} sample_id={sample_id!r} contains unsupported characters"
+            )
+        if not any(row[column] for column in input_columns):
+            raise ValueError(
+                f"sample_manifest.tsv line {line_no} must define a local FASTQ input: "
+                + " or ".join(input_columns)
+            )
+        if not row["species"]:
+            raise ValueError(f"sample_manifest.tsv line {line_no} has empty species")
+        if row["species"] != species:
+            raise ValueError(
+                f"sample_manifest.tsv line {line_no} species={row['species']!r} "
+                f"does not match config species={species!r}"
+            )
+        if protocol == "droplet" and row["rna_sample"]:
+            raise ValueError("Droplet does not support RNA association")
+        row_protocol = row["protocol"].lower()
+        if not row_protocol:
+            raise ValueError(f"sample_manifest.tsv line {line_no} has empty protocol")
+        if row_protocol != protocol:
+            raise ValueError(
+                f"sample_manifest.tsv line {line_no} protocol={row['protocol']!r} does not match {protocol!r}"
+            )
+        row["protocol"] = row_protocol
+        sid = row["sample_id"]
+        if sid in seen_ids:
+            raise ValueError(
+                f"sample_manifest.tsv line {line_no} repeats sample_id={sid!r} from line {seen_ids[sid]}"
+            )
+        seen_ids[sid] = line_no
+        for column in ("dna_raw_sample", "rna_sample"):
+            raw_sample = row[column]
+            if not raw_sample:
+                continue
+            if SAMPLE_ID_RE.fullmatch(raw_sample) is None:
+                raise ValueError(
+                    f"sample_manifest.tsv line {line_no} {column}={raw_sample!r} contains unsupported characters"
+                )
+            namespace = "Raw sample" if column in input_columns else "External RNA sample"
+            key = (namespace, raw_sample)
+            if key in seen_raw:
+                other_sid, other_col, other_line = seen_raw[key]
+                raise ValueError(
+                    f"{namespace} {raw_sample!r} is mapped more than once: "
+                    f"{other_sid}/{other_col} (line {other_line}) and {sid}/{column} (line {line_no})"
+                )
+            seen_raw[key] = (sid, column, line_no)
+        rows.append(row)
+    if not rows:
+        raise ValueError(f"sample_manifest.tsv contains no usable rows: {path}")
+    return rows
+
+
+MANIFEST_FIELDS = PROJECT_SAMPLE_MANIFEST_FIELDS
+
+
+def _read_existing_manifest_loose(path: Path) -> list[ProjectSampleRow]:
+    if not path.is_file() or path.stat().st_size == 0:
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        fields = list(reader.fieldnames or [])
+        if not fields:
+            return []
+        if fields != list(MANIFEST_FIELDS):
+            raise ValueError(
+                f"Existing sample manifest {path} header/order does not match the current contract: "
+                f"expected={list(MANIFEST_FIELDS)!r}, observed={fields!r}"
+            )
+        rows: list[ProjectSampleRow] = []
+        for raw in reader:
+            if None in raw:
+                raise ValueError(f"Existing sample manifest {path} line {reader.line_num} has too many fields")
+            row = {field: str(raw.get(field, "") or "").strip() for field in MANIFEST_FIELDS}
+            if any(row.values()):
+                rows.append(row)
+        return rows
+
+
+def build_refreshed_rows(
+    discovered_samples: Iterable[str],
+    existing_rows: Sequence[Mapping[str, str]],
+    *,
+    species: str,
+    protocol: str,
+) -> list[dict[str, str]]:
+    """由 FASTQ inventory 构建确定性的项目 manifest 行，并提示移除失去本地输入的样本及关联。"""
+    protocol = str(protocol).strip().lower()
+    if protocol not in _PROTOCOLS:
+        raise ValueError(f"Unsupported protocol for manifest refresh: {protocol!r}")
+    input_columns = get_protocol(protocol).raw_input_columns
+    discovered = sorted({str(sample).strip() for sample in discovered_samples if str(sample).strip()})
+    discovered_set = set(discovered)
+    rows_by_id: dict[str, dict[str, str]] = {}
+    raw_owners: dict[str, tuple[str, str]] = {}
+    for old in existing_rows:
+        current_dna = str(
+            old.get("dna_raw_sample", "") or ""
+        ).strip()
+        current_rna = str(old.get("rna_sample", "") or "").strip()
+        kept_dna = current_dna if current_dna in discovered_set else ""
+        kept_rna = current_rna if "rna_sample" not in input_columns or current_rna in discovered_set else ""
+        if not kept_dna and not ("rna_sample" in input_columns and kept_rna):
+            association = (
+                f"；外部 RNA 关联 {current_rna!r} 随该行移除"
+                if current_rna and "rna_sample" not in input_columns else ""
+            )
+            warnings.warn(
+                f"样本 {old.get('sample_id', '')!r} 已无本地 FASTQ，刷新结果将移除该行{association}。",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        sample_id = str(old.get("sample_id", "") or "").strip()
+        if not sample_id:
+            raise ValueError(
+                "An existing manifest row that still matches current FASTQs has an empty sample_id; "
+                "assign it once before refresh so biological identity is not guessed."
+            )
+        if sample_id in rows_by_id:
+            raise ValueError(f"Existing sample manifest repeats sample_id={sample_id!r}")
+        row = {
+            "sample_id": sample_id,
+            "dna_raw_sample": kept_dna,
+            "rna_sample": kept_rna,
             "species": species,
             "protocol": protocol,
-            "methylation_backend": backend.name,
-        },
-        "project": {
-            "path": str(project_dir.resolve()),
-            "config": stable_file_identity(config_path, hash_content=True),
-            "sample_manifest": stable_file_identity(sample_manifest, hash_content=True),
-            **({} if protocol == "droplet" else {"barcode_map": stable_file_identity(barcode_map, hash_content=True)}),
-        },
-        "raw_fastqs": _fastq_inventory(
-            project_dir / "01_raw",
-            read_project_sample_manifest(sample_manifest, species=species, protocol=protocol),
-            protocol=protocol,
-        ),
-        "reference": reference_record,
-        "backend_reference": _backend_reference_observation(config, reference),
-        "environments": {
-            "control": control_observation,
-            backend.name: active_backend_observation,
-        },
-        "executables": {
-            "demux_rs": _executable_identity(
-                pipeline_root / "conda" / "rust" / "bin" / "demux_rs"
-            ),
-        },
-    }
+            "notes": str(old.get("notes", "") or "").strip(),
+        }
+        rows_by_id[sample_id] = row
+        for column in input_columns:
+            raw_sample = row[column]
+            if not raw_sample:
+                continue
+            previous = raw_owners.get(raw_sample)
+            if previous is not None:
+                raise ValueError(
+                    f"Raw sample {raw_sample!r} is mapped more than once: "
+                    f"{previous[0]}/{previous[1]} and {sample_id}/{column}"
+                )
+            raw_owners[raw_sample] = (sample_id, column)
+
+    unmatched = [sample for sample in discovered if sample not in raw_owners]
+    if "rna_sample" not in input_columns:
+        external_rna = {row["rna_sample"] for row in rows_by_id.values() if row["rna_sample"]}
+        misplaced = sorted(set(unmatched) & external_rna)
+        if misplaced:
+            raise ValueError(
+                "FASTQ sample(s) declared only as external RNA links are present in DNA 01_raw: "
+                + ", ".join(misplaced)
+                + ". Keep RNA FASTQs in the RNA project; DNA inputs require an explicit dna_raw_sample mapping."
+            )
+    if protocol == "srd" and unmatched:
+        warnings.warn(
+            "New SRD raw sample(s) default to independent DNA routes: "
+            + ", ".join(unmatched)
+            + ". Move a raw name to rna_sample explicitly if it is an RNA-enrichment tube.",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
-def _make_tree_read_only(root: Path) -> None:
+    for raw_sample in unmatched:
+        if raw_sample in rows_by_id:
+            raise ValueError(
+                f"New raw sample {raw_sample!r} collides with an existing sample_id; "
+                "edit sample_manifest.tsv explicitly instead of inferring a pairing"
+            )
+        rows_by_id[raw_sample] = {
+            "sample_id": raw_sample,
+            "dna_raw_sample": raw_sample,
+            "rna_sample": "",
+            "species": species,
+            "protocol": protocol,
+            "notes": "",
+        }
+        raw_owners[raw_sample] = (raw_sample, "dna_raw_sample")
+
+    if set(raw_owners) != discovered_set:
+        raise AssertionError("Manifest refresh did not assign every raw sample exactly once")
+    return sorted(rows_by_id.values(), key=lambda row: row["sample_id"])
 
 
-    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        os.chmod(path, 0o755 if path.is_dir() else 0o444)
-    os.chmod(root, 0o755)
+def _canonical_project_manifest_rows(
+    rows: Sequence[Mapping[str, object]],
+) -> list[dict[str, str]]:
 
 
-def _make_writable(path: Path) -> None:
-    if path.is_symlink() or not path.is_dir():
-        return
-    os.chmod(path, 0o755)
-    for child in path.rglob("*"):
-        if child.is_symlink() or not child.is_dir():
-            continue
-        try:
-            os.chmod(child, 0o755)
-        except FileNotFoundError:
-            pass
+    normalized: list[dict[str, str]] = []
+    for raw in rows:
+        row = {
+            field: str(raw.get(field, "") or "").strip()
+            for field in MANIFEST_FIELDS
+        }
+        row["protocol"] = row["protocol"].lower()
+        normalized.append(row)
+    return sorted(normalized, key=lambda row: row["sample_id"])
 
 
-def _remove_stage(stage: Path) -> None:
-    if stage.exists():
-        _make_writable(stage)
-        shutil.rmtree(stage)
+def _resolve_config(project_arg: str | None, config_arg: str | None) -> tuple[Path, Path]:
+    cwd = Path.cwd().resolve()
+    if config_arg:
+        config_path = Path(config_arg).expanduser()
+        config_path = (cwd / config_path).resolve() if not config_path.is_absolute() else config_path.resolve()
+        if config_path.parent.name != "00_config" or config_path.name != "config.yaml":
+            raise ValueError("Alopex only accepts <project>/00_config/config.yaml")
+        project = config_path.parent.parent.resolve()
+        if project_arg and Path(project_arg).expanduser().resolve() != project:
+            raise ValueError("--project and --configfile resolve to different project roots")
+    else:
+        project = Path(project_arg).expanduser().resolve() if project_arg else cwd
+        config_path = project / "00_config" / "config.yaml"
+
+    if not project.is_dir():
+        raise FileNotFoundError(f"Project directory does not exist: {project}")
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Project config not found: {config_path}")
+    return project, config_path.resolve()
 
 
-def _copy_observed_file(
-    source: Path, destination: Path, expected: Mapping[str, object], input_store: Path
-) -> Mapping[str, object]:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    input_store.mkdir(parents=True, exist_ok=True)
-    shared = input_store / f"{expected['sha256']}.{destination.name}"
-    if not shared.exists():
-        with source.open("rb") as src, destination.open("wb") as dst:
-            shutil.copyfileobj(src, dst, length=1024 * 1024)
-            dst.flush()
-            os.fsync(dst.fileno())
-        copied = stable_file_identity(destination, hash_content=True)
-        for key in ("size_bytes", "sha256"):
-            if copied.get(key) != expected.get(key):
-                raise RuntimeError(f"file changed while creating run snapshot: {source}")
-        destination.chmod(0o444)
-        try:
-            os.link(destination, shared)
-        except FileExistsError:
-            pass
-        destination.unlink()
-    if shared.is_symlink():
-        raise ValueError(f"snapshot input store may not contain a symlink: {shared}")
-    copied = stable_file_identity(shared, hash_content=True)
-    for key in ("size_bytes", "sha256"):
-        if copied.get(key) != expected.get(key):
-            raise RuntimeError(f"snapshot input store identity changed: {shared}")
-    destination.symlink_to(os.path.relpath(shared, destination.parent))
-    return {
-        "source_path": str(source.resolve()),
-        "snapshot_path": str(destination.name),
-        "size_bytes": copied["size_bytes"],
-        "sha256": copied["sha256"],
-    }
-
-
-def create_run_snapshot(
+def refresh_manifest(
     *,
-    pipeline_root: str | Path,
-    project_dir: str | Path,
-    config_path: str | Path,
-    control_env: str | Path,
-    biscuit_env: str | Path,
-    bismark_env: str | Path,
-    rastair_env: str | Path,
-    allow_external_config: bool = False,
-) -> Path:
-    """按本次 run basis 创建或复用唯一不可变的启动 snapshot。"""
-    pipeline = Path(pipeline_root).expanduser().resolve()
-    project = Path(project_dir).expanduser().resolve()
-    config = Path(config_path).expanduser().resolve()
-    basis = _snapshot_basis(
-        pipeline_root=pipeline,
-        project_dir=project,
-        config_path=config,
-        control_env=Path(control_env).expanduser().resolve(),
-        biscuit_env=Path(biscuit_env).expanduser().resolve(),
-        bismark_env=Path(bismark_env).expanduser().resolve(),
-        rastair_env=Path(rastair_env).expanduser().resolve(),
-        allow_external_config=allow_external_config,
-    )
-    snapshot_id = sha256_bytes(canonical_json_bytes(basis))
-    snapshots_root = project / "04_logs" / "provenance" / "snapshots"
-    input_store = snapshots_root.parent / "inputs"
-    snapshots_root.mkdir(parents=True, exist_ok=True)
-    final = snapshots_root / snapshot_id
-    manifest = final / "manifest.json"
-    if manifest.is_file():
-        load_run_snapshot(manifest)
-        return manifest
+    project_dir: Path,
+    config_path: Path,
+    dry_run: bool = False,
+) -> dict[str, object]:
+    """先在内存中校验完整改名与 manifest 计划；预览不写文件，正式写出失败时回滚改名。"""
+    config = load_project_config(config_path)
 
-    stage = Path(tempfile.mkdtemp(prefix=f".{snapshot_id}.", dir=snapshots_root))
-    try:
-        inputs_dir = stage / "inputs"
-        project_basis = basis["project"]
-        copies = {
-            "config": _copy_observed_file(
-                Path(str(project_basis["config"]["path"])), inputs_dir / "config.yaml",
-                project_basis["config"], input_store
-            ),
-            "sample_manifest": _copy_observed_file(
-                Path(str(project_basis["sample_manifest"]["path"])),
-                inputs_dir / "sample_manifest.tsv", project_basis["sample_manifest"], input_store,
-            ),
-            **({} if basis["analysis"]["protocol"] == "droplet" else {"barcode_map": _copy_observed_file(
-                Path(str(project_basis["barcode_map"]["path"])),
-                inputs_dir / "Barcode_Map.csv", project_basis["barcode_map"], input_store,
-            )}),
-        }
-        payload = {
-            "schema_version": SNAPSHOT_SCHEMA_VERSION,
-            "snapshot_id": snapshot_id,
-            "recorded_at_utc": dt.datetime.now(dt.UTC).isoformat(),
-            "basis": basis,
-            "input_copies": copies,
-        }
-        (stage / "manifest.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    if not project_dir.is_dir():
+        raise FileNotFoundError(f"Project directory does not exist: {project_dir}")
+
+    species = str(config["species"])
+    protocol = get_protocol_policy(config).name
+    raw_dir = project_dir / "01_raw"
+    manifest_path = project_dir / "00_config" / "sample_manifest.tsv"
+
+
+    fastq_renames = resolve_single_pair_fastq_collisions(raw_dir, apply=False)
+    discovered = discover_samples(raw_dir, planned_renames=dict(fastq_renames))
+    if not discovered:
+        raise ValueError(f"No paired FASTQ samples found under: {raw_dir}")
+    existing_rows = _read_existing_manifest_loose(manifest_path)
+    rows = build_refreshed_rows(
+        discovered.keys(), existing_rows, species=species, protocol=protocol
+    )
+    if not rows:
+        raise ValueError("Manifest refresh produced no rows")
+
+
+    new_text = render_tsv(rows, MANIFEST_FIELDS)
+    validated = _parse_project_sample_manifest(
+        io.StringIO(new_text), path=manifest_path, species=species, protocol=protocol
+    )
+    map_discovered_samples_to_manifest(discovered, validated, protocol=protocol)
+    changed = _canonical_project_manifest_rows(existing_rows) != rows
+    backup_path: Path | None = None
+
+    if not dry_run:
+        if fastq_renames:
+            _apply_fastq_renames(raw_dir, fastq_renames)
+        try:
+            if changed:
+                if manifest_path.is_file() and existing_rows:
+                    backup_path = manifest_path.with_name(f"{manifest_path.name}.bak")
+                    shutil.copy2(manifest_path, backup_path)
+                write_tsv_atomic(manifest_path, rows, MANIFEST_FIELDS)
+        except Exception:
+            for source, target in reversed(fastq_renames):
+                target.rename(source)
+            raise
+
+    return {
+        "project_dir": project_dir,
+        "config_path": config_path,
+        "raw_dir": raw_dir,
+        "manifest_path": manifest_path,
+        "species": species,
+        "protocol": protocol,
+        "discovered_count": len(discovered),
+        "row_count": len(rows),
+        "changed": changed,
+        "backup_path": backup_path,
+        "fastq_renames": fastq_renames,
+        "rows": rows,
+        "text": new_text,
+    }
+
+
+def init_project_directory(project_dir: str | Path, pipeline_root: str | Path) -> Path:
+    """初始化项目骨架：目录、config 模板、manifest 头、Barcode Map 与 launcher symlink。"""
+    if not str(project_dir).strip():
+        raise ValueError("empty project path")
+    root = Path(pipeline_root).expanduser().resolve()
+    project = Path(project_dir).expanduser()
+    project.mkdir(parents=True, exist_ok=True)
+    project = project.resolve()
+    if project == root:
+        raise ValueError("the Pipeline installation directory cannot also be a project")
+    for name in ("00_config", "01_raw", "02_work", "03_results", "04_logs", "05_tmp"):
+        (project / name).mkdir(exist_ok=True)
+    config = project / "00_config" / "config.yaml"
+    if not config.exists():
+        config.write_text(CONFIG_TEMPLATE_YAML, encoding="utf-8")
+    manifest = project / "00_config" / "sample_manifest.tsv"
+    if not manifest.exists():
+        manifest.write_text(
+            "sample_id\tdna_raw_sample\trna_sample\tspecies\tprotocol\tnotes\n",
             encoding="utf-8",
         )
-        _make_tree_read_only(stage)
-        try:
-            os.replace(stage, final)
-        except OSError:
-            if not manifest.is_file():
-                raise
-            _remove_stage(stage)
-        load_run_snapshot(manifest)
-        return manifest
-    except Exception:
-        _remove_stage(stage)
-        raise
+    barcode = project / "00_config" / "Barcode_Map.csv"
+    if not barcode.exists() and load_project_config(config)["analysis"]["protocol"] != "droplet":
+        source = root / "resources" / "Barcode_Map.csv"
+        if not source.is_file():
+            raise FileNotFoundError(f"Barcode Map template is missing: {source}")
+        shutil.copy2(source, barcode)
+    launcher = project / "run_pipeline.sh"
+    if not launcher.exists() and not launcher.is_symlink():
+        launcher.symlink_to(root / "core" / "run_pipeline.sh")
+    elif not launcher.is_symlink():
+        print(f"WARNING: {launcher} already exists and was not replaced.")
+    return project
 
 
-def load_run_snapshot_basis(path: str | Path) -> Mapping[str, object]:
-    manifest = Path(path).expanduser().resolve()
-    try:
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid run snapshot JSON: {manifest}: {exc}") from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
-        raise ValueError(f"unsupported run snapshot schema: {manifest}")
-    basis = payload.get("basis")
-    if not isinstance(basis, dict):
-        raise ValueError(f"run snapshot basis is missing: {manifest}")
-    expected_id = sha256_bytes(canonical_json_bytes(basis))
-    if payload.get("snapshot_id") != expected_id or manifest.parent.name != expected_id:
-        raise ValueError(f"run snapshot content address is invalid: {manifest}")
-    return payload
+def print_refresh_result(args, result) -> int:
+    """refresh-manifest 的用户可见输出（预览/更新/未变化 + 改名计划）。"""
+    action = "Previewed" if args.dry_run else ("Updated" if result["changed"] else "Unchanged")
+    print(f"{action} sample manifest")
+    print(f"  Project:  {result['project_dir']}")
+    print(f"  Config:   {result['config_path']}")
+    print(f"  Raw:      {result['raw_dir']}")
+    print(f"  Manifest: {result['manifest_path']}")
+    print(f"  Protocol: {result['protocol']}")
+    print(f"  Species:  {result['species']}")
+    print(f"  FASTQ samples: {result['discovered_count']}")
+    print(f"  Manifest rows: {result['row_count']}")
+    if result["fastq_renames"]:
+        state = "Planned renames" if args.dry_run else "Normalized FASTQ pairs"
+        print(f"  {state}: {len(result['fastq_renames'])} file(s)")
+        for source, target in result["fastq_renames"]:
+            rel_source = Path(source).relative_to(result["raw_dir"])
+            print(f"    {rel_source} -> {target.name}")
+    if result["backup_path"]:
+        print(f"  Backup:   {result['backup_path']}")
+    if args.dry_run:
+        print("\n" + str(result["text"]), end="")
+    return 0
 
 
-def _validate_input_copy(snapshot_root: Path, record: object, expected: object, label: str) -> Path:
-    if not isinstance(record, Mapping) or not isinstance(expected, Mapping):
-        raise ValueError(f"run snapshot {label} copy is malformed")
-    relative = str(record.get("snapshot_path", ""))
-    path = snapshot_root / "inputs" / relative
-    if Path(relative).name != relative or not path.is_file():
-        raise FileNotFoundError(f"run snapshot {label} copy is missing: {path}")
-    stat = path.stat()
-    if stat.st_size != expected.get("size_bytes") or sha256_file(path) != expected.get("sha256"):
-        raise ValueError(f"run snapshot {label} copy changed: {path}")
-    if record.get("size_bytes") != expected.get("size_bytes") or record.get("sha256") != expected.get("sha256"):
-        raise ValueError(f"run snapshot {label} copy identity disagrees with basis")
-    return path
+# 输入与解复用：细胞识别和提交边界
 
-
-def load_run_snapshot(path: str | Path) -> Mapping[str, object]:
-    """加载并校验该唯一不可变 snapshot 及其小型输入副本。"""
-    manifest = Path(path).expanduser().resolve()
-    payload = load_run_snapshot_basis(manifest)
-    project = payload["basis"].get("project")
-    copies = payload.get("input_copies")
-    if not isinstance(project, Mapping) or not isinstance(copies, Mapping):
-        raise ValueError(f"run snapshot input copies are malformed: {manifest}")
-    for key in ("config", "sample_manifest", *([] if payload["basis"]["analysis"]["protocol"] == "droplet" else ["barcode_map"])):
-        _validate_input_copy(manifest.parent, copies.get(key), project.get(key), key)
-    return payload
-
-
-def snapshot_input_path(snapshot: str | Path, key: str) -> Path:
-    """从 snapshot 返回 config/sample_manifest/barcode_map 的不可变副本路径。"""
-    if key not in {"config", "sample_manifest", "barcode_map"}:
-        raise ValueError(f"unsupported snapshot input key: {key}")
-    manifest = Path(snapshot).expanduser().resolve()
-    payload = load_run_snapshot(manifest)
-    root = manifest.parent
-    record = payload.get("input_copies", {}).get(key)
-    if not isinstance(record, Mapping):
-        raise ValueError(f"run snapshot {key} copy is missing")
-    return root / "inputs" / str(record["snapshot_path"])
-
-
-RUN_MANIFEST_SCHEMA_VERSION = 8
-DELIVERY_READY_SCHEMA_VERSION = 2
-CPG_REPRESENTATION = "snapatac2_import_values_0based_v1"
-
-_DELIVERY_DIR_NAMES = frozenset(PUBLIC_RESULT_DIR_NAMES)
-
-
-def _utc_now() -> str:
-    return dt.datetime.now(dt.UTC).isoformat()
-
-
-def _read_json(path: Path, label: str) -> dict[str, object]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid {label} JSON: {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ValueError(f"{label} must contain a JSON object: {path}")
-    return value
-
-
-def _safe_relative(text: object, *, label: str) -> Path:
-    relative = Path(str(text))
-    if (
-        not relative.parts
-        or relative.is_absolute()
-        or ".." in relative.parts
-        or relative == Path(".")
-    ):
-        raise ValueError(f"unsafe {label}: {text!r}")
-    return relative
-
-
-def _delivery_id(value: object) -> str:
-    text = str(value)
-    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
-        raise ValueError(f"invalid delivery id: {text!r}")
-    return text
-
-
-def _remove_path(path: Path) -> None:
-    if not path.exists() and not path.is_symlink():
-        return
-    if path.is_dir() and not path.is_symlink():
-        _make_writable(path)
-        shutil.rmtree(path)
-    else:
-        path.unlink(missing_ok=True)
-
-
-def _output_relative_is_owned(relative: Path) -> bool:
-    return relative.parts[0] in _DELIVERY_DIR_NAMES
-
-
-def _check_result_directories(root: Path, relative: Path, *, label: str) -> None:
-    directory = root
-    for part in (*relative.parts[:-1], None):
-        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
-            raise ValueError(f"{label} requires real result directories: {directory}")
-        if part is not None:
-            directory /= part
-
-
-def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
-    manifest = Path("QC_Results/sample_manifest.tsv")
-    declared = {manifest, Path("QC_Results/multiqc_report.html")}
-    _check_result_directories(results, manifest, label="staged delivery")
-    if (results / manifest).is_symlink():
-        raise ValueError(f"staged result may not be a symlink: {results / manifest}")
-    with (results / manifest).open(encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        required = {"sample_id", "cpg_path", "snp_path"}
-        if not required.issubset(reader.fieldnames or []):
-            raise ValueError("final sample manifest is missing current delivery path fields")
-        for row in reader:
-            for field, directory, suffix in (
-                ("cpg_path", "CpG", ".cpg.tsv.zst"),
-                ("snp_path", "SNP", ".snps.vcf.gz" if row.get("methylation_backend") == "rastair" else ".snps.bed.gz"),
-            ):
-                value = str(row.get(field) or "").strip()
-                if not value:
-                    continue
-                sample_id = str(row.get("sample_id") or "").strip()
-                if SAMPLE_ID_RE.fullmatch(sample_id) is None:
-                    raise ValueError(f"invalid delivery sample_id: {sample_id!r}")
-                relative = Path(directory) / f"{sample_id}{suffix}"
-                if value != f"03_results/{relative.as_posix()}":
-                    raise ValueError(f"final sample manifest has an invalid {field}: {value!r}")
-                declared.add(relative)
-                if field == "snp_path":
-                    declared.add(relative.with_name(relative.name + ".tbi"))
-
-    records: list[dict[str, object]] = []
-    for relative in sorted(declared):
-        _check_result_directories(results, relative, label="staged delivery")
-        path = results / relative
-        if path.is_symlink():
-            raise ValueError(f"staged result may not be a symlink: {path}")
-        if not path.is_file():
-            raise FileNotFoundError(f"declared staged result is missing: {path}")
-        stat = path.stat()
-        records.append(
-            {
-                "path": relative.as_posix(),
-                "size_bytes": stat.st_size,
-                "sha256": sha256_file(path),
-            }
+def demux_source_revision(source_root: str | Path, *, count_only: bool = False) -> str:
+    """计算 Rust 身份；calling 身份排除不参与计数和分子复核的配对输出模块。"""
+    root = Path(source_root).expanduser().resolve()
+    main_rs = root / "src" / "main.rs"
+    paths = [root / "Cargo.toml", root / "Cargo.lock", main_rs,
+             root.parent.parent / DROPLET_DESIGN_RESOURCE]
+    missing = [path for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "missing Rust source identity file(s): " + ", ".join(map(str, missing))
         )
-    return records
-
-
-def _validate_inventory(
-    root: Path,
-    records: object,
-    *,
-    label: str,
-) -> list[dict[str, object]]:
-    if not isinstance(records, list) or not records:
-        raise ValueError(f"{label} inventory is empty or malformed")
-    validated: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for raw in records:
-        if not isinstance(raw, Mapping):
-            raise ValueError(f"{label} inventory contains a malformed record")
-        if (
-            type(raw.get("size_bytes")) is not int
-            or raw["size_bytes"] < 0
-            or re.fullmatch(r"[0-9a-f]{64}", str(raw.get("sha256", ""))) is None
-        ):
-            raise ValueError(f"{label} inventory contains an invalid size/hash record")
-        relative = _safe_relative(raw.get("path", ""), label=f"{label} output path")
-        if not _output_relative_is_owned(relative):
-            raise ValueError(f"{label} inventory contains an unknown output: {relative}")
-        key = relative.as_posix()
-        if key in seen:
-            raise ValueError(f"{label} inventory repeats output: {key}")
-        seen.add(key)
-        _check_result_directories(root, relative, label=label)
-        path = root / relative
-        if not path.is_file() or path.is_symlink():
-            raise FileNotFoundError(f"{label} output is missing: {path}")
-        stat = path.stat()
-        if stat.st_size != raw.get("size_bytes"):
-            raise ValueError(f"{label} output size changed: {path}")
-        validated.append(dict(raw))
-    return validated
-
-
-def write_delivery_ready(
-    out_json: str | Path,
-    *,
-    staged_results_dir: str | Path,
-    run_snapshot_path: str | Path,
-) -> Path:
-    """按最终 sample manifest 声明的 CpG/SNP 与固定 QC 产物生成一次 inventory。
-
-    未声明的 stable stage 文件不进入本次发布；只保存 sealed inventory 与 run snapshot 的绑定，
-    结构上固定的路径（稳定 stage、公开目录）不落盘。
-    """
-    output = Path(out_json).expanduser().resolve()
-    stage_results = Path(staged_results_dir).expanduser().resolve()
-    project = stage_results.parent.parent
-    expected_publish_root = project / "05_tmp" / "finalize" / output.parent.name
-    if output.parent != expected_publish_root.resolve(strict=False):
-        raise ValueError(f"delivery-ready path is outside its publication transaction: {output}")
-    expected_stage = (project / "02_work" / "results_stage").resolve(strict=False)
-    if stage_results != expected_stage:
-        raise ValueError(f"biological result stage must be stable: {stage_results} != {expected_stage}")
-
-    snapshot_path = Path(run_snapshot_path).expanduser().resolve()
-    snapshot = load_run_snapshot(snapshot_path)
-    basis = snapshot.get("basis")
-    if not isinstance(basis, Mapping):
-        raise ValueError("run snapshot basis is missing")
-    project_record = basis.get("project")
-    if not isinstance(project_record, Mapping):
-        raise ValueError("run snapshot delivery identity is incomplete")
-    snapshot_project = Path(str(project_record.get("path", ""))).resolve()
-    if snapshot_project != project.resolve():
-        raise ValueError("run snapshot project and delivery project disagree")
-    delivery_id = _delivery_id(output.parent.name)
-    if snapshot.get("snapshot_id") != delivery_id:
-        raise ValueError("delivery generation must use the run snapshot id")
-
-    payload: dict[str, object] = {
-        "schema_version": DELIVERY_READY_SCHEMA_VERSION,
-        "delivery_id": delivery_id,
-        "recorded_at_utc": _utc_now(),
-        "project_dir": str(project.resolve()),
-        "run_snapshot_path": str(snapshot_path),
-        "outputs": _staged_output_inventory(stage_results),
-    }
-    atomic_write_json(output, payload)
-    return output
-
-def load_delivery_ready(
-    path: str | Path, *, validate_staged: bool = True
-) -> dict[str, object]:
-    manifest = Path(path).expanduser().resolve()
-    payload = _read_json(manifest, "delivery-ready")
-    if payload.get("schema_version") != DELIVERY_READY_SCHEMA_VERSION:
-        raise ValueError(f"unsupported delivery-ready schema: {manifest}")
-    project = Path(str(payload.get("project_dir", ""))).expanduser().resolve()
-
-
-    stage = (project / "02_work" / "results_stage").resolve(strict=False)
-    delivery_id = _delivery_id(payload.get("delivery_id", ""))
-    expected_root = project / "05_tmp" / "finalize" / delivery_id
-    if manifest.parent != expected_root.resolve(strict=False):
-        raise ValueError("delivery-ready location and delivery_id disagree")
-    if validate_staged:
-        _validate_inventory(stage, payload.get("outputs"), label="staged delivery")
-    return payload
-
-
-def _manifest_path(project: Path) -> Path:
-    return project / "03_results" / "run_manifest.json"
-
-
-def load_run_manifest(
-    path_or_project: str | Path,
-    *,
-    validate_outputs: bool = True,
-) -> dict[str, object]:
-    path = Path(path_or_project).expanduser().resolve()
-    manifest = path if path.name == "run_manifest.json" else _manifest_path(path)
-    payload = _read_json(manifest, "run manifest")
-    if payload.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION:
-        raise ValueError(f"unsupported run manifest schema: {manifest}")
-    project = Path(str(payload.get("project_dir", ""))).expanduser().resolve()
-    if manifest != _manifest_path(project).resolve(strict=False):
-        raise ValueError("run manifest project and location disagree")
-    if validate_outputs:
-        _validate_inventory(
-            project / "03_results",
-            payload.get("outputs"),
-            label="published delivery",
+    rust_sources = sorted((root / "src").rglob("*.rs"))
+    if rust_sources != [main_rs]:
+        raise ValueError(
+            "demux_rs source tree must contain only src/main.rs: "
+            + ", ".join(str(path) for path in rust_sources)
         )
-    return payload
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: Path(os.path.relpath(item, root)).as_posix()):
+        relative = Path(os.path.relpath(path, root)).as_posix().encode()
+        data = path.read_bytes()
+        if count_only and path == main_rs:
+            before, output_marker, output_and_rest = data.partition(b"\nmod output {\n")
+            _, droplet_marker, after = output_and_rest.partition(b"\nmod droplet {\n")
+            if not output_marker or not droplet_marker:
+                raise ValueError("cannot locate Rust output and droplet module boundaries")
+            data = before + droplet_marker + after
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    return "sha256:" + digest.hexdigest()
 
 
-_PUBLIC_DIRNAME = "03_results"
-
-
-def _publish_hardlink(stage: Path, public: Path, relative: Path) -> None:
-    destination = public / relative
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    tmp = destination.with_name(
-        f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+def verify_demux_binary_revision(binary_path: str | Path, expected_revision: str) -> None:
+    """校验 demux_rs --build-info 内嵌的源码指纹与当前源码完全一致。"""
+    binary = Path(binary_path).expanduser().resolve()
+    if not binary.is_file():
+        raise FileNotFoundError(f"demux binary missing: {binary}")
+    completed = subprocess.run(
+        [str(binary), "--build-info"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
-    try:
-        os.link(stage / relative, tmp)
-        os.replace(tmp, destination)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-def _prune_stale_public_files(public: Path, allowed: set[str]) -> None:
-    for path in sorted(public.rglob("*"), reverse=True):
-        relative = path.relative_to(public)
-        if path.is_symlink() or path.is_file():
-            if relative.as_posix() not in allowed:
-                _remove_path(path)
-        elif path.is_dir() and not any(path.iterdir()):
-            _remove_path(path)
-
-
-def _run_manifest_payload(ready: Mapping[str, object], snapshot: Mapping[str, object]) -> dict[str, object]:
-    snapshot_path = Path(str(ready["run_snapshot_path"])).resolve()
-    basis = snapshot["basis"]
-    if not isinstance(basis, Mapping):
-        raise ValueError("run snapshot basis is missing")
-    pipeline_record = basis.get("pipeline")
-    analysis_record = basis.get("analysis")
-    reference_record = basis.get("reference")
-    if not all(isinstance(item, Mapping) for item in (pipeline_record, analysis_record, reference_record)):
-        raise ValueError("run snapshot provenance identity is incomplete")
-    return {
-        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
-        "project_dir": str(ready["project_dir"]),
-        "recorded_at_utc": _utc_now(),
-        "status": "complete",
-        "delivery": {
-            "id": ready["delivery_id"],
-        },
-        "pipeline": {
-            "name": "Alopex",
-            "source_root": str(pipeline_record.get("root", "")),
-        },
-        "run": {
-            "protocol": str(analysis_record.get("protocol", "")),
-            "species": str(analysis_record.get("species", "")),
-            "methylation_backend": str(analysis_record.get("methylation_backend", "")),
-            "cpg_representation": CPG_REPRESENTATION,
-            "snapshot_id": snapshot["snapshot_id"],
-            "snapshot_path": str(snapshot_path),
-            "reference_path": str(Path(str(reference_record.get("resolved_path", ""))).resolve()),
-        },
-        "outputs": [dict(item) for item in ready["outputs"]],
-    }
-
-
-def publish_delivery(ready_path: str | Path) -> Path:
-    """发布一笔 sealed 结果树到真实目录 03_results/。
-
-    事务语义是 invalidate-first / commit-last：任何公开文件发生变化之前先删除
-    旧 run_manifest.json，安装并校验全部公开文件之后才写回新 marker——marker 的
-    存在即代表一代完整交付，中断只会留下无 marker 的待重发状态，不会留下
-    「混合代结果 + complete marker」。交付内容全部来自 stable stage 的硬链接，
-    逐文件原子落地（os.replace）；发布中断不损坏 stable stage，重新运行
-    launcher 会直接重走本流程。生产调用必须位于 Snakemake 持有项目锁的
-    onsuccess 回调内，锁在发布与 BAM/demux 清理完成后释放。
-    """
-    ready_manifest = Path(ready_path).expanduser().resolve()
-    ready = load_delivery_ready(ready_manifest, validate_staged=False)
-    project = Path(str(ready["project_dir"])).resolve()
-    public = project / _PUBLIC_DIRNAME
-    stage = (project / "02_work" / "results_stage").resolve(strict=False)
-
-    outputs = _validate_inventory(stage, ready.get("outputs"), label="staged delivery")
-    snapshot_path = Path(str(ready["run_snapshot_path"])).resolve()
-    snapshot = load_run_snapshot(snapshot_path)
-    payload = _run_manifest_payload(ready, snapshot)
-    config = load_project_config(
-        snapshot_path.parent / "inputs" / snapshot["input_copies"]["config"]["snapshot_path"]
-    )
-    for record in outputs:
-        _check_result_directories(public, Path(record["path"]), label="published delivery")
-
-    marker = _manifest_path(project)
-    _remove_path(marker)
-
-    public.mkdir(parents=True, exist_ok=True)
-
-    allowed: set[str] = set()
-    for record in outputs:
-        relative = _safe_relative(record["path"], label="published output path")
-        allowed.add(relative.as_posix())
-        _publish_hardlink(stage, public, relative)
-
-    _prune_stale_public_files(public, allowed)
-    _validate_inventory(public, outputs, label="published delivery")
-
-    atomic_write_json(marker, payload)
-
-    if not config["retention"]["keep_final_bam"]:
-        try:
-            for path in _retained_bam_paths(project, config):
-                path.unlink(missing_ok=True)
-        except (OSError, ValueError) as exc:
-            logger.warning("Could not fully reclaim unretained BAMs: %s", exc)
-
-    finalize_root = project / "05_tmp" / "finalize"
-    if ready_manifest.parent.parent == finalize_root:
-        _remove_path(ready_manifest.parent)
-    clean_demux_scratch_after_publish(project)
-    return marker
-
-
-def _retained_bam_paths(project: Path, config: Mapping[str, object]) -> tuple[Path, ...]:
-    layout = ProjectLayout(project / "02_work", project / "03_results", get_backend(config).name)
-    for directory in (layout.intermediate_dir, layout.intermediate_dir / layout.backend):
-        if directory.is_symlink():
-            raise ValueError(f"Refusing to access retained BAMs through a symlink: {directory}")
-    paths = []
-    with (layout.result_root / "QC_Results/sample_manifest.tsv").open() as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        if not {"sample_id", "analysis_status"} <= set(reader.fieldnames or ()):
-            raise ValueError("Final manifest is missing BAM retention identity/status")
-        for row in reader:
-            if row["analysis_status"] != "PASS":
-                continue
-            if SAMPLE_ID_RE.fullmatch(row["sample_id"]) is None:
-                raise ValueError(f"Invalid retained BAM sample_id: {row['sample_id']!r}")
-            paths.extend(layout.cell(row["sample_id"]).retained_bam_files)
-    return tuple(paths)
-
-
-def clean_demux_scratch_after_publish(project_dir: str | Path) -> None:
-    """在已完成发布后先清除 demux 提交边界；失败时保留 FASTQ，拒绝经目录符号链接清理。"""
-    project = Path(project_dir).expanduser().resolve()
-    scratch = project / "02_work" / "demux"
-    if not scratch.is_dir():
-        return
-    if (project / "02_work").is_symlink() or scratch.is_symlink():
-        logger.warning("Refusing to reclaim demux scratch through a symlink: %s", scratch)
-        return
-    try:
-        _remove_path(scratch / "state")
-    except OSError as exc:
-        logger.warning("Demux state could not be removed; preserving FASTQs: %s: %s", scratch, exc)
-        return
-    try:
-        _remove_path(scratch)
-    except OSError as exc:
-        logger.warning("Could not fully reclaim demux scratch: %s: %s", scratch, exc)
-
-
-def _unsealed_project_state_paths(project: Path) -> tuple[str, ...]:
-    state_paths: list[str] = []
-    for relative in ("02_work", "03_results"):
-        path = project / relative
-        if path.is_dir() and any(path.iterdir()):
-            state_paths.append(relative)
-    runtime_tmp = project / "05_tmp"
-    if runtime_tmp.is_dir():
-        state_paths.extend(
-            f"05_tmp/{child.name}"
-            for child in sorted(runtime_tmp.iterdir(), key=lambda item: item.name)
-            if child.name != "xdg_cache"
+    payload = json.loads(completed.stdout)
+    if not isinstance(payload, dict):
+        raise ValueError("demux --build-info did not return a JSON object")
+    actual = payload.get("source_revision")
+    if actual != expected_revision:
+        raise ValueError(
+            f"demux binary source revision mismatch: {actual!r} != {expected_revision!r}"
         )
-    return tuple(state_paths)
-
-
-def project_status(
-    *,
-    project_dir: str | Path,
-    current_snapshot: str | Path | None = None,
-) -> dict[str, object]:
-    """检查 resumable/public 项目状态，不因 provenance identity 强制重算。
-
-    provenance snapshot 只是审计记录，不决定既有 Snakemake 工作可否复用；
-    复用权威是 Snakemake 自身的 DAG、input、params、code、软件环境与 incomplete-output 逻辑。
-    complete_current 比较 launcher 本次 snapshot 的内容地址并检查声明的保留 BAM/索引，不重算 basis。
-    """
-    project = Path(project_dir).expanduser().resolve()
-    public_manifest = _manifest_path(project)
-    if public_manifest.is_file():
-        try:
-            manifest = load_run_manifest(public_manifest)
-        except (FileNotFoundError, ValueError, OSError) as exc:
-            return {
-                "status": "resumable",
-                "reason": f"public manifest will be replaced: {exc}",
-            }
-        if manifest.get("status") == "complete":
-            if current_snapshot is not None:
-                try:
-                    snapshot = load_run_snapshot(Path(current_snapshot))
-                    if manifest["run"]["snapshot_id"] == snapshot["snapshot_id"]:
-                        config_path = (
-                            Path(current_snapshot).resolve().parent / "inputs"
-                            / snapshot["input_copies"]["config"]["snapshot_path"]
-                        )
-                        config = load_project_config(config_path)
-                        keep_bam = config["retention"]["keep_final_bam"]
-                        for path in _retained_bam_paths(project, config):
-                            if keep_bam and not path.is_file():
-                                return {
-                                    "status": "resumable",
-                                    "reason": f"requested retained BAM/index is missing: {path}",
-                                }
-                            if not keep_bam and (path.exists() or path.is_symlink()):
-                                return {
-                                    "status": "resumable",
-                                    "reason": f"unretained BAM/index awaits cleanup under the Snakemake lock: {path}",
-                                }
-                        return {
-                            "status": "complete_current",
-                            "manifest": str(public_manifest),
-                            "delivery_id": manifest.get("delivery", {}).get("id", ""),
-                        }
-                except (FileNotFoundError, ValueError, RuntimeError, OSError, KeyError, TypeError):
-                    pass
-            return {
-                "status": "resumable",
-                "reason": "completed delivery differs from current inputs/code/environment; reusing compatible Snakemake outputs",
-            }
-        return {
-            "status": "resumable",
-            "reason": "public manifest status is not complete; normal execution will repair it",
-        }
-
-
-    if _unsealed_project_state_paths(project):
-        return {
-            "status": "resumable",
-            "reason": "existing Snakemake work has no provenance snapshot; preserving and reusing it",
-        }
-    return {"status": "new"}
-
-
-def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _validate_copy(source: Path, partial: Path, *, is_bam: bool, samtools: str) -> None:
-    if source.stat().st_size != partial.stat().st_size:
-        raise OSError(f"partial-copy size mismatch: {source} -> {partial}")
-    if is_bam:
-        subprocess.run(
-            [samtools, "quickcheck", "-v", str(partial)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
-    if source.suffix == ".json":
-        with partial.open("r", encoding="utf-8") as handle:
-            json.load(handle)
-
-
-def publish(
-    pairs: list[tuple[Path, Path]],
-    *,
-    commit_last: Path | None,
-    bam_destination: Path | None,
-    samtools: str,
-) -> None:
-    """将文件组 staged 为 .partial 并校验；替换前撤销旧 commit_last，全部完成后最后提交它。"""
-    destinations = [destination for _source, destination in pairs]
-    if len(destinations) != len(set(destinations)):
-        raise ValueError("duplicate destination in atomic publish bundle")
-    if commit_last is not None and commit_last not in destinations:
-        raise ValueError("--commit-last must match one --file destination")
-    if bam_destination is not None and bam_destination not in destinations:
-        raise ValueError("--bam-destination must match one --file destination")
-
-    job_token = os.environ.get("SLURM_JOB_ID", "local")
-    partials: dict[Path, Path] = {}
-    try:
-        for source, destination in pairs:
-            if not source.is_file():
-                raise FileNotFoundError(f"publish source is missing: {source}")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-
-
-            for orphan in destination.parent.glob(f"{destination.name}.partial.*"):
-                if orphan.is_file() or orphan.is_symlink():
-                    orphan.unlink()
-
-            partial = destination.with_name(
-                f"{destination.name}.partial.{job_token}.{os.getpid()}"
-            )
-            with source.open("rb") as reader, partial.open("xb") as writer:
-                partials[destination] = partial
-                shutil.copyfileobj(reader, writer, length=8 * 1024 * 1024)
-                writer.flush()
-                os.fsync(writer.fileno())
-            _validate_copy(
-                source,
-                partial,
-                is_bam=bam_destination is not None and destination == bam_destination,
-                samtools=samtools,
-            )
-
-        ordered = [destination for destination in destinations if destination != commit_last]
-        if commit_last is not None:
-            if commit_last.exists() or commit_last.is_symlink():
-                commit_last.unlink()
-            ordered.append(commit_last)
-
-        for destination in ordered:
-            os.replace(partials[destination], destination)
-            _fsync_directory(destination.parent)
-            del partials[destination]
-    finally:
-        for partial in partials.values():
-            try:
-                partial.unlink()
-            except FileNotFoundError:
-                pass
-
-
-class DemuxRow(TypedDict):
-    demux_sample: str
-    project_sample_id: str
-    raw_sample: str
-    pipeline_mode: str
-    route_id: str
-    demux_mode: str
-    downstream_dna: str
-    demux_report_schema_version: str
-    demux_build_version: str
-    demux_source_revision: str
-    retention_policy: str
-    retention_threshold: str
-    rna_output_role: str
-    high_cph_role: str
-    plate_id: str
-    cell_order: str
-    dna_barcode: str
-    rna_barcode: str
-    dna_reads: str
-    rna_reads: str
-    input_fastq_pairs: str
-    input_read_pairs: str
-    usable_read_pairs: str
-    matched_reads: str
-    unmatched_reads: str
-    ambiguous_reads: str
-    short_reads: str
-    unassigned_rate: str
-    dna_r1: str
-    dna_r2: str
-    rna_r1: str
-    rna_r2: str
-    dna_status: str
-    rna_status: str
-
-
-class ProjectSampleRow(TypedDict):
-    sample_id: str
-    dna_raw_sample: str
-    rna_sample: str
-    species: str
-    protocol: str
-    notes: str
-
-
-class CellIdentityRow(ProjectSampleRow):
-    project_sample_id: str
-    plate_id: str
-    cell_order: str
-    dna_barcode: str
-    rna_barcode: str
-
-
-class BarcodeRow(TypedDict):
-    dna_barcode: str
-    rna_barcode: str
-    plate_id: str
-    cell_order: str
-
-
-class FileIdentity(TypedDict):
-    path: str
-    size_bytes: int
-    sha256: str
-
-
-class DemuxCompletion(TypedDict, total=False):
-    schema_version: int
-    status: str
-    generation_id: str
-    run_id: str
-    project_sample_id: str
-    cell_count: int
-    cell_ids_sha256: str
-    manifest: FileIdentity
-    report: FileIdentity
-    multiqc: FileIdentity
-    initial_cell_manifest: FileIdentity
-    dna_dir: str
-    rna_dir: str
-    _manifest_path: str
-    _cell_manifest_path: str
-    _rows: list[DemuxRow]
-
-
-ManifestIndex = dict[str, list[tuple[Path, DemuxRow]]]
-
-
-class FastqPairFiles(TypedDict):
-    r1: list[str]
-    r2: list[str]
-
-
-class MappedDemuxRun(FastqPairFiles):
-    raw_sample: str
-    sample_id: str
-    route_id: str
-    source_column: str
-
-
-DiscoveredSamples = dict[str, FastqPairFiles]
-MappedDemuxRuns = dict[str, MappedDemuxRun]
-
-
-def render_tsv(
-    rows: Sequence[Mapping[str, object]], fieldnames: Sequence[str]
-) -> str:
-    """按当前 schema 序列化 TSV；固定 Unix 换行与确定性输出。"""
-
-    buffer = io.StringIO(newline="")
-    writer = csv.DictWriter(
-        buffer,
-        fieldnames=list(fieldnames),
-        delimiter="\t",
-        lineterminator="\n",
-        extrasaction="raise",
-    )
-    writer.writeheader()
-    supported = set(fieldnames)
-    for row in rows:
-        unsupported = sorted(set(row) - supported)
-        if unsupported:
-            raise ValueError(
-                "Manifest row contains unsupported field(s): "
-                + ", ".join(str(field) for field in unsupported)
-            )
-        writer.writerow(
-            {
-                field: "" if row.get(field) is None else str(row.get(field, ""))
-                for field in fieldnames
-            }
-        )
-    return buffer.getvalue()
-
-
-def write_tsv_atomic(
-    path: str | Path,
-    rows: Sequence[Mapping[str, object]],
-    fieldnames: Sequence[str],
-) -> None:
-    """先在最终路径旁写临时文件，再以一次原子 rename 发布小体积 manifest。"""
-
-    output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".tmp")
-    temporary.write_text(render_tsv(rows, fieldnames), encoding="utf-8")
-    temporary.replace(output)
-
-
-def file_identity(path: str | Path) -> FileIdentity:
-    source = Path(path).resolve()
-    if not source.is_file():
-        raise FileNotFoundError(f"Committed demux file is missing: {source}")
-    return {
-        "path": str(source),
-        "size_bytes": source.stat().st_size,
-        "sha256": sha256_file(source),
-    }
 
 
 DEMUX_REPORT_SCHEMA_VERSION = 3
+
+
 _REPORT_FIELDS = {
     "schema_version", "build_version", "source_revision", "mode",
     "retention_policy", "retention_threshold", "input_fastq_pairs",
     "input_read_pairs", "usable_read_pairs", "matched_reads", "read_fates", "samples",
 }
+
+
 _FATE_FIELDS = {"dna_assigned", "rna_assigned", "ambiguous", "unmatched", "short"}
+
+
 _SAMPLE_FIELDS = {
     "sample_name", "cell_sample_id", "plate_id", "cell_order", "dna_barcode",
     "rna_barcode", "dna_read_count", "rna_read_count", "dna_status", "rna_status",
 }
+
+
 _OUTPUT_STATUSES = {"Pass", "Zero_Output", "Low_Reads_Removed"}
 
 
@@ -5080,6 +3525,8 @@ def _parse_demux_report(raw: object, source: Path) -> DemuxReport:
 
 
 DEMUX_CHUNK_READ_PAIRS = 50_000_000
+
+
 DEMUX_CHUNK_RAW_BYTES = 16 * 1024 ** 3
 
 
@@ -5492,125 +3939,6 @@ def merge_demux_chunks(index_dir: str | Path, packs_dir: str | Path, dna_dir: st
     result = Path(report_path)
     result.parent.mkdir(parents=True, exist_ok=True)
     result.write_text(json.dumps(aggregate, indent=2) + "\n", encoding="utf-8")
-
-
-PROJECT_SAMPLE_MANIFEST_FIELDS = (
-    "sample_id",
-    "dna_raw_sample",
-    "rna_sample",
-    "species",
-    "protocol",
-    "notes",
-)
-INITIAL_CELL_MANIFEST_FIELDS = (
-    "sample_id",
-    "project_sample_id",
-    "species",
-    "protocol",
-    "plate_id",
-    "cell_order",
-    "dna_barcode",
-    "rna_barcode",
-    "dna_raw_sample",
-    "rna_sample",
-    "notes",
-)
-
-
-def _require_header(fields: list[str], expected: tuple[str, ...], *, source: Path, label: str) -> None:
-    if fields != list(expected):
-        raise ValueError(
-            f"{label} header/order does not match the current contract: {source}; "
-            f"expected={list(expected)!r}, observed={fields!r}"
-        )
-
-
-def read_project_sample_manifest(
-    path: Path,
-    *,
-    species: str,
-    protocol: str,
-) -> list[ProjectSampleRow]:
-    """读取并校验用户维护的项目 sample manifest。"""
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        return _parse_project_sample_manifest(handle, path=path, species=species, protocol=protocol)
-
-
-def _parse_project_sample_manifest(
-    handle: TextIO, *, path: Path, species: str, protocol: str
-) -> list[ProjectSampleRow]:
-    input_columns = get_protocol(protocol).raw_input_columns
-    reader = csv.DictReader(handle, delimiter="\t")
-    fields = list(reader.fieldnames or [])
-    _require_header(fields, PROJECT_SAMPLE_MANIFEST_FIELDS, source=path, label="sample manifest")
-    rows: list[ProjectSampleRow] = []
-    seen_ids: dict[str, int] = {}
-    seen_raw: dict[tuple[str, str], tuple[str, str, int]] = {}
-    for raw in reader:
-        line_no = reader.line_num
-        if None in raw:
-            raise ValueError(
-                f"sample_manifest.tsv line {line_no} has more fields than its header"
-            )
-        row = {key: str(raw.get(key, "") or "").strip() for key in PROJECT_SAMPLE_MANIFEST_FIELDS}
-        if not any(row.values()):
-            continue
-        sample_id = row["sample_id"]
-        if not sample_id:
-            raise ValueError(f"sample_manifest.tsv line {line_no} has empty sample_id")
-        if SAMPLE_ID_RE.fullmatch(sample_id) is None:
-            raise ValueError(
-                f"sample_manifest.tsv line {line_no} sample_id={sample_id!r} contains unsupported characters"
-            )
-        if not any(row[column] for column in input_columns):
-            raise ValueError(
-                f"sample_manifest.tsv line {line_no} must define a local FASTQ input: "
-                + " or ".join(input_columns)
-            )
-        if not row["species"]:
-            raise ValueError(f"sample_manifest.tsv line {line_no} has empty species")
-        if row["species"] != species:
-            raise ValueError(
-                f"sample_manifest.tsv line {line_no} species={row['species']!r} "
-                f"does not match config species={species!r}"
-            )
-        if protocol == "droplet" and row["rna_sample"]:
-            raise ValueError("Droplet does not support RNA association")
-        row_protocol = row["protocol"].lower()
-        if not row_protocol:
-            raise ValueError(f"sample_manifest.tsv line {line_no} has empty protocol")
-        if row_protocol != protocol:
-            raise ValueError(
-                f"sample_manifest.tsv line {line_no} protocol={row['protocol']!r} does not match {protocol!r}"
-            )
-        row["protocol"] = row_protocol
-        sid = row["sample_id"]
-        if sid in seen_ids:
-            raise ValueError(
-                f"sample_manifest.tsv line {line_no} repeats sample_id={sid!r} from line {seen_ids[sid]}"
-            )
-        seen_ids[sid] = line_no
-        for column in ("dna_raw_sample", "rna_sample"):
-            raw_sample = row[column]
-            if not raw_sample:
-                continue
-            if SAMPLE_ID_RE.fullmatch(raw_sample) is None:
-                raise ValueError(
-                    f"sample_manifest.tsv line {line_no} {column}={raw_sample!r} contains unsupported characters"
-                )
-            namespace = "Raw sample" if column in input_columns else "External RNA sample"
-            key = (namespace, raw_sample)
-            if key in seen_raw:
-                other_sid, other_col, other_line = seen_raw[key]
-                raise ValueError(
-                    f"{namespace} {raw_sample!r} is mapped more than once: "
-                    f"{other_sid}/{other_col} (line {other_line}) and {sid}/{column} (line {line_no})"
-                )
-            seen_raw[key] = (sid, column, line_no)
-        rows.append(row)
-    if not rows:
-        raise ValueError(f"sample_manifest.tsv contains no usable rows: {path}")
-    return rows
 
 
 @lru_cache(maxsize=1)
@@ -6060,22 +4388,19 @@ def map_discovered_samples_to_manifest(
         raise ValueError("Raw FASTQ / sample_manifest mismatch: manifest raw sample(s) without paired FASTQ: " + ", ".join(missing_fastq))
 
     mapped: MappedDemuxRuns = {}
-    used_run_ids: set[str] = set()
     for raw_sample in sorted(expected_raw):
         identity = expected_raw[raw_sample]
         sid = identity["sample_id"]
         route_id = identity["route_id"]
         run_id = sid if identity["source_column"] == "dna_raw_sample" else f"{sid}__rna"
-        if run_id in used_run_ids:
+        if run_id in mapped:
             raise ValueError(f"Canonical demux run ID collision: {run_id!r}")
-        used_run_ids.add(run_id)
         mapped[run_id] = {
             "r1": discovered[raw_sample]["r1"],
             "r2": discovered[raw_sample]["r2"],
             "raw_sample": raw_sample,
             "sample_id": sid,
             "route_id": route_id,
-            "source_column": identity["source_column"],
         }
     return mapped
 
@@ -6089,6 +4414,8 @@ DEMUX_MANIFEST_FIELDS = (
     "matched_reads", "unmatched_reads", "ambiguous_reads", "short_reads", "unassigned_rate",
     "dna_r1", "dna_r2", "rna_r1", "rna_r2", "dna_status", "rna_status",
 )
+
+
 DEMUX_CELL_STATUSES = {"Pass", "Zero_Output", "Low_Reads_Removed"}
 
 
@@ -6123,7 +4450,6 @@ def write_demux_manifest(
     downstream_dna: bool,
     raw_sample: str,
     cell_manifest_path: str,
-    *, calling_metrics: str = "", structure_metrics: str = "",
 ) -> None:
     """把 Rust report 转换为规范的 checkpoint manifest。"""
     rep = report
@@ -6534,6 +4860,8 @@ DEMUX_COMPLETION_SCHEMA = 1
 
 
 _CONTENT_VERIFIED_KEYS = ("manifest", "initial_cell_manifest")
+
+
 _EXISTENCE_KEYS = ("report", "multiqc")
 
 
@@ -6742,12 +5070,14 @@ def validate_demux_completion(
 def demux_manifest_index(
     state_dir: str | Path,
     run_ids: list[str] | tuple[str, ...],
-) -> ManifestIndex:
-    """逐个校验已提交 generation 并按 cell ID 建立行索引。
+    *, protocol: str,
+) -> DemuxIndex:
+    """校验已提交 generation 与当前协议，统一建立 run/cell 索引及通过名单。
 
     反复展开 DAG 的调用方必须自行负责 memoisation；本模块保持纯校验/索引层，不藏任何状态。
     """
     state_dir = Path(state_dir).resolve()
+    protocol = get_protocol(protocol).name
     normalized_runs = tuple(sorted({str(run_id).strip() for run_id in run_ids}))
     if not normalized_runs or any(
         SAMPLE_ID_RE.fullmatch(run_id) is None for run_id in normalized_runs
@@ -6764,7 +5094,8 @@ def demux_manifest_index(
             + ", ".join(str(path) for path in missing)
         )
 
-    index: ManifestIndex = {}
+    by_cell: dict[str, tuple[Path, DemuxRow]] = {}
+    passing: list[str] = []
     for completion in completions:
         run_id = completion.parent.name
         manifest = completion.parent / "manifest.tsv"
@@ -6775,12 +5106,19 @@ def demux_manifest_index(
             raise ValueError(
                 f"Demux completion directory/run_id mismatch: {completion}"
             )
-        for row in committed["_rows"]:
-            sample = str(row.get("demux_sample", "") or "").strip()
-            if not sample or sample == "__SUMMARY__":
+        rows = tuple(row for row in committed["_rows"] if row["demux_sample"] != "__SUMMARY__")
+        for row in rows:
+            if row["pipeline_mode"] != protocol:
+                raise ValueError(f"Demux manifest was produced under a different protocol: {manifest}")
+            if row["downstream_dna"] != "true":
                 continue
-            index.setdefault(sample, []).append((manifest, row))
-    return index
+            sample = row["demux_sample"]
+            if sample in by_cell:
+                raise ValueError(f"Canonical DNA cell {sample!r} appears in more than one committed demux run")
+            by_cell[sample] = (manifest, row)
+            if row["dna_status"] == "Pass":
+                passing.append(sample)
+    return DemuxIndex(state_dir, normalized_runs, MappingProxyType(by_cell), tuple(passing))
 
 
 def read_demux_generation(
@@ -6815,38 +5153,26 @@ def read_demux_generation(
 
 
 def resolve_demux_fastq_from_manifest(
-    state_dir: str,
     demux_sample: str,
     read_pair: int,
     *,
-    manifest_index: ManifestIndex,
+    manifest_index: DemuxIndex,
 ) -> Path:
     """只从已提交的 manifest 解析 dna_status=Pass 的 DNA FASTQ。"""
-    state_dir = Path(state_dir).resolve()
     base = Path(str(demux_sample)).name
     key = f"dna_r{int(read_pair)}"
-    matches = [
-        (manifest, row)
-        for manifest, row in manifest_index.get(base, [])
-        if str(row.get("downstream_dna", "")).strip().lower() == "true"
-    ]
+    match = manifest_index.by_cell.get(base)
 
-    if not matches:
+    if match is None:
         raise FileNotFoundError(
             f"No current demux manifest row found for DNA sample {base!r}. "
             "The checkpoint manifest is the sole authority; remove stale demux markers "
             "and rerun demultiplexing instead of guessing a path."
         )
-    if len(matches) > 1:
-        raise ValueError(
-            f"DNA sample {base!r} appears in multiple demux manifests: "
-            + ", ".join(str(item[0]) for item in matches)
-        )
-
-    manifest, row = matches[0]
+    manifest, row = match
     manifest = manifest.resolve()
     try:
-        manifest.relative_to(state_dir)
+        manifest.relative_to(manifest_index.state_dir)
     except ValueError as exc:
         raise ValueError(
             f"Manifest index entry escapes the committed demux state directory: {manifest}"
@@ -6881,6 +5207,136 @@ def rna_fastq_collect_destination(
     )
 
 
+def write_demux_mqc(
+    report: DemuxReport, out_json: str, pipeline_mode: str, route_id: str,
+    *, calling_metrics: str = "", structure_metrics: str = "",
+) -> None:
+    """把 demultiplexing 统计转换为 MultiQC custom content。"""
+    rep = report
+    policy = get_protocol(pipeline_mode)
+    route = get_raw_route(route_id, policy.name)
+    demux_mode = rep["mode"]
+    if demux_mode != route.demux_mode:
+        raise ValueError(
+            f"Demux report mode {demux_mode!r} does not match raw route "
+            f"{route.route_id!r} ({route.demux_mode!r})"
+        )
+    data = {}
+    for sample in rep["samples"]:
+        key = sample["cell_sample_id"]
+        row = {
+            "Protocol": policy.name,
+            "Route": route.route_id,
+            "PlateID": sample["plate_id"],
+            "Cell_Order": sample["cell_order"],
+            "DNA_Barcode": sample["dna_barcode"],
+            "DNA_Reads": sample["dna_read_count"],
+            "DNA_Status": sample["dna_status"],
+        }
+        if demux_mode == "dna-rna":
+            row.update({
+                "RNA_Barcode": sample["rna_barcode"],
+                "RNA_Reads": sample["rna_read_count"],
+                "RNA_Status": sample["rna_status"],
+            })
+        data[key] = row
+
+    fate = rep["read_fates"]
+    summary = {
+        "Input_Read_Pairs": rep["input_read_pairs"],
+        "Usable_Read_Pairs": rep["usable_read_pairs"],
+        "Matched_Read_Pairs": rep["matched_reads"],
+        "Short_Read_Pairs": fate["short"],
+        "Ambiguous_Read_Pairs": fate["ambiguous"],
+        "Unmatched_Read_Pairs": fate["unmatched"],
+    }
+    if pipeline_mode == "droplet":
+        calling = _read_json(Path(calling_metrics), "Droplet calling")
+        structure = _read_json(Path(structure_metrics), "Droplet structure")
+        if calling.get("status") != "complete" or calling["called_cells"] != len(rep["samples"]):
+            raise ValueError("Droplet calling/report cell count mismatch")
+        screen = calling["barcode_error_screen"]
+        summary.update({"Called_Cells": calling["called_cells"], "Calling_Threshold": calling["threshold"],
+                        "Design_Excluded_Candidates": calling["barcode_design_filter"]["excluded_candidates"],
+                        "Design_Excluded_Exact_Read_Pairs": calling["barcode_design_filter"]["excluded_exact_read_pairs"],
+                        "Barcode_Error_Candidates_Removed": screen["removed_barcodes"],
+                        "Barcode_Molecule_Candidates_Checked": screen["molecule_checked"],
+                        "Barcode_Insufficient_Molecule_Evidence": screen["insufficient_molecule_evidence"],
+                        "Barcode_Child_Signatures_Capped": screen["child_signatures_capped"],
+                        "Structured_Reads": structure["structured_reads"], "Structured_UMI_With_N": structure["umi_with_n"]})
+    route_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", route.route_id)
+    obj = {
+        "id": f"demux_rs_{route_key}",
+        "section_name": f"Demultiplexing Stats: {route.route_id}",
+        "description": (
+            f"Protocol={policy.name}; route={route.route_id}; "
+            f"read interpreter={demux_mode}; "
+            f"retention threshold={rep['retention_threshold']} read pairs. "
+            f"Run summary: {summary}"
+        ),
+        "plot_type": "table",
+        "pconfig": {
+            "id": f"demux_rs_table_{route_key}",
+            "title": f"Demultiplexing Statistics: {route.route_id}",
+            "col1_header": "Sample Name",
+        },
+        "data": data,
+    }
+    atomic_write_json(out_json, obj)
+
+
+# 科学处理：共用统计
+
+_COUNT = r"([0-9][0-9,]*)"
+
+
+def _required_count(text: str, label: str, patterns: Sequence[str]) -> int:
+    matches: list[int] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
+            matches.append(int(match.group(1).replace(",", "")))
+    if not matches:
+        raise ValueError(f"Bismark report is missing required field: {label}")
+    if len(set(matches)) != 1:
+        raise ValueError(f"Bismark report has conflicting values for {label}: {matches}")
+    return matches[0]
+
+
+def _optional_count(text: str, label: str, patterns: Sequence[str], *, default: int = 0) -> int:
+    matches: list[int] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
+            matches.append(int(match.group(1).replace(",", "")))
+    if not matches:
+        return default
+    if len(set(matches)) != 1:
+        raise ValueError(f"Bismark report has conflicting values for {label}: {matches}")
+    return matches[0]
+
+
+def _required_float(text: str, label: str, pattern: str) -> float:
+    matches = [
+        float(match.group(1))
+        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
+    ]
+    if not matches:
+        raise ValueError(f"Bismark report is missing required field: {label}")
+    if any(not math.isclose(matches[0], value, abs_tol=1e-9) for value in matches[1:]):
+        raise ValueError(f"Bismark report has conflicting values for {label}: {matches}")
+    return matches[0]
+
+
+def _count_bam_pairs(bam: Path, samtools: str) -> int:
+    result = subprocess.run(
+        [samtools, "view", "-c", str(bam)],
+        check=True, text=True, stdout=subprocess.PIPE,
+    )
+    records = int(result.stdout.strip())
+    if records < 0 or records % 2:
+        raise ValueError("Bismark processed BAM contains an odd or negative alignment count")
+    return records // 2
+
+
 def _parse_cutadapt_metrics(path: Path) -> dict[str, int | float]:
     payload = _read_json_if_present(path)
     counts = payload.get("read_counts")
@@ -6906,77 +5362,6 @@ def _parse_cutadapt_metrics(path: Path) -> dict[str, int | float]:
     }
 
 
-def _parse_cph_methylation_pct(path: Path) -> float:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    if not lines or lines[0].strip() != "BISCUITqc CpH Retention by Read Position Table":
-        raise ValueError(f"Malformed BISCUIT CpH retention title: {path}")
-    if len(lines) < 2:
-        raise ValueError(f"BISCUIT CpH retention table lacks a header: {path}")
-    reader = csv.DictReader(lines[1:], delimiter="\t")
-    required = {"ReadInPair", "Position", "Conversion/Retention", "Count"}
-    if not required.issubset(set(reader.fieldnames or [])):
-        raise ValueError(f"Malformed BISCUIT CpH retention header: {path}")
-    seen: set[tuple[str, int, str]] = set()
-    retained = total = 0
-    for row in reader:
-        read = str(row["ReadInPair"]).strip()
-        state = str(row["Conversion/Retention"]).strip()
-        if read not in {"1", "2"} or state not in {"C", "R"}:
-            raise ValueError(f"Malformed BISCUIT CpH retention row: {path}: {row}")
-        try:
-            position = int(str(row["Position"]).strip())
-            count = int(str(row["Count"]).strip())
-        except ValueError as exc:
-            raise ValueError(f"Invalid BISCUIT CpH count/position: {path}: {row}") from exc
-        if position < 0 or count < 0:
-            raise ValueError(f"Negative BISCUIT CpH count/position: {path}: {row}")
-        identity = (read, position, state)
-        if identity in seen:
-            raise ValueError(f"Duplicate BISCUIT CpH state: {path}: {row}")
-        seen.add(identity)
-        total += count
-        if state == "R":
-            retained += count
-    return 100.0 * retained / total if total else math.nan
-
-
-def _parse_bismark_non_cpg_methylation_pct(path: Path) -> float:
-    text = path.read_text(encoding="utf-8", errors="strict")
-    counts: dict[tuple[str, str], int] = {}
-    for state in ("Methylated", "Unmethylated"):
-        for context in ("CHG", "CHH"):
-            if state == "Methylated":
-                patterns = (
-                    rf"^(?:Total )?methylated C(?:'|’)?s in {context} context:\s*([0-9][0-9,]*)\s*$",
-                    rf"^(?:Total )?methylated cytosines in {context} context:\s*([0-9][0-9,]*)\s*$",
-                )
-            else:
-                patterns = (
-                    rf"^(?:Total )?unmethylated C(?:'|’)?s in {context} context:\s*([0-9][0-9,]*)\s*$",
-                    rf"^(?:Total )?unmethylated cytosines in {context} context:\s*([0-9][0-9,]*)\s*$",
-                    rf"^Total C to T conversions in {context} context:\s*([0-9][0-9,]*)\s*$",
-                )
-            observed = [
-                int(match.group(1).replace(",", ""))
-                for pattern in patterns
-                for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
-            ]
-            if not observed:
-                raise ValueError(
-                    f"Bismark extraction report lacks {state} {context} count: {path}"
-                )
-            if len(set(observed)) != 1:
-                raise ValueError(
-                    f"Bismark extraction report has conflicting {state} {context} counts: {path}"
-                )
-            counts[(state, context)] = observed[0]
-    methylated = sum(counts[("Methylated", context)] for context in ("CHG", "CHH"))
-    total = methylated + sum(
-        counts[("Unmethylated", context)] for context in ("CHG", "CHH")
-    )
-    return 100.0 * methylated / total if total else math.nan
-
-
 def _read_json_if_present(path: Path) -> dict[str, object]:
     if not path.is_file():
         return {}
@@ -6988,95 +5373,6 @@ def _read_json_if_present(path: Path) -> dict[str, object]:
         raise ValueError(f"JSON root must be an object: {path}")
     return value
 
-
-def _read_dupsifter_metrics(
-    path: Path, sample: str, trimmed_pairs: int
-) -> tuple[dict[str, int], dict[str, int]]:
-    payload = _read_json_if_present(path)
-    data = payload.get("data")
-    if not isinstance(data, dict) or set(data) != {sample}:
-        raise ValueError(f"Dupsifter QC must contain exactly sample {sample!r}: {path}")
-    row = data[sample]
-    if not isinstance(row, dict):
-        raise ValueError(f"Dupsifter QC sample row is invalid: {path}")
-    native: dict[str, int] = {}
-    for field in DUPSIFTER_MQC_FIELDS:
-        value = row.get(field)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"Dupsifter QC has invalid {field}: {path}")
-        native[field.lower()] = value
-
-    both = native["both_mapped"]
-    one = native["one_mapped_forward"] + native["one_mapped_reverse"]
-    unmapped = native["no_mapped"]
-    no_primary = native["no_primary"]
-
-
-    accepted = both + one
-    rejected = unmapped + no_primary
-    duplicate = native["dup_both"] + native["dup_forward"] + native["dup_reverse"]
-    if accepted + rejected != trimmed_pairs:
-        raise ValueError(
-            "Dupsifter pair categories disagree with Cutadapt output: "
-            f"accepted({accepted}) + rejected({rejected}) != trimmed({trimmed_pairs})"
-        )
-    if duplicate > accepted:
-        raise ValueError(
-            f"Dupsifter duplicate pairs exceed accepted mapped pairs: {path}"
-        )
-    return native, {
-        "both_primary_mapped_pairs": both,
-        "one_primary_mapped_pairs": one,
-        "backend_accepted_pairs": accepted,
-        "backend_rejected_pairs": rejected,
-        "unmapped_pairs": unmapped,
-        "no_primary_pairs": no_primary,
-        "duplicate_pairs": duplicate,
-        "postdedup_pairs": accepted - duplicate,
-    }
-
-
-def _read_biscuit_native_mapping(path: Path) -> dict[str, object]:
-    if not path.is_file():
-        raise FileNotFoundError(f"Missing BISCUIT MAPQ table: {path}")
-    lines = path.read_text(encoding="utf-8").splitlines()
-    if len(lines) < 3 or lines[:2] != ["BISCUITqc Mapping Quality Table", "MapQ\tCount"]:
-        raise ValueError(f"Malformed BISCUIT MAPQ table header or missing counts: {path}")
-    rows = [line for line in lines[2:] if line.strip()]
-    if not rows:
-        raise ValueError(f"BISCUIT MAPQ table lacks count rows: {path}")
-    optimal = suboptimal = unaligned = 0
-    for line in rows:
-        fields = line.split()
-        if len(fields) != 2:
-            raise ValueError(f"Malformed BISCUIT MAPQ row in {path}: {line!r}")
-        label, raw_count = fields[0], fields[1].replace(",", "")
-        try:
-            count = int(raw_count)
-        except ValueError as exc:
-            raise ValueError(f"Invalid BISCUIT MAPQ count in {path}: {line!r}") from exc
-        if count < 0:
-            raise ValueError(f"Negative BISCUIT MAPQ count in {path}: {line!r}")
-        if label == "unmapped":
-            unaligned += count
-        else:
-            try:
-                mapq = int(label)
-            except ValueError as exc:
-                raise ValueError(f"Invalid BISCUIT MAPQ label in {path}: {label!r}") from exc
-            if mapq >= 40:
-                optimal += count
-            else:
-                suboptimal += count
-    total = optimal + suboptimal + unaligned
-    return {
-        "optimally_aligned_reads": optimal,
-        "suboptimally_aligned_reads": suboptimal,
-        "unaligned_native_reads": unaligned,
-        "native_mapping_policy": "biscuit_primary_mapq_ge_40",
-        "native_mapping_unit": "individual_primary_reads_postdedup",
-        "native_mapping_pct": 100.0 * optimal / total if total else 0.0,
-    }
 
 def _read_high_cph_summary(path: Path, sample: str, backend: str) -> dict[str, object]:
     if backend == "bismark":
@@ -7182,352 +5478,1128 @@ def _read_high_cph_summary(path: Path, sample: str, backend: str) -> dict[str, o
     return payload
 
 
-def _write_pair_level_multiqc(rows: list[dict[str, object]], out_json: Path) -> None:
-    data: dict[str, dict[str, object]] = {}
-    for row in rows:
-        if row.get("backend_qc_status") != "PASS":
-            continue
-        sample = str(row["sample_id"])
-        input_pairs = int(row["cutadapt_input_pairs"])
-        trimmed_pairs = int(row["trimmed_pairs"])
-        accepted_pairs = int(row["backend_accepted_pairs"])
-        duplicate_pairs = int(row["duplicate_pairs"])
-        postdedup_pairs = int(row["postdedup_pairs"])
-        final_pairs = int(row["final_retained_pairs"])
-        non_cpg = float(row["non_cpg_methylation_pct"])
-        data[sample] = {
-            "Backend": row["methylation_backend"],
-            "Mapping_Policy": row["mapping_policy"],
-            "Input_Pairs": input_pairs,
-            "Trimmed_Pairs": trimmed_pairs,
-            "Accepted_Pairs": accepted_pairs,
-            "PostDedup_Pairs": postdedup_pairs,
-            "Final_Retained_Pairs": final_pairs,
-            "Trim_Retention_pct": (
-                100.0 * trimmed_pairs / input_pairs if input_pairs else 0.0
-            ),
-            "Native_Mapping_pct": float(row["native_mapping_pct"]),
-            "Native_Mapping_Unit": row["native_mapping_unit"],
-            "Duplicate_Pair_Rate_pct": (None if row.get("protocol") == "droplet" else
-                100.0 * duplicate_pairs / accepted_pairs if accepted_pairs else 0.0
-            ),
-            "Dedup_Policy": row["dedup_policy"],
-            **{key: row[key] for key in ("cpg_read_observations", "cpg_umi_observations", "cpg_ambiguous_umi_sites") if key in row},
-            "PostDedup_Retention_pct": (
-                100.0 * postdedup_pairs / accepted_pairs if accepted_pairs else 0.0
-            ),
-            "Final_Pair_Yield_pct": (
-                100.0 * final_pairs / input_pairs if input_pairs else 0.0
-            ),
-            "High_CpH_Flag_Rate_pct": (None if row["methylation_backend"] == "rastair" else 100.0 * float(row["high_cph_fraction"])),
-            "High_CpH_Status": row["high_cph_role"],
-            **{key: row[key] for key in ("lambda_cpg_observations", "lambda_false_positive_pct", "pUC19_cpg_observations", "pUC19_conversion_pct", "bam_primary_records") if key in row},
-            "Non_CpG_Methylation_pct": non_cpg if math.isfinite(non_cpg) else None,
-            **{key: row[key] for key in ("non_cpg_observations", "non_cpg_candidate_pairs", "non_cpg_oriented_pairs", "non_cpg_ambiguous_pairs", "snp_sites") if key in row},
-        }
-    payload = {
-        "id": "dna_pipeline_pair_level_qc",
-        "section_name": "Alopex pair-level QC",
-        "description": (
-            "Read-pair retention funnel plus backend-native mapping QC. BISCUIT native "
-            "mapping is primary MAPQ>=40 individual reads; Bismark native mapping is "
-            "unique concordant read pairs. These mapping percentages use declared units "
-            "and must not be treated as the same numerator definition. TAPS uses proper primary pairs "
-            "with at least one MAPQ>=20 non-QC-failed mate; duplicate flags are excluded only during calling. "
-            "TAPS Non-CpG is uncorrected CHG/CHH conversion in host pairs with unambiguous CpG-based orientation; "
-            "SNPs/errors may contribute and unorientable pairs are excluded. "
-            "TAPS high-CpH filtering is not applicable; cDNA is not excluded. Lambda assumes unmethylated "
-            "DNA (CpG false positives); pUC19 assumes CpG-methylated DNA (conversion); missing coverage is not assessed."
-        ),
-        "plot_type": "table",
-        "pconfig": {
-            "id": "dna_pipeline_pair_level_qc_table",
-            "title": "Canonical pair-level QC",
-            "col1_header": "Cell",
-        },
-        "data": data,
-    }
-    atomic_write_json(out_json, payload)
+# 科学处理：BISCUIT
+
+BSCONV_P_COLUMNS = 9
 
 
-def _write_cutadapt_multiqc(rows: list[dict[str, object]], out_json: Path) -> None:
-    data: dict[str, dict[str, object]] = {}
-    for row in rows:
-        if row.get("backend_qc_status") != "PASS":
-            continue
-        input_pairs = int(row["cutadapt_input_pairs"])
-        trimmed_pairs = int(row["trimmed_pairs"])
-        data[str(row["sample_id"])] = {
-            "Input_Pairs": input_pairs,
-            "Trimmed_Pairs": trimmed_pairs,
-            "Trim_Retention_pct": (
-                100.0 * trimmed_pairs / input_pairs if input_pairs else 0.0
-            ),
-            "R1_Adapter_pct": float(row["r1_adapter_pct"]),
-            "R2_Adapter_pct": float(row["r2_adapter_pct"]),
-        }
-    payload = {
-        "id": "dna_pipeline_cutadapt_qc",
-        "section_name": "Alopex Cutadapt R1/R2 QC",
-        "description": (
-            "Lightweight trimming QC parsed from the production Cutadapt JSON; "
-            "no FASTQ is rescanned for presentation."
-        ),
-        "plot_type": "table",
-        "pconfig": {
-            "id": "dna_pipeline_cutadapt_qc_table",
-            "title": "Cutadapt R1 / R2 QC",
-            "col1_header": "Cell",
-        },
-        "data": data,
-    }
-    atomic_write_json(out_json, payload)
+def open_text(path: Path) -> TextIO:
+    if str(path) == "-":
+        return sys.stdin
+    return path.open("r", encoding="utf-8")
 
 
-def write_final_sample_manifest(
-    initial_cell_manifest: str,
-    intermediate_dir: str,
-    staged_results_dir: str,
-    out_tsv: str,
-    *,
-    options: Mapping[str, object],
-    published_results_dir: str | None = None,
-    bismark: str | None = None,
-    pair_qc_multiqc_json: str | None = None,
-    cutadapt_qc_multiqc_json: str | None = None,
-    workers: int = 1,
-) -> None:
-    """把已提交的 demux 身份与已启用的 per-cell 结果产物连接成最终 manifest。
+def normalize_read_name(value: str) -> str:
 
-    编排五个纯阶段：选项解析 → 期望 route 规划 → 已提交代际合并 →
-    per-cell 指标核算 → 排序与落盘；阶段之间只通过显式参数传递数据。
-    """
-    intermediate = Path(intermediate_dir)
-    demux_state = intermediate / "demux" / "state"
-    results = Path(staged_results_dir)
-    published_results = Path(published_results_dir) if published_results_dir else results
-    opts = _parse_final_options(options)
-    layout = ProjectLayout(intermediate, results, opts["backend"])
-    published_layout = ProjectLayout(intermediate, published_results, opts["backend"])
-    output = Path(out_tsv)
-
-    initial_cells = read_cell_identity_manifest(initial_cell_manifest)
-    cells: dict[str, dict[str, object]] = {
-        cell_id: dict(row) for cell_id, row in initial_cells.items()
-    }
+    return str(value).strip().split()[0]
 
 
-    expected_runs = _plan_expected_runs(cells, demux_state)
-    _merge_committed_generations(
-        demux_state,
-        initial_cell_manifest,
-        cells,
-        expected_runs,
+def indexed_excluded_contigs(bam_path: Path, samtools: str, excluded: set[str]) -> list[str]:
+    proc = subprocess.run(
+        [samtools, "idxstats", str(bam_path)],
+        text=True,
+        capture_output=True,
+        check=False,
     )
-    _require_declared_routes(cells)
-    _apply_cell_metrics(
-        cells,
-        layout=layout,
-        published_layout=published_layout,
-        backend=opts["backend"],
-        publish_rna_bam=opts["publish_rna_bam"],
-        generate_snp=opts["generate_snp"],
-        keep_final_bam=opts["keep_final_bam"],
-        bismark=bismark,
-        workers=workers,
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"samtools idxstats failed for {bam_path}")
+    contigs = []
+    for line in proc.stdout.splitlines():
+        fields = line.split("\t")
+        if fields and fields[0] in excluded:
+            contigs.append(fields[0])
+    return contigs
+
+
+def excluded_reads_from_bam(bam_path: Path, samtools: str, excluded: set[str]) -> set[str]:
+    """经 samtools idxstats/view 流式收集排除 contig 上的 QNAME，不物化完整 SAM。"""
+    contigs = indexed_excluded_contigs(bam_path, samtools, excluded)
+    if not contigs:
+        return set()
+
+    proc = subprocess.Popen(
+        [samtools, "view", str(bam_path), *contigs],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
     )
-    _emit_final_tsv(cells, output, pair_qc_multiqc_json, cutadapt_qc_multiqc_json)
-
-
-def _parse_final_options(options: Mapping[str, object]) -> dict[str, object]:
-
-    backend = str(options.get("methylation_backend", "")).strip().lower()
-    if backend not in {"biscuit", "bismark", "rastair"}:
-        raise ValueError("methylation_backend must be biscuit, bismark or rastair")
-    option_fields = {
-        "generate_snp",
-        "keep_final_bam",
-        "publish_rna_bam",
-        "methylation_backend",
-    }
-    if set(options) != option_fields:
-        missing = sorted(option_fields - set(options))
-        extra = sorted(set(options) - option_fields)
-        details = []
-        if missing:
-            details.append("missing=" + ",".join(missing))
-        if extra:
-            details.append("unsupported=" + ",".join(extra))
-        raise ValueError("Final manifest options do not match the current contract: " + "; ".join(details))
-    active_options = dict(options)
-    for key, value in active_options.items():
-        if key == "methylation_backend":
+    assert proc.stdout is not None
+    names = set()
+    for line in proc.stdout:
+        if not line:
             continue
-        if not isinstance(value, bool):
-            raise ValueError(f"Final manifest option {key} must be a boolean")
+        names.add(normalize_read_name(line.split("\t", 1)[0]))
+    proc.stdout.close()
+    stderr = proc.stderr.read() if proc.stderr is not None else ""
+    returncode = proc.wait()
+    if returncode != 0:
+        raise RuntimeError(stderr.strip() or f"samtools view failed for {bam_path}")
+    return names
+
+
+def _high_cph_multiqc_payload(
+    sample_name: str,
+    summary: Mapping[str, object],
+    protocol: str,
+    high_cph_role: str,
+) -> dict[str, object]:
+    if summary.get("backend") == "bismark":
+        return {
+            "id": "dna_pipeline_bismark_nonconversion",
+            "section_name": "Bismark non-conversion filtering",
+            "plot_type": "table", "data": {sample_name: dict(summary)},
+        }
+    fraction = float(summary["high_cph_fraction"])
+    row = {
+        "Candidate_Read_Pairs": int(summary["candidate_read_pairs"]),
+        "Flagged_Read_Pairs": int(summary["flagged_read_pairs"]),
+        "High_CpH_Fraction": fraction,
+        "Excluded_Read_Pairs": int(summary["excluded_read_pairs"]),
+        "Threshold": float(summary["threshold"]),
+    }
+    interpretation = (
+        "candidate cDNA contamination"
+        if high_cph_role == "cdna_contamination"
+        else "residual high-CpH/non-converted DNA reads"
+    )
     return {
-        "backend": backend,
-        "generate_snp": active_options["generate_snp"],
-        "keep_final_bam": active_options["keep_final_bam"],
-        "publish_rna_bam": active_options["publish_rna_bam"],
+        "id": "bsconv_filter",
+        "section_name": "High-CpH Read Assessment",
+        "description": (
+            f"Protocol={protocol}; high-CpH reads are interpreted as {interpretation}. "
+            "They are excluded from DNA methylation pileup."
+        ),
+        "plot_type": "table",
+        "pconfig": {
+            "id": "bsconv_filter_table",
+            "title": "High-CpH Read Assessment",
+            "col1_header": "Sample",
+        },
+        "data": {sample_name: row},
     }
 
 
-def _plan_expected_runs(
-    cells: dict[str, dict[str, object]],
-    demux_state: Path,
-) -> dict[str, dict[str, str]]:
-
-
-    expected_runs: dict[str, dict[str, str]] = {}
-    for record in cells.values():
-        project_id = str(record.get("project_sample_id", "") or "").strip()
-        protocol = str(record.get("protocol", "") or "").strip().lower()
-        dna_raw_sample = str(record.get("dna_raw_sample", "") or "").strip()
-        rna_sample = str(record.get("rna_sample", "") or "").strip()
-        routes = []
-        if dna_raw_sample:
-            routes.append((project_id, default_dna_route(protocol), dna_raw_sample))
-        if rna_sample and "rna_sample" in get_protocol(protocol).raw_input_columns:
-            routes.append((f"{project_id}__rna", "srd_rna_enrichment_tube", rna_sample))
-        for run_id, route_id, raw_sample in routes:
-            expected = {
-                "project_sample_id": project_id,
-                "route_id": route_id,
-                "raw_sample": raw_sample,
-            }
-            if expected_runs.setdefault(run_id, expected) != expected:
-                raise ValueError(f"Demux run_id={run_id!r} has conflicting project sample routes")
-    missing_run_files = []
-    for run_id in sorted(expected_runs):
-        for name in ("manifest.tsv", "completion.json"):
-            path = demux_state / run_id / name
-            if not path.is_file():
-                missing_run_files.append(path)
-    if missing_run_files:
-        raise FileNotFoundError(
-            "Current run is missing committed demux route file(s): "
-            + ", ".join(str(path) for path in missing_run_files)
-        )
-    return expected_runs
-
-
-def _require_declared_routes(cells: dict[str, dict[str, object]]) -> None:
-    for cell_id, record in cells.items():
-        protocol = str(record.get("protocol", "") or "").strip().lower()
-        if str(record.get("dna_raw_sample", "") or "").strip():
-            expected_route = default_dna_route(protocol)
-            if record.get("dna_route_id") != expected_route:
-                raise ValueError(
-                    f"Cell {cell_id!r} declares dna_raw_sample but has no matching committed "
-                    f"demux route {expected_route!r}"
-                )
-        if "rna_sample" in get_protocol(protocol).raw_input_columns and str(record.get("rna_sample", "") or "").strip():
-            if record.get("rna_enrichment_route_id") != "srd_rna_enrichment_tube":
-                raise ValueError(
-                    f"Cell {cell_id!r} declares rna_sample but has no matching committed "
-                    "srd_rna_enrichment_tube demux route"
-                )
-
-
-def _merge_committed_generations(
-    demux_state: Path,
-    initial_cell_manifest: str,
-    cells: dict[str, dict[str, object]],
-    expected_runs: dict[str, dict[str, str]],
+def write_multiqc(
+    path: Path,
+    sample_name: str,
+    summary: Mapping[str, object],
+    protocol: str,
+    high_cph_role: str,
 ) -> None:
-    for run_id, expected_run in sorted(expected_runs.items()):
-        manifest = demux_state / run_id / "manifest.tsv"
-        completion = demux_state / run_id / "completion.json"
+    """把 high-CpH 评估汇总写成 MultiQC custom-content table JSON。"""
+    obj = _high_cph_multiqc_payload(sample_name, summary, protocol, high_cph_role)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2) + "\n")
 
-        committed = read_demux_generation(
-            completion,
-            expected_manifest_path=manifest,
-            expected_cell_manifest_path=initial_cell_manifest,
+
+def _parse_excluded_contigs_json(value: str) -> set[str]:
+    try:
+        raw = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--excluded-contigs-json is invalid JSON: {exc}") from exc
+    if not isinstance(raw, list) or any(
+        not isinstance(value, str) or not value.strip() for value in raw
+    ):
+        raise ValueError("--excluded-contigs-json must be a JSON array of non-empty strings")
+    if len(set(raw)) != len(raw):
+        raise ValueError("--excluded-contigs-json must not repeat a contig")
+    return {str(value).strip() for value in raw}
+
+
+def _sort_unique_count(source: Path, destination: Path) -> int:
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    os.close(fd)
+    temporary_path = Path(temporary)
+    try:
+        proc = subprocess.run(
+            ["sort", "-u", str(source), "-o", str(temporary_path)],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
         )
-        if committed.get("run_id") != run_id:
-            raise ValueError(
-                f"Demux completion {completion} declares run_id={committed.get('run_id')!r}; "
-                f"expected {run_id!r}"
-            )
-        for demux in committed["_rows"]:
-            cell_id = str(demux.get("demux_sample", "") or "").strip()
-            if not cell_id or cell_id == "__SUMMARY__":
-                continue
-            if cell_id not in cells:
-                raise ValueError(
-                    f"Demux manifest {manifest} contains cell {cell_id!r} absent from initial cell manifest"
-                )
-            record = cells[cell_id]
-            project_id = str(demux.get("project_sample_id", "") or "").strip()
+        if proc.returncode != 0:
+            raise ValueError(proc.stderr.strip() or f"sort -u failed for {source}")
+        with temporary_path.open("r", encoding="utf-8") as handle:
+            count = sum(1 for line in handle if line.strip())
+        os.replace(temporary_path, destination)
+        return count
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
-            route = canonical_raw_route_id(str(demux.get("route_id", "") or ""))
-            raw = str(demux.get("raw_sample", "") or "")
-            if (
-                project_id != expected_run["project_sample_id"]
-                or route != expected_run["route_id"]
-                or raw != expected_run["raw_sample"]
+def split_pairs(
+    source: Path, bio: Path, excluded: Path, excluded_contigs: set[str]
+) -> tuple[int, int]:
+    """按原始顺序拆分 paired BAM，校验相邻 R1/R2 并在写出时累计两路 pair 数。"""
+    import pysam
+
+    counts = [0, 0]
+    with pysam.AlignmentFile(str(source), "rb") as reader, \
+         pysam.AlignmentFile(str(bio), "wb", template=reader, format_options=[b"level=1"]) as bio_out, \
+         pysam.AlignmentFile(str(excluded), "wb", template=reader, format_options=[b"level=1"]) as excluded_out:
+        excluded_ids = {reader.get_tid(name) for name in excluded_contigs} - {-1}
+        records = reader.fetch(until_eof=True)
+        for left in records:
+            right = next(records, None)
+            if right is None:
+                raise ValueError("Odd number of alignment records in paired Bismark BAM")
+            if left.query_name != right.query_name:
+                raise ValueError("paired Bismark BAM is not mate-adjacent")
+            if not (
+                left.is_paired and right.is_paired
+                and left.is_read1 != left.is_read2
+                and right.is_read1 != right.is_read2
+                and left.is_read1 == right.is_read2
+                and left.is_read2 == right.is_read1
             ):
-                raise ValueError(
-                    f"Demux route {run_id!r} does not match the declared sample route: "
-                    f"observed=({project_id!r}, {route!r}, {raw!r}), "
-                    f"expected=({expected_run['project_sample_id']!r}, "
-                    f"{expected_run['route_id']!r}, {expected_run['raw_sample']!r})"
-                )
-            if (
-                str(demux.get("pipeline_mode", "")).strip().lower() == "srd"
-                and str(demux.get("rna_status", "")) == "Pass"
-            ):
-                intermediate = demux_state.parent.parent
-                project_root = intermediate.parent
-                collected = [
-                    rna_fastq_collect_destination(intermediate, route, cell_id, mate)
-                    for mate in (1, 2)
-                ]
-                missing = [path for path in collected if not path.is_file()]
-                if missing:
-                    raise FileNotFoundError(
-                        "Committed SRD RNA FASTQ is missing from the collection area "
-                        "(rna_collect_fastq must run first): "
-                        + ", ".join(str(path) for path in missing)
-                    )
-                r1, r2 = (str(path.relative_to(project_root)) for path in collected)
-                if route == "srd_rna_enrichment_tube":
-                    record["rna_enrichment_rna_fastq_r1"] = r1
-                    record["rna_enrichment_rna_fastq_r2"] = r2
+                raise ValueError(f"Bismark records are not an R1/R2 pair: {left.query_name!r}")
+            route = int(bool(excluded_ids.intersection((
+                left.reference_id, left.next_reference_id,
+                right.reference_id, right.next_reference_id,
+            ))))
+            destination = excluded_out if route else bio_out
+            destination.write(left)
+            destination.write(right)
+            counts[route] += 1
+    return counts[0], counts[1]
+
+
+def run_bsconv_extraction(args) -> None:
+    """主流程：流式解析 bsconv TSV、排除指定 contig、按阈值划分高 retention QNAME，
+    外部 sort -u 按 read-pair 去重后写出 high-read-names、summary 与 MultiQC JSON。"""
+    if not 0 <= args.threshold <= 1:
+        raise ValueError("--threshold must be between 0 and 1")
+
+    excluded = _parse_excluded_contigs_json(args.excluded_contigs_json)
+    excluded_read_names: set[str] | None = None
+    total = excluded_rows = metric_rows = missing_metric = 0
+    high_metric_rows = 0
+    args.high_read_names.parent.mkdir(parents=True, exist_ok=True)
+
+
+    raw_high_path: Path | None = None
+    raw_candidate_path: Path | None = None
+    raw_excluded_path: Path | None = None
+    candidate_unique_path: Path | None = None
+    excluded_unique_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=args.high_read_names.name + ".",
+            suffix=".unsorted",
+            dir=args.high_read_names.parent,
+            delete=False,
+        ) as raw_high_handle, tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=args.high_read_names.name + ".",
+            suffix=".candidate.unsorted",
+            dir=args.high_read_names.parent,
+            delete=False,
+        ) as raw_candidate_handle, tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=args.high_read_names.name + ".",
+            suffix=".excluded.unsorted",
+            dir=args.high_read_names.parent,
+            delete=False,
+        ) as raw_excluded_handle:
+            raw_high_path = Path(raw_high_handle.name)
+            raw_candidate_path = Path(raw_candidate_handle.name)
+            raw_excluded_path = Path(raw_excluded_handle.name)
+            with open_text(args.bsconv_tsv) as handle:
+                reader = csv.reader(handle, delimiter="\t")
+                for row in reader:
+                    if not row or row[0].startswith("#"):
+                        continue
+                    if len(row) != BSCONV_P_COLUMNS or not all(
+                        re.fullmatch(r"[0-9]+", value) for value in row[:8]
+                    ) or not row[8].strip():
+                        raise ValueError(
+                            f"Unexpected biscuit bsconv -p row at {args.bsconv_tsv}:{reader.line_num} "
+                            f"(expect 8 nonnegative integer cytosine counts + QNAME): {row!r}"
+                        )
+
+                    read_name = normalize_read_name(row[8])
+                    if excluded_read_names is None:
+                        excluded_read_names = (
+                            excluded_reads_from_bam(
+                                args.alignment_bam, args.samtools, excluded
+                            )
+                            if excluded
+                            else set()
+                        )
+                    total += 1
+                    if read_name in excluded_read_names:
+                        excluded_rows += 1
+                        raw_excluded_handle.write(read_name + "\n")
+                        continue
+
+
+                    retained = int(row[0]) + int(row[2]) + int(row[6])
+                    converted = int(row[1]) + int(row[3]) + int(row[7])
+                    sites = retained + converted
+                    if sites == 0:
+                        missing_metric += 1
+                        continue
+                    metric_rows += 1
+                    raw_candidate_handle.write(read_name + "\n")
+                    if retained / sites > args.threshold:
+                        high_metric_rows += 1
+                        raw_high_handle.write(read_name + "\n")
+
+
+        candidate_unique_path = raw_candidate_path.with_suffix(".unique")
+        excluded_unique_path = raw_excluded_path.with_suffix(".unique")
+        candidate_read_pairs = _sort_unique_count(raw_candidate_path, candidate_unique_path)
+        flagged_read_pairs = _sort_unique_count(raw_high_path, args.high_read_names)
+        excluded_read_pairs = _sort_unique_count(raw_excluded_path, excluded_unique_path)
+        candidate_unique_path.unlink(missing_ok=True)
+        excluded_unique_path.unlink(missing_ok=True)
+    finally:
+        for temporary in (
+            raw_high_path,
+            raw_candidate_path,
+            raw_excluded_path,
+            candidate_unique_path,
+            excluded_unique_path,
+        ):
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    summary = {
+        "schema_version": 2,
+        "backend": "biscuit",
+        "sample": args.sample_name,
+        "metric_unit": "read_pairs",
+        "candidate_read_pairs": candidate_read_pairs,
+        "flagged_read_pairs": flagged_read_pairs,
+        "high_cph_fraction": (
+            flagged_read_pairs / candidate_read_pairs if candidate_read_pairs else 0.0
+        ),
+        "excluded_read_pairs": excluded_read_pairs,
+        "filter_applied": True,
+        "missing_metric_rows": missing_metric,
+        "observed_metric_rows": metric_rows,
+        "flagged_metric_rows": high_metric_rows,
+        "observed_rows": total,
+        "excluded_rows": excluded_rows,
+        "threshold": args.threshold,
+        "metric": "CpH_retention",
+        "comparison": ">",
+        "protocol": args.protocol,
+        "high_cph_role": args.high_cph_role,
+    }
+    args.summary_json.parent.mkdir(parents=True, exist_ok=True)
+    args.summary_json.write_text(json.dumps(summary, indent=2) + "\n")
+    if args.multiqc_json:
+        write_multiqc(
+            args.multiqc_json,
+            args.sample_name,
+            summary,
+            args.protocol,
+            args.high_cph_role,
+        )
+
+
+DUPSIFTER_STAT_FIELDS: tuple[tuple[str, str], ...] = (
+    ("number of individual reads processed", "Reads_Processed"),
+    ("number of reads with both reads mapped", "Both_Mapped"),
+    ("number of reads with only one read mapped to the forward strand", "One_Mapped_Forward"),
+    ("number of reads with only one read mapped to the reverse strand", "One_Mapped_Reverse"),
+    ("number of reads with both reads marked as duplicates", "Dup_Both"),
+    ("number of reads on the forward strand marked as duplicates", "Dup_Forward"),
+    ("number of reads on the reverse strand marked as duplicates", "Dup_Reverse"),
+    ("number of individual primary-alignment reads", "Primary_Reads"),
+    ("number of individual secondary- and supplementary-alignment reads", "Secondary_Supplementary"),
+    ("number of reads with no reads mapped", "No_Mapped"),
+    ("number of reads with no primary reads", "No_Primary"),
+)
+
+
+DUPSIFTER_MQC_FIELDS = tuple(field for _label, field in DUPSIFTER_STAT_FIELDS)
+
+
+def write_dupsifter_mqc(
+    stat_path: str,
+    out_json: str,
+    demux_sample: str,
+    *,
+    metadata: Mapping[str, str],
+) -> None:
+    """从 DAG 提交的 manifest 行写 Dupsifter custom content。"""
+    row = {str(key): str(value or "") for key, value in metadata.items()}
+    if row.get("demux_sample") != demux_sample:
+        raise ValueError(
+            f"Dupsifter metadata sample mismatch: {row.get('demux_sample')!r} "
+            f"!= {demux_sample!r}"
+        )
+    if str(row.get("downstream_dna", "")).strip().lower() != "true":
+        raise ValueError(
+            f"Dupsifter sample {demux_sample!r} belongs to non-DNA route "
+            f"{row.get('route_id')!r}; refusing downstream DNA QC."
+        )
+    if row.get("dna_status") != "Pass":
+        raise ValueError(
+            f"Dupsifter sample {demux_sample!r} has dna_status={row.get('dna_status')!r}; "
+            "refusing downstream DNA QC."
+        )
+
+    plate_id = row.get("plate_id", "")
+    cell_order = row.get("cell_order", "")
+    dna_bc = row.get("dna_barcode", "")
+    raw_sample = row.get("raw_sample", "")
+    pipeline_mode = row.get("pipeline_mode", "")
+    route_id = row.get("route_id", "")
+
+    metrics = {}
+    mapping = dict(DUPSIFTER_STAT_FIELDS)
+    stat = Path(stat_path)
+    if stat.exists():
+        for line_no, line in enumerate(stat.read_text().splitlines(), start=1):
+            if "]" in line and ":" in line:
+                content = line.split("]", 1)[1].strip()
+                if ":" in content:
+                    key, value = content.split(":", 1)
+                    key = key.strip()
+                    value = value.strip().replace(",", "")
+                    if key in mapping:
+                        try:
+                            metrics[mapping[key]] = int(value)
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"Invalid Dupsifter count at {stat}:{line_no}: {key}={value!r}"
+                            ) from exc
+    row_key = demux_sample
+    output_row = {
+        "Protocol": pipeline_mode,
+        "Route": route_id,
+        "PlateID": plate_id,
+        "Cell_Order": cell_order,
+        "DNA_Barcode": dna_bc,
+    }
+    output_row.update(metrics)
+    obj = {
+        "id": "dupsifter",
+        "section_name": "Dupsifter Stats",
+        "description": f"Duplicate marking statistics for {demux_sample}; raw source={raw_sample}",
+        "plot_type": "table",
+        "pconfig": {"id": "dupsifter_table", "title": "Dupsifter Statistics", "col1_header": "Sample Name"},
+        "data": {row_key: output_row},
+    }
+    atomic_write_json(out_json, obj)
+
+
+def _parse_cph_methylation_pct(path: Path) -> float:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0].strip() != "BISCUITqc CpH Retention by Read Position Table":
+        raise ValueError(f"Malformed BISCUIT CpH retention title: {path}")
+    if len(lines) < 2:
+        raise ValueError(f"BISCUIT CpH retention table lacks a header: {path}")
+    reader = csv.DictReader(lines[1:], delimiter="\t")
+    required = {"ReadInPair", "Position", "Conversion/Retention", "Count"}
+    if not required.issubset(set(reader.fieldnames or [])):
+        raise ValueError(f"Malformed BISCUIT CpH retention header: {path}")
+    seen: set[tuple[str, int, str]] = set()
+    retained = total = 0
+    for row in reader:
+        read = str(row["ReadInPair"]).strip()
+        state = str(row["Conversion/Retention"]).strip()
+        if read not in {"1", "2"} or state not in {"C", "R"}:
+            raise ValueError(f"Malformed BISCUIT CpH retention row: {path}: {row}")
+        try:
+            position = int(str(row["Position"]).strip())
+            count = int(str(row["Count"]).strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid BISCUIT CpH count/position: {path}: {row}") from exc
+        if position < 0 or count < 0:
+            raise ValueError(f"Negative BISCUIT CpH count/position: {path}: {row}")
+        identity = (read, position, state)
+        if identity in seen:
+            raise ValueError(f"Duplicate BISCUIT CpH state: {path}: {row}")
+        seen.add(identity)
+        total += count
+        if state == "R":
+            retained += count
+    return 100.0 * retained / total if total else math.nan
+
+
+def _read_dupsifter_metrics(
+    path: Path, sample: str, trimmed_pairs: int
+) -> tuple[dict[str, int], dict[str, int]]:
+    payload = _read_json_if_present(path)
+    data = payload.get("data")
+    if not isinstance(data, dict) or set(data) != {sample}:
+        raise ValueError(f"Dupsifter QC must contain exactly sample {sample!r}: {path}")
+    row = data[sample]
+    if not isinstance(row, dict):
+        raise ValueError(f"Dupsifter QC sample row is invalid: {path}")
+    native: dict[str, int] = {}
+    for field in DUPSIFTER_MQC_FIELDS:
+        value = row.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"Dupsifter QC has invalid {field}: {path}")
+        native[field.lower()] = value
+
+    both = native["both_mapped"]
+    one = native["one_mapped_forward"] + native["one_mapped_reverse"]
+    unmapped = native["no_mapped"]
+    no_primary = native["no_primary"]
+
+
+    accepted = both + one
+    rejected = unmapped + no_primary
+    duplicate = native["dup_both"] + native["dup_forward"] + native["dup_reverse"]
+    if accepted + rejected != trimmed_pairs:
+        raise ValueError(
+            "Dupsifter pair categories disagree with Cutadapt output: "
+            f"accepted({accepted}) + rejected({rejected}) != trimmed({trimmed_pairs})"
+        )
+    if duplicate > accepted:
+        raise ValueError(
+            f"Dupsifter duplicate pairs exceed accepted mapped pairs: {path}"
+        )
+    return native, {
+        "both_primary_mapped_pairs": both,
+        "one_primary_mapped_pairs": one,
+        "backend_accepted_pairs": accepted,
+        "backend_rejected_pairs": rejected,
+        "unmapped_pairs": unmapped,
+        "no_primary_pairs": no_primary,
+        "duplicate_pairs": duplicate,
+        "postdedup_pairs": accepted - duplicate,
+    }
+
+
+def _read_biscuit_native_mapping(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing BISCUIT MAPQ table: {path}")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 3 or lines[:2] != ["BISCUITqc Mapping Quality Table", "MapQ\tCount"]:
+        raise ValueError(f"Malformed BISCUIT MAPQ table header or missing counts: {path}")
+    rows = [line for line in lines[2:] if line.strip()]
+    if not rows:
+        raise ValueError(f"BISCUIT MAPQ table lacks count rows: {path}")
+    optimal = suboptimal = unaligned = 0
+    for line in rows:
+        fields = line.split()
+        if len(fields) != 2:
+            raise ValueError(f"Malformed BISCUIT MAPQ row in {path}: {line!r}")
+        label, raw_count = fields[0], fields[1].replace(",", "")
+        try:
+            count = int(raw_count)
+        except ValueError as exc:
+            raise ValueError(f"Invalid BISCUIT MAPQ count in {path}: {line!r}") from exc
+        if count < 0:
+            raise ValueError(f"Negative BISCUIT MAPQ count in {path}: {line!r}")
+        if label == "unmapped":
+            unaligned += count
+        else:
+            try:
+                mapq = int(label)
+            except ValueError as exc:
+                raise ValueError(f"Invalid BISCUIT MAPQ label in {path}: {label!r}") from exc
+            if mapq >= 40:
+                optimal += count
+            else:
+                suboptimal += count
+    total = optimal + suboptimal + unaligned
+    return {
+        "optimally_aligned_reads": optimal,
+        "suboptimally_aligned_reads": suboptimal,
+        "unaligned_native_reads": unaligned,
+        "native_mapping_policy": "biscuit_primary_mapq_ge_40",
+        "native_mapping_unit": "individual_primary_reads_postdedup",
+        "native_mapping_pct": 100.0 * optimal / total if total else 0.0,
+    }
+
+
+# 科学处理：Bismark 与 Droplet UMI
+
+def parse_alignment_report(path: Path) -> dict[str, int | float]:
+    text = path.read_text(encoding="utf-8", errors="strict")
+    total = _required_count(
+        text,
+        "sequence_pairs_total",
+        [rf"^Sequence pairs analysed in total:\s*{_COUNT}\s*$"],
+    )
+    unique = _required_count(
+        text,
+        "unique_best_pairs",
+        [rf"^Number of paired-end alignments with a unique best hit:\s*{_COUNT}\s*$"],
+    )
+    no_alignment = _required_count(
+        text,
+        "pairs_without_alignment",
+        [rf"^Sequence pairs with no alignments under any condition:\s*{_COUNT}\s*$"],
+    )
+    non_unique = _required_count(
+        text,
+        "pairs_not_unique",
+        [rf"^Sequence pairs did not map uniquely:\s*{_COUNT}\s*$"],
+    )
+    discarded = _optional_count(
+        text,
+        "pairs_discarded_no_genomic_sequence",
+        [
+            rf"^Sequence pairs which were discarded because genomic sequence could not be extracted:\s*{_COUNT}\s*$"
+        ],
+    )
+    mapping_efficiency = _required_float(
+        text, "mapping_efficiency", r"^Mapping efficiency:\s*([0-9]+(?:\.[0-9]+)?)%\s*$"
+    )
+    if unique + no_alignment + non_unique != total:
+        raise ValueError(
+            "Bismark alignment counts are inconsistent: "
+            f"unique({unique}) + unaligned({no_alignment}) + "
+            f"non_unique({non_unique}) != total({total})"
+        )
+    if discarded > unique:
+        raise ValueError(
+            "Bismark discarded-pair count exceeds uniquely aligned pairs: "
+            f"discarded={discarded}, unique={unique}"
+        )
+    expected_efficiency = 0.0 if total == 0 else unique * 100.0 / total
+    if not math.isclose(mapping_efficiency, expected_efficiency, abs_tol=0.11):
+        raise ValueError(
+            "Bismark mapping efficiency disagrees with the exact report counts: "
+            f"reported={mapping_efficiency}, expected={expected_efficiency:.6f}"
+        )
+    return {
+        "total": total,
+        "unique": unique,
+        "no_alignment": no_alignment,
+        "non_unique": non_unique,
+        "discarded": discarded,
+        "mapping_efficiency": mapping_efficiency,
+    }
+
+
+def parse_dedup_report(path: Path) -> dict[str, int]:
+    text = path.read_text(encoding="utf-8", errors="strict")
+    total = _required_count(
+        text,
+        "dedup_pairs_analysed",
+        [rf"^Total number of alignments analysed in .+?:\s*{_COUNT}(?:\s|$)"],
+    )
+    removed = _required_count(
+        text,
+        "duplicate_pairs_removed",
+        [rf"^Total number duplicated alignments removed:\s*{_COUNT}(?:\s|$)"],
+    )
+    leftover = _required_count(
+        text,
+        "deduplicated_pairs_left",
+        [rf"^Total count of deduplicated leftover sequences:\s*{_COUNT}(?:\s|$)"],
+    )
+    if removed > total or leftover != total - removed:
+        raise ValueError(
+            "Bismark deduplication counts are inconsistent: "
+            f"total={total}, removed={removed}, leftover={leftover}"
+        )
+    return {"total": total, "removed": removed, "leftover": leftover}
+
+
+def _read_filter_summary(path: Path, sample: str) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Bismark non-conversion summary must be an object")
+    if set(payload) != FILTER_SUMMARY_FIELDS:
+        raise ValueError(
+            "Bismark non-conversion summary schema mismatch: "
+            f"expected={sorted(FILTER_SUMMARY_FIELDS)}, observed={sorted(payload)}"
+        )
+    if (
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != FILTER_SUMMARY_SCHEMA_VERSION
+        or payload["backend"] != "bismark"
+        or payload["metric_unit"] != "read_pairs"
+    ):
+        raise ValueError("Invalid Bismark non-conversion summary identity")
+    if payload["sample"] != sample:
+        raise ValueError(
+            f"Bismark non-conversion summary sample mismatch: {payload['sample']!r}"
+        )
+    for field in (
+        "candidate_read_pairs",
+        "flagged_read_pairs",
+        "excluded_read_pairs",
+        "final_retained_pairs",
+        "minimum_count",
+    ):
+        if isinstance(payload[field], bool) or not isinstance(payload[field], int):
+            raise ValueError(f"Bismark non-conversion summary {field} must be an integer")
+    for field in ("high_cph_fraction", "threshold"):
+        if isinstance(payload[field], bool) or not isinstance(
+            payload[field], (int, float)
+        ):
+            raise ValueError(f"Bismark non-conversion summary {field} must be numeric")
+    candidate = payload["candidate_read_pairs"]
+    high_cph = payload["flagged_read_pairs"]
+    excluded = payload["excluded_read_pairs"]
+    retained = payload["final_retained_pairs"]
+    fraction = float(payload["high_cph_fraction"])
+    threshold = float(payload["threshold"])
+    minimum_count = payload["minimum_count"]
+    filter_applied = payload["filter_applied"]
+    if candidate < 0 or excluded < 0 or not 0 <= high_cph <= candidate:
+        raise ValueError("Invalid Bismark non-conversion summary counts")
+    if retained != candidate - high_cph + excluded:
+        raise ValueError(
+            "Bismark non-conversion retained pairs disagree with the filter funnel: "
+            f"retained={retained}, expected={candidate - high_cph + excluded} "
+            f"(candidate={candidate}, flagged={high_cph}, excluded={excluded})"
+        )
+    expected_fraction = 0.0 if candidate == 0 else high_cph / candidate
+    if not math.isclose(fraction, expected_fraction, abs_tol=1e-12):
+        raise ValueError("Bismark non-conversion summary fraction is inconsistent")
+    if not 0 <= threshold <= 1:
+        raise ValueError("Bismark non-conversion threshold must be within [0, 1]")
+    if minimum_count < 1:
+        raise ValueError("Bismark non-conversion minimum_count must be >= 1")
+    if not isinstance(filter_applied, bool):
+        raise ValueError("Bismark non-conversion filter_applied must be boolean")
+    if payload["protocol"] not in {"cabernet", "srd", "droplet"}:
+        raise ValueError("Bismark non-conversion protocol is invalid")
+    if payload["high_cph_role"] not in {
+        "cdna_contamination",
+        "residual_high_cph",
+    }:
+        raise ValueError("Bismark non-conversion high_cph_role is invalid")
+    expected_role = {"cabernet": "cdna_contamination", "droplet": "cdna_contamination", "srd": "residual_high_cph"}
+    if payload["high_cph_role"] != expected_role[payload["protocol"]]:
+        raise ValueError("Bismark non-conversion protocol/role contract is invalid")
+    if not filter_applied:
+        raise ValueError("Bismark non-conversion summary must record the fixed filter action")
+    return payload
+
+
+DROPLET_DEDUP_POLICY = "per_cytosine_umi_consensus_hamming1"
+
+
+DROPLET_MIN_MAPQ = 10
+
+
+DROPLET_MIN_BASEQ = 20
+
+
+def droplet_umi_consensus(groups: Mapping[str, Sequence[int]]) -> tuple[int, int, int, int]:
+    """逐位点按原始丰度合并 Hamming-1 UMI；多数碱基优先，平票比较平均质量，仍平票则不调用。"""
+    counts = {umi: int(v[0]) + int(v[1]) for umi, v in groups.items()}
+    remaining = {umi: list(v) for umi, v in groups.items()}
+    merged = ambiguous = methyl = unmethyl = 0
+    for umi in sorted(counts, key=lambda key: (-counts[key], key)):
+        if umi not in remaining:
+            continue
+        value = remaining[umi]
+        if counts[umi] > 1 and len(remaining) > 1:
+            if len(remaining) < 48:
+                neighbors = [key for key in remaining if counts[key] < counts[umi]
+                             and sum(a != b for a, b in zip(umi, key)) == 1]
+                neighbors.sort(key=lambda key: next((i, "ACGTN".index(b)) for i, (a, b) in enumerate(zip(umi, key)) if a != b))
+            else:
+                neighbors = [umi[:i] + alternate + umi[i + 1:] for i, base in enumerate(umi)
+                             for alternate in "ACGTN" if alternate != base]
+            for neighbor in neighbors:
+                if neighbor in remaining and counts[neighbor] < counts[umi]:
+                    other = remaining.pop(neighbor)
+                    value = [a + b for a, b in zip(value, other)]
+                    merged += 1
+        remaining.pop(umi)
+        m, u, qm, qu = value
+        if m > u or (m == u and qm > qu):
+            methyl += 1
+        elif u > m or (m == u and qu > qm):
+            unmethyl += 1
+        else:
+            ambiguous += 1
+    return methyl, unmethyl, merged, ambiguous
+
+
+def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Path,
+                     qc: str | Path, mbias: str | Path, *, sample: str,
+                     scratch: str | Path, samtools: str, threads: int = 1) -> None:
+    """保留过滤 BAM 的全部 pairs，按参考胞嘧啶/UMI 生成分子共识 coverage、QC 及 read-level M-bias。"""
+    import pysam
+
+    if SAMPLE_ID_RE.fullmatch(sample) is None:
+        raise ValueError("Invalid Droplet sample identity")
+    root = Path(tempfile.mkdtemp(prefix="droplet_consensus_", dir=scratch))
+    proc = None
+    try:
+        converted = root / "conversion.bam"
+        ordered = root / "coordinate.bam"
+        pairs = umi_n = 0
+        seen = set()
+        checked_contigs = set()
+        with pysam.FastaFile(str(reference)) as fasta:
+            reference_lengths = dict(zip(fasta.references, fasta.lengths))
+        with pysam.AlignmentFile(str(bam), "rb") as source, pysam.AlignmentFile(str(converted), "wb", template=source) as target:
+            iterator = iter(source)
+            for first in iterator:
+                second = next(iterator, None)
+                if second is None or first.query_name != second.query_name or first.query_name in seen:
+                    raise ValueError("Droplet calling requires unique, adjacent complete read pairs")
+                seen.add(first.query_name)
+                if (first.flag, second.flag) not in {(99, 147), (163, 83), (147, 99), (83, 163)}:
+                    raise ValueError("Unexpected Bismark paired flags")
+                umi = first.query_name.rsplit(":", 1)[-1]
+                if not re.fullmatch(r"[ACGTN]{12}", umi):
+                    raise ValueError("Droplet QNAME must end with a 12 bp UMI")
+                for mate, record in enumerate((first, second), 1):
+                    contig = record.reference_name
+                    if contig not in checked_contigs:
+                        if contig not in reference_lengths or source.get_reference_length(contig) != reference_lengths[contig]:
+                            raise ValueError(f"Droplet BAM/reference contig mismatch: {contig}")
+                        checked_contigs.add(contig)
+                    if any(not record.has_tag(tag) for tag in ("XM", "XR", "XG")):
+                        raise ValueError("Bismark methylation tags missing")
+                    if record.has_tag("UR") and record.get_tag("UR") != umi:
+                        raise ValueError("Droplet UR tag disagrees with QNAME")
+                    conversion = record.get_tag("XG")
+                    if conversion not in {"CT", "GA"}:
+                        raise ValueError("Invalid Bismark genome conversion")
+                    record.set_tag("UR", umi, value_type="Z")
+                    record.set_tag("YI", f"{mate}{'R' if record.is_reverse else 'F'}", value_type="Z")
+                    record.is_reverse = conversion == "GA"
+                    record.mate_is_reverse = conversion == "GA"
+                    target.write(record)
+                pairs += 1
+                umi_n += int("N" in umi)
+        del seen
+        subprocess.run([samtools, "sort", "-@", str(max(0, min(threads, 4) - 1)),
+                        "-m", "512M", "-T", str(root / "sort"), "-o", str(ordered), str(converted)], check=True)
+        converted.unlink()
+        contexts = {key: {"methyl": 0, "unmethyl": 0, "read_observations": 0,
+                          "umi_groups": 0, "merged_umis": 0, "ambiguous_umis": 0,
+                          "strand_sites": 0} for key in ("CpG", "CHG", "CHH")}
+        cycles: dict[tuple[str, str, int], list[int]] = {}
+        command = [samtools, "mpileup", "-Q", str(DROPLET_MIN_BASEQ), "-q", str(DROPLET_MIN_MAPQ),
+                   "-B", "-d", "0", "-f", str(reference), "--output-BP", "--output-extra", "RLEN,UR,YI",
+                   "--no-output-ins-mods", "--no-output-ins", "--no-output-ins",
+                   "--no-output-del", "--no-output-del", "--no-output-ends", str(ordered)]
+        with pysam.FastaFile(str(reference)) as fa, gzip.open(root / "coverage.gz", "wt") as handle:
+            proc = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, bufsize=1024 * 1024)
+            chrom = None
+            sequence = ""
+            for line in proc.stdout:
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) != 10:
+                    raise ValueError("Unexpected samtools mpileup columns")
+                if int(fields[3]) == 0:
+                    continue
+                base = fields[2].upper()
+                if base not in {"C", "G"}:
+                    continue
+                if chrom != fields[0]:
+                    chrom = fields[0]
+                    sequence = fa.fetch(chrom).upper()
+                pos = int(fields[1]) - 1
+                if not 0 <= pos < len(sequence) or sequence[pos] != base:
+                    raise ValueError("Droplet pileup coordinate disagrees with reference")
+                context_seq = sequence[pos:pos + 3] if base == "C" else sequence[max(0, pos - 2):pos + 1][::-1].translate(str.maketrans("ACGT", "TGCA"))
+                if context_seq.startswith("CG"):
+                    context = "CpG"
+                elif len(context_seq) == 3 and context_seq[1] in "ACT" and context_seq[2] in "ACGT":
+                    context = "CHG" if context_seq[2] == "G" else "CHH"
                 else:
-                    record["dna_tube_rna_fastq_r1"] = r1
-                    record["dna_tube_rna_fastq_r2"] = r2
-            if route == "srd_rna_enrichment_tube":
-                if record.get("rna_enrichment_route_id"):
-                    raise ValueError(f"Cell {cell_id!r} has more than one SRD RNA-enrichment demux route")
-                record.update({
-                    "rna_enrichment_route_id": route,
-                    "rna_enrichment_raw_sample": raw,
-                    "rna_enrichment_dna_reads": demux.get("dna_reads", "0"),
-                    "rna_enrichment_dna_status": demux.get("dna_status", ""),
-                    "rna_enrichment_rna_reads": demux.get("rna_reads", "0"),
-                    "rna_enrichment_rna_status": demux.get("rna_status", ""),
-                    "rna_enrichment_input_read_pairs": demux.get("input_read_pairs", "0"),
-                    "rna_enrichment_matched_read_pairs": demux.get("matched_reads", "0"),
-                    "rna_enrichment_unassigned_rate": demux.get("unassigned_rate", ""),
-                })
-            elif str(demux.get("downstream_dna", "")).strip().lower() == "true":
-                if record.get("dna_route_id"):
-                    raise ValueError(f"Cell {cell_id!r} has more than one downstream-DNA demux route")
-                record.update({
-                    "dna_route_id": route,
-                    "dna_raw_sample": raw,
-                    "dna_reads": demux.get("dna_reads", "0"),
-                    "dna_status": demux.get("dna_status", ""),
-                    "dna_tube_rna_reads": demux.get("rna_reads", "0"),
-                    "dna_tube_rna_status": demux.get("rna_status", ""),
-                    "dna_input_read_pairs": demux.get("input_read_pairs", "0"),
-                    "dna_matched_read_pairs": demux.get("matched_reads", "0"),
-                    "dna_unassigned_rate": demux.get("unassigned_rate", ""),
-                    "high_cph_role": demux.get("high_cph_role", ""),
-                })
+                    continue
+                bases, qualities = fields[4:6]
+                positions, lengths, umis, mates = (value.split(",") for value in fields[6:10])
+                if len({len(bases), len(qualities), len(positions), len(lengths), len(umis), len(mates), int(fields[3])}) != 1:
+                    raise ValueError(f"Unpaired mpileup observations at {chrom}:{pos + 1}")
+                methyl_base, unmethyl_base = (".", "T") if base == "C" else (",", "a")
+                groups: dict[str, list[int]] = {}
+                for observed, quality, position, length, umi, mate in zip(bases, qualities, positions, lengths, umis, mates):
+                    if observed not in (methyl_base, unmethyl_base):
+                        continue
+                    if not re.fullmatch(r"[ACGTN]{12}", umi) or mate not in {"1F", "1R", "2F", "2R"}:
+                        raise ValueError("Invalid Droplet pileup molecule identity")
+                    state = int(observed == unmethyl_base)
+                    values = groups.setdefault(umi, [0, 0, 0, 0])
+                    values[state] += 1
+                    values[state + 2] += ord(quality) - 33
+                    cycle = int(position) if mate[1] == "F" else int(length) - int(position) + 1
+                    if not 1 <= cycle <= int(length):
+                        raise ValueError("Invalid Droplet pileup read position")
+                    cycles.setdefault((context, mate[0], cycle), [0, 0])[state] += 1
+                if not groups:
+                    continue
+                m, u, merged, ambiguous = droplet_umi_consensus(groups)
+                stats = contexts[context]
+                stats["read_observations"] += sum(v[0] + v[1] for v in groups.values())
+                stats["umi_groups"] += len(groups)
+                stats["merged_umis"] += merged
+                stats["ambiguous_umis"] += ambiguous
+                stats["methyl"] += m
+                stats["unmethyl"] += u
+                stats["strand_sites"] += int(m + u > 0)
+                if context == "CpG" and m + u:
+                    handle.write(f"{chrom}\t{pos + 1}\t{pos + 1}\t{100 * m / (m + u):.8f}\t{m}\t{u}\n")
+            proc.stdout.close()
+            if proc.wait() != 0:
+                raise RuntimeError("Droplet samtools mpileup failed")
+            proc = None
+        with (root / "mbias.txt").open("w") as handle:
+            handle.write("Alopex Droplet read-level M-bias; MAPQ>=10, baseQ>=20, before UMI consensus\n\n")
+            for context in contexts:
+                for mate in ("1", "2"):
+                    handle.write(f"{context} context (R{mate})\n====================\nposition\tcount_methylated\tcount_unmethylated\t% methylation\tcoverage\n")
+                    for ctx, read, cycle in sorted(cycles):
+                        if ctx == context and read == mate:
+                            m, u = cycles[(ctx, read, cycle)]
+                            handle.write(f"{cycle}\t{m}\t{u}\t{100 * m / (m + u):.8f}\t{m + u}\n")
+                    handle.write("\n")
+        cpg = contexts["CpG"]
+        payload = {"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY,
+                   "min_mapq": DROPLET_MIN_MAPQ, "min_baseq": DROPLET_MIN_BASEQ,
+                   "metric_unit": "cytosine_umi_consensus", "processed_pairs": pairs,
+                   "umi_with_n_pairs": umi_n, "contexts": contexts,
+                   "id": "alopex_droplet_umi_consensus", "section_name": "Droplet UMI consensus",
+                   "description": "逐胞嘧啶 UMI 共识；read-level 观测及分子计数不等同 read-pair 去重率。M-bias 为质量过滤后、UMI 共识前的 read-level 统计。",
+                   "plot_type": "table", "data": {sample: {"CpG_read_observations": cpg["read_observations"],
+                       "CpG_UMI_observations": cpg["methyl"] + cpg["unmethyl"],
+                       "CpG_ambiguous_UMIs": cpg["ambiguous_umis"], "CpG_strand_sites": cpg["strand_sites"]}}}
+        (root / "qc.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        read_droplet_umi_qc(root / "qc.json", sample)
+        for name, target in (("coverage.gz", coverage), ("mbias.txt", mbias), ("qc.json", qc)):
+            os.replace(root / name, target)
+    finally:
+        if proc is not None:
+            proc.stdout.close()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        shutil.rmtree(root)
+
+
+def read_droplet_umi_qc(path: str | Path, sample: str) -> dict[str, Any]:
+    """校验逐胞嘧啶 UMI 共识计数、单位与实际参数，禁止作为 read-pair 去重率解释。"""
+    data = _read_json(Path(path), "Droplet UMI consensus QC")
+    for key, value in {"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY,
+                       "min_mapq": DROPLET_MIN_MAPQ, "min_baseq": DROPLET_MIN_BASEQ,
+                       "metric_unit": "cytosine_umi_consensus"}.items():
+        if data.get(key) != value:
+            raise ValueError(f"Invalid Droplet UMI QC {key}: {path}")
+    for key in ("processed_pairs", "umi_with_n_pairs"):
+        data[key] = _integer(data.get(key), key, Path(path))
+    if not 0 <= data["umi_with_n_pairs"] <= data["processed_pairs"]:
+        raise ValueError("Invalid Droplet UMI pair counts")
+    for context in ("CpG", "CHG", "CHH"):
+        values = data.get("contexts", {}).get(context, {})
+        for key in ("methyl", "unmethyl", "read_observations", "umi_groups", "merged_umis", "ambiguous_umis", "strand_sites"):
+            values[key] = _integer(values.get(key), key, Path(path))
+            if values[key] < 0:
+                raise ValueError("Negative Droplet UMI count")
+        called = values["methyl"] + values["unmethyl"]
+        if not (values["strand_sites"] <= called <= values["umi_groups"] <= values["read_observations"]):
+            raise ValueError("Droplet UMI observation accounting is inconsistent")
+        if values["umi_groups"] != called + values["merged_umis"] + values["ambiguous_umis"]:
+            raise ValueError("Droplet UMI consensus accounting does not close")
+    return data
+
+
+def build_metrics(
+    *,
+    sample: str,
+    version: str,
+    alignment_report: Path,
+    dedup_report: Path,
+    filter_summary: Mapping[str, Any],
+    protocol: str = "cabernet",
+) -> dict[str, Any]:
+    """reconcile 各 pair-level 来源：alignment/dedup 报告与恒定执行的 non-conversion
+    已统一校验的过滤摘要（含 processed BAM 的 retained 实测计数）必须守恒，矛盾即抛错。"""
+    version_lines = [line.strip() for line in version.splitlines() if line.strip()]
+    if not sample or not version_lines:
+        raise ValueError("sample and Bismark version are required")
+    version_label = next(
+        (
+            line
+            for line in version_lines
+            if re.search(
+                r"\bbismark\b.*?(?<![A-Za-z0-9])v?3(?:\.[0-9]+)+\b",
+                line,
+                flags=re.IGNORECASE,
+            )
+        ),
+        "",
+    )
+    if not version_label:
+        raise ValueError(f"Expected a Bismark 3.x version string, observed: {version!r}")
+    alignment = parse_alignment_report(alignment_report)
+    unique_pairs = int(alignment["unique"])
+    discarded_pairs = int(alignment["discarded"])
+    accepted_pairs = unique_pairs - discarded_pairs
+
+    umi_qc = read_droplet_umi_qc(dedup_report, sample) if protocol == "droplet" else None
+    dedup = {"total": accepted_pairs, "removed": 0, "leftover": accepted_pairs} if umi_qc is not None else parse_dedup_report(dedup_report)
+    if dedup["total"] != accepted_pairs:
+        raise ValueError(
+            "Bismark deduplication input disagrees with usable uniquely aligned pairs: "
+            f"analysed={dedup['total']}, expected={accepted_pairs} "
+            f"(unique={unique_pairs}, discarded={discarded_pairs})"
+        )
+    duplicate_pairs = dedup["removed"]
+    postdedup_pairs = dedup["leftover"]
+
+    filtered = filter_summary
+    candidate_pairs = int(filtered["candidate_read_pairs"])
+    excluded_pairs = int(filtered["excluded_read_pairs"])
+    flagged_pairs = int(filtered["flagged_read_pairs"])
+    if candidate_pairs + excluded_pairs != postdedup_pairs:
+        raise ValueError(
+            "Bismark filtering summary disagrees with post-dedup pairs: "
+            f"candidate({candidate_pairs}) + excluded({excluded_pairs}) "
+            f"!= postdedup({postdedup_pairs})"
+        )
+    removed_pairs = flagged_pairs
+
+    final_retained_pairs = int(filtered["final_retained_pairs"])
+    if final_retained_pairs != postdedup_pairs - removed_pairs:
+        raise ValueError(
+            "Bismark processed-BAM retained pairs disagree with the pair funnel: "
+            f"retained={final_retained_pairs}, "
+            f"expected={postdedup_pairs - removed_pairs}"
+        )
+
+    if umi_qc is not None and umi_qc["processed_pairs"] != final_retained_pairs:
+        raise ValueError("Droplet caller input disagrees with non-conversion retained pairs")
+    return {
+        "umi_qc": umi_qc,
+        "total_pairs": int(alignment["total"]),
+        "accepted_pairs": accepted_pairs,
+        "unmapped_pairs": int(alignment["no_alignment"]) + discarded_pairs,
+        "ambiguous_pairs": int(alignment["non_unique"]),
+        "duplicate_pairs": duplicate_pairs,
+        "postdedup_pairs": postdedup_pairs,
+        "final_retained_pairs": final_retained_pairs,
+    }
+
+
+def write_filter_summary(
+    *,
+    sample: str,
+    candidate_pairs: int,
+    removed_pairs: int,
+    excluded_pairs: int,
+    retained_pairs: int,
+    percentage: float,
+    minimum_count: int,
+    protocol: str,
+    high_cph_role: str,
+    summary: Path,
+    multiqc: Path,
+) -> None:
+    """按规则内实测计数写出 schema v3 filter summary 与 MultiQC table JSON。
+
+    retained 必须等于 candidate - removed + excluded（processed BAM 的实测
+    pair 数）；任何计数矛盾都在写出前失败。
+    """
+    if isinstance(minimum_count, bool) or not isinstance(minimum_count, int) or minimum_count < 1:
+        raise SystemExit("filter summary minimum_count must be an integer >= 1")
+    if (
+        isinstance(percentage, bool)
+        or not isinstance(percentage, (int, float))
+        or not 0 <= percentage <= 100
+    ):
+        raise SystemExit("filter summary percentage must be within [0, 100]")
+    if min(candidate_pairs, removed_pairs, excluded_pairs, retained_pairs) < 0:
+        raise SystemExit("filter summary counts must be non-negative integers")
+    if removed_pairs > candidate_pairs:
+        raise SystemExit("flagged pairs exceed candidate pairs")
+    if retained_pairs != candidate_pairs - removed_pairs + excluded_pairs:
+        raise SystemExit(
+            "retained pairs disagree with the filter funnel: "
+            f"retained={retained_pairs}, "
+            f"expected={candidate_pairs - removed_pairs + excluded_pairs}"
+        )
+    payload = {
+        "schema_version": FILTER_SUMMARY_SCHEMA_VERSION,
+        "backend": "bismark",
+        "sample": sample,
+        "metric_unit": "read_pairs",
+        "candidate_read_pairs": candidate_pairs,
+        "flagged_read_pairs": removed_pairs,
+        "high_cph_fraction": (
+            removed_pairs / candidate_pairs if candidate_pairs else 0.0
+        ),
+        "excluded_read_pairs": excluded_pairs,
+        "final_retained_pairs": retained_pairs,
+        "threshold": percentage / 100.0,
+        "minimum_count": minimum_count,
+        "filter_applied": True,
+        "protocol": protocol,
+        "high_cph_role": high_cph_role,
+    }
+    summary.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    multiqc.write_text(
+        json.dumps(
+            _high_cph_multiqc_payload(sample, payload, protocol, high_cph_role),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_bismark_pair_split(args) -> int:
+    """把 BAM 路由到 bio/excluded，标准输出仅返回两路 pair 计数供当前规则使用。"""
+    excluded_contigs = _parse_excluded_contigs_json(args.excluded_contigs_json)
+    args.bio.parent.mkdir(parents=True, exist_ok=True)
+    args.excluded.parent.mkdir(parents=True, exist_ok=True)
+    print(*split_pairs(args.input_bam, args.bio, args.excluded, excluded_contigs))
+    return 0
+
+
+def _parse_bismark_non_cpg_methylation_pct(path: Path) -> float:
+    text = path.read_text(encoding="utf-8", errors="strict")
+    counts: dict[tuple[str, str], int] = {}
+    for state in ("Methylated", "Unmethylated"):
+        for context in ("CHG", "CHH"):
+            if state == "Methylated":
+                patterns = (
+                    rf"^(?:Total )?methylated C(?:'|’)?s in {context} context:\s*([0-9][0-9,]*)\s*$",
+                    rf"^(?:Total )?methylated cytosines in {context} context:\s*([0-9][0-9,]*)\s*$",
+                )
+            else:
+                patterns = (
+                    rf"^(?:Total )?unmethylated C(?:'|’)?s in {context} context:\s*([0-9][0-9,]*)\s*$",
+                    rf"^(?:Total )?unmethylated cytosines in {context} context:\s*([0-9][0-9,]*)\s*$",
+                    rf"^Total C to T conversions in {context} context:\s*([0-9][0-9,]*)\s*$",
+                )
+            observed = [
+                int(match.group(1).replace(",", ""))
+                for pattern in patterns
+                for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
+            ]
+            if not observed:
+                raise ValueError(
+                    f"Bismark extraction report lacks {state} {context} count: {path}"
+                )
+            if len(set(observed)) != 1:
+                raise ValueError(
+                    f"Bismark extraction report has conflicting {state} {context} counts: {path}"
+                )
+            counts[(state, context)] = observed[0]
+    methylated = sum(counts[("Methylated", context)] for context in ("CHG", "CHH"))
+    total = methylated + sum(
+        counts[("Unmethylated", context)] for context in ("CHG", "CHH")
+    )
+    return 100.0 * methylated / total if total else math.nan
 
 
 def _bismark_version_text(bismark: str | None) -> str:
@@ -7539,8 +6611,14 @@ def _bismark_version_text(bismark: str | None) -> str:
     return (version.stdout + version.stderr).strip()
 
 
+# 科学处理：TAPS
+
 TAPS_BWA_INSERT_UPPER_FLOOR = 1000
+
+
 TAPS_BWA_INSERT_PROBE_PAIRS = 10000
+
+
 TAPS_BWA_BATCH_BASES = 150000000
 
 
@@ -7587,8 +6665,14 @@ def taps_bwa_insert_model(r1: str, r2: str, bwa: str, prefix: str, scratch: str,
 
 
 TAPS_MIN_MAPQ = 20
+
+
 TAPS_MIN_BASEQ = 30
+
+
 TAPS_INCLUDE_FLAGS = 3
+
+
 TAPS_EXCLUDE_FLAGS = 3852
 
 
@@ -7981,6 +7065,360 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
     atomic_write_json(output_qc, qc)
 
 
+# 汇总与交付：逐细胞结果和报告
+
+def _write_pair_level_multiqc(rows: list[dict[str, object]], out_json: Path) -> None:
+    data: dict[str, dict[str, object]] = {}
+    for row in rows:
+        if row.get("backend_qc_status") != "PASS":
+            continue
+        sample = str(row["sample_id"])
+        input_pairs = int(row["cutadapt_input_pairs"])
+        trimmed_pairs = int(row["trimmed_pairs"])
+        accepted_pairs = int(row["backend_accepted_pairs"])
+        duplicate_pairs = int(row["duplicate_pairs"])
+        postdedup_pairs = int(row["postdedup_pairs"])
+        final_pairs = int(row["final_retained_pairs"])
+        non_cpg = float(row["non_cpg_methylation_pct"])
+        data[sample] = {
+            "Backend": row["methylation_backend"],
+            "Mapping_Policy": row["mapping_policy"],
+            "Input_Pairs": input_pairs,
+            "Trimmed_Pairs": trimmed_pairs,
+            "Accepted_Pairs": accepted_pairs,
+            "PostDedup_Pairs": postdedup_pairs,
+            "Final_Retained_Pairs": final_pairs,
+            "Trim_Retention_pct": (
+                100.0 * trimmed_pairs / input_pairs if input_pairs else 0.0
+            ),
+            "Native_Mapping_pct": float(row["native_mapping_pct"]),
+            "Native_Mapping_Unit": row["native_mapping_unit"],
+            "Duplicate_Pair_Rate_pct": (None if row.get("protocol") == "droplet" else
+                100.0 * duplicate_pairs / accepted_pairs if accepted_pairs else 0.0
+            ),
+            "Dedup_Policy": row["dedup_policy"],
+            **{key: row[key] for key in ("cpg_read_observations", "cpg_umi_observations", "cpg_ambiguous_umi_sites") if key in row},
+            "PostDedup_Retention_pct": (
+                100.0 * postdedup_pairs / accepted_pairs if accepted_pairs else 0.0
+            ),
+            "Final_Pair_Yield_pct": (
+                100.0 * final_pairs / input_pairs if input_pairs else 0.0
+            ),
+            "High_CpH_Flag_Rate_pct": (None if row["methylation_backend"] == "rastair" else 100.0 * float(row["high_cph_fraction"])),
+            "High_CpH_Status": row["high_cph_role"],
+            **{key: row[key] for key in ("lambda_cpg_observations", "lambda_false_positive_pct", "pUC19_cpg_observations", "pUC19_conversion_pct", "bam_primary_records") if key in row},
+            "Non_CpG_Methylation_pct": non_cpg if math.isfinite(non_cpg) else None,
+            **{key: row[key] for key in ("non_cpg_observations", "non_cpg_candidate_pairs", "non_cpg_oriented_pairs", "non_cpg_ambiguous_pairs", "snp_sites") if key in row},
+        }
+    payload = {
+        "id": "dna_pipeline_pair_level_qc",
+        "section_name": "Alopex pair-level QC",
+        "description": (
+            "Read-pair retention funnel plus backend-native mapping QC. BISCUIT native "
+            "mapping is primary MAPQ>=40 individual reads; Bismark native mapping is "
+            "unique concordant read pairs. These mapping percentages use declared units "
+            "and must not be treated as the same numerator definition. TAPS uses proper primary pairs "
+            "with at least one MAPQ>=20 non-QC-failed mate; duplicate flags are excluded only during calling. "
+            "TAPS Non-CpG is uncorrected CHG/CHH conversion in host pairs with unambiguous CpG-based orientation; "
+            "SNPs/errors may contribute and unorientable pairs are excluded. "
+            "TAPS high-CpH filtering is not applicable; cDNA is not excluded. Lambda assumes unmethylated "
+            "DNA (CpG false positives); pUC19 assumes CpG-methylated DNA (conversion); missing coverage is not assessed."
+        ),
+        "plot_type": "table",
+        "pconfig": {
+            "id": "dna_pipeline_pair_level_qc_table",
+            "title": "Canonical pair-level QC",
+            "col1_header": "Cell",
+        },
+        "data": data,
+    }
+    atomic_write_json(out_json, payload)
+
+
+def _write_cutadapt_multiqc(rows: list[dict[str, object]], out_json: Path) -> None:
+    data: dict[str, dict[str, object]] = {}
+    for row in rows:
+        if row.get("backend_qc_status") != "PASS":
+            continue
+        input_pairs = int(row["cutadapt_input_pairs"])
+        trimmed_pairs = int(row["trimmed_pairs"])
+        data[str(row["sample_id"])] = {
+            "Input_Pairs": input_pairs,
+            "Trimmed_Pairs": trimmed_pairs,
+            "Trim_Retention_pct": (
+                100.0 * trimmed_pairs / input_pairs if input_pairs else 0.0
+            ),
+            "R1_Adapter_pct": float(row["r1_adapter_pct"]),
+            "R2_Adapter_pct": float(row["r2_adapter_pct"]),
+        }
+    payload = {
+        "id": "dna_pipeline_cutadapt_qc",
+        "section_name": "Alopex Cutadapt R1/R2 QC",
+        "description": (
+            "Lightweight trimming QC parsed from the production Cutadapt JSON; "
+            "no FASTQ is rescanned for presentation."
+        ),
+        "plot_type": "table",
+        "pconfig": {
+            "id": "dna_pipeline_cutadapt_qc_table",
+            "title": "Cutadapt R1 / R2 QC",
+            "col1_header": "Cell",
+        },
+        "data": data,
+    }
+    atomic_write_json(out_json, payload)
+
+
+def write_final_sample_manifest(
+    initial_cell_manifest: str,
+    intermediate_dir: str,
+    staged_results_dir: str,
+    out_tsv: str,
+    *,
+    options: Mapping[str, object],
+    published_results_dir: str | None = None,
+    bismark: str | None = None,
+    pair_qc_multiqc_json: str | None = None,
+    cutadapt_qc_multiqc_json: str | None = None,
+    workers: int = 1,
+) -> None:
+    """把已提交的 demux 身份与已启用的 per-cell 结果产物连接成最终 manifest。
+
+    编排五个纯阶段：选项解析 → 期望 route 规划 → 已提交代际合并 →
+    per-cell 指标核算 → 排序与落盘；阶段之间只通过显式参数传递数据。
+    """
+    intermediate = Path(intermediate_dir)
+    demux_state = intermediate / "demux" / "state"
+    results = Path(staged_results_dir)
+    published_results = Path(published_results_dir) if published_results_dir else results
+    opts = _parse_final_options(options)
+    layout = ProjectLayout(intermediate, results, opts["backend"])
+    published_layout = ProjectLayout(intermediate, published_results, opts["backend"])
+    output = Path(out_tsv)
+
+    initial_cells = read_cell_identity_manifest(initial_cell_manifest)
+    cells: dict[str, dict[str, object]] = {
+        cell_id: dict(row) for cell_id, row in initial_cells.items()
+    }
+
+
+    expected_runs = _plan_expected_runs(cells, demux_state)
+    _merge_committed_generations(
+        demux_state,
+        initial_cell_manifest,
+        cells,
+        expected_runs,
+    )
+    _require_declared_routes(cells)
+    _apply_cell_metrics(
+        cells,
+        layout=layout,
+        published_layout=published_layout,
+        backend=opts["backend"],
+        publish_rna_bam=opts["publish_rna_bam"],
+        generate_snp=opts["generate_snp"],
+        keep_final_bam=opts["keep_final_bam"],
+        cpg_coordinate_base=opts["cpg_coordinate_base"],
+        bismark=bismark,
+        workers=workers,
+    )
+    _emit_final_tsv(cells, output, pair_qc_multiqc_json, cutadapt_qc_multiqc_json)
+
+
+def _parse_final_options(options: Mapping[str, object]) -> dict[str, object]:
+
+    backend = str(options.get("methylation_backend", "")).strip().lower()
+    if backend not in {"biscuit", "bismark", "rastair"}:
+        raise ValueError("methylation_backend must be biscuit, bismark or rastair")
+    option_fields = {
+        "generate_snp",
+        "keep_final_bam",
+        "publish_rna_bam",
+        "methylation_backend",
+        "cpg_coordinate_base",
+    }
+    if set(options) != option_fields:
+        missing = sorted(option_fields - set(options))
+        extra = sorted(set(options) - option_fields)
+        details = []
+        if missing:
+            details.append("missing=" + ",".join(missing))
+        if extra:
+            details.append("unsupported=" + ",".join(extra))
+        raise ValueError("Final manifest options do not match the current contract: " + "; ".join(details))
+    active_options = dict(options)
+    for key, value in active_options.items():
+        if key in {"methylation_backend", "cpg_coordinate_base"}:
+            continue
+        if not isinstance(value, bool):
+            raise ValueError(f"Final manifest option {key} must be a boolean")
+    cpg_representation(active_options["cpg_coordinate_base"])
+    return {
+        "backend": backend,
+        "cpg_coordinate_base": active_options["cpg_coordinate_base"],
+        "generate_snp": active_options["generate_snp"],
+        "keep_final_bam": active_options["keep_final_bam"],
+        "publish_rna_bam": active_options["publish_rna_bam"],
+    }
+
+
+def _plan_expected_runs(
+    cells: dict[str, dict[str, object]],
+    demux_state: Path,
+) -> dict[str, dict[str, str]]:
+
+
+    expected_runs: dict[str, dict[str, str]] = {}
+    for record in cells.values():
+        project_id = str(record.get("project_sample_id", "") or "").strip()
+        protocol = str(record.get("protocol", "") or "").strip().lower()
+        dna_raw_sample = str(record.get("dna_raw_sample", "") or "").strip()
+        rna_sample = str(record.get("rna_sample", "") or "").strip()
+        routes = []
+        if dna_raw_sample:
+            routes.append((project_id, default_dna_route(protocol), dna_raw_sample))
+        if rna_sample and "rna_sample" in get_protocol(protocol).raw_input_columns:
+            routes.append((f"{project_id}__rna", "srd_rna_enrichment_tube", rna_sample))
+        for run_id, route_id, raw_sample in routes:
+            expected = {
+                "project_sample_id": project_id,
+                "route_id": route_id,
+                "raw_sample": raw_sample,
+            }
+            if expected_runs.setdefault(run_id, expected) != expected:
+                raise ValueError(f"Demux run_id={run_id!r} has conflicting project sample routes")
+    missing_run_files = []
+    for run_id in sorted(expected_runs):
+        for name in ("manifest.tsv", "completion.json"):
+            path = demux_state / run_id / name
+            if not path.is_file():
+                missing_run_files.append(path)
+    if missing_run_files:
+        raise FileNotFoundError(
+            "Current run is missing committed demux route file(s): "
+            + ", ".join(str(path) for path in missing_run_files)
+        )
+    return expected_runs
+
+
+def _require_declared_routes(cells: dict[str, dict[str, object]]) -> None:
+    for cell_id, record in cells.items():
+        protocol = str(record.get("protocol", "") or "").strip().lower()
+        if str(record.get("dna_raw_sample", "") or "").strip():
+            expected_route = default_dna_route(protocol)
+            if record.get("dna_route_id") != expected_route:
+                raise ValueError(
+                    f"Cell {cell_id!r} declares dna_raw_sample but has no matching committed "
+                    f"demux route {expected_route!r}"
+                )
+        if "rna_sample" in get_protocol(protocol).raw_input_columns and str(record.get("rna_sample", "") or "").strip():
+            if record.get("rna_enrichment_route_id") != "srd_rna_enrichment_tube":
+                raise ValueError(
+                    f"Cell {cell_id!r} declares rna_sample but has no matching committed "
+                    "srd_rna_enrichment_tube demux route"
+                )
+
+
+def _merge_committed_generations(
+    demux_state: Path,
+    initial_cell_manifest: str,
+    cells: dict[str, dict[str, object]],
+    expected_runs: dict[str, dict[str, str]],
+) -> None:
+    for run_id, expected_run in sorted(expected_runs.items()):
+        manifest = demux_state / run_id / "manifest.tsv"
+        completion = demux_state / run_id / "completion.json"
+
+        committed = read_demux_generation(
+            completion,
+            expected_manifest_path=manifest,
+            expected_cell_manifest_path=initial_cell_manifest,
+        )
+        if committed.get("run_id") != run_id:
+            raise ValueError(
+                f"Demux completion {completion} declares run_id={committed.get('run_id')!r}; "
+                f"expected {run_id!r}"
+            )
+        for demux in committed["_rows"]:
+            cell_id = str(demux.get("demux_sample", "") or "").strip()
+            if not cell_id or cell_id == "__SUMMARY__":
+                continue
+            if cell_id not in cells:
+                raise ValueError(
+                    f"Demux manifest {manifest} contains cell {cell_id!r} absent from initial cell manifest"
+                )
+            record = cells[cell_id]
+            project_id = str(demux.get("project_sample_id", "") or "").strip()
+
+
+            route = canonical_raw_route_id(str(demux.get("route_id", "") or ""))
+            raw = str(demux.get("raw_sample", "") or "")
+            if (
+                project_id != expected_run["project_sample_id"]
+                or route != expected_run["route_id"]
+                or raw != expected_run["raw_sample"]
+            ):
+                raise ValueError(
+                    f"Demux route {run_id!r} does not match the declared sample route: "
+                    f"observed=({project_id!r}, {route!r}, {raw!r}), "
+                    f"expected=({expected_run['project_sample_id']!r}, "
+                    f"{expected_run['route_id']!r}, {expected_run['raw_sample']!r})"
+                )
+            if (
+                str(demux.get("pipeline_mode", "")).strip().lower() == "srd"
+                and str(demux.get("rna_status", "")) == "Pass"
+            ):
+                intermediate = demux_state.parent.parent
+                project_root = intermediate.parent
+                collected = [
+                    rna_fastq_collect_destination(intermediate, route, cell_id, mate)
+                    for mate in (1, 2)
+                ]
+                missing = [path for path in collected if not path.is_file()]
+                if missing:
+                    raise FileNotFoundError(
+                        "Committed SRD RNA FASTQ is missing from the collection area "
+                        "(rna_collect_fastq must run first): "
+                        + ", ".join(str(path) for path in missing)
+                    )
+                r1, r2 = (str(path.relative_to(project_root)) for path in collected)
+                if route == "srd_rna_enrichment_tube":
+                    record["rna_enrichment_rna_fastq_r1"] = r1
+                    record["rna_enrichment_rna_fastq_r2"] = r2
+                else:
+                    record["dna_tube_rna_fastq_r1"] = r1
+                    record["dna_tube_rna_fastq_r2"] = r2
+            if route == "srd_rna_enrichment_tube":
+                if record.get("rna_enrichment_route_id"):
+                    raise ValueError(f"Cell {cell_id!r} has more than one SRD RNA-enrichment demux route")
+                record.update({
+                    "rna_enrichment_route_id": route,
+                    "rna_enrichment_raw_sample": raw,
+                    "rna_enrichment_dna_reads": demux.get("dna_reads", "0"),
+                    "rna_enrichment_dna_status": demux.get("dna_status", ""),
+                    "rna_enrichment_rna_reads": demux.get("rna_reads", "0"),
+                    "rna_enrichment_rna_status": demux.get("rna_status", ""),
+                    "rna_enrichment_input_read_pairs": demux.get("input_read_pairs", "0"),
+                    "rna_enrichment_matched_read_pairs": demux.get("matched_reads", "0"),
+                    "rna_enrichment_unassigned_rate": demux.get("unassigned_rate", ""),
+                })
+            elif str(demux.get("downstream_dna", "")).strip().lower() == "true":
+                if record.get("dna_route_id"):
+                    raise ValueError(f"Cell {cell_id!r} has more than one downstream-DNA demux route")
+                record.update({
+                    "dna_route_id": route,
+                    "dna_raw_sample": raw,
+                    "dna_reads": demux.get("dna_reads", "0"),
+                    "dna_status": demux.get("dna_status", ""),
+                    "dna_tube_rna_reads": demux.get("rna_reads", "0"),
+                    "dna_tube_rna_status": demux.get("rna_status", ""),
+                    "dna_input_read_pairs": demux.get("input_read_pairs", "0"),
+                    "dna_matched_read_pairs": demux.get("matched_reads", "0"),
+                    "dna_unassigned_rate": demux.get("unassigned_rate", ""),
+                    "high_cph_role": demux.get("high_cph_role", ""),
+                })
+
+
 def _taps_cell_metrics(job: Mapping[str, object], cutadapt: Mapping[str, object]) -> dict[str, object]:
     paths = job["paths"]
     qc = json.loads(Path(paths["rastair_qc"]).read_text())
@@ -8021,7 +7459,7 @@ def _taps_cell_metrics(job: Mapping[str, object], cutadapt: Mapping[str, object]
                 raise FileNotFoundError(paths[key])
     return {**cutadapt, **{k: v for k, v in qc.items() if k.startswith(("bam_", "lambda_", "pUC19_"))},
             "methylation_backend": "rastair", "backend_qc_status": "PASS", "analysis_status": "PASS",
-            "cpg_path": job["public"]["cpg"], "cpg_representation": CPG_REPRESENTATION,
+            "cpg_path": job["public"]["cpg"], "cpg_representation": cpg_representation(job["cpg_coordinate_base"]),
             "snp_path": job["public"]["snp"], "snp_sites": qc["snp_sites"],
             "rna_bam_path": "", "methylation_signal": "5mC+5hmC",
             "retained_bam_path": job["public"]["marked_bam"] if keep_bam else "",
@@ -8220,7 +7658,7 @@ def _metrics_for_cell(job: Mapping[str, object]) -> tuple[str, dict[str, object]
     updates["methylation_backend"] = backend
     updates["backend_qc_status"] = "PASS"
     updates["cpg_path"] = str(public["cpg"])
-    updates["cpg_representation"] = CPG_REPRESENTATION
+    updates["cpg_representation"] = cpg_representation(job["cpg_coordinate_base"])
     updates["snp_path"] = str(public["snp"]) if generate_snp else ""
     updates["rna_bam_path"] = str(public["rna_bam"]) if publish_rna_bam else ""
     updates["analysis_status"] = "PASS"
@@ -8237,6 +7675,7 @@ def _apply_cell_metrics(
     generate_snp: bool,
     bismark: str | None,
     keep_final_bam: bool,
+    cpg_coordinate_base: int,
     workers: int = 1,
 ) -> None:
     published_results = published_layout.result_root
@@ -8260,6 +7699,8 @@ def _apply_cell_metrics(
             continue
         paths = layout.cell(cell_id)
         public_paths = published_layout.cell(cell_id)
+        artifacts = cell_artifacts(paths, str(record["protocol"]),
+                                   generate_snp=generate_snp, keep_final_bam=keep_final_bam)
         jobs.append(
             {
                 "cell_id": cell_id,
@@ -8268,26 +7709,8 @@ def _apply_cell_metrics(
                 "publish_rna_bam": publish_rna_bam,
                 "generate_snp": generate_snp,
                 "keep_final_bam": keep_final_bam,
-                "paths": {
-                    "rastair_qc": paths.rastair_qc,
-                    "marked_bam": paths.marked_bam,
-                    "marked_bam_index": paths.marked_bam_index,
-                    "cutadapt_json": paths.cutadapt_json,
-                    "dupsifter_multiqc": paths.dupsifter_multiqc,
-                    "mapq_table": paths.biscuit_qc_source("mapq_table.txt"),
-                    "cph_table": paths.biscuit_qc_source("CpHRetentionByReadPos.txt"),
-                    "biscuit_qc_dir": paths.biscuit_qc_dir,
-                    "high_cph_summary": paths.high_cph_summary,
-                    "bismark_align_report": paths.bismark_align_report,
-                    "bismark_dedup_report": paths.droplet_umi_qc if record["protocol"] == "droplet" else paths.bismark_dedup_report,
-                    "bismark_extract_report": paths.droplet_umi_qc if record["protocol"] == "droplet" else paths.bismark_extract_report,
-                    "bismark_mbias": paths.bismark_mbias,
-                    "cpg": paths.cpg,
-                    "snp": paths.snp,
-                    "snp_index": paths.snp_index,
-                    "rna_bam": paths.rna_bam,
-                    "rna_bam_index": paths.rna_bam_index,
-                },
+                "cpg_coordinate_base": cpg_coordinate_base,
+                "paths": dict(artifacts.metrics),
                 "public": {
                     "marked_bam": str(paths.marked_bam.relative_to(project_root)),
                     "marked_bam_index": str(paths.marked_bam_index.relative_to(project_root)),
@@ -8387,16 +7810,6 @@ def _emit_final_tsv(
     write_tsv_atomic(output, sorted_rows, fields)
 
 
-MULTIQC_BISCUIT_SOURCE_SUFFIXES = (
-    "strand_table.txt",
-    "totalReadConversionRate.txt",
-    "CpGRetentionByReadPos.txt",
-    "mapq_table.txt",
-    "totalBaseConversionRate.txt",
-    "CpHRetentionByReadPos.txt",
-    "isize_table.txt",
-    "dup_report.txt",
-)
 
 
 def should_skip_biscuit_dup_report(report_path: str) -> str | None:
@@ -8596,801 +8009,1772 @@ def prepare_high_cph_multiqc_sources(
     return sources
 
 
-def write_demux_mqc(
-    report: DemuxReport, out_json: str, pipeline_mode: str, route_id: str,
-    *, calling_metrics: str = "", structure_metrics: str = "",
-) -> None:
-    """把 demultiplexing 统计转换为 MultiQC custom content。"""
-    rep = report
-    policy = get_protocol(pipeline_mode)
-    route = get_raw_route(route_id, policy.name)
-    demux_mode = rep["mode"]
-    if demux_mode != route.demux_mode:
-        raise ValueError(
-            f"Demux report mode {demux_mode!r} does not match raw route "
-            f"{route.route_id!r} ({route.demux_mode!r})"
-        )
-    data = {}
-    for sample in rep["samples"]:
-        key = sample["cell_sample_id"]
-        row = {
-            "Protocol": policy.name,
-            "Route": route.route_id,
-            "PlateID": sample["plate_id"],
-            "Cell_Order": sample["cell_order"],
-            "DNA_Barcode": sample["dna_barcode"],
-            "DNA_Reads": sample["dna_read_count"],
-            "DNA_Status": sample["dna_status"],
-        }
-        if demux_mode == "dna-rna":
-            row.update({
-                "RNA_Barcode": sample["rna_barcode"],
-                "RNA_Reads": sample["rna_read_count"],
-                "RNA_Status": sample["rna_status"],
-            })
-        data[key] = row
+# 汇总与交付：运行快照和持锁发布
 
-    fate = rep["read_fates"]
-    summary = {
-        "Input_Read_Pairs": rep["input_read_pairs"],
-        "Usable_Read_Pairs": rep["usable_read_pairs"],
-        "Matched_Read_Pairs": rep["matched_reads"],
-        "Short_Read_Pairs": fate["short"],
-        "Ambiguous_Read_Pairs": fate["ambiguous"],
-        "Unmatched_Read_Pairs": fate["unmatched"],
-    }
-    if pipeline_mode == "droplet":
-        calling = _read_json(Path(calling_metrics), "Droplet calling")
-        structure = _read_json(Path(structure_metrics), "Droplet structure")
-        if calling.get("status") != "complete" or calling["called_cells"] != len(rep["samples"]):
-            raise ValueError("Droplet calling/report cell count mismatch")
-        screen = calling["barcode_error_screen"]
-        summary.update({"Called_Cells": calling["called_cells"], "Calling_Threshold": calling["threshold"],
-                        "Design_Excluded_Candidates": calling["barcode_design_filter"]["excluded_candidates"],
-                        "Design_Excluded_Exact_Read_Pairs": calling["barcode_design_filter"]["excluded_exact_read_pairs"],
-                        "Barcode_Error_Candidates_Removed": screen["removed_barcodes"],
-                        "Barcode_Molecule_Candidates_Checked": screen["molecule_checked"],
-                        "Barcode_Insufficient_Molecule_Evidence": screen["insufficient_molecule_evidence"],
-                        "Barcode_Child_Signatures_Capped": screen["child_signatures_capped"],
-                        "Structured_Reads": structure["structured_reads"], "Structured_UMI_With_N": structure["umi_with_n"]})
-    route_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", route.route_id)
-    obj = {
-        "id": f"demux_rs_{route_key}",
-        "section_name": f"Demultiplexing Stats: {route.route_id}",
-        "description": (
-            f"Protocol={policy.name}; route={route.route_id}; "
-            f"read interpreter={demux_mode}; "
-            f"retention threshold={rep['retention_threshold']} read pairs. "
-            f"Run summary: {summary}"
-        ),
-        "plot_type": "table",
-        "pconfig": {
-            "id": f"demux_rs_table_{route_key}",
-            "title": f"Demultiplexing Statistics: {route.route_id}",
-            "col1_header": "Sample Name",
-        },
-        "data": data,
-    }
-    atomic_write_json(out_json, obj)
+SNAPSHOT_SCHEMA_VERSION = 10
 
 
-DUPSIFTER_STAT_FIELDS: tuple[tuple[str, str], ...] = (
-    ("number of individual reads processed", "Reads_Processed"),
-    ("number of reads with both reads mapped", "Both_Mapped"),
-    ("number of reads with only one read mapped to the forward strand", "One_Mapped_Forward"),
-    ("number of reads with only one read mapped to the reverse strand", "One_Mapped_Reverse"),
-    ("number of reads with both reads marked as duplicates", "Dup_Both"),
-    ("number of reads on the forward strand marked as duplicates", "Dup_Forward"),
-    ("number of reads on the reverse strand marked as duplicates", "Dup_Reverse"),
-    ("number of individual primary-alignment reads", "Primary_Reads"),
-    ("number of individual secondary- and supplementary-alignment reads", "Secondary_Supplementary"),
-    ("number of reads with no reads mapped", "No_Mapped"),
-    ("number of reads with no primary reads", "No_Primary"),
-)
-DUPSIFTER_MQC_FIELDS = tuple(field for _label, field in DUPSIFTER_STAT_FIELDS)
+_SOURCE_ROOTS = ("core",)
 
 
-def write_dupsifter_mqc(
-    stat_path: str,
-    out_json: str,
-    demux_sample: str,
-    *,
-    metadata: Mapping[str, str],
-) -> None:
-    """从 DAG 提交的 manifest 行写 Dupsifter custom content。"""
-    row = {str(key): str(value or "") for key, value in metadata.items()}
-    if row.get("demux_sample") != demux_sample:
-        raise ValueError(
-            f"Dupsifter metadata sample mismatch: {row.get('demux_sample')!r} "
-            f"!= {demux_sample!r}"
-        )
-    if str(row.get("downstream_dna", "")).strip().lower() != "true":
-        raise ValueError(
-            f"Dupsifter sample {demux_sample!r} belongs to non-DNA route "
-            f"{row.get('route_id')!r}; refusing downstream DNA QC."
-        )
-    if row.get("dna_status") != "Pass":
-        raise ValueError(
-            f"Dupsifter sample {demux_sample!r} has dna_status={row.get('dna_status')!r}; "
-            "refusing downstream DNA QC."
-        )
-
-    plate_id = row.get("plate_id", "")
-    cell_order = row.get("cell_order", "")
-    dna_bc = row.get("dna_barcode", "")
-    raw_sample = row.get("raw_sample", "")
-    pipeline_mode = row.get("pipeline_mode", "")
-    route_id = row.get("route_id", "")
-
-    metrics = {}
-    mapping = dict(DUPSIFTER_STAT_FIELDS)
-    stat = Path(stat_path)
-    if stat.exists():
-        for line_no, line in enumerate(stat.read_text().splitlines(), start=1):
-            if "]" in line and ":" in line:
-                content = line.split("]", 1)[1].strip()
-                if ":" in content:
-                    key, value = content.split(":", 1)
-                    key = key.strip()
-                    value = value.strip().replace(",", "")
-                    if key in mapping:
-                        try:
-                            metrics[mapping[key]] = int(value)
-                        except ValueError as exc:
-                            raise ValueError(
-                                f"Invalid Dupsifter count at {stat}:{line_no}: {key}={value!r}"
-                            ) from exc
-    row_key = demux_sample
-    output_row = {
-        "Protocol": pipeline_mode,
-        "Route": route_id,
-        "PlateID": plate_id,
-        "Cell_Order": cell_order,
-        "DNA_Barcode": dna_bc,
-    }
-    output_row.update(metrics)
-    obj = {
-        "id": "dupsifter",
-        "section_name": "Dupsifter Stats",
-        "description": f"Duplicate marking statistics for {demux_sample}; raw source={raw_sample}",
-        "plot_type": "table",
-        "pconfig": {"id": "dupsifter_table", "title": "Dupsifter Statistics", "col1_header": "Sample Name"},
-        "data": {row_key: output_row},
-    }
-    atomic_write_json(out_json, obj)
+_SOURCE_SUFFIXES = {".py", ".sh", ".yaml", ".toml", ".rs", ".lock"}
 
 
-MANIFEST_FIELDS = PROJECT_SAMPLE_MANIFEST_FIELDS
+_SOURCE_EXCLUDED_PARTS = {
+    ".git", ".pytest_cache", ".snakemake", "__pycache__", "conda", "target", "vendor"
+}
 
 
-def _read_existing_manifest_loose(path: Path) -> list[ProjectSampleRow]:
-    if not path.is_file() or path.stat().st_size == 0:
-        return []
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        fields = list(reader.fieldnames or [])
-        if not fields:
-            return []
-        if fields != list(MANIFEST_FIELDS):
-            raise ValueError(
-                f"Existing sample manifest {path} header/order does not match the current contract: "
-                f"expected={list(MANIFEST_FIELDS)!r}, observed={fields!r}"
-            )
-        rows: list[ProjectSampleRow] = []
-        for raw in reader:
-            if None in raw:
-                raise ValueError(f"Existing sample manifest {path} line {reader.line_num} has too many fields")
-            row = {field: str(raw.get(field, "") or "").strip() for field in MANIFEST_FIELDS}
-            if any(row.values()):
-                rows.append(row)
-        return rows
-
-
-def build_refreshed_rows(
-    discovered_samples: Iterable[str],
-    existing_rows: Sequence[Mapping[str, str]],
-    *,
-    species: str,
-    protocol: str,
-) -> list[dict[str, str]]:
-    """由 FASTQ inventory 构建确定性的项目 manifest 行，并提示移除失去本地输入的样本及关联。"""
-    protocol = str(protocol).strip().lower()
-    if protocol not in _PROTOCOLS:
-        raise ValueError(f"Unsupported protocol for manifest refresh: {protocol!r}")
-    input_columns = get_protocol(protocol).raw_input_columns
-    discovered = sorted({str(sample).strip() for sample in discovered_samples if str(sample).strip()})
-    discovered_set = set(discovered)
-    rows_by_id: dict[str, dict[str, str]] = {}
-    raw_owners: dict[str, tuple[str, str]] = {}
-    for old in existing_rows:
-        current_dna = str(
-            old.get("dna_raw_sample", "") or ""
-        ).strip()
-        current_rna = str(old.get("rna_sample", "") or "").strip()
-        kept_dna = current_dna if current_dna in discovered_set else ""
-        kept_rna = current_rna if "rna_sample" not in input_columns or current_rna in discovered_set else ""
-        if not kept_dna and not ("rna_sample" in input_columns and kept_rna):
-            association = (
-                f"；外部 RNA 关联 {current_rna!r} 随该行移除"
-                if current_rna and "rna_sample" not in input_columns else ""
-            )
-            warnings.warn(
-                f"样本 {old.get('sample_id', '')!r} 已无本地 FASTQ，刷新结果将移除该行{association}。",
-                UserWarning,
-                stacklevel=2,
-            )
+def _pipeline_source_identity(root: Path) -> Mapping[str, object]:
+    records: list[dict[str, object]] = []
+    for top in _SOURCE_ROOTS:
+        base = root / top
+        if not base.exists():
             continue
-        sample_id = str(old.get("sample_id", "") or "").strip()
-        if not sample_id:
-            raise ValueError(
-                "An existing manifest row that still matches current FASTQs has an empty sample_id; "
-                "assign it once before refresh so biological identity is not guessed."
-            )
-        if sample_id in rows_by_id:
-            raise ValueError(f"Existing sample manifest repeats sample_id={sample_id!r}")
-        row = {
-            "sample_id": sample_id,
-            "dna_raw_sample": kept_dna,
-            "rna_sample": kept_rna,
-            "species": species,
-            "protocol": protocol,
-            "notes": str(old.get("notes", "") or "").strip(),
-        }
-        rows_by_id[sample_id] = row
-        for column in input_columns:
-            raw_sample = row[column]
-            if not raw_sample:
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or any(part in _SOURCE_EXCLUDED_PARTS for part in path.parts):
                 continue
-            previous = raw_owners.get(raw_sample)
-            if previous is not None:
-                raise ValueError(
-                    f"Raw sample {raw_sample!r} is mapped more than once: "
-                    f"{previous[0]}/{previous[1]} and {sample_id}/{column}"
-                )
-            raw_owners[raw_sample] = (sample_id, column)
+            if path.suffix.lower() not in _SOURCE_SUFFIXES and path.name != "Snakefile":
+                continue
+            records.append({
+                "path": str(path.relative_to(root)),
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            })
+    design = root / DROPLET_DESIGN_RESOURCE
+    if design.is_file():
+        records.append({"path": DROPLET_DESIGN_RESOURCE, "size_bytes": design.stat().st_size,
+                        "sha256": sha256_file(design)})
+    return {
+        "method": "production-source-tree-v1",
+        "sha256": sha256_bytes(canonical_json_bytes(records)),
+        "file_count": len(records),
+    }
 
-    unmatched = [sample for sample in discovered if sample not in raw_owners]
-    if "rna_sample" not in input_columns:
-        external_rna = {row["rna_sample"] for row in rows_by_id.values() if row["rna_sample"]}
-        misplaced = sorted(set(unmatched) & external_rna)
-        if misplaced:
-            raise ValueError(
-                "FASTQ sample(s) declared only as external RNA links are present in DNA 01_raw: "
-                + ", ".join(misplaced)
-                + ". Keep RNA FASTQs in the RNA project; DNA inputs require an explicit dna_raw_sample mapping."
+
+def _environment_observation(label: str, prefix: Path) -> Mapping[str, object]:
+    resolved = prefix.expanduser().resolve()
+    warnings: list[str] = []
+    try:
+        record: Mapping[str, object] | None = read_environment_identity(resolved)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        record = None
+        warnings.append(str(exc))
+    return {
+        "label": label,
+        "resolved_prefix": str(resolved),
+        "record": record,
+        "capture_warnings": warnings,
+    }
+
+
+def _fastq_inventory(
+    raw_dir: Path, manifest_rows: list[ProjectSampleRow], *, protocol: str,
+) -> list[Mapping[str, object]]:
+    discovered = discover_samples(raw_dir, selected_samples=manifest_raw_samples(manifest_rows, protocol))
+    map_discovered_samples_to_manifest(discovered, manifest_rows, protocol=protocol)
+    if not discovered:
+        raise ValueError(f"no paired FASTQ samples found under: {raw_dir}")
+    result: list[Mapping[str, object]] = []
+    for sample, mates in sorted(discovered.items()):
+        r1s, r2s = list(mates["r1"]), list(mates["r2"])
+        if len(r1s) != len(r2s):
+            raise ValueError(f"FASTQ inventory became unpaired for sample {sample!r}")
+        for segment, (r1, r2) in enumerate(zip(r1s, r2s, strict=True), start=1):
+            result.append({
+                "raw_sample": sample,
+                "segment": segment,
+                "r1": stable_file_identity(Path(r1), hash_content=False),
+                "r2": stable_file_identity(Path(r2), hash_content=False),
+            })
+    return result
+
+
+def _executable_identity(path: Path) -> Mapping[str, object]:
+    if not path.is_file():
+        return {"path": str(path), "present": False}
+    observation: dict[str, object] = {
+        "present": True,
+        **stable_file_identity(path, hash_content=True),
+    }
+    if path.name == "demux_rs":
+        try:
+            completed = subprocess.run(
+                [str(path), "--build-info"], check=False, capture_output=True,
+                text=True, timeout=20,
             )
-    if protocol == "srd" and unmatched:
-        warnings.warn(
-            "New SRD raw sample(s) default to independent DNA routes: "
-            + ", ".join(unmatched)
-            + ". Move a raw name to rna_sample explicitly if it is an RNA-enrichment tube.",
-            UserWarning,
-            stacklevel=2,
+            observation["build_info_exit_code"] = completed.returncode
+            if completed.returncode == 0:
+                observation["build_info"] = json.loads(completed.stdout)
+            else:
+                observation["build_info_error"] = completed.stderr.strip()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            observation["build_info_error"] = str(exc)
+    return observation
+
+
+def _backend_reference_observation(
+    config: Mapping[str, object], reference: Path
+) -> Mapping[str, object]:
+    backend = get_backend(dict(config))
+    if backend == "bismark":
+        public = Path(f"{reference}.bismark")
+        if not public.is_dir():
+            raise FileNotFoundError(f"Bismark reference directory is missing or invalid: {public}")
+        resolved = public.resolve(strict=True)
+        genome = resolved / "genome.fa"
+        if not genome.is_file() or genome.stat().st_size == 0:
+            raise FileNotFoundError(f"Incomplete Bismark reference generation: {resolved}")
+        local_alignment = bool(get_protocol_config(config)["bismark"]["local_alignment"])
+        indexes = backend_active_index_paths(
+            reference, "bismark", bismark_local_alignment=local_alignment
         )
-
-
-    for raw_sample in unmatched:
-        if raw_sample in rows_by_id:
-            raise ValueError(
-                f"New raw sample {raw_sample!r} collides with an existing sample_id; "
-                "edit sample_manifest.tsv explicitly instead of inferring a pairing"
+        missing = [path for path in indexes if not path.is_file() or path.stat().st_size == 0]
+        if missing:
+            raise FileNotFoundError(
+                "Incomplete Bismark index generation: "
+                + ", ".join(str(path) for path in missing[:8])
             )
-        rows_by_id[raw_sample] = {
-            "sample_id": raw_sample,
-            "dna_raw_sample": raw_sample,
-            "rna_sample": "",
-            "species": species,
-            "protocol": protocol,
-            "notes": "",
+        return {
+            "backend": "bismark",
+            "alignment_mode": "local-faithful" if local_alignment else "end-to-end-combined",
+            "public_path": str(public.absolute()),
+            "resolved_path": str(resolved),
+            "genome": stable_file_identity(genome, hash_content=False),
+            "indexes": [stable_file_identity(path, hash_content=False) for path in indexes],
         }
-        raw_owners[raw_sample] = (raw_sample, "dna_raw_sample")
 
-    if set(raw_owners) != discovered_set:
-        raise AssertionError("Manifest refresh did not assign every raw sample exactly once")
-    return sorted(rows_by_id.values(), key=lambda row: row["sample_id"])
-
-
-def _canonical_project_manifest_rows(
-    rows: Sequence[Mapping[str, object]],
-) -> list[dict[str, str]]:
-
-
-    normalized: list[dict[str, str]] = []
-    for raw in rows:
-        row = {
-            field: str(raw.get(field, "") or "").strip()
-            for field in MANIFEST_FIELDS
-        }
-        row["protocol"] = row["protocol"].lower()
-        normalized.append(row)
-    return sorted(normalized, key=lambda row: row["sample_id"])
+    indexes = backend_active_index_paths(reference, backend)
+    missing = [path for path in indexes if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        raise FileNotFoundError(
+            f"Incomplete {backend} reference generation: "
+            + ", ".join(str(path) for path in missing)
+        )
+    return {
+        "backend": backend,
+        "indexes": [stable_file_identity(path, hash_content=False) for path in indexes],
+    }
 
 
-def _resolve_config(project_arg: str | None, config_arg: str | None) -> tuple[Path, Path]:
-    cwd = Path.cwd().resolve()
-    if config_arg:
-        config_path = Path(config_arg).expanduser()
-        config_path = (cwd / config_path).resolve() if not config_path.is_absolute() else config_path.resolve()
-        if config_path.parent.name != "00_config" or config_path.name != "config.yaml":
-            raise ValueError("Alopex only accepts <project>/00_config/config.yaml")
-        project = config_path.parent.parent.resolve()
-        if project_arg and Path(project_arg).expanduser().resolve() != project:
-            raise ValueError("--project and --configfile resolve to different project roots")
-    else:
-        project = Path(project_arg).expanduser().resolve() if project_arg else cwd
-        config_path = project / "00_config" / "config.yaml"
-
-    if not project.is_dir():
-        raise FileNotFoundError(f"Project directory does not exist: {project}")
-    if not config_path.is_file():
-        raise FileNotFoundError(f"Project config not found: {config_path}")
-    return project, config_path.resolve()
-
-
-def refresh_manifest(
+def _snapshot_basis(
     *,
+    pipeline_root: Path,
     project_dir: Path,
     config_path: Path,
-    dry_run: bool = False,
-) -> dict[str, object]:
-    """先在内存中校验完整改名与 manifest 计划；预览不写文件，正式写出失败时回滚改名。"""
+    control_env: Path,
+    biscuit_env: Path,
+    bismark_env: Path,
+    rastair_env: Path,
+    allow_external_config: bool = False,
+) -> Mapping[str, object]:
     config = load_project_config(config_path)
+    expected_project = config_path.parent.parent.resolve()
+    if not allow_external_config and project_dir.resolve() != expected_project:
+        raise ValueError(f"project/config mismatch: {project_dir} != {expected_project}")
 
-    if not project_dir.is_dir():
-        raise FileNotFoundError(f"Project directory does not exist: {project_dir}")
+    sample_manifest = project_dir / "00_config" / "sample_manifest.tsv"
+    barcode_map = project_dir / "00_config" / "Barcode_Map.csv"
+    for path in (config_path, sample_manifest, *([] if config["analysis"]["protocol"] == "droplet" else [barcode_map])):
+        if not path.is_file():
+            raise FileNotFoundError(f"run-start input is missing: {path}")
 
-    species = str(config["species"])
-    protocol = get_protocol_policy(config).name
-    raw_dir = project_dir / "01_raw"
-    manifest_path = project_dir / "00_config" / "sample_manifest.tsv"
-
-
-    fastq_renames = resolve_single_pair_fastq_collisions(raw_dir, apply=False)
-    discovered = discover_samples(raw_dir, planned_renames=dict(fastq_renames))
-    if not discovered:
-        raise ValueError(f"No paired FASTQ samples found under: {raw_dir}")
-    existing_rows = _read_existing_manifest_loose(manifest_path)
-    rows = build_refreshed_rows(
-        discovered.keys(), existing_rows, species=species, protocol=protocol
+    species = str(config.get("species", "")).strip()
+    reference = Path(resolve_reference(config, species, project_dir, pipeline_root=pipeline_root))
+    reference_record = reference_identity(
+        reference,
+        expected_species=species or None,
     )
-    if not rows:
-        raise ValueError("Manifest refresh produced no rows")
-
-
-    new_text = render_tsv(rows, MANIFEST_FIELDS)
-    validated = _parse_project_sample_manifest(
-        io.StringIO(new_text), path=manifest_path, species=species, protocol=protocol
+    control_observation = _environment_observation("control", control_env)
+    backend = get_backend(config)
+    active_backend_observation = _environment_observation(
+        backend, {"biscuit": biscuit_env, "bismark": bismark_env,
+                       "rastair": rastair_env}[backend]
     )
-    map_discovered_samples_to_manifest(discovered, validated, protocol=protocol)
-    changed = _canonical_project_manifest_rows(existing_rows) != rows
-    backup_path: Path | None = None
-
-    if not dry_run:
-        if fastq_renames:
-            _apply_fastq_renames(raw_dir, fastq_renames)
-        try:
-            if changed:
-                if manifest_path.is_file() and existing_rows:
-                    backup_path = manifest_path.with_name(f"{manifest_path.name}.bak")
-                    shutil.copy2(manifest_path, backup_path)
-                write_tsv_atomic(manifest_path, rows, MANIFEST_FIELDS)
-        except Exception:
-            for source, target in reversed(fastq_renames):
-                target.rename(source)
-            raise
-
+    protocol = str(config.get("analysis", {}).get("protocol", "")).strip().lower()
     return {
-        "project_dir": project_dir,
-        "config_path": config_path,
-        "raw_dir": raw_dir,
-        "manifest_path": manifest_path,
-        "species": species,
-        "protocol": protocol,
-        "discovered_count": len(discovered),
-        "row_count": len(rows),
-        "changed": changed,
-        "backup_path": backup_path,
-        "fastq_renames": fastq_renames,
-        "rows": rows,
-        "text": new_text,
-    }
-
-
-BSCONV_P_COLUMNS = 9
-
-
-def open_text(path: Path) -> TextIO:
-    if str(path) == "-":
-        return sys.stdin
-    return path.open("r", encoding="utf-8")
-
-
-def normalize_read_name(value: str) -> str:
-
-    return str(value).strip().split()[0]
-
-
-def indexed_excluded_contigs(bam_path: Path, samtools: str, excluded: set[str]) -> list[str]:
-    proc = subprocess.run(
-        [samtools, "idxstats", str(bam_path)],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or f"samtools idxstats failed for {bam_path}")
-    contigs = []
-    for line in proc.stdout.splitlines():
-        fields = line.split("\t")
-        if fields and fields[0] in excluded:
-            contigs.append(fields[0])
-    return contigs
-
-
-def excluded_reads_from_bam(bam_path: Path, samtools: str, excluded: set[str]) -> set[str]:
-    """经 samtools idxstats/view 流式收集排除 contig 上的 QNAME，不物化完整 SAM。"""
-    contigs = indexed_excluded_contigs(bam_path, samtools, excluded)
-    if not contigs:
-        return set()
-
-    proc = subprocess.Popen(
-        [samtools, "view", str(bam_path), *contigs],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1,
-    )
-    assert proc.stdout is not None
-    names = set()
-    for line in proc.stdout:
-        if not line:
-            continue
-        names.add(normalize_read_name(line.split("\t", 1)[0]))
-    proc.stdout.close()
-    stderr = proc.stderr.read() if proc.stderr is not None else ""
-    returncode = proc.wait()
-    if returncode != 0:
-        raise RuntimeError(stderr.strip() or f"samtools view failed for {bam_path}")
-    return names
-
-
-def _high_cph_multiqc_payload(
-    sample_name: str,
-    summary: Mapping[str, object],
-    protocol: str,
-    high_cph_role: str,
-) -> dict[str, object]:
-    if summary.get("backend") == "bismark":
-        return {
-            "id": "dna_pipeline_bismark_nonconversion",
-            "section_name": "Bismark non-conversion filtering",
-            "plot_type": "table", "data": {sample_name: dict(summary)},
-        }
-    fraction = float(summary["high_cph_fraction"])
-    row = {
-        "Candidate_Read_Pairs": int(summary["candidate_read_pairs"]),
-        "Flagged_Read_Pairs": int(summary["flagged_read_pairs"]),
-        "High_CpH_Fraction": fraction,
-        "Excluded_Read_Pairs": int(summary["excluded_read_pairs"]),
-        "Threshold": float(summary["threshold"]),
-    }
-    interpretation = (
-        "candidate cDNA contamination"
-        if high_cph_role == "cdna_contamination"
-        else "residual high-CpH/non-converted DNA reads"
-    )
-    return {
-        "id": "bsconv_filter",
-        "section_name": "High-CpH Read Assessment",
-        "description": (
-            f"Protocol={protocol}; high-CpH reads are interpreted as {interpretation}. "
-            "They are excluded from DNA methylation pileup."
-        ),
-        "plot_type": "table",
-        "pconfig": {
-            "id": "bsconv_filter_table",
-            "title": "High-CpH Read Assessment",
-            "col1_header": "Sample",
+        "pipeline": {
+            "root": str(pipeline_root.resolve()),
+            "source": _pipeline_source_identity(pipeline_root),
         },
-        "data": {sample_name: row},
-    }
-
-
-def write_multiqc(
-    path: Path,
-    sample_name: str,
-    summary: Mapping[str, object],
-    protocol: str,
-    high_cph_role: str,
-) -> None:
-    """把 high-CpH 评估汇总写成 MultiQC custom-content table JSON。"""
-    obj = _high_cph_multiqc_payload(sample_name, summary, protocol, high_cph_role)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2) + "\n")
-
-
-def _parse_excluded_contigs_json(value: str) -> set[str]:
-    try:
-        raw = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"--excluded-contigs-json is invalid JSON: {exc}") from exc
-    if not isinstance(raw, list) or any(
-        not isinstance(value, str) or not value.strip() for value in raw
-    ):
-        raise ValueError("--excluded-contigs-json must be a JSON array of non-empty strings")
-    if len(set(raw)) != len(raw):
-        raise ValueError("--excluded-contigs-json must not repeat a contig")
-    return {str(value).strip() for value in raw}
-
-
-def _sort_unique_count(source: Path, destination: Path) -> int:
-    env = dict(os.environ)
-    env["LC_ALL"] = "C"
-    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
-    os.close(fd)
-    temporary_path = Path(temporary)
-    try:
-        proc = subprocess.run(
-            ["sort", "-u", str(source), "-o", str(temporary_path)],
-            text=True,
-            capture_output=True,
-            env=env,
-            check=False,
-        )
-        if proc.returncode != 0:
-            raise ValueError(proc.stderr.strip() or f"sort -u failed for {source}")
-        with temporary_path.open("r", encoding="utf-8") as handle:
-            count = sum(1 for line in handle if line.strip())
-        os.replace(temporary_path, destination)
-        return count
-    finally:
-        temporary_path.unlink(missing_ok=True)
-
-
-def split_pairs(
-    source: Path, bio: Path, excluded: Path, excluded_contigs: set[str]
-) -> tuple[int, int]:
-    """按原始顺序拆分 paired BAM，校验相邻 R1/R2 并在写出时累计两路 pair 数。"""
-    import pysam
-
-    counts = [0, 0]
-    with pysam.AlignmentFile(str(source), "rb") as reader, \
-         pysam.AlignmentFile(str(bio), "wb", template=reader, format_options=[b"level=1"]) as bio_out, \
-         pysam.AlignmentFile(str(excluded), "wb", template=reader, format_options=[b"level=1"]) as excluded_out:
-        excluded_ids = {reader.get_tid(name) for name in excluded_contigs} - {-1}
-        records = reader.fetch(until_eof=True)
-        for left in records:
-            right = next(records, None)
-            if right is None:
-                raise ValueError("Odd number of alignment records in paired Bismark BAM")
-            if left.query_name != right.query_name:
-                raise ValueError("paired Bismark BAM is not mate-adjacent")
-            if not (
-                left.is_paired and right.is_paired
-                and left.is_read1 != left.is_read2
-                and right.is_read1 != right.is_read2
-                and left.is_read1 == right.is_read2
-                and left.is_read2 == right.is_read1
-            ):
-                raise ValueError(f"Bismark records are not an R1/R2 pair: {left.query_name!r}")
-            route = int(bool(excluded_ids.intersection((
-                left.reference_id, left.next_reference_id,
-                right.reference_id, right.next_reference_id,
-            ))))
-            destination = excluded_out if route else bio_out
-            destination.write(left)
-            destination.write(right)
-            counts[route] += 1
-    return counts[0], counts[1]
-
-
-def run_bsconv_extraction(args) -> None:
-    """主流程：流式解析 bsconv TSV、排除指定 contig、按阈值划分高 retention QNAME，
-    外部 sort -u 按 read-pair 去重后写出 high-read-names、summary 与 MultiQC JSON。"""
-    if not 0 <= args.threshold <= 1:
-        raise ValueError("--threshold must be between 0 and 1")
-
-    excluded = _parse_excluded_contigs_json(args.excluded_contigs_json)
-    excluded_read_names: set[str] | None = None
-    total = excluded_rows = metric_rows = missing_metric = 0
-    high_metric_rows = 0
-    args.high_read_names.parent.mkdir(parents=True, exist_ok=True)
-
-
-    raw_high_path: Path | None = None
-    raw_candidate_path: Path | None = None
-    raw_excluded_path: Path | None = None
-    candidate_unique_path: Path | None = None
-    excluded_unique_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            prefix=args.high_read_names.name + ".",
-            suffix=".unsorted",
-            dir=args.high_read_names.parent,
-            delete=False,
-        ) as raw_high_handle, tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            prefix=args.high_read_names.name + ".",
-            suffix=".candidate.unsorted",
-            dir=args.high_read_names.parent,
-            delete=False,
-        ) as raw_candidate_handle, tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            prefix=args.high_read_names.name + ".",
-            suffix=".excluded.unsorted",
-            dir=args.high_read_names.parent,
-            delete=False,
-        ) as raw_excluded_handle:
-            raw_high_path = Path(raw_high_handle.name)
-            raw_candidate_path = Path(raw_candidate_handle.name)
-            raw_excluded_path = Path(raw_excluded_handle.name)
-            with open_text(args.bsconv_tsv) as handle:
-                reader = csv.reader(handle, delimiter="\t")
-                for row in reader:
-                    if not row or row[0].startswith("#"):
-                        continue
-                    if len(row) != BSCONV_P_COLUMNS or not all(
-                        re.fullmatch(r"[0-9]+", value) for value in row[:8]
-                    ) or not row[8].strip():
-                        raise ValueError(
-                            f"Unexpected biscuit bsconv -p row at {args.bsconv_tsv}:{reader.line_num} "
-                            f"(expect 8 nonnegative integer cytosine counts + QNAME): {row!r}"
-                        )
-
-                    read_name = normalize_read_name(row[8])
-                    if excluded_read_names is None:
-                        excluded_read_names = (
-                            excluded_reads_from_bam(
-                                args.alignment_bam, args.samtools, excluded
-                            )
-                            if excluded
-                            else set()
-                        )
-                    total += 1
-                    if read_name in excluded_read_names:
-                        excluded_rows += 1
-                        raw_excluded_handle.write(read_name + "\n")
-                        continue
-
-
-                    retained = int(row[0]) + int(row[2]) + int(row[6])
-                    converted = int(row[1]) + int(row[3]) + int(row[7])
-                    sites = retained + converted
-                    if sites == 0:
-                        missing_metric += 1
-                        continue
-                    metric_rows += 1
-                    raw_candidate_handle.write(read_name + "\n")
-                    if retained / sites > args.threshold:
-                        high_metric_rows += 1
-                        raw_high_handle.write(read_name + "\n")
-
-
-        candidate_unique_path = raw_candidate_path.with_suffix(".unique")
-        excluded_unique_path = raw_excluded_path.with_suffix(".unique")
-        candidate_read_pairs = _sort_unique_count(raw_candidate_path, candidate_unique_path)
-        flagged_read_pairs = _sort_unique_count(raw_high_path, args.high_read_names)
-        excluded_read_pairs = _sort_unique_count(raw_excluded_path, excluded_unique_path)
-        candidate_unique_path.unlink(missing_ok=True)
-        excluded_unique_path.unlink(missing_ok=True)
-    finally:
-        for temporary in (
-            raw_high_path,
-            raw_candidate_path,
-            raw_excluded_path,
-            candidate_unique_path,
-            excluded_unique_path,
-        ):
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-
-    summary = {
-        "schema_version": 2,
-        "backend": "biscuit",
-        "sample": args.sample_name,
-        "metric_unit": "read_pairs",
-        "candidate_read_pairs": candidate_read_pairs,
-        "flagged_read_pairs": flagged_read_pairs,
-        "high_cph_fraction": (
-            flagged_read_pairs / candidate_read_pairs if candidate_read_pairs else 0.0
+        "analysis": {
+            "species": species,
+            "protocol": protocol,
+            "methylation_backend": backend,
+            "cpg_coordinate_base": config["analysis"]["cpg_coordinate_base"],
+        },
+        "project": {
+            "path": str(project_dir.resolve()),
+            "config": stable_file_identity(config_path, hash_content=True),
+            "sample_manifest": stable_file_identity(sample_manifest, hash_content=True),
+            **({} if protocol == "droplet" else {"barcode_map": stable_file_identity(barcode_map, hash_content=True)}),
+        },
+        "raw_fastqs": _fastq_inventory(
+            project_dir / "01_raw",
+            read_project_sample_manifest(sample_manifest, species=species, protocol=protocol),
+            protocol=protocol,
         ),
-        "excluded_read_pairs": excluded_read_pairs,
-        "filter_applied": True,
-        "missing_metric_rows": missing_metric,
-        "observed_metric_rows": metric_rows,
-        "flagged_metric_rows": high_metric_rows,
-        "observed_rows": total,
-        "excluded_rows": excluded_rows,
-        "threshold": args.threshold,
-        "metric": "CpH_retention",
-        "comparison": ">",
-        "protocol": args.protocol,
-        "high_cph_role": args.high_cph_role,
+        "reference": reference_record,
+        "backend_reference": _backend_reference_observation(config, reference),
+        "environments": {
+            "control": control_observation,
+            backend: active_backend_observation,
+        },
+        "executables": {
+            "demux_rs": _executable_identity(
+                pipeline_root / "conda" / "rust" / "bin" / "demux_rs"
+            ),
+        },
     }
-    args.summary_json.parent.mkdir(parents=True, exist_ok=True)
-    args.summary_json.write_text(json.dumps(summary, indent=2) + "\n")
-    if args.multiqc_json:
-        write_multiqc(
-            args.multiqc_json,
-            args.sample_name,
-            summary,
-            args.protocol,
-            args.high_cph_role,
-        )
 
 
-def run_bismark_pair_split(args) -> int:
-    """把 BAM 路由到 bio/excluded，标准输出仅返回两路 pair 计数供当前规则使用。"""
-    excluded_contigs = _parse_excluded_contigs_json(args.excluded_contigs_json)
-    args.bio.parent.mkdir(parents=True, exist_ok=True)
-    args.excluded.parent.mkdir(parents=True, exist_ok=True)
-    print(*split_pairs(args.input_bam, args.bio, args.excluded, excluded_contigs))
-    return 0
+def _make_tree_read_only(root: Path) -> None:
 
 
-def init_project_directory(project_dir: str | Path, pipeline_root: str | Path) -> Path:
-    """初始化项目骨架：目录、config 模板、manifest 头、Barcode Map 与 launcher symlink。"""
-    if not str(project_dir).strip():
-        raise ValueError("empty project path")
-    root = Path(pipeline_root).expanduser().resolve()
-    project = Path(project_dir).expanduser()
-    project.mkdir(parents=True, exist_ok=True)
-    project = project.resolve()
-    if project == root:
-        raise ValueError("the Pipeline installation directory cannot also be a project")
-    for name in ("00_config", "01_raw", "02_work", "03_results", "04_logs", "05_tmp"):
-        (project / name).mkdir(exist_ok=True)
-    config = project / "00_config" / "config.yaml"
-    if not config.exists():
-        config.write_text(CONFIG_TEMPLATE_YAML, encoding="utf-8")
-    manifest = project / "00_config" / "sample_manifest.tsv"
-    if not manifest.exists():
-        manifest.write_text(
-            "sample_id\tdna_raw_sample\trna_sample\tspecies\tprotocol\tnotes\n",
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        os.chmod(path, 0o755 if path.is_dir() else 0o444)
+    os.chmod(root, 0o755)
+
+
+def _make_writable(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        return
+    os.chmod(path, 0o755)
+    for child in path.rglob("*"):
+        if child.is_symlink() or not child.is_dir():
+            continue
+        try:
+            os.chmod(child, 0o755)
+        except FileNotFoundError:
+            pass
+
+
+def _remove_stage(stage: Path) -> None:
+    if stage.exists():
+        _make_writable(stage)
+        shutil.rmtree(stage)
+
+
+def _copy_observed_file(
+    source: Path, destination: Path, expected: Mapping[str, object], input_store: Path
+) -> Mapping[str, object]:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    input_store.mkdir(parents=True, exist_ok=True)
+    shared = input_store / f"{expected['sha256']}.{destination.name}"
+    if not shared.exists():
+        with source.open("rb") as src, destination.open("wb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        copied = stable_file_identity(destination, hash_content=True)
+        for key in ("size_bytes", "sha256"):
+            if copied.get(key) != expected.get(key):
+                raise RuntimeError(f"file changed while creating run snapshot: {source}")
+        destination.chmod(0o444)
+        try:
+            os.link(destination, shared)
+        except FileExistsError:
+            pass
+        destination.unlink()
+    if shared.is_symlink():
+        raise ValueError(f"snapshot input store may not contain a symlink: {shared}")
+    copied = stable_file_identity(shared, hash_content=True)
+    for key in ("size_bytes", "sha256"):
+        if copied.get(key) != expected.get(key):
+            raise RuntimeError(f"snapshot input store identity changed: {shared}")
+    destination.symlink_to(os.path.relpath(shared, destination.parent))
+    return {
+        "source_path": str(source.resolve()),
+        "snapshot_path": str(destination.name),
+        "size_bytes": copied["size_bytes"],
+        "sha256": copied["sha256"],
+    }
+
+
+def create_run_snapshot(
+    *,
+    pipeline_root: str | Path,
+    project_dir: str | Path,
+    config_path: str | Path,
+    control_env: str | Path,
+    biscuit_env: str | Path,
+    bismark_env: str | Path,
+    rastair_env: str | Path,
+    allow_external_config: bool = False,
+) -> Path:
+    """按本次 run basis 创建或复用唯一不可变的启动 snapshot。"""
+    pipeline = Path(pipeline_root).expanduser().resolve()
+    project = Path(project_dir).expanduser().resolve()
+    config = Path(config_path).expanduser().resolve()
+    basis = _snapshot_basis(
+        pipeline_root=pipeline,
+        project_dir=project,
+        config_path=config,
+        control_env=Path(control_env).expanduser().resolve(),
+        biscuit_env=Path(biscuit_env).expanduser().resolve(),
+        bismark_env=Path(bismark_env).expanduser().resolve(),
+        rastair_env=Path(rastair_env).expanduser().resolve(),
+        allow_external_config=allow_external_config,
+    )
+    snapshot_id = sha256_bytes(canonical_json_bytes(basis))
+    snapshots_root = project / "04_logs" / "provenance" / "snapshots"
+    input_store = snapshots_root.parent / "inputs"
+    snapshots_root.mkdir(parents=True, exist_ok=True)
+    final = snapshots_root / snapshot_id
+    manifest = final / "manifest.json"
+    if manifest.is_file():
+        load_run_snapshot(manifest)
+        return manifest
+
+    stage = Path(tempfile.mkdtemp(prefix=f".{snapshot_id}.", dir=snapshots_root))
+    try:
+        inputs_dir = stage / "inputs"
+        project_basis = basis["project"]
+        copies = {
+            "config": _copy_observed_file(
+                Path(str(project_basis["config"]["path"])), inputs_dir / "config.yaml",
+                project_basis["config"], input_store
+            ),
+            "sample_manifest": _copy_observed_file(
+                Path(str(project_basis["sample_manifest"]["path"])),
+                inputs_dir / "sample_manifest.tsv", project_basis["sample_manifest"], input_store,
+            ),
+            **({} if basis["analysis"]["protocol"] == "droplet" else {"barcode_map": _copy_observed_file(
+                Path(str(project_basis["barcode_map"]["path"])),
+                inputs_dir / "Barcode_Map.csv", project_basis["barcode_map"], input_store,
+            )}),
+        }
+        payload = {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "snapshot_id": snapshot_id,
+            "recorded_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+            "basis": basis,
+            "input_copies": copies,
+        }
+        (stage / "manifest.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-    barcode = project / "00_config" / "Barcode_Map.csv"
-    if not barcode.exists() and load_project_config(config)["analysis"]["protocol"] != "droplet":
-        source = root / "resources" / "Barcode_Map.csv"
-        if not source.is_file():
-            raise FileNotFoundError(f"Barcode Map template is missing: {source}")
-        shutil.copy2(source, barcode)
-    launcher = project / "run_pipeline.sh"
-    if not launcher.exists() and not launcher.is_symlink():
-        launcher.symlink_to(root / "core" / "run_pipeline.sh")
-    elif not launcher.is_symlink():
-        print(f"WARNING: {launcher} already exists and was not replaced.")
-    return project
+        _make_tree_read_only(stage)
+        try:
+            os.replace(stage, final)
+        except OSError:
+            if not manifest.is_file():
+                raise
+            _remove_stage(stage)
+        load_run_snapshot(manifest)
+        return manifest
+    except Exception:
+        _remove_stage(stage)
+        raise
 
 
-def print_refresh_result(args, result) -> int:
-    """refresh-manifest 的用户可见输出（预览/更新/未变化 + 改名计划）。"""
-    action = "Previewed" if args.dry_run else ("Updated" if result["changed"] else "Unchanged")
-    print(f"{action} sample manifest")
-    print(f"  Project:  {result['project_dir']}")
-    print(f"  Config:   {result['config_path']}")
-    print(f"  Raw:      {result['raw_dir']}")
-    print(f"  Manifest: {result['manifest_path']}")
-    print(f"  Protocol: {result['protocol']}")
-    print(f"  Species:  {result['species']}")
-    print(f"  FASTQ samples: {result['discovered_count']}")
-    print(f"  Manifest rows: {result['row_count']}")
-    if result["fastq_renames"]:
-        state = "Planned renames" if args.dry_run else "Normalized FASTQ pairs"
-        print(f"  {state}: {len(result['fastq_renames'])} file(s)")
-        for source, target in result["fastq_renames"]:
-            rel_source = Path(source).relative_to(result["raw_dir"])
-            print(f"    {rel_source} -> {target.name}")
-    if result["backup_path"]:
-        print(f"  Backup:   {result['backup_path']}")
-    if args.dry_run:
-        print("\n" + str(result["text"]), end="")
-    return 0
+def load_run_snapshot_basis(path: str | Path) -> Mapping[str, object]:
+    manifest = Path(path).expanduser().resolve()
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid run snapshot JSON: {manifest}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+        raise ValueError(f"unsupported run snapshot schema: {manifest}")
+    basis = payload.get("basis")
+    if not isinstance(basis, dict):
+        raise ValueError(f"run snapshot basis is missing: {manifest}")
+    expected_id = sha256_bytes(canonical_json_bytes(basis))
+    if payload.get("snapshot_id") != expected_id or manifest.parent.name != expected_id:
+        raise ValueError(f"run snapshot content address is invalid: {manifest}")
+    return payload
 
+
+def _validate_input_copy(snapshot_root: Path, record: object, expected: object, label: str) -> Path:
+    if not isinstance(record, Mapping) or not isinstance(expected, Mapping):
+        raise ValueError(f"run snapshot {label} copy is malformed")
+    relative = str(record.get("snapshot_path", ""))
+    path = snapshot_root / "inputs" / relative
+    if Path(relative).name != relative or not path.is_file():
+        raise FileNotFoundError(f"run snapshot {label} copy is missing: {path}")
+    stat = path.stat()
+    if stat.st_size != expected.get("size_bytes") or sha256_file(path) != expected.get("sha256"):
+        raise ValueError(f"run snapshot {label} copy changed: {path}")
+    if record.get("size_bytes") != expected.get("size_bytes") or record.get("sha256") != expected.get("sha256"):
+        raise ValueError(f"run snapshot {label} copy identity disagrees with basis")
+    return path
+
+
+def load_run_snapshot(path: str | Path) -> Mapping[str, object]:
+    """加载并校验该唯一不可变 snapshot 及其小型输入副本。"""
+    manifest = Path(path).expanduser().resolve()
+    payload = load_run_snapshot_basis(manifest)
+    project = payload["basis"].get("project")
+    copies = payload.get("input_copies")
+    if not isinstance(project, Mapping) or not isinstance(copies, Mapping):
+        raise ValueError(f"run snapshot input copies are malformed: {manifest}")
+    for key in ("config", "sample_manifest", *([] if payload["basis"]["analysis"]["protocol"] == "droplet" else ["barcode_map"])):
+        _validate_input_copy(manifest.parent, copies.get(key), project.get(key), key)
+    return payload
+
+
+def snapshot_input_path(snapshot: str | Path, key: str) -> Path:
+    """从 snapshot 返回 config/sample_manifest/barcode_map 的不可变副本路径。"""
+    if key not in {"config", "sample_manifest", "barcode_map"}:
+        raise ValueError(f"unsupported snapshot input key: {key}")
+    manifest = Path(snapshot).expanduser().resolve()
+    payload = load_run_snapshot(manifest)
+    root = manifest.parent
+    record = payload.get("input_copies", {}).get(key)
+    if not isinstance(record, Mapping):
+        raise ValueError(f"run snapshot {key} copy is missing")
+    return root / "inputs" / str(record["snapshot_path"])
+
+
+RUN_MANIFEST_SCHEMA_VERSION = 8
+
+
+DELIVERY_READY_SCHEMA_VERSION = 2
+
+
+_DELIVERY_DIR_NAMES = frozenset(PUBLIC_RESULT_DIR_NAMES)
+
+
+def _delivery_id(value: object) -> str:
+    text = str(value)
+    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+        raise ValueError(f"invalid delivery id: {text!r}")
+    return text
+
+
+def _output_relative_is_owned(relative: Path) -> bool:
+    return relative.parts[0] in _DELIVERY_DIR_NAMES
+
+
+def _check_result_directories(root: Path, relative: Path, *, label: str) -> None:
+    directory = root
+    for part in (*relative.parts[:-1], None):
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise ValueError(f"{label} requires real result directories: {directory}")
+        if part is not None:
+            directory /= part
+
+
+def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
+    manifest = Path("QC_Results/sample_manifest.tsv")
+    declared = {manifest, Path("QC_Results/multiqc_report.html")}
+    _check_result_directories(results, manifest, label="staged delivery")
+    if (results / manifest).is_symlink():
+        raise ValueError(f"staged result may not be a symlink: {results / manifest}")
+    with (results / manifest).open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        required = {"sample_id", "cpg_path", "snp_path"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError("final sample manifest is missing current delivery path fields")
+        for row in reader:
+            for field, directory, suffix in (
+                ("cpg_path", "CpG", ".cpg.tsv.zst"),
+                ("snp_path", "SNP", ".snps.vcf.gz" if row.get("methylation_backend") == "rastair" else ".snps.bed.gz"),
+            ):
+                value = str(row.get(field) or "").strip()
+                if not value:
+                    continue
+                sample_id = str(row.get("sample_id") or "").strip()
+                if SAMPLE_ID_RE.fullmatch(sample_id) is None:
+                    raise ValueError(f"invalid delivery sample_id: {sample_id!r}")
+                relative = Path(directory) / f"{sample_id}{suffix}"
+                if value != f"03_results/{relative.as_posix()}":
+                    raise ValueError(f"final sample manifest has an invalid {field}: {value!r}")
+                declared.add(relative)
+                if field == "snp_path":
+                    declared.add(relative.with_name(relative.name + ".tbi"))
+
+    records: list[dict[str, object]] = []
+    for relative in sorted(declared):
+        _check_result_directories(results, relative, label="staged delivery")
+        path = results / relative
+        if path.is_symlink():
+            raise ValueError(f"staged result may not be a symlink: {path}")
+        if not path.is_file():
+            raise FileNotFoundError(f"declared staged result is missing: {path}")
+        stat = path.stat()
+        records.append(
+            {
+                "path": relative.as_posix(),
+                "size_bytes": stat.st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return records
+
+
+def _validate_inventory(
+    root: Path,
+    records: object,
+    *,
+    label: str,
+) -> list[dict[str, object]]:
+    if not isinstance(records, list) or not records:
+        raise ValueError(f"{label} inventory is empty or malformed")
+    validated: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for raw in records:
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{label} inventory contains a malformed record")
+        if (
+            type(raw.get("size_bytes")) is not int
+            or raw["size_bytes"] < 0
+            or re.fullmatch(r"[0-9a-f]{64}", str(raw.get("sha256", ""))) is None
+        ):
+            raise ValueError(f"{label} inventory contains an invalid size/hash record")
+        relative = _safe_relative(raw.get("path", ""), label=f"{label} output path")
+        if not _output_relative_is_owned(relative):
+            raise ValueError(f"{label} inventory contains an unknown output: {relative}")
+        key = relative.as_posix()
+        if key in seen:
+            raise ValueError(f"{label} inventory repeats output: {key}")
+        seen.add(key)
+        _check_result_directories(root, relative, label=label)
+        path = root / relative
+        if not path.is_file() or path.is_symlink():
+            raise FileNotFoundError(f"{label} output is missing: {path}")
+        stat = path.stat()
+        if stat.st_size != raw.get("size_bytes"):
+            raise ValueError(f"{label} output size changed: {path}")
+        validated.append(dict(raw))
+    return validated
+
+
+def write_delivery_ready(
+    out_json: str | Path,
+    *,
+    staged_results_dir: str | Path,
+    run_snapshot_path: str | Path,
+) -> Path:
+    """按最终 sample manifest 声明的 CpG/SNP 与固定 QC 产物生成一次 inventory。
+
+    未声明的 stable stage 文件不进入本次发布；只保存 sealed inventory 与 run snapshot 的绑定，
+    结构上固定的路径（稳定 stage、公开目录）不落盘。
+    """
+    output = Path(out_json).expanduser().resolve()
+    stage_results = Path(staged_results_dir).expanduser().resolve()
+    project = stage_results.parent.parent
+    expected_publish_root = project / "05_tmp" / "finalize" / output.parent.name
+    if output.parent != expected_publish_root.resolve(strict=False):
+        raise ValueError(f"delivery-ready path is outside its publication transaction: {output}")
+    expected_stage = (project / "02_work" / "results_stage").resolve(strict=False)
+    if stage_results != expected_stage:
+        raise ValueError(f"biological result stage must be stable: {stage_results} != {expected_stage}")
+
+    snapshot_path = Path(run_snapshot_path).expanduser().resolve()
+    snapshot = load_run_snapshot(snapshot_path)
+    basis = snapshot.get("basis")
+    if not isinstance(basis, Mapping):
+        raise ValueError("run snapshot basis is missing")
+    project_record = basis.get("project")
+    if not isinstance(project_record, Mapping):
+        raise ValueError("run snapshot delivery identity is incomplete")
+    snapshot_project = Path(str(project_record.get("path", ""))).resolve()
+    if snapshot_project != project.resolve():
+        raise ValueError("run snapshot project and delivery project disagree")
+    delivery_id = _delivery_id(output.parent.name)
+    if snapshot.get("snapshot_id") != delivery_id:
+        raise ValueError("delivery generation must use the run snapshot id")
+
+    payload: dict[str, object] = {
+        "schema_version": DELIVERY_READY_SCHEMA_VERSION,
+        "delivery_id": delivery_id,
+        "recorded_at_utc": _utc_now(),
+        "project_dir": str(project.resolve()),
+        "run_snapshot_path": str(snapshot_path),
+        "outputs": _staged_output_inventory(stage_results),
+    }
+    atomic_write_json(output, payload)
+    return output
+
+
+def load_delivery_ready(
+    path: str | Path, *, validate_staged: bool = True
+) -> dict[str, object]:
+    manifest = Path(path).expanduser().resolve()
+    payload = _read_json(manifest, "delivery-ready")
+    if payload.get("schema_version") != DELIVERY_READY_SCHEMA_VERSION:
+        raise ValueError(f"unsupported delivery-ready schema: {manifest}")
+    project = Path(str(payload.get("project_dir", ""))).expanduser().resolve()
+
+
+    stage = (project / "02_work" / "results_stage").resolve(strict=False)
+    delivery_id = _delivery_id(payload.get("delivery_id", ""))
+    expected_root = project / "05_tmp" / "finalize" / delivery_id
+    if manifest.parent != expected_root.resolve(strict=False):
+        raise ValueError("delivery-ready location and delivery_id disagree")
+    if validate_staged:
+        _validate_inventory(stage, payload.get("outputs"), label="staged delivery")
+    return payload
+
+
+def _manifest_path(project: Path) -> Path:
+    return project / "03_results" / "run_manifest.json"
+
+
+def load_run_manifest(
+    path_or_project: str | Path,
+    *,
+    validate_outputs: bool = True,
+) -> dict[str, object]:
+    path = Path(path_or_project).expanduser().resolve()
+    manifest = path if path.name == "run_manifest.json" else _manifest_path(path)
+    payload = _read_json(manifest, "run manifest")
+    if payload.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(f"unsupported run manifest schema: {manifest}")
+    project = Path(str(payload.get("project_dir", ""))).expanduser().resolve()
+    if manifest != _manifest_path(project).resolve(strict=False):
+        raise ValueError("run manifest project and location disagree")
+    if validate_outputs:
+        _validate_inventory(
+            project / "03_results",
+            payload.get("outputs"),
+            label="published delivery",
+        )
+    return payload
+
+
+_PUBLIC_DIRNAME = "03_results"
+
+
+def _publish_hardlink(stage: Path, public: Path, relative: Path) -> None:
+    destination = public / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destination.with_name(
+        f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    try:
+        os.link(stage / relative, tmp)
+        os.replace(tmp, destination)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _prune_stale_public_files(public: Path, allowed: set[str]) -> None:
+    for path in sorted(public.rglob("*"), reverse=True):
+        relative = path.relative_to(public)
+        if path.is_symlink() or path.is_file():
+            if relative.as_posix() not in allowed:
+                _remove_path(path)
+        elif path.is_dir() and not any(path.iterdir()):
+            _remove_path(path)
+
+
+def _run_manifest_payload(ready: Mapping[str, object], snapshot: Mapping[str, object]) -> dict[str, object]:
+    snapshot_path = Path(str(ready["run_snapshot_path"])).resolve()
+    basis = snapshot["basis"]
+    if not isinstance(basis, Mapping):
+        raise ValueError("run snapshot basis is missing")
+    pipeline_record = basis.get("pipeline")
+    analysis_record = basis.get("analysis")
+    reference_record = basis.get("reference")
+    if not all(isinstance(item, Mapping) for item in (pipeline_record, analysis_record, reference_record)):
+        raise ValueError("run snapshot provenance identity is incomplete")
+    return {
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "project_dir": str(ready["project_dir"]),
+        "recorded_at_utc": _utc_now(),
+        "status": "complete",
+        "delivery": {
+            "id": ready["delivery_id"],
+        },
+        "pipeline": {
+            "name": "Alopex",
+            "source_root": str(pipeline_record.get("root", "")),
+        },
+        "run": {
+            "protocol": str(analysis_record.get("protocol", "")),
+            "species": str(analysis_record.get("species", "")),
+            "methylation_backend": str(analysis_record.get("methylation_backend", "")),
+            "cpg_representation": cpg_representation(analysis_record["cpg_coordinate_base"]),
+            "snapshot_id": snapshot["snapshot_id"],
+            "snapshot_path": str(snapshot_path),
+            "reference_path": str(Path(str(reference_record.get("resolved_path", ""))).resolve()),
+        },
+        "outputs": [dict(item) for item in ready["outputs"]],
+    }
+
+
+def publish_delivery(ready_path: str | Path) -> Path:
+    """发布一笔 sealed 结果树到真实目录 03_results/。
+
+    事务语义是 invalidate-first / commit-last：任何公开文件发生变化之前先删除
+    旧 run_manifest.json，安装并校验全部公开文件之后才写回新 marker——marker 的
+    存在即代表一代完整交付，中断只会留下无 marker 的待重发状态，不会留下
+    「混合代结果 + complete marker」。交付内容全部来自 stable stage 的硬链接，
+    逐文件原子落地（os.replace）；发布中断不损坏 stable stage，重新运行
+    launcher 会直接重走本流程。生产调用必须位于 Snakemake 持有项目锁的
+    onsuccess 回调内，锁在发布与 BAM/demux 清理完成后释放。
+    """
+    ready_manifest = Path(ready_path).expanduser().resolve()
+    ready = load_delivery_ready(ready_manifest, validate_staged=False)
+    project = Path(str(ready["project_dir"])).resolve()
+    public = project / _PUBLIC_DIRNAME
+    stage = (project / "02_work" / "results_stage").resolve(strict=False)
+
+    outputs = _validate_inventory(stage, ready.get("outputs"), label="staged delivery")
+    snapshot_path = Path(str(ready["run_snapshot_path"])).resolve()
+    snapshot = load_run_snapshot(snapshot_path)
+    payload = _run_manifest_payload(ready, snapshot)
+    config = load_project_config(
+        snapshot_path.parent / "inputs" / snapshot["input_copies"]["config"]["snapshot_path"]
+    )
+    for record in outputs:
+        _check_result_directories(public, Path(record["path"]), label="published delivery")
+
+    marker = _manifest_path(project)
+    _remove_path(marker)
+
+    public.mkdir(parents=True, exist_ok=True)
+
+    allowed: set[str] = set()
+    for record in outputs:
+        relative = _safe_relative(record["path"], label="published output path")
+        allowed.add(relative.as_posix())
+        _publish_hardlink(stage, public, relative)
+
+    _prune_stale_public_files(public, allowed)
+    _validate_inventory(public, outputs, label="published delivery")
+
+    atomic_write_json(marker, payload)
+
+    if not config["retention"]["keep_final_bam"]:
+        try:
+            for path in _retained_bam_paths(project, config):
+                path.unlink(missing_ok=True)
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not fully reclaim unretained BAMs: %s", exc)
+
+    finalize_root = project / "05_tmp" / "finalize"
+    if ready_manifest.parent.parent == finalize_root:
+        _remove_path(ready_manifest.parent)
+    clean_demux_scratch_after_publish(project)
+    return marker
+
+
+def _retained_bam_paths(project: Path, config: Mapping[str, object]) -> tuple[Path, ...]:
+    layout = ProjectLayout(project / "02_work", project / "03_results", get_backend(config))
+    for directory in (layout.intermediate_dir, layout.intermediate_dir / layout.backend):
+        if directory.is_symlink():
+            raise ValueError(f"Refusing to access retained BAMs through a symlink: {directory}")
+    paths = []
+    with (layout.result_root / "QC_Results/sample_manifest.tsv").open() as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if not {"sample_id", "analysis_status"} <= set(reader.fieldnames or ()):
+            raise ValueError("Final manifest is missing BAM retention identity/status")
+        for row in reader:
+            if row["analysis_status"] != "PASS":
+                continue
+            if SAMPLE_ID_RE.fullmatch(row["sample_id"]) is None:
+                raise ValueError(f"Invalid retained BAM sample_id: {row['sample_id']!r}")
+            artifacts = cell_artifacts(layout.cell(row["sample_id"]), config["analysis"]["protocol"],
+                                       generate_snp=False, keep_final_bam=True)
+            paths.extend(artifacts.retained_bams)
+    return tuple(paths)
+
+
+def clean_demux_scratch_after_publish(project_dir: str | Path) -> None:
+    """在已完成发布后先清除 demux 提交边界；失败时保留 FASTQ，拒绝经目录符号链接清理。"""
+    project = Path(project_dir).expanduser().resolve()
+    scratch = project / "02_work" / "demux"
+    if not scratch.is_dir():
+        return
+    if (project / "02_work").is_symlink() or scratch.is_symlink():
+        logger.warning("Refusing to reclaim demux scratch through a symlink: %s", scratch)
+        return
+    try:
+        _remove_path(scratch / "state")
+    except OSError as exc:
+        logger.warning("Demux state could not be removed; preserving FASTQs: %s: %s", scratch, exc)
+        return
+    try:
+        _remove_path(scratch)
+    except OSError as exc:
+        logger.warning("Could not fully reclaim demux scratch: %s: %s", scratch, exc)
+
+
+def _unsealed_project_state_paths(project: Path) -> tuple[str, ...]:
+    state_paths: list[str] = []
+    for relative in ("02_work", "03_results"):
+        path = project / relative
+        if path.is_dir() and any(path.iterdir()):
+            state_paths.append(relative)
+    runtime_tmp = project / "05_tmp"
+    if runtime_tmp.is_dir():
+        state_paths.extend(
+            f"05_tmp/{child.name}"
+            for child in sorted(runtime_tmp.iterdir(), key=lambda item: item.name)
+            if child.name != "xdg_cache"
+        )
+    return tuple(state_paths)
+
+
+def project_status(
+    *,
+    project_dir: str | Path,
+    current_snapshot: str | Path | None = None,
+) -> dict[str, object]:
+    """检查 resumable/public 项目状态，不因 provenance identity 强制重算。
+
+    provenance snapshot 只是审计记录，不决定既有 Snakemake 工作可否复用；
+    复用权威是 Snakemake 自身的 DAG、input、params、code、软件环境与 incomplete-output 逻辑。
+    complete_current 比较 launcher 本次 snapshot 的内容地址并检查声明的保留 BAM/索引，不重算 basis。
+    """
+    project = Path(project_dir).expanduser().resolve()
+    public_manifest = _manifest_path(project)
+    if public_manifest.is_file():
+        try:
+            manifest = load_run_manifest(public_manifest)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            return {
+                "status": "resumable",
+                "reason": f"public manifest will be replaced: {exc}",
+            }
+        if manifest.get("status") == "complete":
+            if current_snapshot is not None:
+                try:
+                    snapshot = load_run_snapshot(Path(current_snapshot))
+                    if manifest["run"]["snapshot_id"] == snapshot["snapshot_id"]:
+                        config_path = (
+                            Path(current_snapshot).resolve().parent / "inputs"
+                            / snapshot["input_copies"]["config"]["snapshot_path"]
+                        )
+                        config = load_project_config(config_path)
+                        keep_bam = config["retention"]["keep_final_bam"]
+                        for path in _retained_bam_paths(project, config):
+                            if keep_bam and not path.is_file():
+                                return {
+                                    "status": "resumable",
+                                    "reason": f"requested retained BAM/index is missing: {path}",
+                                }
+                            if not keep_bam and (path.exists() or path.is_symlink()):
+                                return {
+                                    "status": "resumable",
+                                    "reason": f"unretained BAM/index awaits cleanup under the Snakemake lock: {path}",
+                                }
+                        return {
+                            "status": "complete_current",
+                            "manifest": str(public_manifest),
+                            "delivery_id": manifest.get("delivery", {}).get("id", ""),
+                        }
+                except (FileNotFoundError, ValueError, RuntimeError, OSError, KeyError, TypeError):
+                    pass
+            return {
+                "status": "resumable",
+                "reason": "completed delivery differs from current inputs/code/environment; reusing compatible Snakemake outputs",
+            }
+        return {
+            "status": "resumable",
+            "reason": "public manifest status is not complete; normal execution will repair it",
+        }
+
+
+    if _unsealed_project_state_paths(project):
+        return {
+            "status": "resumable",
+            "reason": "existing Snakemake work has no provenance snapshot; preserving and reusing it",
+        }
+    return {"status": "new"}
+
+
+# Doctor 维护：环境和参考构建
+
+ENVS_SPEC_NAME = "envs.yaml"
+
+
+def envs_section(envs_path: str | Path, role: str) -> dict[str, object]:
+    """用 Conda 自带的 ruamel.yaml 读取角色 spec，支持未安装 PyYAML 的 Seed。"""
+    from ruamel.yaml import YAML
+
+    payload = YAML(typ="safe", pure=True).load(Path(envs_path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get(role) is None:
+        raise ValueError(f"envs.yaml has no section for role {role!r}: {envs_path}")
+    section = payload[role]
+    if not isinstance(section, dict):
+        raise ValueError(f"envs.yaml section {role!r} must be a mapping")
+    return section
+
+
+def envs_section_sha256(envs_path: str | Path, role: str) -> str:
+    """角色 section 的 canonical SHA256（环境身份与复用判定的唯一口径）。"""
+    section = envs_section(envs_path, role)
+    return sha256_bytes(canonical_json_bytes(section))
+
+
+def envs_spec_logical_name(role: str) -> str:
+    """返回环境 spec 的逻辑名，与环境安装位置无关。"""
+    return f"{ENVS_SPEC_NAME}#{role}"
+
+
+def write_envs_section_spec(envs_path: str | Path, role: str, destination: str | Path) -> Path:
+    """把角色 section 抽取为独立 conda spec 文件（conda env create 的输入）。"""
+    from ruamel.yaml import YAML
+
+    section = envs_section(envs_path, role)
+    target = Path(destination)
+    parser = YAML(typ="safe", pure=True)
+    parser.default_flow_style = False
+    parser.sort_base_mapping_type_on_output = False
+    stream = io.StringIO()
+    parser.dump(section, stream)
+    atomic_write_bytes(target, stream.getvalue().encode("utf-8"))
+    return target
+
+
+def record_environment_identity(
+    *,
+    prefix: str | Path,
+    role: str,
+    spec_name: str,
+    spec_sha256: str,
+) -> Mapping[str, object]:
+    """为一个 Conda prefix 记录最小的受管环境契约（spec 身份为逻辑名+section SHA）。"""
+
+    prefix_path = Path(prefix).expanduser().resolve()
+    if not prefix_path.is_dir():
+        raise FileNotFoundError(f"environment prefix is missing: {prefix_path}")
+    if not str(spec_sha256).strip():
+        raise ValueError("spec_sha256 must be a non-empty digest")
+
+    payload: dict[str, object] = {
+        "schema_version": ENVIRONMENT_IDENTITY_SCHEMA,
+        "complete": True,
+        "role": str(role),
+        "prefix": str(prefix_path),
+        "specification": {
+            "path": str(spec_name),
+            "sha256": str(spec_sha256),
+        },
+    }
+    atomic_write_json(prefix_path / IDENTITY_NAME, payload, mode=0o444)
+    return payload
+
+
+RELEASE_SCHEMA = 5
+
+
+RELEASE_NAME = ".dna_pipeline_release.json"
+
+
+RELEASE_ROLES = ("control", "biscuit", "bismark", "rastair", "notebook")
+
+
+def finalize_release(release_s: str, release_id: str, expected_subdir: str) -> None:
+    """为一个完整构建的 release 写出 0o444 的 release manifest（提交前最后一步）。"""
+    release_path = Path(release_s).expanduser().absolute()
+    if release_path.name != release_id:
+        raise ValueError(f"release id/path mismatch: {release_id} != {release_path.name}")
+    release = release_path.resolve(strict=True)
+    records: dict[str, dict[str, object]] = {}
+    for role in RELEASE_ROLES:
+        role_path = release_path / role
+        prefix = role_path.resolve(strict=True)
+        if release.parent not in prefix.parents:
+            raise ValueError(f"release role escaped managed release store: {role} -> {prefix}")
+        identity = read_environment_identity(prefix)
+        if identity.get("role") != role:
+            raise ValueError(f"environment role mismatch: {role}")
+        records[role] = {
+            "relative_path": role,
+            "resolved_prefix": str(prefix),
+            "reused": role_path.is_symlink(),
+        }
+    payload: dict[str, object] = {
+        "schema_version": RELEASE_SCHEMA,
+        "complete": True,
+        "release_id": release_id,
+        "created_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "release_path": str(release),
+        "platform": {"conda_subdir": expected_subdir},
+        "roles": records,
+    }
+    atomic_write_json(release / RELEASE_NAME, payload, mode=0o444)
+
+
+def publish_release(current_s: str, target_s: str) -> None:
+    """以临时 symlink + 一次 os.replace 原子切换 conda/current（唯一 COMMIT 点）。"""
+    current = Path(current_s).expanduser().absolute()
+    target = Path(target_s).expanduser().resolve(strict=True)
+    if not target.is_dir():
+        raise FileNotFoundError(f"release directory missing: {target}")
+    if current.exists() and not current.is_symlink():
+        raise ValueError(f"current path is not a symlink: {current}")
+    current.parent.mkdir(parents=True, exist_ok=True)
+    temporary = current.with_name(f".{current.name}.publish.{os.getpid()}")
+    try:
+        temporary.unlink(missing_ok=True)
+        os.symlink(str(target), temporary)
+        os.replace(temporary, current)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def validate_release(current_s: str, expected_subdir: str, envs_path: str) -> None:
+    """只读校验 current 指针、release manifest、role prefix 与 envs section SHA 契约。"""
+    current = Path(current_s).expanduser().absolute()
+    if not current.is_symlink():
+        raise ValueError(f"current is not a symlink: {current}")
+    release = current.resolve(strict=True)
+    payload = json.loads((release / RELEASE_NAME).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema_version") != RELEASE_SCHEMA or payload.get("complete") is not True:
+        raise ValueError("release identity is incomplete or unsupported")
+    if payload.get("release_id") != release.name:
+        raise ValueError("release id/path mismatch")
+    if Path(str(payload.get("release_path", ""))).resolve() != release:
+        raise ValueError("release path drift")
+    platform = payload.get("platform") or {}
+    if platform.get("conda_subdir") != expected_subdir:
+        raise ValueError(f"release platform mismatch: {platform.get('conda_subdir')} != {expected_subdir}")
+    records = payload.get("roles")
+    if not isinstance(records, dict) or set(records) != set(RELEASE_ROLES):
+        raise ValueError("release roles are invalid")
+
+    for role in RELEASE_ROLES:
+        role_path = release / role
+        prefix = role_path.resolve(strict=True)
+        if release.parent not in prefix.parents:
+            raise ValueError(f"{role} prefix escaped managed release store")
+        record = records[role]
+        if not isinstance(record, dict) or record.get("relative_path") != role:
+            raise ValueError(f"{role} release record is invalid")
+        recorded_resolved = str(record.get("resolved_prefix", "")).strip()
+        if recorded_resolved and Path(recorded_resolved).resolve() != prefix:
+            raise ValueError(f"{role} resolved prefix drift")
+        environment = read_environment_identity(prefix)
+        if environment.get("role") != role:
+            raise ValueError(f"{role} environment identity role mismatch")
+        recorded = (environment.get("specification") or {}).get("sha256")
+        if recorded != envs_section_sha256(envs_path, role):
+            raise ValueError(f"{role} specification changed; rebuild required")
+
+
+def environment_is_reusable(prefix_s: str, role: str, envs_path: str) -> None:
+    """判断既有 prefix 可否复用：身份记录存在、role 匹配且 envs section SHA 未变。"""
+    environment = read_environment_identity(prefix_s)
+    if environment.get("role") != role:
+        raise ValueError(f"{role} environment identity role mismatch")
+    if (environment.get("specification") or {}).get("sha256") != envs_section_sha256(
+        envs_path, role
+    ):
+        raise ValueError(f"{role} specification changed")
+
+
+def _atomic_text_path(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path.with_name(f".{path.name}.tmp.{os.getpid()}")
+
+
+def _gtf_attributes(raw: str) -> dict[str, str]:
+    attributes: dict[str, str] = {}
+    for item in raw.split(";"):
+        key, separator, value = item.strip().partition(" ")
+        if separator:
+            attributes[key] = value.strip().strip('"')
+    return attributes
+
+
+def _annotation_release_signature(species: str) -> tuple[str, str]:
+    if species == "hg38":
+        return "GRCh38", "version 48"
+    if species == "mm10":
+        return "GRCm38", "version M25"
+    raise ValueError(f"unsupported standard species: {species}")
+
+
+def build_downstream_references(
+    *,
+    species: str,
+    fasta: str | Path,
+    annotation_gtf: str | Path,
+    tss_bed: str | Path,
+    single_cpg_bed: str | Path,
+) -> Mapping[str, object]:
+    """构建 TSS bins 与 SnapATAC2 兼容的 single-CpG BED。
+
+    CpG BED 为 BED3、0-based half-open，每条 interval 覆盖 CpG 二核苷酸 ``[C, G+1)``，
+    因此两条链上报出的 base-resolution 值都会落入同一个 SnapATAC2 peak_file feature。
+    """
+
+    reference = Path(fasta).expanduser().resolve()
+    fai = Path(f"{reference}.fai")
+    annotation = Path(annotation_gtf).expanduser().resolve()
+    tss = Path(tss_bed).expanduser().resolve()
+    cpg = Path(single_cpg_bed).expanduser().resolve()
+    if not reference.is_file() or reference.stat().st_size == 0:
+        raise FileNotFoundError(f"reference FASTA is missing or empty: {reference}")
+    if not fai.is_file() or fai.stat().st_size == 0:
+        raise FileNotFoundError(f"reference FAI is missing or empty: {fai}")
+    if not annotation.is_file() or annotation.stat().st_size == 0:
+        raise FileNotFoundError(
+            f"reference annotation GTF is missing or empty: {annotation}"
+        )
+
+    contigs = _fai_contigs(fai)
+    host_contigs = [
+        (name, length)
+        for name, length in contigs
+        if name not in {"lambda", "pUC19"}
+    ]
+    contig_lengths = dict(host_contigs)
+    expected_build, expected_release = _annotation_release_signature(species)
+    header_lines: list[str] = []
+    tss_tmp = _atomic_text_path(tss)
+    cpg_tmp = _atomic_text_path(cpg)
+    tss_count = 0
+    protein_coding_gene_count = 0
+    seen_intervals: set[tuple[str, int, int]] = set()
+
+    try:
+        with annotation.open("rt", encoding="utf-8") as source, tss_tmp.open(
+            "wt", encoding="utf-8", newline=""
+        ) as output:
+            for line_number, raw in enumerate(source, start=1):
+                if raw.startswith("#"):
+                    if len(header_lines) < 100:
+                        header_lines.append(raw.rstrip("\n"))
+                    continue
+                fields = raw.rstrip("\n").split("\t")
+                if len(fields) != 9:
+                    raise ValueError(
+                        f"invalid GTF field count on line {line_number}: {annotation}"
+                    )
+                (
+                    chrom,
+                    _source,
+                    feature,
+                    start_s,
+                    end_s,
+                    _score,
+                    strand,
+                    _frame,
+                    attrs_s,
+                ) = fields
+                if (
+                    feature != "gene"
+                    or chrom not in contig_lengths
+                    or strand not in {"+", "-"}
+                ):
+                    continue
+                attrs = _gtf_attributes(attrs_s)
+                if attrs.get("gene_type") != "protein_coding":
+                    continue
+                gene_id = attrs.get("gene_id", "").strip()
+                if not gene_id:
+                    raise ValueError(
+                        "protein-coding GTF gene lacks gene_id on line "
+                        f"{line_number}: {annotation}"
+                    )
+                try:
+                    gene_start = int(start_s) - 1
+                    gene_end = int(end_s)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"invalid GTF coordinate on line {line_number}: {annotation}"
+                    ) from exc
+                if (
+                    gene_start < 0
+                    or gene_end <= gene_start
+                    or gene_end > contig_lengths[chrom]
+                ):
+                    raise ValueError(
+                        "GTF gene exceeds canonical contig bounds on line "
+                        f"{line_number}: {annotation}"
+                    )
+                protein_coding_gene_count += 1
+                transcription_start = gene_start if strand == "+" else gene_end
+                for offset in range(-2000, 2000, 20):
+                    if strand == "+":
+                        bin_start = transcription_start + offset
+                        bin_end = bin_start + 20
+                    else:
+                        bin_end = transcription_start - offset
+                        bin_start = bin_end - 20
+                    if bin_start < 0 or bin_end > contig_lengths[chrom]:
+                        continue
+                    interval = (chrom, bin_start, bin_end)
+                    if interval in seen_intervals:
+                        continue
+                    seen_intervals.add(interval)
+                    region = f"{chrom}:{bin_start}-{bin_end}"
+                    output.write(
+                        f"{chrom}\t{bin_start}\t{bin_end}\t{region}\t.\t{strand}\t"
+                        f"{gene_id}\t{region}\t{offset}\n"
+                    )
+                    tss_count += 1
+
+        header = "\n".join(header_lines)
+        if expected_build not in header or expected_release not in header:
+            raise ValueError(
+                f"{species} GTF must be GENCODE {expected_release} on "
+                f"{expected_build}: {annotation}"
+            )
+        if protein_coding_gene_count == 0 or tss_count == 0:
+            raise ValueError(f"GTF produced no protein-coding TSS bins: {annotation}")
+
+        cpg_count = 0
+        selected = {name for name, _length in host_contigs}
+        current = ""
+        current_position = 0
+        previous_base = ""
+        cpg_tmp.parent.mkdir(parents=True, exist_ok=True)
+        with reference.open("rt", encoding="utf-8") as source, cpg_tmp.open(
+            "wb"
+        ) as raw_output:
+            with gzip.GzipFile(
+                filename="", mode="wb", fileobj=raw_output, mtime=0
+            ) as compressed:
+                with io.TextIOWrapper(
+                    compressed, encoding="utf-8", newline=""
+                ) as output:
+                    for raw in source:
+                        if raw.startswith(">"):
+                            current = raw[1:].split(None, 1)[0]
+                            current_position = 0
+                            previous_base = ""
+                            continue
+                        sequence = "".join(raw.split()).upper()
+                        if not sequence or current not in selected:
+                            continue
+                        combined = previous_base + sequence
+                        combined_start = current_position - (1 if previous_base else 0)
+                        match = combined.find("CG")
+                        while match >= 0:
+                            start = combined_start + match
+                            end = start + 2
+                            output.write(f"{current}\t{start}\t{end}\n")
+                            cpg_count += 1
+                            match = combined.find("CG", match + 2)
+                        previous_base = sequence[-1]
+                        current_position += len(sequence)
+        if cpg_count == 0:
+            raise ValueError(f"reference produced no CpG sites: {reference}")
+
+        os.replace(tss_tmp, tss)
+        os.replace(cpg_tmp, cpg)
+    finally:
+        for temporary in (tss_tmp, cpg_tmp):
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    return {
+        "species": species,
+        "protein_coding_gene_count": protein_coding_gene_count,
+        "tss_bin_count": tss_count,
+        "single_cpg_count": cpg_count,
+        "tss_bed": str(tss),
+        "single_cpg_bed": str(cpg),
+    }
+
+
+def append_spikein_contigs(lambda_fasta: Path, puc19_fasta: Path, target_fasta: Path) -> None:
+    """把 lambda 与 pUC19 spike-in contig 追加到临时 assembled FASTA 末尾。"""
+
+    def spike_sequence(path: Path) -> str:
+        data = "".join(
+            line.strip()
+            for line in path.read_text().splitlines()
+            if line and not line.startswith(">")
+        ).upper()
+        if not data:
+            raise ValueError(f"empty spike FASTA: {path}")
+        return data
+
+    with target_fasta.open("a") as handle:
+        for name, path in (("lambda", lambda_fasta), ("pUC19", puc19_fasta)):
+            sequence = spike_sequence(path)
+            handle.write(f">{name}\n")
+            for offset in range(0, len(sequence), 60):
+                handle.write(sequence[offset : offset + 60] + "\n")
+
+
+def fai_contract_check(mode: str, label: str, fai: Path, fasta: Path) -> bool:
+    """校验 source/assembled FASTA 是否满足标准 contig 长度契约。
+
+    只读取很小的 .fai 并通过 FAI 几何 + FASTA 大小的算术检查排除截断文件，
+    不扫描序列本身。mode=source 允许 UCSC FASTA 中的额外 contig（primary 与
+    spike 必须全部存在且长度精确）；mode=assembled 只允许标准 contig 的精确顺序。
+    """
+
+    records: list[tuple[str, int, int, int, int]] = []
+    seen: set[str] = set()
+    for line in fai.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) < 5 or not fields[0]:
+            return False
+        name = fields[0]
+        if name in seen:
+            return False
+        seen.add(name)
+        try:
+            length, offset, line_bases, line_width = (int(v) for v in fields[1:5])
+        except ValueError:
+            return False
+        if length <= 0 or offset < 0 or line_bases <= 0 or line_width < line_bases:
+            return False
+        records.append((name, length, offset, line_bases, line_width))
+    if not records:
+        return False
+
+
+    fasta_size = fasta.stat().st_size
+    for _name, length, offset, line_bases, line_width in records:
+        full_rows = (length - 1) // line_bases
+        final_row_start = offset + full_rows * line_width
+        final_row_bases = (length - 1) % line_bases + 1
+        if final_row_start + final_row_bases > fasta_size:
+            return False
+
+    length_records = [(name, length) for name, length, *_ in records]
+    if mode == "source":
+        if label in MANAGED_SPECIES:
+            observed = dict(length_records)
+            return all(
+                observed.get(name) == length
+                for name, length in _PRIMARY_CONTIGS[label]
+            )
+        if label in SPIKE_CONTIGS:
+            return (
+                len(length_records) == 1
+                and length_records[0][1] == SPIKE_CONTIGS[label]
+            )
+        return False
+    if mode == "assembled":
+        return label in MANAGED_CONTIGS and length_records == MANAGED_CONTIGS[label]
+    return False
+
+
+# Doctor 维护：测试路线和 fixture
+
+DEFAULT_ROUTE = "hg38-cabernet-bismark"
+
+
+TEST_ROUTES: dict[str, dict[str, str]] = {
+    "hg38-taps-rastair": {"species": "hg38", "protocol": "taps", "methylation_backend": "rastair", "reference_key": "hg38"},
+    "hg38-cabernet-bismark": {
+        "species": "hg38",
+        "protocol": "cabernet",
+        "methylation_backend": "bismark",
+        "reference_key": "hg38",
+    },
+    "mm10-srd-biscuit": {
+        "species": "mm10",
+        "protocol": "srd",
+        "methylation_backend": "biscuit",
+        "reference_key": "mm10",
+    },
+}
+
+
+def resolve_route(route: str) -> str:
+    """返回具体 route id；空值与 auto 应用隐式默认。"""
+    name = str(route or "").strip()
+    if name == "auto" or not name:
+        return DEFAULT_ROUTE
+    if name not in TEST_ROUTES:
+        raise ValueError(f"unsupported test route: {name}")
+    return name
+
+
+def apply_common_route_config(cfg: dict[str, Any], route_id: str) -> None:
+    """把 route 定义的分析子集应用到目标 config（各消费者共享的唯一实现）。
+
+    写出前合并内置默认，保证合成的项目/运行时 config 总是完整可校验。
+    """
+    meta = TEST_ROUTES[resolve_route(route_id)]
+    cfg["species"] = meta["species"]
+    references = cfg.setdefault("references", {})
+    if not str(references.get(meta["reference_key"], "")).strip():
+        raise SystemExit(
+            f"ERROR: references.{meta['reference_key']} is required for {meta['protocol']} test mode"
+        )
+    analysis = cfg.setdefault("analysis", {})
+    analysis["protocol"] = meta["protocol"]
+    apply_config_defaults(cfg)
+    module = cfg[meta["protocol"]]
+    if meta["protocol"] not in _PROTOCOL_FIXED_CONFIG:
+        module["methylation_backend"] = meta["methylation_backend"]
+    if meta["protocol"] in ("cabernet", "srd"):
+        module.setdefault("biscuit", {})["generate_snp"] = False
+    if meta["methylation_backend"] == "bismark":
+        module.setdefault("bismark", {})["library_type"] = "non_directional"
+
+
+def synthesize_route_config(source: Path, destination: Path, route: str) -> None:
+    """把项目 config 与 route 覆盖合成为 test 模式 effective config。"""
+    import yaml
+
+    cfg = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    apply_common_route_config(cfg, resolve_route(route))
+
+
+    runtime = cfg.setdefault("runtime", {})
+    runtime["local_executor_cores"] = max(8, int(runtime.get("local_executor_cores", 8)))
+    destination.write_text(
+        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+
+
+BENCHMARK_SCHEMA_VERSION = 2
+
+
+BENCHMARK_ID = "doctor_hpc_raw_v2"
+
+
+def _benchmark_fastq_pairs(r1: Path, r2: Path) -> Iterable[tuple[bytes, bytes]]:
+    with gzip.open(r1, "rb") as left, gzip.open(r2, "rb") as right:
+        while True:
+            records = [[handle.readline() for _ in range(4)] for handle in (left, right)]
+            if not records[0][0] and not records[1][0]:
+                return
+            names = []
+            for mate, lines in enumerate(records, 1):
+                if (not all(lines) or not lines[0].startswith(b"@") or not lines[2].startswith(b"+")
+                        or len(lines[1].rstrip()) != len(lines[3].rstrip())):
+                    raise ValueError(f"Malformed Doctor FASTQ: {r1 if mate == 1 else r2}")
+                name = lines[0].split()[0]
+                names.append(re.sub(rb"/[12]$", b"", name))
+            if names[0] != names[1]:
+                raise ValueError(f"Doctor FASTQ mate names disagree: {names}")
+            yield b"".join(records[0]), b"".join(records[1])
+
+
+def validate_benchmark(root: Path, manifest_path: Path) -> None:
+    """核对真实抽样的文件身份、逐记录配对、来源序号与当前 fixture schema；运行时不访问 HPC。"""
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != BENCHMARK_SCHEMA_VERSION or manifest.get("benchmark_id") != BENCHMARK_ID:
+        raise ValueError("Unsupported Doctor benchmark schema/id")
+
+    def verify_entry(entry: dict[str, Any]) -> Path:
+        name = str(entry["path"])
+        path = root / name
+        if Path(name).name != name or not path.is_file() or path.is_symlink():
+            raise ValueError(f"Invalid Doctor benchmark file: {name}")
+        if sha256_file(path) != entry["sha256"]:
+            raise ValueError(f"Doctor benchmark SHA256 mismatch: {name}")
+        return path
+
+    verify_entry(manifest["barcode_map"])
+    total = 0
+    for label, dataset in manifest["datasets"].items():
+        files = {entry["path"]: verify_entry(entry) for entry in dataset["fastq_files"]}
+        r1 = sorted(name for name in files if "_R1_" in name)
+        if not r1 or set(files) != set(r1 + [name.replace("_R1_", "_R2_") for name in r1]):
+            raise ValueError("Doctor benchmark FASTQ mate inventory is invalid")
+        count = 0
+        names = set()
+        for name in r1:
+            for left, _right in _benchmark_fastq_pairs(files[name], files[name.replace("_R1_", "_R2_")]):
+                qname = re.sub(rb"/[12]$", b"", left.splitlines()[0].split()[0])
+                if qname in names:
+                    raise ValueError(f"Repeated source read in Doctor fixture: {label}")
+                names.add(qname)
+                count += 1
+        ordinals = dataset["source_provenance"]["selected_ordinals_1based"]
+        if (count != dataset["read_pairs"] or len(ordinals) != count or ordinals != sorted(set(ordinals))
+                or not ordinals or ordinals[0] < 1 or ordinals[-1] > dataset["source_provenance"]["scanned_pairs"]):
+            raise ValueError(f"Doctor benchmark count/source ordinal mismatch: {label}")
+        if dataset["source_provenance"]["raw_records_modified"] is not False:
+            raise ValueError("Doctor real FASTQ must preserve the source records")
+        total += count
+    print(f"Fixed benchmark verified: {BENCHMARK_ID} | real pairs={total} | datasets={len(manifest['datasets'])}")
+
+
+def _write_benchmark_fastqs(project: Path, stem: str, pairs: Sequence[tuple[str, str, str]]) -> None:
+    for mate in (1, 2):
+        with (project / "01_raw" / f"{stem}_R{mate}_001.fastq.gz").open("wb") as raw:
+            with gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as handle:
+                for name, left, right in pairs:
+                    seq = left if mate == 1 else right
+                    handle.write(f"@{name}/{mate}\n{seq}\n+\n{'I' * len(seq)}\n".encode())
+
+
+def stage_benchmark_supplement(project: Path, reference: Path, label: str, route: str) -> dict[str, object]:
+    """为真实抽样补充明确命名的合成对照、重复/CpH 和 SRD 双管 RNA 布局，原始记录不改写。"""
+    backend = TEST_ROUTES[route]["methylation_backend"]
+    samtools = Path(__file__).resolve().parent.parent / "conda/current" / backend / "bin/samtools"
+    fasta = subprocess.check_output([str(samtools), "faidx", str(reference), "chrM", "lambda", "pUC19"], text=True)
+    sequences: dict[str, str] = {}
+    for line in fasta.splitlines():
+        if line.startswith(">"):
+            chrom = line[1:].split()[0]
+            sequences[chrom] = ""
+        else:
+            sequences[chrom] += line.upper()
+    with (project / "00_config/Barcode_Map.csv").open() as handle:
+        barcodes = list(csv.DictReader(handle))[:2]
+    complement = str.maketrans("ACGT", "TGCA")
+    pairs = []
+    for chrom, seq in sequences.items():
+        for index in range(12):
+            start = 300 + 53 * index
+            fragment = seq[start:start + 180]
+            if len(fragment) != 180 or set(fragment) - set("ACGT"):
+                raise ValueError(f"Doctor control reference is not callable: {chrom}:{start}")
+            molecule = "".join("T" if base == "C" and not (chrom == "pUC19" and seq[start + pos:start + pos + 2] == "CG")
+                               else base for pos, base in enumerate(fragment))
+            barcode = barcodes[index % 2]["DNA_Barcode"]
+            pairs.append((f"synthetic_control_{chrom}_{index}", barcode + "AGATGTGTATAAGAGACAG" + "G" * 9 + molecule[:100],
+                          molecule[-100:].translate(complement)[::-1]))
+    fragment = sequences["chrM"][2000:2180]
+    if len(fragment) != 180 or set(fragment) - set("ACGT"):
+        raise ValueError("Doctor unconverted control reference is not callable")
+    for barcode in barcodes:
+        for duplicate in range(2):
+            pairs.append((f"synthetic_high_cph_{barcode['PlateID']}_{duplicate}",
+                          barcode["DNA_Barcode"] + "AGATGTGTATAAGAGACAG" + "G" * 9 + fragment[:100],
+                          fragment[-100:].translate(complement)[::-1]))
+    dna_pairs = len(pairs)
+    rna = []
+    if TEST_ROUTES[route]["protocol"] == "srd":
+        for barcode in barcodes:
+            for index in range(12):
+                payload = sequences["chrM"][300 + index:400 + index]
+                umi = "ACGT" + "ACGT"[index % 4] * 4
+                rna.append((f"synthetic_srd_{barcode['PlateID']}_{index}",
+                            "GTCTAACGCGTTAC" + barcode["RNA_Barcode"] + umi + "A" * 5 + payload,
+                            payload.translate(complement)[::-1]))
+        pairs.extend((name + "_dna_tube", left, right) for name, left, right in rna)
+        _write_benchmark_fastqs(project, label + "_RNA", rna)
+    _write_benchmark_fastqs(project, label + "_L003", pairs)
+    return {"kind": "synthetic_supplement", "dna_pairs": dna_pairs, "rna_pairs_per_tube": len(rna),
+            "controls": ["chrM", "lambda", "pUC19"], "high_cph_duplicate_pairs": 4,
+            "native_srd_library": False, "reference": str(reference)}
+
+
+def stage_taps_truth(project: Path, reference: Path) -> None:
+    """从固定参考窗口生成独立 TAPS 双链/重叠/重复/9 bp gap 真值 FASTQ，不复用转化文库 fixture。"""
+    samtools = Path(__file__).resolve().parent.parent / "conda/current/rastair/bin/samtools"
+    text = subprocess.check_output([str(samtools), "faidx", str(reference), "chr1:1000001-1006000", "lambda", "pUC19"], text=True)
+    sequences: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.startswith(">"):
+            name = line[1:].split(":")[0]
+            sequences[name] = ""
+        else:
+            sequences[name] += line.upper()
+    barcode = "ACGTACGT"
+    (project / "00_config/Barcode_Map.csv").write_text("DNA_Barcode,PlateID,Cell_Order\nACGTACGT,TAPS,1\n")
+    complement = str.maketrans("ACGTN", "TGCAN")
+    pairs = []
+    for chrom, seq in sequences.items():
+        for index in range(40):
+            start = 300 + 17 * index
+            fragment = seq[start:start + 180]
+            if len(fragment) != 180 or "N" in fragment:
+                raise ValueError(f"TAPS truth reference window is not callable: {chrom}:{start}")
+            converted = list(fragment)
+            modified = chrom == "pUC19" or (chrom == "chr1" and index % 4 < 2)
+            ot = index % 2 == 0
+            if modified:
+                for pos in range(len(fragment)):
+                    context = start + pos if ot else start + pos - 1
+                    if seq[context:context + 2] == "CG":
+                        converted[pos] = "T" if ot else "A"
+            molecule = "".join(converted)
+            pair = (barcode + "AGATGTGTATAAGAGACAG" + "CCCCCCCCC" + molecule[:100],
+                    molecule[-100:].translate(complement)[::-1])
+            pairs.append((f"taps_{chrom}_{index}", *pair))
+            if index % 10 == 0:
+                pairs.append((f"taps_{chrom}_{index}_duplicate", *pair))
+    pairs.append(("taps_unmapped", barcode + "AGATGTGTATAAGAGACAG" + "CCCCCCCCC" + "N" * 100, "N" * 100))
+    for mate in (1, 2):
+        path = project / "01_raw" / f"Taps_R{mate}.fastq.gz"
+        with path.open("wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as gz:
+            for name, r1, r2 in pairs:
+                seq = r1 if mate == 1 else r2
+                gz.write(f"@{name}/{mate}\n{seq}\n+\n{'I' * len(seq)}\n".encode())
+    atomic_write_json(project / "04_logs/taps_truth.json", {"fixture": "taps_native_v1", "pairs": len(pairs),
+                      "sample": "Taps_TAPS", "lambda": "unmodified", "pUC19": "CpG_modified", "host": "mixed",
+                      "fragment_bp": 180, "read_bp": 100, "gap_bp": 9, "duplicate_input_pairs": 12,
+                      "reference": str(reference)})
+
+
+def verify_taps_truth(project: Path) -> None:
+    """核对独立 TAPS FASTQ 真值、BAM 保留、对照分母和 sealed 交付的边界。"""
+    truth = json.loads((project / "04_logs/taps_truth.json").read_text())
+    with (project / "03_results/QC_Results/sample_manifest.tsv").open() as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    if len(rows) != 1:
+        raise ValueError("TAPS truth must publish exactly one cell")
+    row = rows[0]
+    if row["protocol"] != "taps" or row["methylation_backend"] != "rastair" or int(row["dna_reads"]) != truth["pairs"]:
+        raise ValueError("TAPS truth protocol/demux mismatch")
+    if int(row["bam_primary_records"]) != 2 * int(row["trimmed_pairs"]) or min(
+        int(row["bam_duplicate_records"]), int(row["duplicate_pairs"])
+    ) <= 0:
+        raise ValueError("TAPS truth BAM retention/duplicate mismatch")
+    if not (float(row["lambda_false_positive_pct"]) == 0.0 and float(row["pUC19_conversion_pct"]) == 100.0):
+        raise ValueError("TAPS control truth mismatch")
+    if min(int(row["lambda_cpg_observations"]), int(row["pUC19_cpg_observations"])) <= 0:
+        raise ValueError("TAPS controls have no observations")
+    if row["high_cph_role"] != "not_applicable" or float(row["non_cpg_methylation_pct"]) != 0.0 or int(row["non_cpg_observations"]) <= 0:
+        raise ValueError("TAPS truth requires measured zero host CHG/CHH conversion")
+    if not row["snp_path"] or not (project / row["snp_path"]).is_file() or not Path(str(project / row["snp_path"]) + ".tbi").is_file():
+        raise ValueError("TAPS truth SNP VCF/index is missing")
+    for key in ("retained_bam_path", "retained_bam_index"):
+        if not row[key] or not (project / row[key]).is_file():
+            raise ValueError("TAPS retained BAM/index is missing")
+    marker = json.loads((project / "03_results/run_manifest.json").read_text())
+    if marker["status"] != "complete" or ".bam" in json.dumps(marker["outputs"]):
+        raise ValueError("TAPS sealed inventory must exclude BAM")
+    if (project / "02_work/demux").exists():
+        raise ValueError("TAPS published demux scratch was not reclaimed")
+    print(f"TAPS synthetic truth PASS: {truth['pairs']} pairs; unmethylated lambda / modified pUC19; marked BAM retained")
+
+
+def stage_route_config(project: Path, reference: Path, route: str) -> None:
+    """由 Doctor 在独立项目内统一配置环境已准备好的路线、真实抽样及显式合成补充。"""
+    import yaml
+
+    route_id = resolve_route(route)
+    project, reference = project.resolve(), reference.resolve()
+    for folder in ("00_config", "01_raw", "02_work", "03_results", "04_logs", "05_tmp"):
+        (project / folder).mkdir(parents=True, exist_ok=True)
+    cfg = yaml.safe_load(CONFIG_TEMPLATE_YAML)
+    cfg["references"][TEST_ROUTES[route_id]["reference_key"]] = str(reference)
+    apply_common_route_config(cfg, route_id)
+    fixture_root = Path(__file__).resolve().parent.parent / "resources/doctor_benchmark"
+    fixture = json.loads((fixture_root / "benchmark.json").read_text())
+    cfg["common"]["demux"]["min_matched_read_pairs"] = 10
+    manifest = "sample_id\tdna_raw_sample\trna_sample\tspecies\tprotocol\tnotes\n"
+    if route_id == "hg38-taps-rastair":
+        stage_taps_truth(project, reference)
+        manifest += "Taps\tTaps\tTaps_RNA\thg38\ttaps\tindependent_synthetic_truth_with_external_RNA_link\n"
+        cfg["retention"]["keep_final_bam"] = True
+        provenance = {"kind": "independent_synthetic_chemistry_truth", "real_taps_pairs": 0}
+    else:
+        label = fixture["routes"][route_id]["dataset"]
+        dataset = fixture["datasets"][label]
+        for entry in dataset["fastq_files"]:
+            shutil.copyfile(fixture_root / entry["path"], project / "01_raw" / entry["path"])
+        shutil.copyfile(fixture_root / fixture["barcode_map"]["path"], project / "00_config/Barcode_Map.csv")
+        supplement = stage_benchmark_supplement(project, reference, label, route_id)
+        rna = label + "_RNA"
+        manifest += f"{label}\t{label}\t{rna}\t{cfg['species']}\t{cfg['analysis']['protocol']}\treal_Cabernet_DNA_plus_explicit_synthetic_supplement\n"
+        provenance = {"dataset": label, "real_raw_pairs": dataset["read_pairs"],
+                      "source_provenance": dataset["source_provenance"], "supplement": supplement}
+    cfg["slurm"]["jobs"] = 8
+    cfg["runtime"]["local_executor_cores"] = 2
+    (project / "00_config/config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
+    (project / "00_config/sample_manifest.tsv").write_text(manifest)
+    atomic_write_json(project / "04_logs/doctor_fixture.json", {"benchmark_id": BENCHMARK_ID, "route": route_id,
+                      "benchmark_sha256": sha256_file(fixture_root / "benchmark.json"), **provenance})
+
+
+def _benchmark_cpg_metrics(path: Path) -> dict[str, dict[str, int]]:
+    from compression import zstd
+
+    metrics: dict[str, dict[str, int]] = {}
+    seen = set()
+    with zstd.open(path, "rt", encoding="utf-8") as handle:
+        if handle.readline() != "chrom\tpos\tmethyl\tunmethyl\n":
+            raise ValueError(f"Doctor canonical CpG header mismatch: {path}")
+        for line in handle:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 4:
+                raise ValueError(f"Doctor canonical CpG must have four columns: {path}")
+            chrom, pos, methyl, unmethyl = fields
+            pos, methyl, unmethyl = int(pos), int(methyl), int(unmethyl)
+            if min(pos, methyl, unmethyl) < 0 or methyl + unmethyl <= 0 or (chrom, pos) in seen:
+                raise ValueError(f"Doctor canonical CpG invalid/duplicate observation: {path}")
+            seen.add((chrom, pos))
+            counts = metrics.setdefault(chrom, {"rows": 0, "methyl": 0, "unmethyl": 0})
+            counts["rows"] += 1
+            counts["methyl"] += methyl
+            counts["unmethyl"] += unmethyl
+    return metrics
+
+
+def verify_route_outputs(project: Path, benchmark_path: Path, route: str) -> None:
+    """核对多 cell 的拆分/过滤守恒、实际宿主和对照 CpG、SRD 保留及密封交付，保存可追溯回归报告。"""
+    if route not in TEST_ROUTES:
+        raise ValueError(f"unsupported route: {route}")
+    benchmark = json.loads(benchmark_path.read_text())
+    with (project / "03_results/QC_Results/sample_manifest.tsv").open() as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    run_manifest = json.loads((project / "03_results/run_manifest.json").read_text())
+    if run_manifest.get("schema_version") != 8 or run_manifest.get("status") != "complete":
+        raise ValueError(f"{route}: sealed run manifest is not complete schema 8")
+    if TEST_ROUTES[route]["protocol"] in {"cabernet", "taps"}:
+        expected_link = "Taps_RNA" if route == "hg38-taps-rastair" else "hg38_cabernet_RNA"
+        if any(row.get("rna_sample") != expected_link or row.get("rna_enrichment_route_id") for row in rows):
+            raise ValueError(f"{route}: external RNA association was lost or became a local RNA route")
+    if not (project / "03_results/QC_Results/multiqc_report.html").is_file():
+        raise ValueError("Doctor MultiQC report missing")
+    expected = benchmark["routes"][route]
+    cpg_metrics = {}
+    if route == "hg38-taps-rastair":
+        verify_taps_truth(project)
+        for row in rows:
+            cpg_metrics[row["sample_id"]] = _benchmark_cpg_metrics(project / row["cpg_path"])
+    else:
+        if len(rows) != len(expected["cells"]) or {row["sample_id"] for row in rows} != set(expected["cells"]):
+            raise ValueError(f"{route}: unexpected final manifest cell set")
+        active = []
+        for row in rows:
+            sample = row["sample_id"]
+            if (row["protocol"] != TEST_ROUTES[route]["protocol"] or row["species"] != TEST_ROUTES[route]["species"]
+                    or row["methylation_backend"] != TEST_ROUTES[route]["methylation_backend"]):
+                raise ValueError(f"{sample}: route identity mismatch")
+            wanted = {**expected["cells"][sample], **{key: expected[key] for key in ("dna_input_read_pairs", "dna_matched_read_pairs")}}
+            for field, value in wanted.items():
+                if row.get(field) != str(value):
+                    raise ValueError(f"{sample}: demux {field}={row.get(field)!r}, expected {value!r}")
+            if row["dna_status"] != "Pass":
+                if row["analysis_status"] != "NOT_ANALYZED" or row["cpg_path"]:
+                    raise ValueError(f"{sample}: low/zero barcode was analyzed")
+                continue
+            active.append(row)
+            for field, minimum in (("backend_accepted_pairs", expected["minimum_accepted_pairs_per_active_cell"]),
+                                   ("final_retained_pairs", expected["minimum_final_pairs_per_active_cell"])):
+                if int(row[field]) < minimum:
+                    raise ValueError(f"{sample}: {field} below {minimum}")
+            trimmed, accepted, rejected, duplicate, postdedup, removed, final = (int(row[field]) for field in
+                ("trimmed_pairs", "backend_accepted_pairs", "backend_rejected_pairs", "duplicate_pairs", "postdedup_pairs",
+                 "high_cph_removed_pairs", "final_retained_pairs"))
+            if trimmed != accepted + rejected or accepted != duplicate + postdedup or postdedup != removed + final:
+                raise ValueError(f"{sample}: pair funnel does not close")
+            counts = _benchmark_cpg_metrics(project / row["cpg_path"])
+            cpg_metrics[sample] = counts
+            if sum(value["rows"] for chrom, value in counts.items() if chrom not in {"chrM", "lambda", "pUC19"}) < expected["minimum_host_cpg_rows_per_active_cell"]:
+                raise ValueError(f"{sample}: real host genome CpG coverage missing")
+            if any(counts.get(chrom, {}).get("rows", 0) == 0 for chrom in ("chrM", "lambda", "pUC19")):
+                raise ValueError(f"{sample}: synthetic control CpG coverage missing")
+            if route == "mm10-srd-biscuit":
+                for field in ("dna_tube_rna_reads", "rna_enrichment_rna_reads"):
+                    if int(row[field]) != 12:
+                        raise ValueError(f"{sample}: SRD synthetic RNA count mismatch")
+                for field in ("dna_tube_rna_fastq_r1", "dna_tube_rna_fastq_r2", "rna_enrichment_rna_fastq_r1", "rna_enrichment_rna_fastq_r2", "rna_bam_path"):
+                    if not row[field] or not (project / row[field]).is_file():
+                        raise ValueError(f"{sample}: retained SRD {field} missing")
+                for prefix in ("dna_tube_rna_fastq", "rna_enrichment_rna_fastq"):
+                    if sum(1 for _ in _benchmark_fastq_pairs(project / row[prefix + "_r1"], project / row[prefix + "_r2"])) != 12:
+                        raise ValueError(f"{sample}: collected RNA FASTQ pair count mismatch")
+                if not (project / (row["rna_bam_path"] + ".bai")).is_file():
+                    raise ValueError(f"{sample}: SRD retained BAM index missing")
+        for field, minimum in (("duplicate_pairs", expected["minimum_duplicate_pairs_total"]),
+                               ("high_cph_removed_pairs", expected["minimum_high_cph_pairs_total"])):
+            if sum(int(row[field]) for row in active) < minimum:
+                raise ValueError(f"{route}: {field} regression branch was not exercised")
+    declared = {row["cpg_path"].removeprefix("03_results/") for row in rows if row["cpg_path"]}
+    public = {str(path.relative_to(project / "03_results")) for path in (project / "03_results/CpG").glob("*")}
+    if public != declared or ".bam" in json.dumps(run_manifest["outputs"]):
+        raise ValueError("Doctor public inventory contains unexpected scientific output/BAM")
+    if (project / "02_work/demux").exists():
+        raise ValueError("Doctor published demux scratch was not reclaimed")
+    report = {"status": "PASS", "route": route, "fixture": json.loads((project / "04_logs/doctor_fixture.json").read_text()),
+              "run": run_manifest["run"], "snapshot": json.loads(Path(run_manifest["run"]["snapshot_path"]).read_text()),
+              "cells": rows, "cpg_counts": cpg_metrics, "inventory": run_manifest["outputs"]}
+    atomic_write_json(project / "04_logs/doctor_verification.json", report)
+    print(f"{route}: PASS; {len(declared)} active / {len(rows)} total cells; exact demux, native mapping/filter funnel, CpG and retention verified")
+
+
+# 内部 CLI
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Alopex 核心模块内部 CLI。")
@@ -9831,12 +10215,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             raise ValueError(f"unsupported dna_pipeline command: {command}")
     except (
-        FileNotFoundError,
         ValueError,
         RuntimeError,
         OSError,
         subprocess.SubprocessError,
-        json.JSONDecodeError,
     ) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

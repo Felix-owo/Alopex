@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-
+# 运行环境与尝试日志
 if [[ -n "${DNA_PIPELINE_ROOT:-}" ]]; then
     export PYTHONPATH="$DNA_PIPELINE_ROOT/core${PYTHONPATH:+:$PYTHONPATH}"
 fi
@@ -37,6 +37,7 @@ dna_pipeline_init_attempt_logs() {
     done
 }
 
+# 独占 scratch 生命周期
 # 在有空间余量的首选候选盘上创建本 job 专属 scratch 目录并导出为 TMPDIR；请求 110% 余量且路径锁定在 namespace 内。
 dna_pipeline_allocate_scratch() {
     local configured_tmp="$1"
@@ -147,6 +148,7 @@ dna_pipeline_log_scratch() {
     df -h "$DNA_PIPELINE_SCRATCH_BASE"
 }
 
+# 工具输出定位
 # --recursive 递归搜索；--exclude-glob 可多次给出，命中文件名即从候选中剔除。
 dna_pipeline_find_single_output() {
     local directory="$1"
@@ -207,6 +209,7 @@ dna_pipeline_find_single_output() {
 }
 
 
+# 科学处理：稳定统计与格式转换
 # 把 mapped/variant 计数序列化为 final manifest 直接消费的稳定 pileup stats JSON。
 dna_pipeline_write_pileup_stats() {
     local output="$1" sample="$2" mapped="$3" variants="$4" empty=false
@@ -274,7 +277,7 @@ dna_pipeline_run_bsconv_classification() {
     fi
 }
 
-# 把后端计数流统一写成四列 canonical CpG；压缩固定单线程，避免嵌套并行。
+# 把后端计数流按配置偏移写成四列 CpG；压缩固定单线程，避免嵌套并行。
 dna_pipeline_emit_canonical_cpg() {
     local zstd="${1:?}" pos_expr="${2:?}" out_tmp="${3:?}" source="${4:-stdin}"
     {
@@ -290,7 +293,7 @@ dna_pipeline_emit_canonical_cpg() {
             if (($2 $3 $5 $6) ~ /[^0-9]/) invalid("coordinates and counts must be nonnegative integers");
             start=$2+0; end=$3+0; m=$5+0; u=$6+0; pos=start+OFF;
             if (start > 9007199254740991 || end > 9007199254740991 || m > 9007199254740991 || u > 9007199254740991) invalid("integer exceeds exact range");
-            if (pos < 0 || end < start) invalid("invalid coordinate interval");
+            if (pos < 0 || pos > 9007199254740991 || end < start) invalid("invalid coordinate interval");
             if (m+u>0) print $1, pos, m, u;
         }'
     } | "$zstd" -q -T1 -c > "$out_tmp"

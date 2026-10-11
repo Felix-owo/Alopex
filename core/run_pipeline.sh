@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 入口定位与 CLI
 # 按脚本真实路径定位 Pipeline，支持 launcher 符号链接。
 dna_pipeline_resolve_launcher_source() {
     local source="${BASH_SOURCE[0]}" directory target
@@ -127,6 +128,7 @@ if [[ -n "$DNA_PIPELINE_INIT_PROJECT" ]]; then
         "$DNA_PIPELINE_INIT_PROJECT" --pipeline-root "$DNA_PIPELINE_ROOT"
     exit $?
 fi
+# 运行环境与项目发现
 DNA_PIPELINE_BISCUIT_ENV="$DNA_PIPELINE_ROOT/conda/current/biscuit"
 DNA_PIPELINE_BISMARK_ENV="$DNA_PIPELINE_ROOT/conda/current/bismark"
 DNA_PIPELINE_RASTAIR_ENV="$DNA_PIPELINE_ROOT/conda/current/rastair"
@@ -187,6 +189,7 @@ DNA_PIPELINE_CONFIG="$(discover_project_config "$DNA_PIPELINE_LAUNCH_DIR" || tru
 DNA_PIPELINE_PROJECT_DIR="$(cd "$(dirname "$DNA_PIPELINE_CONFIG")/.." && pwd -P)"
 export DNA_PIPELINE_CONFIG DNA_PIPELINE_PROJECT_DIR
 
+# 日志、中断与启动器临时文件
 # 清理 launcher 临时合成目录。
 cleanup_launcher_tmp() {
     if [[ -n "${DNA_PIPELINE_RUNTIME_TMP:-}" && -d "${DNA_PIPELINE_RUNTIME_TMP:-}" ]]; then
@@ -206,6 +209,7 @@ if (( DNA_PIPELINE_REFRESH_MANIFEST == 1 )); then
     exit $?
 fi
 
+# 运行快照与公共参数
 project_hash8() {
     "$DNA_PIPELINE_PYTHON" -c 'import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:8])' "$DNA_PIPELINE_PROJECT_DIR"
 }
@@ -290,6 +294,7 @@ run_snakemake_tracked() {
 }
 
 
+# 有效配置与独立维护动作
 for internal_helper in \
     "$DNA_PIPELINE_ROOT/core/job_runtime.sh" \
     "$DNA_PIPELINE_ROOT/core/dna_pipeline.py"; do
@@ -337,7 +342,7 @@ case "$DNA_PIPELINE_METHYLATION_BACKEND" in
         DNA_PIPELINE_RULE_ENV="$DNA_PIPELINE_BISMARK_ENV"
         ;;
     *)
-        echo "ERROR: analysis.methylation_backend must be biscuit, bismark or rastair." >&2
+        echo "ERROR: 当前协议的 methylation_backend 必须为 biscuit、bismark 或 rastair。" >&2
         exit 2
         ;;
 esac
@@ -453,6 +458,7 @@ elif [[ "$DNA_PIPELINE_PROJECT_STATUS" == resumable ]]; then
     fi
 fi
 
+# 执行器参数与统一启动
 # 按平台选择执行器，已有 Slurm allocation 仍提交规则作业。
 detect_executor() {
     local system_name
@@ -464,8 +470,6 @@ detect_executor() {
             if [[ -n "$DNA_PIPELINE_DOCTOR_LOCAL_CORES" ]]; then
                 printf '%s\n' local
             else
-                command -v sbatch >/dev/null 2>&1 || { echo "ERROR: Linux execution requires sbatch." >&2; return 127; }
-                command -v squeue >/dev/null 2>&1 || { echo "ERROR: Linux execution requires squeue." >&2; return 127; }
                 printf '%s\n' slurm
             fi ;;
         *) echo "ERROR: unsupported OS: $system_name" >&2; return 2 ;;
@@ -478,8 +482,7 @@ if [[ "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" ]]; then
 fi
 export DNA_PIPELINE_EXECUTOR DNA_PIPELINE_IN_SLURM_ALLOCATION DNA_PIPELINE_DATA_MODE DNA_PIPELINE_TEST_ROUTE
 
-# 本地执行器的 mem_mb 调度预算：SLURM allocation 内取作业实际内存，否则取宿主总内存；
-# 使多个整基因组 index 级作业按声明内存串行，避免并发驻留击穿 cgroup/物理内存。
+# 本地 mem_mb 预算取 allocation 实际内存或宿主总内存，约束大内存作业的并发。
 dna_pipeline_local_mem_budget_mib() {
     local budget=""
     if [[ "${SLURM_MEM_PER_NODE:-}" =~ ^[1-9][0-9]*$ ]]; then
@@ -495,63 +498,35 @@ dna_pipeline_local_mem_budget_mib() {
     echo "$budget"
 }
 
-# 在 macOS 或 Doctor 内部小型路线运行本地执行器。
-run_local() {
-    local cores latency_wait protocol reference execution_label mem_budget
+# 为 macOS 或 Doctor 内部小型路线准备本地执行参数与预算。
+prepare_local_executor() {
+    local cores mem_budget
     cores="$CFG_LOCAL_CORES"
     [[ -z "$DNA_PIPELINE_DOCTOR_LOCAL_CORES" ]] || cores="$DNA_PIPELINE_DOCTOR_LOCAL_CORES"
-    execution_label="local"
-    latency_wait="$CFG_LATENCY_WAIT"
-    protocol="$CFG_PROTOCOL"
-    reference="$CFG_SPECIES"
     [[ "$cores" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: runtime.local_executor_cores must be positive." >&2; return 2; }
     cores="$("$DNA_PIPELINE_PYTHON" -c 'import sys; from dna_pipeline import effective_cpu_count; print(effective_cpu_count(int(sys.argv[1])))' "$cores")" || return $?
-    [[ "$latency_wait" =~ ^[0-9]+$ ]] || { echo "ERROR: runtime.latency_wait_seconds must be >=0." >&2; return 2; }
     mem_budget="$(dna_pipeline_local_mem_budget_mib)" || return $?
-    dna_pipeline_prepare_common_args "$latency_wait"
-    if (( DNA_PIPELINE_READ_ONLY == 1 )); then
-        dna_pipeline_prepare_read_only_inputs
-    fi
-    echo "Starting Alopex with local executor..."
-    echo "Config: $DNA_PIPELINE_WORKFLOW_CONFIG"
-    echo "Project: $DNA_PIPELINE_PROJECT_DIR"
-    echo "Executor: $execution_label"
-    echo "Protocol: $protocol"
-    echo "Backend: $DNA_PIPELINE_METHYLATION_BACKEND"
-    echo "Reference: $reference"
-    echo "Cores: $cores"
-    echo "Mem budget: ${mem_budget} MiB"
+    DNA_PIPELINE_EXECUTOR_ARGS=(--executor local --cores "$cores" --resources mem_mb="$mem_budget")
+    DNA_PIPELINE_EXECUTOR_LABEL="local"
+    DNA_PIPELINE_EXECUTOR_SUMMARY=("Cores: $cores" "Mem budget: ${mem_budget} MiB")
     export DNA_PIPELINE_LOCAL_CORES="$cores"
-    if (( DNA_PIPELINE_READ_ONLY == 0 )); then echo "Run snapshot: $DNA_PIPELINE_RUN_SNAPSHOT"; fi
-    if (( DNA_PIPELINE_READ_ONLY == 1 )); then
-        cd "$DNA_PIPELINE_RUNTIME_TMP"
-    else
-        cd "$DNA_PIPELINE_PROJECT_DIR"
-    fi
-    DNA_PIPELINE_CMD=("$DNA_PIPELINE_SNAKEMAKE" --snakefile "$DNA_PIPELINE_ROOT/core/Snakefile" --executor local --cores "$cores" --resources mem_mb="$mem_budget" "${DNA_PIPELINE_COMMON_ARGS[@]}")
-    (( DNA_PIPELINE_READ_ONLY == 0 )) || DNA_PIPELINE_CMD+=(--dry-run)
-    DNA_PIPELINE_CMD+=(--configfile "$SNAPSHOT_CONFIG")
-    local controller_run_id
-    controller_run_id="$DNA_PIPELINE_DELIVERY_ID"
-    run_snakemake_tracked "$controller_run_id" "${DNA_PIPELINE_CMD[@]}"
 }
 
-# 在当前 shell 运行 Slurm controller，规则作业通过 sbatch 提交。
-run_slurm() {
-    local jobs controller_cores latency_wait account partition qos configured_tmp project_hash plugin_version protocol effective_account
-    local -a default_resources plugin_args cmd
+# 为 Slurm 准备提交参数，controller 始终留在当前 shell 或 allocation。
+prepare_slurm_executor() {
+    local jobs controller_cores account partition qos configured_tmp project_hash plugin_version logdir
+    local -a default_resources plugin_args
     command -v sbatch >/dev/null 2>&1 || { echo "ERROR: sbatch not found." >&2; return 127; }
     command -v squeue >/dev/null 2>&1 || { echo "ERROR: squeue not found." >&2; return 127; }
-    local logdir
     if (( DNA_PIPELINE_READ_ONLY == 1 )); then
         logdir="$DNA_PIPELINE_RUNTIME_TMP/slurm"
     else
         logdir="$DNA_PIPELINE_PROJECT_DIR/04_logs/slurm"
     fi
     mkdir -p "$logdir"
-    jobs="$CFG_SLURM_JOBS"; controller_cores="$CFG_SLURM_CONTROLLER_CORES"; latency_wait="$CFG_LATENCY_WAIT"
+    jobs="$CFG_SLURM_JOBS"; controller_cores="$CFG_SLURM_CONTROLLER_CORES"
     account="$CFG_SLURM_ACCOUNT"; partition="$CFG_SLURM_PARTITION"; qos="$CFG_SLURM_QOS"; configured_tmp="$CFG_SLURM_NODE_TMPDIR"
-    [[ "$jobs" =~ ^[1-9][0-9]*$ && "$controller_cores" =~ ^[1-9][0-9]*$ && "$latency_wait" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid Slurm/runtime numeric settings." >&2; return 2; }
+    [[ "$jobs" =~ ^[1-9][0-9]*$ && "$controller_cores" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: invalid Slurm/runtime numeric settings." >&2; return 2; }
     if [[ -n "$configured_tmp" ]]; then
         DNA_PIPELINE_NODE_TMPDIR="$(PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" \
             -m dna_pipeline resolve-tmpdir --path "$configured_tmp")"
@@ -562,45 +537,54 @@ run_slurm() {
     project_hash="$(project_hash8)"
     plugin_version="$("$DNA_PIPELINE_PYTHON" -c 'from importlib.metadata import version;print(version("snakemake-executor-plugin-slurm"))' 2>/dev/null || true)"
     [[ -n "$plugin_version" ]] || { echo "ERROR: SLURM executor plugin is missing." >&2; return 127; }
-    dna_pipeline_prepare_common_args "$latency_wait"
-    default_resources=(); effective_account="$account"
+    default_resources=()
     if [[ -n "$partition" ]]; then default_resources+=("slurm_partition=$partition"); fi
-    if [[ -n "$effective_account" ]]; then default_resources+=("slurm_account=$effective_account"); fi
+    if [[ -n "$account" ]]; then default_resources+=("slurm_account=$account"); fi
     plugin_args=(--slurm-jobname-prefix "Alopex_${project_hash}" --slurm-logdir "$logdir" --slurm-delete-logfiles-older-than 0 --slurm-status-command squeue)
     if [[ -n "${SBATCH_EXCLUDE:-}" ]]; then plugin_args+=(--slurm-exclude-failed-nodes "$SBATCH_EXCLUDE"); fi
-    if [[ -z "$effective_account" ]]; then plugin_args+=(--slurm-no-account); fi
+    if [[ -z "$account" ]]; then plugin_args+=(--slurm-no-account); fi
     if [[ -n "$qos" ]]; then plugin_args+=(--slurm-qos "$qos"); fi
+    DNA_PIPELINE_EXECUTOR_ARGS=(--executor slurm --max-jobs-per-timespan 30/1s --max-status-checks-per-second 5 --scheduler greedy --jobs "$jobs" --local-cores "$controller_cores")
+    if (( ${#default_resources[@]} > 0 )); then DNA_PIPELINE_EXECUTOR_ARGS+=(--default-resources "${default_resources[@]}"); fi
+    DNA_PIPELINE_EXECUTOR_ARGS+=("${plugin_args[@]}")
+    if (( DNA_PIPELINE_IN_SLURM_ALLOCATION == 1 )); then
+        DNA_PIPELINE_EXECUTOR_LABEL="slurm (plugin $plugin_version; controller=current allocation ${SLURM_JOB_ID})"
+    else
+        DNA_PIPELINE_EXECUTOR_LABEL="slurm (plugin $plugin_version; controller=current login shell)"
+    fi
+    DNA_PIPELINE_EXECUTOR_SUMMARY=("SLURM jobs: $jobs (controller cores=$controller_cores)")
+    if [[ -n "${SBATCH_EXCLUDE:-}" ]]; then DNA_PIPELINE_EXECUTOR_SUMMARY+=("SLURM excluded nodes: $SBATCH_EXCLUDE"); fi
+}
+
+# 统一准备 workflow、工作目录和启动日志，并透传 Snakemake 的退出结果。
+run_workflow() {
+    [[ "$CFG_LATENCY_WAIT" =~ ^[0-9]+$ ]] || { echo "ERROR: runtime.latency_wait_seconds must be >=0." >&2; return 2; }
+    case "$DNA_PIPELINE_EXECUTOR" in
+        local) prepare_local_executor ;;
+        slurm) prepare_slurm_executor ;;
+    esac
+    dna_pipeline_prepare_common_args "$CFG_LATENCY_WAIT"
     if (( DNA_PIPELINE_READ_ONLY == 1 )); then
         dna_pipeline_prepare_read_only_inputs
     fi
-    protocol="$CFG_PROTOCOL"
-    reference="$CFG_SPECIES"
-    echo "Starting Alopex with Snakemake SLURM executor..."
-    echo "Config: $DNA_PIPELINE_WORKFLOW_CONFIG"; echo "Project: $DNA_PIPELINE_PROJECT_DIR"
-    if (( DNA_PIPELINE_IN_SLURM_ALLOCATION == 1 )); then
-        echo "Executor: slurm (plugin $plugin_version; controller=current allocation ${SLURM_JOB_ID})"
-    else
-        echo "Executor: slurm (plugin $plugin_version; controller=current login shell)"
-    fi
-    echo "Protocol: $protocol"; echo "Backend: $DNA_PIPELINE_METHYLATION_BACKEND"; echo "Reference: $reference"; echo "SLURM jobs: $jobs (controller cores=$controller_cores)"
-    if [[ -n "${SBATCH_EXCLUDE:-}" ]]; then echo "SLURM excluded nodes: $SBATCH_EXCLUDE"; fi
+    echo "Starting Alopex with $DNA_PIPELINE_EXECUTOR executor..."
+    echo "Config: $DNA_PIPELINE_WORKFLOW_CONFIG"
+    echo "Project: $DNA_PIPELINE_PROJECT_DIR"
+    echo "Executor: $DNA_PIPELINE_EXECUTOR_LABEL"
+    echo "Protocol: $CFG_PROTOCOL"
+    echo "Backend: $DNA_PIPELINE_METHYLATION_BACKEND"
+    echo "Reference: $CFG_SPECIES"
+    printf '%s\n' "${DNA_PIPELINE_EXECUTOR_SUMMARY[@]}"
     if (( DNA_PIPELINE_READ_ONLY == 0 )); then echo "Run snapshot: $DNA_PIPELINE_RUN_SNAPSHOT"; fi
     if (( DNA_PIPELINE_READ_ONLY == 1 )); then
         cd "$DNA_PIPELINE_RUNTIME_TMP"
     else
         cd "$DNA_PIPELINE_PROJECT_DIR"
     fi
-    cmd=("$DNA_PIPELINE_SNAKEMAKE" --snakefile "$DNA_PIPELINE_ROOT/core/Snakefile" --executor slurm --max-jobs-per-timespan 30/1s --max-status-checks-per-second 5 --scheduler greedy --jobs "$jobs" --local-cores "$controller_cores" "${DNA_PIPELINE_COMMON_ARGS[@]}")
-    if (( ${#default_resources[@]} > 0 )); then cmd+=(--default-resources "${default_resources[@]}"); fi
-    cmd+=("${plugin_args[@]}")
-    (( DNA_PIPELINE_READ_ONLY == 0 )) || cmd+=(--dry-run)
-    cmd+=(--configfile "$SNAPSHOT_CONFIG")
-    local controller_run_id
-    controller_run_id="$DNA_PIPELINE_DELIVERY_ID"
-    run_snakemake_tracked "$controller_run_id" "${cmd[@]}"
+    DNA_PIPELINE_CMD=("$DNA_PIPELINE_SNAKEMAKE" --snakefile "$DNA_PIPELINE_ROOT/core/Snakefile" "${DNA_PIPELINE_EXECUTOR_ARGS[@]}" "${DNA_PIPELINE_COMMON_ARGS[@]}")
+    (( DNA_PIPELINE_READ_ONLY == 0 )) || DNA_PIPELINE_CMD+=(--dry-run)
+    DNA_PIPELINE_CMD+=(--configfile "$SNAPSHOT_CONFIG")
+    run_snakemake_tracked "$DNA_PIPELINE_DELIVERY_ID" "${DNA_PIPELINE_CMD[@]}"
 }
 
-case "$DNA_PIPELINE_EXECUTOR" in
-    local) run_local ;;
-    slurm) run_slurm ;;
-esac
+run_workflow

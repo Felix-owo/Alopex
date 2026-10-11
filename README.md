@@ -1,4 +1,4 @@
-# Alopex v14.7
+# Alopex v14.8
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -145,15 +145,26 @@ run_pipeline.sh
 编辑 `00_config/config.yaml`，确认物种、reference 和路线。例如：
 
 ```yaml
-schema_version: 2
+schema_version: 3
 species: hg38
 references:
   hg38: /path/to/Alopex/resources/hg38_reference/hg38.primary.lambda.puc19.fa
 analysis:
   protocol: cabernet
+  cpg_coordinate_base: 1
+cabernet:
   methylation_backend: bismark
 ```
 
+初始化模板将 demux、high-CpH、Bismark 和 BISCUIT 参数统一放在 `common`，只需修改一次。
+`cabernet`、`srd` 保留后端选择，四个协议模块都可声明适用参数的差异，覆盖公共值。
+例如 `common.bismark.local_alignment: true` 对使用 Bismark 的协议生效，
+`cabernet.bismark.local_alignment: false` 则单独覆盖 Cabernet。优先级为内置默认 → common → 选定协议；列表整体替换。
+TAPS 只读取 common.demux 并自动使用 Rastair；Droplet 自动使用 Bismark、spacer=0、non_directional。
+这些固定参数不出现在 config 中，也不接受手动声明；没有差异时可写 `taps: {}`、`droplet: {}` 或省略模块。
+物种/reference、`analysis`、`runtime`、`slurm` 和 `retention` 仍是全局设置。
+CpG 的 `pos` 默认 1-based；设置 `analysis.cpg_coordinate_base: 0` 输出 0-based，下游自动按 sealed 配置归一化。
+当前 schema 为 3；已有项目须按模块结构调整配置，平面布局不再接受。
 完整模板、默认值、可调参数及计数单位见初始化生成的 config 行内注释。
 Droplet 使用 `protocol: droplet`、Bismark `non_directional`，不需要 Barcode Map，
 `rna_sample` 留空；若在初始化前写好 Droplet config，初始化会直接跳过 Barcode Map。
@@ -161,7 +172,7 @@ Droplet 在 non-conversion 过滤后按胞嘧啶位点/UMI 汇集分子共识，
 下游 QC 表的 `Duplicate_Pair_Rate%` 不适用，保留为空值；它不表示 QC 计算失败。
 固定 MAPQ≥10、baseQ≥20；未解决的共识平票不调用。保留 BAM 时其中仍有 PCR 复制，
 独立分子计数以 CpG 输出为准；QC 的 pair 去重率为空，位点分子统计见 MultiQC 与 final manifest。
-TAPS 使用 `protocol: taps`、`methylation_backend: rastair`，默认生成 SNP VCF/索引与 Non-CpG QC，无需额外开关。
+TAPS 设置 `analysis.protocol: taps` 即自动使用 Rastair，默认生成 SNP VCF/索引与 Non-CpG QC，无需额外开关。
 HPC 每个 cell 的比对和调用合并为 Slurm 作业，S/M/L/XL 统一 16 CPU、16 GiB；最多三次尝试，内存16/24/32 GiB，CPU和时限不变。local调用最多4 CPU；质量/深度阈值保持相同。
 BWA按当前cell的原生FR推断均值/SD，允许插入长度上限至少1000 bp；该先验影响配对和MAPQ，实际效果和验证范围见本版 Release 说明。
 Non-CpG 为可判链宿主分子的 CHG/CHH 原始转换率；判链分母保留在 manifest/MultiQC，零观测为缺失。
@@ -241,7 +252,7 @@ stage 重试。已完成的快路只读退出；清理失败保留残留与告�
 └── run_manifest.json
 ```
 
-CpG 唯一格式为 `chrom, pos, methyl, unmethyl`，tab 分隔、pos 为 0-based，计数为非负整数。
+CpG 唯一格式为 `chrom, pos, methyl, unmethyl`，tab 分隔、pos 默认 1-based，计数为非负整数。`analysis.cpg_coordinate_base: 0` 可改为 0-based（仅接受整数 0/1，省略默认 1）。BED/VCF/BAM 仍按各自格式；下游根据 sealed 交付的坐标身份将输入归一化为 SnapATAC2 所需的 0-based。
 坏行会报告来源和行号并阻止提交；合法空结果保留表头。SRD 的 RNA FASTQ 和被筛除 BAM
 固定保存在 `02_work/RNA/{FASTQ,BAM}/`，不进入公开 inventory。
 
