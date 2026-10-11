@@ -3134,15 +3134,17 @@ fn init_tables() {
 fn ensure_fastq_input(path: &Path, label: &str, stream: bool) -> Result<()> {
     if stream {
         use std::os::unix::fs::FileTypeExt;
-        let metadata = std::fs::metadata(path)?;
         anyhow::ensure!(
-            metadata.file_type().is_fifo()
-                && path.parent() == Some(Path::new("/dev/fd"))
+            path.parent() == Some(Path::new("/dev/fd"))
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .and_then(|name| name.parse::<u32>().ok())
-                    .is_some(),
+                    .is_some()
+                && std::fs::File::open(path)
+                    .and_then(|file| file.metadata())
+                    .with_context(|| format!("Cannot inspect {} inherited pipe: {}", label, path.display()))?
+                    .file_type().is_fifo(),
             "{} must be an inherited pipe: {}",
             label,
             path.display()
@@ -3317,6 +3319,47 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn inherited_pipe_validation_survives_concurrent_processes() {
+        use std::fs::File;
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::process::Command;
+        const CHILD: &str = "ALOPEX_PIPE_VALIDATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let children: Vec<_> = (0..8)
+                .map(|_| {
+                    Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", "tests::inherited_pipe_validation_survives_concurrent_processes", "--nocapture"])
+                        .env(CHILD, "1")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn().unwrap()
+                })
+                .collect();
+            let results: Vec<_> = children.into_iter().map(|p| p.wait_with_output().unwrap()).collect();
+            for result in results {
+                assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            }
+            return;
+        }
+        let (mut reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"@pair\nACGT\n+\nIIII\n").unwrap();
+        drop(writer);
+        let path = PathBuf::from(format!("/dev/fd/{}", reader.as_raw_fd()));
+        for _ in 0..4096 {
+            ensure_fastq_input(&path, "--r1", true).unwrap();
+        }
+        let mut content = String::new();
+        reader.read_to_string(&mut content).unwrap();
+        assert_eq!(content, "@pair\nACGT\n+\nIIII\n");
+        let file = File::open(std::env::current_exe().unwrap()).unwrap();
+        for invalid in ["/dev/null".to_string(), "/dev/fd/invalid".to_string(),
+                        "/dev/fd/2147483647".to_string(), format!("/dev/fd/{}", file.as_raw_fd())] {
+            assert!(ensure_fastq_input(Path::new(&invalid), "--r1", true).is_err());
+        }
+    }
 
     #[test]
     fn input_contract_requires_gzip_fastq_suffix_and_magic_on_both_mates() {

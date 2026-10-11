@@ -1,4 +1,4 @@
-# Alopex v14.8
+# Alopex v14.9
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -10,16 +10,12 @@ Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报
 | Cabernet–TAPS+ | BWA-MEM + Rastair | 标记重复、调用 CpG 和 SNP，统计 Non-CpG；不执行 CpH/cDNA 筛除 |
 
 用户入口只有 `core/doctor.sh`（构建与维护）和 `core/run_pipeline.sh`（项目运行）。
-各参数的含义与默认值见初始化项目生成的 `00_config/config.yaml` 模板行内注释。
+完整配置及参数默认值见初始化项目生成的 `00_config/config.yaml`；下游用法见
+[下游 README](downstream/README.md)，验证范围和升级说明见本版 Release。
 
-## 关于本仓库
-
-本仓库是 Alopex 的 GPL-3.0 公开发布副本，包含完整可运行的 Pipeline：核心 workflow、
-Rust demultiplexer、下游 QC、Doctor 端到端回归 fixture（真实 Cabernet 抽样 reads，
-数据集命名与来源身份已中性化）以及默认 Barcode Map 模板。维护规范、参数表、流程图、
-测试套件与内部 benchmark 归档不随公开副本分发；Doctor 的九个阶段在本副本均可完整执行。
-
-Bismark paired-end 比对在所有协议与比对模式下固定使用 `--maxins 1000`（等价 `-X 1000`），最大插入片段长度为 1000 bp。
+本仓库是 Alopex 的 GPL-3.0 公开发布副本，包含核心 workflow、Rust demultiplexer、下游 QC、
+Doctor 回归 fixture（真实 Cabernet 抽样与合成对照）和默认 Barcode Map。
+维护规范、内部文档、测试套件与 benchmark 归档不随公开副本分发；Doctor 可完整运行。
 
 ## 1. 安装
 
@@ -32,10 +28,8 @@ cd Alopex
 conda --version
 ```
 
-也可使用源码归档部署，无需 `.git`。在目标机器上构建 Conda、Rust 和 reference indexes，
-不要跨平台复制已构建环境。版本以 Git tag 为准。
-Doctor 使用 Seed Conda 自带的 `ruamel.yaml` 抽取环境配置，无需在 Seed 中额外安装 PyYAML。
-科学规则的 Python 入口固定到所选 backend 环境，避免 HPC 已激活环境的 PATH 顺序影响依赖加载。
+也可从源码归档部署，无需 `.git`。Conda、Rust 和 reference indexes 必须在目标机器构建，
+不要跨平台复制环境。版本以 Git tag 为准。
 
 ## 2. 准备标准 reference
 
@@ -62,32 +56,12 @@ resources/reference_source/
 | `hg38.genes.gtf` | GENCODE v48 / GRCh38 | [GENCODE v48 GTF](https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_48/gencode.v48.annotation.gtf.gz) |
 | `mm10.genes.gtf` | GENCODE M25 / GRCm38 | [GENCODE M25 GTF](https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.annotation.gtf.gz) |
 
-可以直接在 Pipeline 根目录执行：
+按表中链接下载，解压为上述固定文件名。例如：
 
 ```bash
 mkdir -p resources/reference_source
-
 curl -fL https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz \
   | gzip -dc > resources/reference_source/hg38.fa
-
-curl -fL https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.fa.gz \
-  | gzip -dc > resources/reference_source/mm10.fa
-
-curl -fL \
-  'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=J02459.1&rettype=fasta&retmode=text' \
-  > resources/reference_source/lambda.fa
-
-curl -fL \
-  'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=L09137.2&rettype=fasta&retmode=text' \
-  > resources/reference_source/pUC19.fa
-
-curl -fL \
-  https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_48/gencode.v48.annotation.gtf.gz \
-  | gzip -dc > resources/reference_source/hg38.genes.gtf
-
-curl -fL \
-  https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.annotation.gtf.gz \
-  | gzip -dc > resources/reference_source/mm10.genes.gtf
 ```
 
 ## 3. 构建与检查
@@ -98,14 +72,12 @@ curl -fL \
 bash core/doctor.sh
 ```
 
-Doctor 检查或修复环境、Rust demultiplexer、hg38/mm10 reference 与三个 backend 的 indexes，
-然后运行 A（hg38/Cabernet/Bismark）、B（mm10/SRD/BISCUIT）和 C（TAPS/Rastair）三条隔离路线。
-登录节点的 A/B 为独立 Slurm workers，可并行；macOS 或已有 allocation 内串行，避免重复使用
-整份内存预算。每条 route 最多 2 CPU，Bismark 16 GiB、BISCUIT/Rastair 24 GiB、20 min。
-C 在 A/B 成功后执行；TAPS 的完整隔离交付及优化子集已有验证；全库链方向真值、SNV 准确度及参数最优性仍未验证，详见本版 Release 说明。
+Doctor 检查或修复环境、Rust demultiplexer、hg38/mm10 reference 和三个 backend 的 indexes，
+再运行 A（hg38/Cabernet/Bismark）、B（mm10/SRD/BISCUIT）、C（TAPS/Rastair）三条隔离路线。
+HPC 登录节点提交 Slurm workers；macOS 或已有 allocation 内串行运行。
 
-成功结尾必须为 `FINAL STATUS: READY`。详细日志在 `logs/doctor/`，成功清理测试沙箱，
-失败保留沙箱和原生诊断。Doctor 每次都重跑三条路线，READY 只代表本次检查和回归通过。
+成功结尾为 `FINAL STATUS: READY`。日志在 `logs/doctor/`；成功清理沙箱，失败保留沙箱和诊断。
+Doctor 每次重跑三路线，READY 仅证明本次工具链及小样本回归通过；完整验证边界见本版 Release。
 
 可单独维护某一段，或先在登录节点填充下载缓存：
 
@@ -156,28 +128,26 @@ cabernet:
   methylation_backend: bismark
 ```
 
-初始化模板将 demux、high-CpH、Bismark 和 BISCUIT 参数统一放在 `common`，只需修改一次。
-`cabernet`、`srd` 保留后端选择，四个协议模块都可声明适用参数的差异，覆盖公共值。
-例如 `common.bismark.local_alignment: true` 对使用 Bismark 的协议生效，
-`cabernet.bismark.local_alignment: false` 则单独覆盖 Cabernet。优先级为内置默认 → common → 选定协议；列表整体替换。
-TAPS 只读取 common.demux 并自动使用 Rastair；Droplet 自动使用 Bismark、spacer=0、non_directional。
-这些固定参数不出现在 config 中，也不接受手动声明；没有差异时可写 `taps: {}`、`droplet: {}` 或省略模块。
-物种/reference、`analysis`、`runtime`、`slurm` 和 `retention` 仍是全局设置。
-CpG 的 `pos` 默认 1-based；设置 `analysis.cpg_coordinate_base: 0` 输出 0-based，下游自动按 sealed 配置归一化。
-当前 schema 为 3；已有项目须按模块结构调整配置，平面布局不再接受。
-完整模板、默认值、可调参数及计数单位见初始化生成的 config 行内注释。
-Droplet 使用 `protocol: droplet`、Bismark `non_directional`，不需要 Barcode Map，
-`rna_sample` 留空；若在初始化前写好 Droplet config，初始化会直接跳过 Barcode Map。
-Droplet 在 non-conversion 过滤后按胞嘧啶位点/UMI 汇集分子共识，保留不同 read pairs 的联合覆盖。
-下游 QC 表的 `Duplicate_Pair_Rate%` 不适用，保留为空值；它不表示 QC 计算失败。
-固定 MAPQ≥10、baseQ≥20；未解决的共识平票不调用。保留 BAM 时其中仍有 PCR 复制，
-独立分子计数以 CpG 输出为准；QC 的 pair 去重率为空，位点分子统计见 MultiQC 与 final manifest。
-TAPS 设置 `analysis.protocol: taps` 即自动使用 Rastair，默认生成 SNP VCF/索引与 Non-CpG QC，无需额外开关。
-HPC 每个 cell 的比对和调用合并为 Slurm 作业，S/M/L/XL 统一 16 CPU、16 GiB；最多三次尝试，内存16/24/32 GiB，CPU和时限不变。local调用最多4 CPU；质量/深度阈值保持相同。
-BWA按当前cell的原生FR推断均值/SD，允许插入长度上限至少1000 bp；该先验影响配对和MAPQ，实际效果和验证范围见本版 Release 说明。
-Non-CpG 为可判链宿主分子的 CHG/CHH 原始转换率；判链分母保留在 manifest/MultiQC，零观测为缺失。
-SNP 未调用位置不能视为纯合参考；如需保留 BAM 做额外重分析，设置 `retention.keep_final_bam: true`。
-默认 SNP VCF 保留原生 PASS 候选、质量及各等位基因的 OT/OB 链支持注释，参考长度由同一 FASTA 的 FAI 校正；正式遗传分析前须评估深度、置信度和链支持，PASS 本身不保证高置信基因型。
+配置优先级为**内置默认 → common → 选定协议**，列表整体替换。共用 demux、high-CpH、
+Bismark 和 BISCUIT 参数放在 `common`；协议模块只写 backend 与差异。例如
+`common.bismark.local_alignment: true` 对 Bismark 路线生效，
+`cabernet.bismark.local_alignment: false` 只覆盖 Cabernet。
+物种/reference、`analysis`、`runtime`、`slurm`、`retention` 为全局设置。
+当前只接受 schema 3 模块结构；完整参数、默认值与覆盖范围见初始化生成的 config 注释。
+
+- **Cabernet/SRD**：默认 Bismark，可选择 BISCUIT。Bismark 所有协议/模式固定 `--maxins 1000`；
+  `local_alignment` 默认 `false`（combined-index end-to-end），`true` 使用 CT/GA local。
+- **Droplet**：`analysis.protocol: droplet`，自动采用 Bismark non-directional、spacer=0；
+  无需 Barcode Map，`rna_sample` 留空。初始化前已有 Droplet config 时跳过 Barcode Map。
+  non-conversion 过滤后按胞嘧啶/UMI 汇集共识；BAM 仍保留 PCR 复制，独立分子计数见 CpG。
+  `Duplicate_Pair_Rate%` 不适用，保留 NaN；MAPQ≥10、baseQ≥20，未解决的平票不调用。
+- **TAPS**：`analysis.protocol: taps`，自动采用 Rastair，生成 SNP VCF/索引和 Non-CpG QC。
+  Non-CpG 是可判链宿主 CHG/CHH 的原始转换率，零观测为缺失；不作 high-CpH 筛除。
+  SNP 未调用位置不等于纯合参考，原生 PASS 也不保证高置信基因型；须结合深度、质量与
+  OT/OB 链支持评估。需要额外重分析时设置 `retention.keep_final_bam: true`。
+
+TAPS/Droplet 的 backend，以及 Droplet 的 spacer/library_type 属于固定策略，不接受 config
+声明；无差异时可写 `taps: {}`、`droplet: {}` 或省略模块。科学阈值见 config 注释；资源档位由 Pipeline 按输入规模自动选择。
 
 孔板 Barcode Map 至少含 `DNA_Barcode,PlateID,Cell_Order`，SRD 还需 `RNA_Barcode`。
 barcode 为 8 或 10 bp A/C/G/T，同长度序列间 Hamming distance 必须大于 2；PlateID 和
@@ -223,10 +193,10 @@ Cabernet/TAPS 的 `rna_sample` 可关联外部 RNA_DARLIN 项目的原始 RNA ba
 
 项目从当前目录向上定位。launcher 不接受额外 Snakemake flag 或 target；初始化、刷新和
 运行分别执行。macOS 使用 local executor；Linux 当前 shell/allocation 承载 controller，
-规则作业经 Slurm 提交。`runtime.*`/`slurm.*` 预算及重试策略的含义见 `00_config/config.yaml` 模板行内注释。
+规则作业经 Slurm 提交。`runtime.*`/`slurm.*` 预算含义见 config 注释；失败任务最多执行三次，内存按首次请求的 1/1.5/2 倍重试。
 
 完整日志：`04_logs/controller/<run_id>.log`。终端每 60 秒、重定向时每 300 秒展示进度；
-进度按有界缓冲只读取新增日志。逐规则证据在 `04_logs/rules/` 和 `04_logs/slurm/`，资源规则的
+逐规则证据在 `04_logs/rules/` 和 `04_logs/slurm/`，资源规则的
 `.attempt1/.attempt2/.attempt3` 保留本轮失败与重试原因。
 
 失败后先检查对应规则及 attempt 日志，修正原因，再运行同一 launcher。保留 `02_work/`
@@ -258,16 +228,15 @@ CpG 唯一格式为 `chrom, pos, methyl, unmethyl`，tab 分隔、pos 默认 1-b
 
 完成需同时满足：
 
-1. controller 成功退出；HPC controller 作业为 `COMPLETED|0:0`。
+1. controller 成功退出；若通过 Slurm 作业承载 controller，该作业须为 `COMPLETED|0:0`。
 2. `03_results/run_manifest.json` 为 `status: complete`，声明的结果与最终 manifest 齐全。
 3. 再次运行 launcher 显示 `Alopex delivery is complete and current`，不启动科学作业。
 
 MultiQC 汇总原生 mapping、pair funnel、重复、过滤、对照和适用的 M-bias；不同 backend
-的 mapping 分母不同。科学解释与空结果的判定以 `00_config/config.yaml` 模板注释及上文协议说明为准；已验证数据范围见本版 Release 说明。
+的 mapping 分母不同。科学解释与空结果的判定见 config 注释及上文协议说明；已验证数据范围见本版 Release。
 超过 1,000 个活跃 DNA 细胞时，MultiQC 固定抽取 1,000 个细胞，所有逐细胞模块使用同一集合；
 较小项目保留全部输入。报告首页标明抽样范围，文库级解复用概要仍为全库计数。
 抽样只用于报告展示，最终样本清单、全部细胞的科学结果及 BAM 保留策略不变。
-Bismark 原生报告的工具后缀仅在展示时去除，使总表按同一个细胞 ID 汇合。
 
 ## 8. 下游
 

@@ -22,8 +22,8 @@ from dna_pipeline import (
     STATIC_FUSED_RULES,
     backend_active_index_paths,
     backend_resource_request,
-    bismark_alignment_instance_count,
-    bismark_library_flag,
+    resolve_bismark_alignment,
+    cutadapt_adapter_specs,
     biscuit_library_mode,
     combined_runtime_min,
     controller_resource_request,
@@ -227,12 +227,7 @@ DEMUX_RUN_ROUTES = {
     for run_id, info in RAW_SAMPLES_MAP.items()
 }
 
-CUTADAPT_ADAPTER_R1 = "N{9}CTGTCTCTTATACACATCT" if PROTOCOL_POLICY.name == "droplet" else "CTGTCTCTTATACACATCT"
-CUTADAPT_ADAPTER_R2 = "N{9}CTRTCTCTTATACACATCT" if PROTOCOL_POLICY.name == "droplet" else "N{9}CTGTCTCTTATACACATCT"
-CUTADAPT_R1_MIN_OVERLAP = 12 if PROTOCOL_POLICY.name == "droplet" else 3
-CUTADAPT_R2_MIN_OVERLAP = 12
-CUTADAPT_ADAPTER_R1_SPEC = f"{CUTADAPT_ADAPTER_R1};min_overlap={CUTADAPT_R1_MIN_OVERLAP}"
-CUTADAPT_ADAPTER_R2_SPEC = f"{CUTADAPT_ADAPTER_R2};min_overlap={CUTADAPT_R2_MIN_OVERLAP}"
+CUTADAPT_ADAPTER_R1_SPEC, CUTADAPT_ADAPTER_R2_SPEC = cutadapt_adapter_specs(PROTOCOL_POLICY.name)
 CUTADAPT_QUALITY_CUTOFF = "20,20"
 CUTADAPT_MIN_LENGTH = 20
 
@@ -252,12 +247,8 @@ BISCUIT_LIBRARY_MODE = biscuit_library_mode(config) if METHYLATION_BACKEND == "b
 BISCUIT_HIGH_CPH_RETENTION_THRESHOLD = float(BISCUIT_CONFIG["high_cph_retention_threshold"]) if METHYLATION_BACKEND == "biscuit" else None
 GENERATE_SNP = METHYLATION_BACKEND == "rastair" or (METHYLATION_BACKEND == "biscuit" and BISCUIT_CONFIG["generate_snp"])
 
-BISMARK_LIBRARY_FLAG = bismark_library_flag(config) if METHYLATION_BACKEND == "bismark" else ""
-BISMARK_ALIGNMENT_INSTANCES = bismark_alignment_instance_count(config) if METHYLATION_BACKEND == "bismark" else None
-BISMARK_LOCAL_ALIGNMENT = bool(BISMARK_CONFIG.get("local_alignment", False))
-BISMARK_LOCAL_ALIGNMENT_FLAG = "--local" if BISMARK_LOCAL_ALIGNMENT else ""
-BISMARK_ALIGNMENT_FLAG = "" if BISMARK_LOCAL_ALIGNMENT else "--combined_index"
-BISMARK_SCORE_MIN = "G,20,8" if BISMARK_LOCAL_ALIGNMENT else "L,0,-0.2"
+BISMARK_ALIGNMENT = resolve_bismark_alignment(config) if METHYLATION_BACKEND == "bismark" else None
+BISMARK_LOCAL_ALIGNMENT = BISMARK_ALIGNMENT.local_alignment if BISMARK_ALIGNMENT else False
 BISMARK_SEED_MISMATCHES = 0
 BISMARK_SEED_LENGTH = 20
 BISMARK_EFFORT_D = 15
@@ -2174,11 +2165,11 @@ else:
             bismark = BISMARK,
             protocol = PROTOCOL_POLICY.name,
             bowtie2_dir = str(Path(BOWTIE2).parent),
-            alignment_instances = BISMARK_ALIGNMENT_INSTANCES,
-            library_flag = BISMARK_LIBRARY_FLAG,
-            alignment_flag = BISMARK_ALIGNMENT_FLAG,
-            score_min = BISMARK_SCORE_MIN,
-            local_alignment_flag = BISMARK_LOCAL_ALIGNMENT_FLAG,
+            alignment_instances = BISMARK_ALIGNMENT.instances,
+            library_flag = BISMARK_ALIGNMENT.library_flag,
+            alignment_flag = BISMARK_ALIGNMENT.index_flag,
+            score_min = BISMARK_ALIGNMENT.score_min,
+            local_alignment_flag = BISMARK_ALIGNMENT.local_flag,
             seed_mismatches = BISMARK_SEED_MISMATCHES,
             seed_length = BISMARK_SEED_LENGTH,
             effort_d = BISMARK_EFFORT_D,

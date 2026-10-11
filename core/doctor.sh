@@ -615,17 +615,25 @@ new_release_id() {
     printf '%s-%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$$"
 }
 
-create_control_from_seed() {
-    local target="$1" role="$2" specification help_text
-    local -a format_args=()
+# 共用环境创建流程；control 由 Seed 引导，其余角色由新 control 的 libmamba 创建。
+create_conda_environment() {
+    local target="$1" role="$2" conda_bin conda_dir specification help_text
+    local -a create_args=(env create)
     specification="$(extract_env_spec "$role")" || return $?
-    echo "使用 Seed Conda 创建 control candidate：$target"
-    echo "  seed         : $SEED_CONDA"
+    if [[ "$role" == control ]]; then
+        conda_bin="$SEED_CONDA"
+        conda_dir="$SEED_CONDA_DIR"
+    else
+        conda_bin="$CONTROL_CONDA"
+        conda_dir="$CONTROL_CONDA_DIR"
+        create_args+=(--solver libmamba)
+    fi
+    echo "使用 Conda 创建 $role candidate：$target"
+    echo "  conda        : $conda_bin"
     echo "  specification: $specification"
-
-    help_text="$(run_conda_probe "$SEED_CONDA" env create --help)" || return $?
+    help_text="$(run_conda_probe "$conda_bin" env create --help)" || return $?
     if [[ "$help_text" == *"--format"* ]]; then
-        format_args=(--format environment-yaml)
+        create_args+=(--format environment-yaml)
     fi
 
     env \
@@ -637,41 +645,10 @@ create_control_from_seed() {
         CONDA_REMOTE_MAX_RETRIES=5 \
         CONDA_REPODATA_THREADS=1 \
         CONDA_VERIFY_THREADS=1 \
-        PATH="$SEED_CONDA_DIR:$HOST_PATH" \
+        PATH="$conda_dir:$HOST_PATH" \
         PYTHONNOUSERSITE=1 \
-        "$SEED_CONDA" env create \
-            "${format_args[@]}" \
-            --prefix "$target" \
-            --file "$specification"
-}
-
-create_from_control() {
-    local target="$1" role="$2" specification help_text
-    local -a format_args=()
-    specification="$(extract_env_spec "$role")" || return $?
-    echo "使用新 control Conda 创建 candidate：$target"
-    echo "  control conda: $CONTROL_CONDA"
-    echo "  specification: $specification"
-
-    help_text="$(run_conda_probe "$CONTROL_CONDA" env create --help)" || return $?
-    if [[ "$help_text" == *"--format"* ]]; then
-        format_args=(--format environment-yaml)
-    fi
-
-    env \
-        "${CLEAN_ENVIRONMENT[@]}" \
-        CONDA_ALWAYS_YES=true \
-        CONDA_DEFAULT_THREADS=1 \
-        CONDA_EXECUTE_THREADS=1 \
-        CONDA_FETCH_THREADS=1 \
-        CONDA_REMOTE_MAX_RETRIES=5 \
-        CONDA_REPODATA_THREADS=1 \
-        CONDA_VERIFY_THREADS=1 \
-        PATH="$CONTROL_CONDA_DIR:$HOST_PATH" \
-        PYTHONNOUSERSITE=1 \
-        "$CONTROL_CONDA" env create \
-            --solver libmamba \
-            "${format_args[@]}" \
+        "$conda_bin" \
+            "${create_args[@]}" \
             --prefix "$target" \
             --file "$specification"
 }
@@ -775,7 +752,7 @@ create_or_reuse_role() {
     fi
 
     echo "创建/更新 $role 环境：$target"
-    retry_transient_create "$role" "$target" create_from_control "$target" "$role"
+    retry_transient_create "$role" "$target" create_conda_environment "$target" "$role"
 }
 
 create_all_other_envs() {
@@ -1035,7 +1012,7 @@ run_conda_section() {
         echo "复用未变化的 control 环境：$CURRENT_CONTROL_RESOLVED"
     else
         echo "创建/更新 control：$CONTROL_TARGET"
-        retry_transient_create control "$CONTROL_TARGET" create_control_from_seed "$CONTROL_TARGET" control
+        retry_transient_create control "$CONTROL_TARGET" create_conda_environment "$CONTROL_TARGET" control
         smoke_control "$CONTROL_TARGET" || {
             echo "ERROR: 新 control 环境未通过 smoke test：$CONTROL_TARGET" >&2
             return 1

@@ -1006,83 +1006,37 @@ properties:
         description: true 保留 02_work/ 最终 BAM；false 在持锁成功发布后回收活跃 cell 的最终 BAM/索引，SRD RNA BAM 除外；默认 false。
         type: boolean
   cabernet:
-    type: object
-    additionalProperties: false
-    required:
-    - methylation_backend
-    properties:
-      methylation_backend:
-        description: 本协议使用的甲基化后端。
-        type: string
-        enum:
-        - biscuit
-        - bismark
-      demux:
-        $ref: '#/$defs/demux_override'
-      high_cph:
-        $ref: '#/$defs/high_cph_override'
-      bismark:
-        $ref: '#/$defs/bismark_override'
-      biscuit:
-        $ref: '#/$defs/biscuit_override'
+    $ref: '#/$defs/plate_protocol'
   srd:
-    type: object
-    additionalProperties: false
-    required:
-    - methylation_backend
-    properties:
-      methylation_backend:
-        description: 本协议使用的甲基化后端。
-        type: string
-        enum:
-        - biscuit
-        - bismark
-      demux:
-        $ref: '#/$defs/demux_override'
-      high_cph:
-        $ref: '#/$defs/high_cph_override'
-      bismark:
-        $ref: '#/$defs/bismark_override'
-      biscuit:
-        $ref: '#/$defs/biscuit_override'
+    $ref: '#/$defs/plate_protocol'
   taps:
     type: object
     additionalProperties: false
     properties:
       demux:
-        $ref: '#/$defs/demux_override'
+        $ref: '#/$defs/demux'
   droplet:
     type: object
     additionalProperties: false
     properties:
       demux:
-        description: Rust 解复用器（demux_rs）参数；省略时使用内置默认。
         type: object
         additionalProperties: false
         properties:
           min_matched_read_pairs:
-            description: 单 cell barcode 匹配 read pairs 的最低门槛，低于该值的 cell 不产出结果。
-            type: integer
-            minimum: 0
+            $ref: '#/$defs/demux/properties/min_matched_read_pairs'
       high_cph:
-        $ref: '#/$defs/high_cph_override'
+        $ref: '#/$defs/high_cph'
       bismark:
-        description: Bismark 后端专属参数；仅 methylation_backend=bismark 时生效。
         type: object
         additionalProperties: false
         properties:
           local_alignment:
-            description: false 用 combined-index end-to-end（默认）、true 用 faithful CT/GA + --local；两模式互斥。
-            type: boolean
+            $ref: '#/$defs/bismark/properties/local_alignment'
           non_conversion_percentage_cutoff:
-            description: 任一 mate 的 non-CG retention 达到该百分比且满足 minimum_count 时移除整对；越低越严格。
-            type: integer
-            minimum: 0
-            maximum: 100
+            $ref: '#/$defs/bismark/properties/non_conversion_percentage_cutoff'
           non_conversion_minimum_count:
-            description: 启用百分比判断所需的最低 informative non-CG C 数量。
-            type: integer
-            minimum: 1
+            $ref: '#/$defs/bismark/properties/non_conversion_minimum_count'
   common:
     type: object
     additionalProperties: false
@@ -1094,20 +1048,51 @@ properties:
     properties:
       demux:
         $ref: '#/$defs/demux'
+        required:
+        - min_matched_read_pairs
+        - dna_w_spacer_len
+      high_cph:
+        $ref: '#/$defs/high_cph'
+        required:
+        - excluded_contigs
+      bismark:
+        $ref: '#/$defs/bismark'
+        required:
+        - library_type
+        - local_alignment
+        - non_conversion_percentage_cutoff
+        - non_conversion_minimum_count
+      biscuit:
+        $ref: '#/$defs/biscuit'
+        required:
+        - library_type
+        - high_cph_retention_threshold
+        - generate_snp
+$defs:
+  plate_protocol:
+    type: object
+    additionalProperties: false
+    required:
+    - methylation_backend
+    properties:
+      methylation_backend:
+        description: 本协议使用的甲基化后端。
+        type: string
+        enum:
+        - biscuit
+        - bismark
+      demux:
+        $ref: '#/$defs/demux'
       high_cph:
         $ref: '#/$defs/high_cph'
       bismark:
         $ref: '#/$defs/bismark'
       biscuit:
         $ref: '#/$defs/biscuit'
-$defs:
   demux:
     description: Rust 解复用器（demux_rs）参数；省略时使用内置默认。
     type: object
     additionalProperties: false
-    required:
-    - min_matched_read_pairs
-    - dna_w_spacer_len
     properties:
       min_matched_read_pairs:
         description: 单 cell barcode 匹配 read pairs 的最低门槛，低于该值的 cell 不产出结果。
@@ -1122,8 +1107,6 @@ $defs:
     description: Cabernet/SRD/Droplet 的 high-CpH / non-conversion 处理参数，固定统计并剔除；TAPS 不适用，无用户开关；省略时使用内置默认。
     type: object
     additionalProperties: false
-    required:
-    - excluded_contigs
     properties:
       excluded_contigs:
         description: 不参与 conversion 判断的 control/线粒体 contig 名称列表。
@@ -1137,10 +1120,6 @@ $defs:
     description: BISCUIT 后端专属参数；仅 methylation_backend=biscuit 时生效。
     type: object
     additionalProperties: false
-    required:
-    - library_type
-    - high_cph_retention_threshold
-    - generate_snp
     properties:
       library_type:
         description: BISCUIT 建库方向模式，决定允许的 strand model。
@@ -1160,11 +1139,6 @@ $defs:
     description: Bismark 后端专属参数；仅 methylation_backend=bismark 时生效。
     type: object
     additionalProperties: false
-    required:
-    - library_type
-    - local_alignment
-    - non_conversion_percentage_cutoff
-    - non_conversion_minimum_count
     properties:
       library_type:
         description: Bismark 建库方向模式，决定搜索的 bisulfite strand space。
@@ -1185,76 +1159,6 @@ $defs:
         description: 启用百分比判断所需的最低 informative non-CG C 数量。
         type: integer
         minimum: 1
-  demux_override:
-    description: Rust 解复用器（demux_rs）参数；省略时使用内置默认。
-    type: object
-    additionalProperties: false
-    properties:
-      min_matched_read_pairs:
-        description: 单 cell barcode 匹配 read pairs 的最低门槛，低于该值的 cell 不产出结果。
-        type: integer
-        minimum: 0
-      dna_w_spacer_len:
-        description: DNA 读段布局中 barcode 与 ME motif 间 W spacer 碱基数，须与实际建库一致。
-        type: integer
-        minimum: 0
-        maximum: 20
-  high_cph_override:
-    description: Cabernet/SRD/Droplet 的 high-CpH / non-conversion 处理参数，固定统计并剔除；TAPS 不适用，无用户开关；省略时使用内置默认。
-    type: object
-    additionalProperties: false
-    properties:
-      excluded_contigs:
-        description: 不参与 conversion 判断的 control/线粒体 contig 名称列表。
-        type: array
-        minItems: 0
-        uniqueItems: true
-        items:
-          type: string
-          pattern: ^[^,\s]+$
-  bismark_override:
-    description: Bismark 后端专属参数；仅 methylation_backend=bismark 时生效。
-    type: object
-    additionalProperties: false
-    properties:
-      library_type:
-        description: Bismark 建库方向模式，决定搜索的 bisulfite strand space。
-        type: string
-        enum:
-        - directional
-        - non_directional
-        - pbat
-      local_alignment:
-        description: false 用 combined-index end-to-end（默认）、true 用 faithful CT/GA + --local；两模式互斥。
-        type: boolean
-      non_conversion_percentage_cutoff:
-        description: 任一 mate 的 non-CG retention 达到该百分比且满足 minimum_count 时移除整对；越低越严格。
-        type: integer
-        minimum: 0
-        maximum: 100
-      non_conversion_minimum_count:
-        description: 启用百分比判断所需的最低 informative non-CG C 数量。
-        type: integer
-        minimum: 1
-  biscuit_override:
-    description: BISCUIT 后端专属参数；仅 methylation_backend=biscuit 时生效。
-    type: object
-    additionalProperties: false
-    properties:
-      library_type:
-        description: BISCUIT 建库方向模式，决定允许的 strand model。
-        type: string
-        enum:
-        - directional
-        - non_directional
-      high_cph_retention_threshold:
-        description: read pair CpH retention 严格大于该值时判为 high-CpH；越低越严格。
-        type: number
-        minimum: 0
-        maximum: 1
-      generate_snp:
-        description: 选定 BISCUIT 后端时发布 SNP；同一协议选择 Bismark 时必须为 false。
-        type: boolean
 """
 
 
@@ -1464,25 +1368,29 @@ def get_backend(config: dict[str, Any]) -> str:
     return name
 
 
-def bismark_library_flag(config: dict[str, Any]) -> str:
-    """把配置的 library type 翻译为 Bismark CLI flag。"""
-    bismark = get_protocol_config(config).get("bismark")
-    if not isinstance(bismark, dict):
-        raise ValueError("bismark must be a mapping")
-    value = str(bismark.get("library_type", "")).strip().lower()
-    if value not in SUPPORTED_BISMARK_LIBRARY_TYPES:
-        raise ValueError(
-            "bismark.library_type must be directional, non_directional, or pbat"
-        )
-    return {
-        "directional": "",
-        "non_directional": "--non_directional",
-        "pbat": "--pbat",
-    }[value]
+@dataclass(frozen=True)
+class BismarkAlignment:
+    """描述所选比对模式的命令参数与并发实例；规则只投影实际消费的叶子值。"""
+
+    local_alignment: bool
+    library_flag: str
+    instances: int
+
+    @property
+    def local_flag(self) -> str:
+        return "--local" if self.local_alignment else ""
+
+    @property
+    def index_flag(self) -> str:
+        return "" if self.local_alignment else "--combined_index"
+
+    @property
+    def score_min(self) -> str:
+        return "G,20,8" if self.local_alignment else "L,0,-0.2"
 
 
-def bismark_alignment_instance_count(config: Mapping[str, object]) -> int:
-    """返回当前 Bismark 模式使用的 Bowtie2 instance 数，用于划分 rule 总 CPU。"""
+def resolve_bismark_alignment(config: Mapping[str, object]) -> BismarkAlignment:
+    """统一推导 library flag、模式与 Bowtie2 实例数，不查询 workflow 或文件系统。"""
     bismark = get_protocol_config(config).get("bismark")
     if not isinstance(bismark, Mapping):
         raise ValueError("bismark must be a mapping")
@@ -1491,9 +1399,19 @@ def bismark_alignment_instance_count(config: Mapping[str, object]) -> int:
         raise ValueError(
             "bismark.library_type must be directional, non_directional, or pbat"
         )
-    if not bool(bismark.get("local_alignment", False)):
-        return 1
-    return 4 if value == "non_directional" else 2
+    local = bool(bismark.get("local_alignment", False))
+    return BismarkAlignment(
+        local_alignment=local,
+        library_flag={"directional": "", "non_directional": "--non_directional", "pbat": "--pbat"}[value],
+        instances=(4 if value == "non_directional" else 2) if local else 1,
+    )
+
+
+def cutadapt_adapter_specs(protocol: str) -> tuple[str, str]:
+    """按协议返回含最短 overlap 的双端接头，不查询运行状态。"""
+    if get_protocol(protocol).name == "droplet":
+        return "N{9}CTGTCTCTTATACACATCT;min_overlap=12", "N{9}CTRTCTCTTATACACATCT;min_overlap=12"
+    return "CTGTCTCTTATACACATCT;min_overlap=3", "N{9}CTGTCTCTTATACACATCT;min_overlap=12"
 
 
 def biscuit_library_mode(config: Mapping[str, object]) -> int:
@@ -1532,7 +1450,7 @@ def validate_config_semantics(config: Mapping[str, object]) -> None:
     if backend == "biscuit":
         biscuit_library_mode(config)
     elif backend == "bismark":
-        bismark_library_flag(dict(config))
+        resolve_bismark_alignment(config)
 
 
 @dataclass(frozen=True)
@@ -1737,6 +1655,11 @@ class CellOutputPaths:
         return Path(f"{self.snp}.tbi")
 
     @property
+    def public_result_files(self) -> dict[str, tuple[Path, ...]]:
+        """按 final manifest 路径字段列出主文件与必需伴随文件；只定义路径，不判断是否启用。"""
+        return {"cpg_path": (self.cpg,), "snp_path": (self.snp, self.snp_index)}
+
+    @property
     def marked_bam(self) -> Path:
         """TAPS 保留全部记录的坐标排序 BAM；重复仅标记，不删除。"""
         return self.backend_dir / f"{self.sample_id}.marked.bam"
@@ -1920,6 +1843,11 @@ class CellArtifacts:
     rna_bams: tuple[Path, ...]
     high_cph_display: Path | None
 
+    @property
+    def final_inputs(self) -> tuple[Path, ...]:
+        """列出汇总实际消费的科学结果、持久 QC 和保留 BAM，不包含临时展示文件。"""
+        return tuple(dict.fromkeys((*self.deliverables, *self.final_qc, *self.rna_bams)))
+
     def multiqc_sources(self) -> tuple[Path, ...]:
         """展示 JSON 已回收时只依赖保留的 summary，不回溯 BAM 规则。"""
         display = self.high_cph_display
@@ -1934,21 +1862,18 @@ def cell_artifacts(
 ) -> CellArtifacts:
     """统一提供 DAG、final manifest 与 MultiQC 的逐细胞文件清单，不改变阶段完成边界。"""
     policy = get_protocol(protocol)
-    metrics = {"cutadapt_json": paths.cutadapt_json, "cpg": paths.cpg}
-    deliverables = [paths.cpg]
+    metrics = {"cutadapt_json": paths.cutadapt_json}
+    public_files = paths.public_result_files
+    deliverables = list(public_files["cpg_path"])
     final_qc = [paths.cutadapt_json]
     multiqc = [paths.cutadapt_json]
     retained = paths.retained_bam_files if keep_final_bam else ()
     final_qc.extend(retained)
     rna = (paths.rna_bam, paths.rna_bam_index) if policy.publishes_rna_bam else ()
-    if rna:
-        metrics.update(rna_bam=paths.rna_bam, rna_bam_index=paths.rna_bam_index)
     if generate_snp:
-        deliverables.extend((paths.snp, paths.snp_index))
-        metrics.update(snp=paths.snp, snp_index=paths.snp_index)
+        deliverables.extend(public_files["snp_path"])
     if paths.backend == "rastair":
-        metrics.update(rastair_qc=paths.rastair_qc, marked_bam=paths.marked_bam,
-                       marked_bam_index=paths.marked_bam_index)
+        metrics["rastair_qc"] = paths.rastair_qc
         final_qc.append(paths.rastair_qc)
     else:
         metrics["high_cph_summary"] = paths.high_cph_summary
@@ -1957,17 +1882,15 @@ def cell_artifacts(
         if paths.backend == "biscuit":
             metrics.update(dupsifter_multiqc=paths.dupsifter_multiqc,
                            mapq_table=paths.biscuit_qc_source("mapq_table.txt"),
-                           cph_table=paths.biscuit_qc_source("CpHRetentionByReadPos.txt"),
-                           biscuit_qc_dir=paths.biscuit_qc_dir)
+                           cph_table=paths.biscuit_qc_source("CpHRetentionByReadPos.txt"))
             final_qc.extend((metrics["dupsifter_multiqc"], metrics["cph_table"]))
             multiqc.extend((metrics["dupsifter_multiqc"], high_cph_source,
                             *paths.biscuit_qc_sources(MULTIQC_BISCUIT_SOURCE_SUFFIXES)))
         else:
             metrics.update(bismark_align_report=paths.bismark_align_report,
                            bismark_extract_report=paths.droplet_umi_qc if policy.name == "droplet" else paths.bismark_extract_report,
-                           bismark_dedup_report=paths.droplet_umi_qc if policy.name == "droplet" else paths.bismark_dedup_report,
-                           bismark_mbias=paths.bismark_mbias)
-            reports = [metrics[key] for key in ("bismark_align_report", "bismark_extract_report", "bismark_mbias")]
+                           bismark_dedup_report=paths.droplet_umi_qc if policy.name == "droplet" else paths.bismark_dedup_report)
+            reports = [metrics["bismark_align_report"], metrics["bismark_extract_report"], paths.bismark_mbias]
             final_qc.extend(reports)
             multiqc.extend((*reports, high_cph_source))
             if policy.name != "droplet":
@@ -7169,6 +7092,47 @@ def _write_cutadapt_multiqc(rows: list[dict[str, object]], out_json: Path) -> No
     atomic_write_json(out_json, payload)
 
 
+@dataclass(frozen=True)
+class FinalManifestOptions:
+    """保存已校验的汇总选项，不再次读取项目的可变配置。"""
+
+    backend: str
+    cpg_coordinate_base: int
+    generate_snp: bool
+    keep_final_bam: bool
+    publish_rna_bam: bool
+
+
+@dataclass(frozen=True)
+class CellMetricJob:
+    """向汇总 worker 传递当前 cell 的身份、路径和选项；只包含可序列化数据。"""
+
+    cell_id: str
+    protocol: str
+    dna_reads: str
+    paths: CellOutputPaths
+    public_paths: CellOutputPaths
+    options: FinalManifestOptions
+    bismark_version: str
+
+
+@dataclass(frozen=True)
+class NativeCellMetrics:
+    """保留原生指标口径，并用独立 read-pair 计数连接公共汇总。"""
+
+    accepted_pairs: int
+    rejected_pairs: int
+    duplicate_pairs: int
+    postdedup_pairs: int
+    fields: dict[str, object]
+
+    def manifest_fields(self) -> dict[str, object]:
+        """展开 pair 漏斗与原生指标，不把 read 或 UMI 指标换成 pair 口径。"""
+        return {**self.fields, "backend_accepted_pairs": self.accepted_pairs,
+                "backend_rejected_pairs": self.rejected_pairs,
+                "duplicate_pairs": self.duplicate_pairs, "postdedup_pairs": self.postdedup_pairs}
+
+
 def write_final_sample_manifest(
     initial_cell_manifest: str,
     intermediate_dir: str,
@@ -7192,8 +7156,8 @@ def write_final_sample_manifest(
     results = Path(staged_results_dir)
     published_results = Path(published_results_dir) if published_results_dir else results
     opts = _parse_final_options(options)
-    layout = ProjectLayout(intermediate, results, opts["backend"])
-    published_layout = ProjectLayout(intermediate, published_results, opts["backend"])
+    layout = ProjectLayout(intermediate, results, opts.backend)
+    published_layout = ProjectLayout(intermediate, published_results, opts.backend)
     output = Path(out_tsv)
 
     initial_cells = read_cell_identity_manifest(initial_cell_manifest)
@@ -7214,18 +7178,14 @@ def write_final_sample_manifest(
         cells,
         layout=layout,
         published_layout=published_layout,
-        backend=opts["backend"],
-        publish_rna_bam=opts["publish_rna_bam"],
-        generate_snp=opts["generate_snp"],
-        keep_final_bam=opts["keep_final_bam"],
-        cpg_coordinate_base=opts["cpg_coordinate_base"],
+        options=opts,
         bismark=bismark,
         workers=workers,
     )
     _emit_final_tsv(cells, output, pair_qc_multiqc_json, cutadapt_qc_multiqc_json)
 
 
-def _parse_final_options(options: Mapping[str, object]) -> dict[str, object]:
+def _parse_final_options(options: Mapping[str, object]) -> FinalManifestOptions:
 
     backend = str(options.get("methylation_backend", "")).strip().lower()
     if backend not in {"biscuit", "bismark", "rastair"}:
@@ -7253,13 +7213,11 @@ def _parse_final_options(options: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(value, bool):
             raise ValueError(f"Final manifest option {key} must be a boolean")
     cpg_representation(active_options["cpg_coordinate_base"])
-    return {
-        "backend": backend,
-        "cpg_coordinate_base": active_options["cpg_coordinate_base"],
-        "generate_snp": active_options["generate_snp"],
-        "keep_final_bam": active_options["keep_final_bam"],
-        "publish_rna_bam": active_options["publish_rna_bam"],
-    }
+    return FinalManifestOptions(
+        backend=backend, cpg_coordinate_base=active_options["cpg_coordinate_base"],
+        generate_snp=active_options["generate_snp"], keep_final_bam=active_options["keep_final_bam"],
+        publish_rna_bam=active_options["publish_rna_bam"],
+    )
 
 
 def _plan_expected_runs(
@@ -7419,10 +7377,11 @@ def _merge_committed_generations(
                 })
 
 
-def _taps_cell_metrics(job: Mapping[str, object], cutadapt: Mapping[str, object]) -> dict[str, object]:
-    paths = job["paths"]
-    qc = json.loads(Path(paths["rastair_qc"]).read_text())
-    if qc["sample"] != job["cell_id"] or qc["backend"] != "rastair":
+def _taps_cell_metrics(
+    cell_id: str, paths: Mapping[str, Path], cutadapt: Mapping[str, object],
+) -> NativeCellMetrics:
+    qc = json.loads(paths["rastair_qc"].read_text())
+    if qc["sample"] != cell_id or qc["backend"] != "rastair":
         raise ValueError("TAPS QC identity disagrees with the active cell")
     if qc["trimmed_pairs"] != cutadapt["trimmed_pairs"] or qc["bam_primary_records"] != 2 * qc["trimmed_pairs"]:
         raise ValueError("TAPS BAM and Cutadapt pair counts disagree")
@@ -7432,9 +7391,6 @@ def _taps_cell_metrics(job: Mapping[str, object], cutadapt: Mapping[str, object]
         raise ValueError("TAPS pair funnel does not close")
     if sum(qc[k] for k in ("unmapped_pairs", "discordant_pairs", "quality_rejected_pairs")) != rejected:
         raise ValueError("TAPS rejection categories do not close")
-    for key in ("cpg", "snp", "snp_index"):
-        if not Path(paths[key]).is_file():
-            raise FileNotFoundError(paths[key])
     non_cpg = {k: v for k, v in qc.items() if k.startswith("non_cpg_")}
     if non_cpg.get("non_cpg_metric_source") != "taps_oriented_host_chg_chh_conversion":
         raise ValueError("TAPS non-CpG QC source is invalid")
@@ -7452,217 +7408,149 @@ def _taps_cell_metrics(job: Mapping[str, object], cutadapt: Mapping[str, object]
     expected_pct = 100.0 * modified / total if total else float("nan")
     if not (math.isnan(expected_pct) and math.isnan(qc["non_cpg_methylation_pct"])) and not math.isclose(expected_pct, qc["non_cpg_methylation_pct"]):
         raise ValueError("TAPS non-CpG percentage disagrees with counts")
-    keep_bam = bool(job["keep_final_bam"])
-    if keep_bam:
-        for key in ("marked_bam", "marked_bam_index"):
-            if not Path(paths[key]).is_file():
-                raise FileNotFoundError(paths[key])
-    return {**cutadapt, **{k: v for k, v in qc.items() if k.startswith(("bam_", "lambda_", "pUC19_"))},
-            "methylation_backend": "rastair", "backend_qc_status": "PASS", "analysis_status": "PASS",
-            "cpg_path": job["public"]["cpg"], "cpg_representation": cpg_representation(job["cpg_coordinate_base"]),
-            "snp_path": job["public"]["snp"], "snp_sites": qc["snp_sites"],
-            "rna_bam_path": "", "methylation_signal": "5mC+5hmC",
-            "retained_bam_path": job["public"]["marked_bam"] if keep_bam else "",
-            "retained_bam_index": job["public"]["marked_bam_index"] if keep_bam else "",
-            "retained_bam_role": "taps_all_alignments_marked_duplicates_for_variant_reanalysis" if keep_bam else "",
-            "mapping_policy": "bwa_rastair_eligible_pairs", "native_mapping_policy": "bwa_proper_primary_any_mate_mapq20",
-            "native_mapping_unit": "read_pairs", "native_mapping_pct": 100.0 * accepted / qc["trimmed_pairs"] if qc["trimmed_pairs"] else 0.0,
-            "both_primary_mapped_pairs": accepted, "one_primary_mapped_pairs": 0,
-            "backend_accepted_pairs": accepted, "backend_rejected_pairs": rejected,
-            "unmapped_pairs": qc["unmapped_pairs"], "ambiguous_pairs": "", "no_primary_pairs": "",
-            "discordant_pairs": qc["discordant_pairs"], "quality_rejected_pairs": qc["quality_rejected_pairs"],
-            "duplicate_pairs": duplicates, "postdedup_pairs": postdedup, "final_retained_pairs": postdedup,
-            "dedup_policy": "samtools_markdup_flag_exclude_in_rastair", "pair_qc_metric_unit": "read_pairs",
-            "high_cph_assessed_pairs": 0, "high_cph_flagged_pairs": 0, "high_cph_removed_pairs": 0,
-            "high_cph_fraction": "nan", "high_cph_role": "not_applicable",
-            **non_cpg}
+    return NativeCellMetrics(accepted, rejected, duplicates, postdedup, {
+        **{k: v for k, v in qc.items() if k.startswith(("bam_", "lambda_", "pUC19_"))},
+        "snp_sites": qc["snp_sites"], "methylation_signal": "5mC+5hmC",
+        "mapping_policy": "bwa_rastair_eligible_pairs", "native_mapping_policy": "bwa_proper_primary_any_mate_mapq20",
+        "native_mapping_unit": "read_pairs", "native_mapping_pct": 100.0 * accepted / qc["trimmed_pairs"] if qc["trimmed_pairs"] else 0.0,
+        "both_primary_mapped_pairs": accepted, "one_primary_mapped_pairs": 0,
+        "unmapped_pairs": qc["unmapped_pairs"], "ambiguous_pairs": "", "no_primary_pairs": "",
+        "discordant_pairs": qc["discordant_pairs"], "quality_rejected_pairs": qc["quality_rejected_pairs"],
+        "final_retained_pairs": postdedup,
+        "dedup_policy": "samtools_markdup_flag_exclude_in_rastair", "pair_qc_metric_unit": "read_pairs",
+        "high_cph_assessed_pairs": 0, "high_cph_flagged_pairs": 0, "high_cph_removed_pairs": 0,
+        "high_cph_fraction": "nan", "high_cph_role": "not_applicable", **non_cpg,
+    })
 
 
-def _metrics_for_cell(job: Mapping[str, object]) -> tuple[str, dict[str, object]]:
-    cell_id = str(job["cell_id"])
-    record = dict(job["record"])
-    backend = str(job["backend"])
-    publish_rna_bam = bool(job["publish_rna_bam"])
-    generate_snp = bool(job["generate_snp"])
-    paths = {key: Path(str(value)) for key, value in job["paths"].items()}
-    public = job["public"]
-    protocol = str(record.get("protocol", "") or "").strip().lower()
+def _biscuit_cell_metrics(
+    cell_id: str, paths: Mapping[str, Path], trimmed_pairs: int,
+) -> NativeCellMetrics:
+    if not paths["dupsifter_multiqc"].is_file():
+        raise FileNotFoundError(f"Active cell is missing Dupsifter QC: {paths['dupsifter_multiqc']}")
+    _native, pairs = _read_dupsifter_metrics(paths["dupsifter_multiqc"], cell_id, trimmed_pairs)
+    counts = [pairs.pop(key) for key in (
+        "backend_accepted_pairs", "backend_rejected_pairs", "duplicate_pairs", "postdedup_pairs")]
+    return NativeCellMetrics(*counts, {
+        **_read_biscuit_native_mapping(paths["mapq_table"]), **pairs, "ambiguous_pairs": "",
+        "mapping_policy": "biscuit_any_primary_pair_funnel",
+        "dedup_policy": "dupsifter_wgbs_signature_remove_dups",
+        "non_cpg_methylation_pct": _parse_cph_methylation_pct(paths["cph_table"]),
+        "non_cpg_metric_source": "biscuit_cph_retention_by_read_position",
+    })
 
-    updates: dict[str, object] = {}
-    canonical: dict[str, object] = {}
-    cutadapt = _parse_cutadapt_metrics(paths["cutadapt_json"])
-    try:
-        demux_pairs = int(str(record.get("dna_reads", "")).strip())
-    except ValueError as exc:
-        raise ValueError(f"Active cell {cell_id!r} has invalid dna_reads") from exc
-    if cutadapt["cutadapt_input_pairs"] != demux_pairs:
+
+def _bismark_cell_metrics(
+    job: CellMetricJob, paths: Mapping[str, Path], trimmed_pairs: int,
+    summary: Mapping[str, object],
+) -> NativeCellMetrics:
+    metrics = build_metrics(
+        sample=job.cell_id, version=job.bismark_version,
+        alignment_report=paths["bismark_align_report"], dedup_report=paths["bismark_dedup_report"],
+        filter_summary=summary, protocol=job.protocol,
+    )
+    total_pairs = int(metrics["total_pairs"])
+    if total_pairs != trimmed_pairs:
         raise ValueError(
-            f"Cutadapt input disagrees with demux DNA pairs for {cell_id!r}: "
-            f"cutadapt={cutadapt['cutadapt_input_pairs']}, demux={demux_pairs}"
+            f"Bismark report disagrees with Cutadapt output for {job.cell_id!r}: "
+            f"bismark={total_pairs}, cutadapt={trimmed_pairs}"
         )
-    trimmed_pairs = int(cutadapt["trimmed_pairs"])
+    accepted = int(metrics["accepted_pairs"])
+    rejected = int(metrics["unmapped_pairs"]) + int(metrics["ambiguous_pairs"])
+    if accepted + rejected != trimmed_pairs:
+        raise ValueError(f"Bismark pair funnel is inconsistent for {job.cell_id!r}")
+    fields = {
+        "native_mapping_policy": "bismark_unique_concordant_pairs",
+        "native_mapping_unit": "read_pairs",
+        "native_mapping_pct": 100.0 * accepted / trimmed_pairs if trimmed_pairs else 0.0,
+        "both_primary_mapped_pairs": accepted, "one_primary_mapped_pairs": 0,
+        "unmapped_pairs": int(metrics["unmapped_pairs"]), "ambiguous_pairs": int(metrics["ambiguous_pairs"]),
+        "no_primary_pairs": "", "mapping_policy": "bismark_unique_concordant",
+        "dedup_policy": DROPLET_DEDUP_POLICY if job.protocol == "droplet" else "bismark_paired_endpoint_orientation",
+    }
+    if job.protocol == "droplet":
+        contexts = metrics["umi_qc"]["contexts"]
+        cph_m = sum(contexts[k]["methyl"] for k in ("CHG", "CHH"))
+        cph_total = cph_m + sum(contexts[k]["unmethyl"] for k in ("CHG", "CHH"))
+        fields.update({
+            "non_cpg_methylation_pct": 100.0 * cph_m / cph_total if cph_total else float("nan"),
+            "non_cpg_metric_source": "droplet_umi_consensus_chg_chh",
+            "molecule_qc_metric_unit": "cytosine_umi_consensus",
+            "cpg_read_observations": contexts["CpG"]["read_observations"],
+            "cpg_umi_observations": contexts["CpG"]["methyl"] + contexts["CpG"]["unmethyl"],
+            "cpg_ambiguous_umi_sites": contexts["CpG"]["ambiguous_umis"],
+        })
+    else:
+        fields.update({
+            "non_cpg_methylation_pct": _parse_bismark_non_cpg_methylation_pct(paths["bismark_extract_report"]),
+            "non_cpg_metric_source": "bismark_extraction_chg_chh",
+        })
+    return NativeCellMetrics(accepted, rejected, int(metrics["duplicate_pairs"]),
+                             int(metrics["postdedup_pairs"]), fields)
 
-    if backend == "rastair":
-        return cell_id, _taps_cell_metrics(job, cutadapt)
 
+def _filtered_cell_metrics(
+    job: CellMetricJob, paths: Mapping[str, Path], trimmed_pairs: int,
+) -> NativeCellMetrics:
     if not paths["high_cph_summary"].is_file():
         raise FileNotFoundError(f"Active cell is missing high-CpH summary: {paths['high_cph_summary']}")
-    bsconv = _read_high_cph_summary(paths["high_cph_summary"], cell_id, backend)
-    if bsconv["protocol"] != protocol:
-        raise ValueError(
-            f"High-CpH summary protocol disagrees with the cell identity: {paths['high_cph_summary']}"
-        )
-    if not bsconv["filter_applied"]:
-        raise ValueError(
-            f"High-CpH summary must record the fixed filter action: {paths['high_cph_summary']}"
-        )
+    summary = _read_high_cph_summary(paths["high_cph_summary"], job.cell_id, job.options.backend)
+    if summary["protocol"] != job.protocol:
+        raise ValueError(f"High-CpH summary protocol disagrees with the cell identity: {paths['high_cph_summary']}")
+    if not summary["filter_applied"]:
+        raise ValueError(f"High-CpH summary must record the fixed filter action: {paths['high_cph_summary']}")
+    native = (_biscuit_cell_metrics(job.cell_id, paths, trimmed_pairs) if job.options.backend == "biscuit"
+              else _bismark_cell_metrics(job, paths, trimmed_pairs, summary))
+    assessed = int(summary["candidate_read_pairs"])
+    removed = int(summary["flagged_read_pairs"])
+    if assessed + int(summary["excluded_read_pairs"]) > native.postdedup_pairs:
+        raise ValueError(f"High-CpH accounting exceeds post-dedup pairs for {job.cell_id!r}")
+    native.fields.update({
+        "high_cph_assessed_pairs": assessed, "high_cph_flagged_pairs": removed,
+        "high_cph_removed_pairs": removed, "final_retained_pairs": native.postdedup_pairs - removed,
+        "pair_qc_metric_unit": "read_pairs", "high_cph_fraction": float(summary["high_cph_fraction"]),
+    })
+    return native
 
-    if backend == "biscuit":
-        if not paths["dupsifter_multiqc"].is_file():
-            raise FileNotFoundError(
-                f"Active cell is missing Dupsifter QC: {paths['dupsifter_multiqc']}"
-            )
-        _native, pair_counts = _read_dupsifter_metrics(
-            paths["dupsifter_multiqc"], cell_id, trimmed_pairs
+
+def _metrics_for_cell(job: CellMetricJob) -> tuple[str, dict[str, object]]:
+    options = job.options
+    artifacts = cell_artifacts(job.paths, job.protocol,
+        generate_snp=options.generate_snp or options.backend == "rastair", keep_final_bam=options.keep_final_bam)
+    cutadapt = _parse_cutadapt_metrics(artifacts.metrics["cutadapt_json"])
+    try:
+        demux_pairs = int(job.dna_reads.strip())
+    except ValueError as exc:
+        raise ValueError(f"Active cell {job.cell_id!r} has invalid dna_reads") from exc
+    if cutadapt["cutadapt_input_pairs"] != demux_pairs:
+        raise ValueError(
+            f"Cutadapt input disagrees with demux DNA pairs for {job.cell_id!r}: "
+            f"cutadapt={cutadapt['cutadapt_input_pairs']}, demux={demux_pairs}"
         )
-        alignment_native = _read_biscuit_native_mapping(paths["mapq_table"])
-        updates.update(alignment_native)
-        canonical.update(pair_counts)
-        canonical.update({
-            "native_mapping_policy": alignment_native["native_mapping_policy"],
-            "native_mapping_unit": alignment_native["native_mapping_unit"],
-            "native_mapping_pct": alignment_native["native_mapping_pct"],
+    if options.backend == "rastair":
+        native = _taps_cell_metrics(job.cell_id, artifacts.metrics, cutadapt)
+    else:
+        native = _filtered_cell_metrics(job, artifacts.metrics, int(cutadapt["trimmed_pairs"]))
+    parsed_inputs = set(artifacts.metrics.values())
+    for path in artifacts.final_inputs:
+        if path in parsed_inputs:
+            continue
+        if not path.is_file():
+            raise FileNotFoundError(f"Active cell is missing a declared result or QC file: {path}")
+    project = job.public_paths.result_root.parent
+    updates = {**cutadapt, **native.manifest_fields(),
+               "methylation_backend": options.backend, "backend_qc_status": "PASS", "analysis_status": "PASS",
+               "cpg_path": str(job.public_paths.cpg.relative_to(project)),
+               "cpg_representation": cpg_representation(options.cpg_coordinate_base),
+               "snp_path": str(job.public_paths.snp.relative_to(project)) if options.generate_snp or options.backend == "rastair" else "",
+               "rna_bam_path": str(job.paths.rna_bam.relative_to(project)) if options.publish_rna_bam else ""}
+    if options.backend == "rastair":
+        updates.update({
+            "retained_bam_path": str(job.paths.marked_bam.relative_to(project)) if options.keep_final_bam else "",
+            "retained_bam_index": str(job.paths.marked_bam_index.relative_to(project)) if options.keep_final_bam else "",
+            "retained_bam_role": "taps_all_alignments_marked_duplicates_for_variant_reanalysis" if options.keep_final_bam else "",
         })
-        canonical["ambiguous_pairs"] = ""
-    else:
-        metrics = build_metrics(
-            sample=cell_id,
-            version=str(job["bismark_version"]),
-            alignment_report=paths["bismark_align_report"],
-            dedup_report=paths["bismark_dedup_report"],
-            filter_summary=bsconv,
-            protocol=record["protocol"],
-        )
-        total_pairs = int(metrics["total_pairs"])
-        if total_pairs != trimmed_pairs:
-            raise ValueError(
-                f"Bismark report disagrees with Cutadapt output for {cell_id!r}: "
-                f"bismark={total_pairs}, cutadapt={trimmed_pairs}"
-            )
-        accepted = int(metrics["accepted_pairs"])
-        rejected = int(metrics["unmapped_pairs"]) + int(metrics["ambiguous_pairs"])
-        if accepted + rejected != trimmed_pairs:
-            raise ValueError(f"Bismark pair funnel is inconsistent for {cell_id!r}")
-        canonical.update(
-            {
-                "native_mapping_policy": "bismark_unique_concordant_pairs",
-                "native_mapping_unit": "read_pairs",
-                "native_mapping_pct": (100.0 * accepted / trimmed_pairs if trimmed_pairs else 0.0),
-                "both_primary_mapped_pairs": accepted,
-                "one_primary_mapped_pairs": 0,
-                "backend_accepted_pairs": accepted,
-                "backend_rejected_pairs": rejected,
-                "unmapped_pairs": int(metrics["unmapped_pairs"]),
-                "ambiguous_pairs": int(metrics["ambiguous_pairs"]),
-                "no_primary_pairs": "",
-                "duplicate_pairs": int(metrics["duplicate_pairs"]),
-                "postdedup_pairs": int(metrics["postdedup_pairs"]),
-            }
-        )
-
-    assessed_pairs = int(bsconv["candidate_read_pairs"])
-    flagged_pairs = int(bsconv["flagged_read_pairs"])
-    excluded_pairs = int(bsconv["excluded_read_pairs"])
-    removed_pairs = flagged_pairs
-    high_cph_fraction = float(bsconv["high_cph_fraction"])
-    postdedup_pairs = int(canonical["postdedup_pairs"])
-    if assessed_pairs + excluded_pairs > postdedup_pairs:
-        raise ValueError(
-            f"High-CpH accounting exceeds post-dedup pairs for {cell_id!r}"
-        )
-    final_retained_pairs = postdedup_pairs - removed_pairs
-
-    canonical.update(
-        {
-            "cutadapt_input_pairs": int(cutadapt["cutadapt_input_pairs"]),
-            "trimmed_pairs": int(cutadapt["trimmed_pairs"]),
-            "high_cph_assessed_pairs": assessed_pairs,
-            "high_cph_flagged_pairs": flagged_pairs,
-            "high_cph_removed_pairs": removed_pairs,
-            "final_retained_pairs": final_retained_pairs,
-            "mapping_policy": (
-                "biscuit_any_primary_pair_funnel"
-                if backend == "biscuit"
-                else "bismark_unique_concordant"
-            ),
-            "dedup_policy": (
-                "dupsifter_wgbs_signature_remove_dups"
-                if backend == "biscuit"
-                else DROPLET_DEDUP_POLICY if record["protocol"] == "droplet" else "bismark_paired_endpoint_orientation"
-            ),
-            "pair_qc_metric_unit": "read_pairs",
-            "r1_adapter_pct": float(cutadapt["r1_adapter_pct"]),
-            "r2_adapter_pct": float(cutadapt["r2_adapter_pct"]),
-            "high_cph_fraction": high_cph_fraction,
-        }
-    )
-    if backend == "biscuit":
-        canonical["non_cpg_methylation_pct"] = _parse_cph_methylation_pct(
-            paths["cph_table"]
-        )
-        canonical["non_cpg_metric_source"] = "biscuit_cph_retention_by_read_position"
-    elif record["protocol"] == "droplet":
-        umi_qc = metrics["umi_qc"]
-        context_counts = umi_qc["contexts"]
-        cph_m = sum(context_counts[k]["methyl"] for k in ("CHG", "CHH"))
-        cph_total = cph_m + sum(context_counts[k]["unmethyl"] for k in ("CHG", "CHH"))
-        canonical["non_cpg_methylation_pct"] = 100.0 * cph_m / cph_total if cph_total else float("nan")
-        canonical["non_cpg_metric_source"] = "droplet_umi_consensus_chg_chh"
-        canonical.update({"molecule_qc_metric_unit": "cytosine_umi_consensus",
-                          "cpg_read_observations": context_counts["CpG"]["read_observations"],
-                          "cpg_umi_observations": context_counts["CpG"]["methyl"] + context_counts["CpG"]["unmethyl"],
-                          "cpg_ambiguous_umi_sites": context_counts["CpG"]["ambiguous_umis"]})
-    else:
-        canonical["non_cpg_methylation_pct"] = (
-            _parse_bismark_non_cpg_methylation_pct(paths["bismark_extract_report"])
-        )
-        canonical["non_cpg_metric_source"] = "bismark_extraction_chg_chh"
-    updates.update(canonical)
-
-    required_outputs = [
-        (paths["cpg"], "CpG result"),
-    ]
-    if backend == "biscuit":
-        required_outputs.append((paths["biscuit_qc_dir"], "BISCUIT QC directory"))
-    else:
-        required_outputs.extend(
-            [
-                (paths["bismark_align_report"], "Bismark alignment report"),
-                (paths["bismark_extract_report"], "Bismark extraction report"),
-                (paths["bismark_mbias"], "Bismark M-bias report"),
-            ]
-        )
-    for required_path, label in required_outputs:
-        if not required_path.exists():
-            raise FileNotFoundError(f"Active cell is missing {label}: {required_path}")
-    if generate_snp and not paths["snp"].is_file():
-        raise FileNotFoundError(f"Active cell is missing enabled SNP result: {paths['snp']}")
-    if publish_rna_bam:
-        for rna_path, label in (
-            (paths["rna_bam"], "SRD RNA BAM"),
-            (paths["rna_bam_index"], "SRD RNA BAM index"),
-        ):
-            if not rna_path.is_file():
-                raise FileNotFoundError(f"Active cell is missing {label}: {rna_path}")
-
-    updates["methylation_backend"] = backend
-    updates["backend_qc_status"] = "PASS"
-    updates["cpg_path"] = str(public["cpg"])
-    updates["cpg_representation"] = cpg_representation(job["cpg_coordinate_base"])
-    updates["snp_path"] = str(public["snp"]) if generate_snp else ""
-    updates["rna_bam_path"] = str(public["rna_bam"]) if publish_rna_bam else ""
-    updates["analysis_status"] = "PASS"
-    return cell_id, updates
+    return job.cell_id, updates
 
 
 def _apply_cell_metrics(
@@ -7670,18 +7558,13 @@ def _apply_cell_metrics(
     *,
     layout: ProjectLayout,
     published_layout: ProjectLayout,
-    backend: str,
-    publish_rna_bam: bool,
-    generate_snp: bool,
+    options: FinalManifestOptions,
     bismark: str | None,
-    keep_final_bam: bool,
-    cpg_coordinate_base: int,
     workers: int = 1,
 ) -> None:
-    published_results = published_layout.result_root
-    project_root = published_results.parent
+    backend = options.backend
     bismark_version = _bismark_version_text(bismark) if backend == "bismark" else ""
-    jobs: list[dict[str, object]] = []
+    jobs: list[CellMetricJob] = []
     for cell_id, record in cells.items():
         is_active = str(record.get("dna_status", "")) == "Pass"
         if not is_active:
@@ -7697,30 +7580,11 @@ def _apply_cell_metrics(
                 }
             )
             continue
-        paths = layout.cell(cell_id)
-        public_paths = published_layout.cell(cell_id)
-        artifacts = cell_artifacts(paths, str(record["protocol"]),
-                                   generate_snp=generate_snp, keep_final_bam=keep_final_bam)
-        jobs.append(
-            {
-                "cell_id": cell_id,
-                "record": dict(record),
-                "backend": backend,
-                "publish_rna_bam": publish_rna_bam,
-                "generate_snp": generate_snp,
-                "keep_final_bam": keep_final_bam,
-                "cpg_coordinate_base": cpg_coordinate_base,
-                "paths": dict(artifacts.metrics),
-                "public": {
-                    "marked_bam": str(paths.marked_bam.relative_to(project_root)),
-                    "marked_bam_index": str(paths.marked_bam_index.relative_to(project_root)),
-                    "cpg": str(public_paths.cpg.relative_to(project_root)),
-                    "snp": str(public_paths.snp.relative_to(project_root)),
-                    "rna_bam": str(paths.rna_bam.relative_to(project_root)),
-                },
-                "bismark_version": bismark_version,
-            }
-        )
+        jobs.append(CellMetricJob(
+            cell_id=cell_id, protocol=str(record["protocol"]).strip().lower(),
+            dna_reads=str(record.get("dna_reads", "")), paths=layout.cell(cell_id),
+            public_paths=published_layout.cell(cell_id), options=options, bismark_version=bismark_version,
+        ))
     if not jobs:
         return
     workers = min(effective_cpu_count(workers), 8, len(jobs))
@@ -8125,7 +7989,7 @@ def _backend_reference_observation(
         genome = resolved / "genome.fa"
         if not genome.is_file() or genome.stat().st_size == 0:
             raise FileNotFoundError(f"Incomplete Bismark reference generation: {resolved}")
-        local_alignment = bool(get_protocol_config(config)["bismark"]["local_alignment"])
+        local_alignment = resolve_bismark_alignment(config).local_alignment
         indexes = backend_active_index_paths(
             reference, "bismark", bismark_local_alignment=local_alignment
         )
@@ -8468,22 +8332,19 @@ def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
         if not required.issubset(reader.fieldnames or []):
             raise ValueError("final sample manifest is missing current delivery path fields")
         for row in reader:
-            for field, directory, suffix in (
-                ("cpg_path", "CpG", ".cpg.tsv.zst"),
-                ("snp_path", "SNP", ".snps.vcf.gz" if row.get("methylation_backend") == "rastair" else ".snps.bed.gz"),
-            ):
+            sample_id = str(row.get("sample_id") or "").strip()
+            paths = CellOutputPaths(results.parent, results, sample_id,
+                                    str(row.get("methylation_backend") or ""))
+            for field, files in paths.public_result_files.items():
                 value = str(row.get(field) or "").strip()
                 if not value:
                     continue
-                sample_id = str(row.get("sample_id") or "").strip()
                 if SAMPLE_ID_RE.fullmatch(sample_id) is None:
                     raise ValueError(f"invalid delivery sample_id: {sample_id!r}")
-                relative = Path(directory) / f"{sample_id}{suffix}"
+                relative = files[0].relative_to(results)
                 if value != f"03_results/{relative.as_posix()}":
                     raise ValueError(f"final sample manifest has an invalid {field}: {value!r}")
-                declared.add(relative)
-                if field == "snp_path":
-                    declared.add(relative.with_name(relative.name + ".tbi"))
+                declared.update(path.relative_to(results) for path in files)
 
     records: list[dict[str, object]] = []
     for relative in sorted(declared):
@@ -9792,9 +9653,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     resolve_tmp = commands.add_parser("resolve-tmpdir", help="把 slurm.node_tmpdir 展开为绝对路径（根目录由语义校验拒绝）。")
     resolve_tmp.add_argument("--path", required=True)
     synthesize = commands.add_parser("synthesize-config", help="合成 test 模式 effective config。")
-    synthesize.add_argument("--source", required=True)
-    synthesize.add_argument("--destination", required=True)
-    synthesize.add_argument("--route", required=True)
+    for field in ('--source', '--destination', '--route'):
+        synthesize.add_argument(field, required=True)
     refresh = commands.add_parser("refresh-manifest", help="根据 01_raw/ 刷新 sample manifest。")
     refresh.add_argument("--project", help="项目根目录；默认使用当前目录。")
     refresh.add_argument("--configfile", help="显式指定项目 config；仅接受 <project>/00_config/config.yaml。")
@@ -9802,21 +9662,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
     create = commands.add_parser("snapshot-create", help="创建/复用内容寻址 run snapshot。")
-    create.add_argument("--pipeline-root", required=True)
-    create.add_argument("--project", required=True)
-    create.add_argument("--config", required=True)
-    create.add_argument("--control-env", required=True)
-    create.add_argument("--biscuit-env", required=True)
-    create.add_argument("--bismark-env", required=True)
-    create.add_argument("--rastair-env", required=True)
+    for field in ('--pipeline-root', '--project', '--config', '--control-env', '--biscuit-env',
+                      '--bismark-env', '--rastair-env'):
+        create.add_argument(field, required=True)
     create.add_argument("--allow-external-config", action="store_true")
     status = commands.add_parser("project-status", help="输出项目交付状态 JSON。")
     status.add_argument("--project", required=True)
     status.add_argument("--current-snapshot")
     ready = commands.add_parser("delivery-ready", help="写出 delivery_ready 发布事务标记。")
-    ready.add_argument("--ready", required=True)
-    ready.add_argument("--staged-results", required=True)
-    ready.add_argument("--run-snapshot", required=True)
+    for field in ('--ready', '--staged-results', '--run-snapshot'):
+        ready.add_argument(field, required=True)
     atomic = commands.add_parser("atomic-publish", help="scratch 文件组校验后原子发布。")
     atomic.add_argument("--file", action="append", nargs=2, metavar=("SOURCE", "DESTINATION"),
                         required=True, dest="files")
@@ -9838,9 +9693,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         taps_cpg.add_argument("--" + field, required=True)
 
     write_initial = commands.add_parser("write-cell-manifest", help="写出初始 cell manifest。")
-    write_initial.add_argument("project_manifest")
-    write_initial.add_argument("barcode_map")
-    write_initial.add_argument("out_tsv")
+    for field in ('project_manifest', 'barcode_map', 'out_tsv'):
+        write_initial.add_argument(field)
     write_initial.add_argument("--species", required=True)
     write_initial.add_argument("--protocol", required=True)
     write_initial.add_argument("--called-cells", action="append", type=lambda value: value.split(":", 1), default=[])
@@ -9876,19 +9730,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     write_metadata.add_argument("--structure-metrics", default="")
     write_completion = commands.add_parser("write-demux-completion", help="demux 事务内写出 completion 提交记录。")
     write_completion.add_argument("out_json")
-    write_completion.add_argument("--run-id", required=True)
-    write_completion.add_argument("--project-sample-id", required=True)
-    write_completion.add_argument("--manifest", required=True)
-    write_completion.add_argument("--report", required=True)
-    write_completion.add_argument("--mqc", required=True)
-    write_completion.add_argument("--dna-dir", required=True)
-    write_completion.add_argument("--rna-dir", required=True)
-    write_completion.add_argument("--cell-manifest", required=True)
+    for field in ('--run-id', '--project-sample-id', '--manifest', '--report', '--mqc',
+                      '--dna-dir', '--rna-dir', '--cell-manifest'):
+        write_completion.add_argument(field, required=True)
     collect = commands.add_parser("collect-rna-fastq", help="收集 RNA FASTQ 到保留区。")
-    collect.add_argument("--manifest", required=True)
-    collect.add_argument("--intermediate-dir", required=True)
-    collect.add_argument("--marker", required=True)
-    collect.add_argument("--run-id", required=True)
+    for field in ('--manifest', '--intermediate-dir', '--marker', '--run-id'):
+        collect.add_argument(field, required=True)
     write_final = commands.add_parser("write-sample-manifest", help="写出最终 sample manifest。")
     for arg in ("initial_manifest", "intermediate_dir", "staged_results_dir",
                 "published_results_dir", "out_tsv", "pair_qc_json", "cutadapt_qc_json"):
@@ -9917,18 +9764,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          required=True)
     split = commands.add_parser("split-bismark-pairs", help="Bismark BAM 配对路由与计数。")
     split.add_argument("--excluded-contigs-json", required=True)
-    split.add_argument("--input-bam", type=Path, required=True)
-    split.add_argument("--bio", type=Path, required=True)
-    split.add_argument("--excluded", type=Path, required=True)
+    for field in ('--input-bam', '--bio', '--excluded'):
+        split.add_argument(field, type=Path, required=True)
     demux_identity = commands.add_parser("demux-identity", help="计算源码指纹或校验 demux_rs 编译期身份。")
     demux_identity.add_argument("operation", choices=("revision", "verify-binary"))
     demux_identity.add_argument("path")
     demux_identity.add_argument("expected_revision", nargs="?")
     summary = commands.add_parser("write-filter-summary", help="写出 Bismark filter summary（schema v3）。")
     summary.add_argument("--sample", required=True)
-    summary.add_argument("--candidate-pairs", type=int, required=True)
-    summary.add_argument("--removed-pairs", type=int, required=True)
-    summary.add_argument("--excluded-pairs", type=int, required=True)
+    for field in ('--candidate-pairs', '--removed-pairs', '--excluded-pairs'):
+        summary.add_argument(field, type=int, required=True)
     summary.add_argument("--processed-bam", type=Path, required=True)
     summary.add_argument("--samtools", required=True)
     summary.add_argument("--percentage", type=float, required=True)
@@ -9943,25 +9788,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     bench_validate.add_argument("--root", required=True)
     bench_validate.add_argument("--manifest", required=True)
     bench_stage = commands.add_parser("benchmark-stage", help="合成沙箱路线 config。")
-    bench_stage.add_argument("--project", required=True)
-    bench_stage.add_argument("--reference", required=True)
-    bench_stage.add_argument("--route", required=True)
+    for field in ('--project', '--reference', '--route'):
+        bench_stage.add_argument(field, required=True)
     bench_verify = commands.add_parser("benchmark-verify", help="校验 sealed 输出守恒。")
-    bench_verify.add_argument("--project", required=True)
-    bench_verify.add_argument("--manifest", required=True)
-    bench_verify.add_argument("--route", required=True)
+    for field in ('--project', '--manifest', '--route'):
+        bench_verify.add_argument(field, required=True)
     env_record = commands.add_parser("env-record", help="为一个新 prefix 记录环境身份。")
     env_record.add_argument("prefix")
     env_record.add_argument("--envs", required=True, help="五角色 envs.yaml 路径。")
     env_record.add_argument("--role", required=True)
     env_spec = commands.add_parser("env-spec", help="抽取角色 section 为独立 conda spec 文件。")
-    env_spec.add_argument("--envs", required=True)
-    env_spec.add_argument("--role", required=True)
-    env_spec.add_argument("--destination", required=True)
+    for field in ('--envs', '--role', '--destination'):
+        env_spec.add_argument(field, required=True)
     env_finalize = commands.add_parser("env-finalize", help="写出 release manifest。")
-    env_finalize.add_argument("release")
-    env_finalize.add_argument("release_id")
-    env_finalize.add_argument("expected_subdir")
+    for field in ('release', 'release_id', 'expected_subdir'):
+        env_finalize.add_argument(field)
     env_publish = commands.add_parser("env-publish", help="原子切换 conda/current。")
     env_publish.add_argument("current")
     env_publish.add_argument("target")
@@ -9989,14 +9830,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     indexes.add_argument("--bismark-root")
     build_downstream = commands.add_parser("build-downstream", help="构建下游 TSS/single-CpG reference。")
     build_downstream.add_argument("--species", required=True, choices=sorted(MANAGED_SPECIES))
-    build_downstream.add_argument("--fasta", required=True)
-    build_downstream.add_argument("--annotation-gtf", required=True)
-    build_downstream.add_argument("--tss-bed", required=True)
-    build_downstream.add_argument("--single-cpg-bed", required=True)
+    for field in ('--fasta', '--annotation-gtf', '--tss-bed', '--single-cpg-bed'):
+        build_downstream.add_argument(field, required=True)
     spikein = commands.add_parser("append-spikein", help="把 lambda/pUC19 追加到 assembled FASTA。")
-    spikein.add_argument("--lambda-fasta", type=Path, required=True)
-    spikein.add_argument("--puc19-fasta", type=Path, required=True)
-    spikein.add_argument("--target-fasta", type=Path, required=True)
+    for field in ('--lambda-fasta', '--puc19-fasta', '--target-fasta'):
+        spikein.add_argument(field, type=Path, required=True)
     return parser
 
 
