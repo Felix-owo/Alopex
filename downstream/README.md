@@ -1,4 +1,4 @@
-# Alopex v14.10 下游 QC 与可视化
+# Alopex v14.11 下游 QC 与可视化
 
 这套下游分析以当前 `Alopex` 的 sealed delivery 为输入，通过
 `03_results/run_manifest.json` 解析 immutable config snapshot、reference FAI、
@@ -44,7 +44,7 @@ Notebook 第二格的 `RECOMPUTE_RAW_ADATA`、`RECOMPUTE_METHYL_STATS`、
 CpG 输入身份复用 sealed inventory 中的 size/hash，不重复读取所有 CpG 计算哈希。需要强制重建 AnnData 时将 `RECOMPUTE_RAW_ADATA`
 设为 `True`；它从 sealed CpG 重建 `RawAdata.h5ad`，结果仍只写入 `06_downstream/`。
 
-RawAdata 的 schema、文件身份、样本集合及当前 sealed 输入全部匹配时，直接复用其空 CpG 集合，不逐细胞启动解压或创建临时链接。失配时重新检查表头和空表，确认 zero-mapped cells 为空后再导入；临时导入链接或 1-based 归一化文件只在重建时创建，源坐标身份参与缓存绑定。导入算法更新仍触发正常重建，不复用旧算法身份。
+RawAdata 的 schema、文件身份、样本集合及当前 sealed 输入全部匹配时，直接复用其空 CpG 集合，不逐细胞启动解压或创建临时链接。失配时完整检查表头、整数计数、所选 base 的真实坐标边界、解压退出码和空表，确认 zero-mapped cells 为空后再导入；两种 base 都只在重建时创建源文件链接，实际坐标身份参与缓存绑定。导入算法更新仍触发正常重建，不复用旧算法身份。
 命令行对应 `--recompute-raw-adata`；其余开关对应 `--recompute-methyl-stats`、
 `--recompute-composition`、`--recompute-gini`、`--recompute-tss`。
 
@@ -56,11 +56,17 @@ Processor 子进程沿用 Notebook 的 Python，运行前请使用上述专用 k
 运行 Notebook 最后一格会调用 `prepare_single_cpg_adata(PATHS, df_qc)`，自动使用当前物种的
 single-CpG BED 和本次交付的 `RawAdata.h5ad`，生成同目录的 `SingleCpG_Adata.h5ad`。
 固定参数为 `value_type="fraction"`、`summary_type="mean"`、`chunk_size=500`、`inplace=False`。
+位点标识 `var_names` 跟随当前 sealed 交付的 `analysis.cpg_coordinate_base`，无需另填参数：
+0-based 使用半开区间（如 `chr1:0-2`），1-based 使用闭区间（如 `chr1:1-2`），
+两者表示同一个 CpG，矩阵数值和列顺序相同。`uns["cpg_coordinate_base"]`、
+`uns["cpg_interval_convention"]` 与 `uns["source_cpg_representation"]` 记录实际坐标制。
+1-based 位点标识用于下游展示和导出；传给要求 BED/0-based 的其他工具时须先归一化。
 保留全部细胞，按 `Sample_ID` 严格对齐并保存完整 QC、`HQ` 及自行添加的注释，不按 HQ 筛选。
 不要修改 `df_qc` 的原有 QC 列；它们会与磁盘上的当前 QC 表校验。
 
 首次运行需要完成矩阵计算。再次运行按交付、RawAdata generation、BED 内容、参数与
 SnapATAC2 版本复用矩阵，只有注释变化时仅更新 `obs`。已有文件未经验证或来源变化时会提示；
+坐标身份也参与复用判断；升级前已生成的 SingleCpG 文件须显式重建，不能直接当作新坐标结果。
 需要替换它时设置 `RECOMPUTE_SINGLECPG=True`，完成后恢复 `False`。新矩阵先写临时文件，
 关闭后替换正式文件；`SingleCpG_Adata.input_schema.json` 是配套的完成及复用记录。
 函数返回路径并关闭自身打开的全部句柄，不保留 `DNA_ADATA_CpG` 活跃写句柄。
@@ -114,7 +120,15 @@ TSS BED（链方向一致的 `±2000 bp / 20 bp` bins，第 9 列为 offset）�
 按需 `make_peak_matrix(..., peak_file=...)` 使用的 BED3：0-based、half-open，每条记录覆盖一个
 CpG 二核苷酸 `[C, G+1)`，不含 lambda/pUC19。Notebook 最后一格从已导入 values 生成 single-CpG matrix；命令行 QC Processor 不执行这一步。Pipeline 的 `03_results/CpG/*.cpg.tsv.zst`
 则直接采用 SnapATAC2 `pp.import_values` 四列输入：`chrom, pos, methyl, unmethyl`，其中
-`pos` 按 `analysis.cpg_coordinate_base` 输出，默认 1-based，可设为 0-based。Downstream 核对 sealed config/run/final manifest 的坐标身份；RawAdata 恒为 0-based。重建时 0-based 文件直接链接导入，1-based 文件在临时目录流式减 1 并压缩后导入；不改公开输入，成功/失败均回收。缓存命中不转换。
+`pos` 按 `analysis.cpg_coordinate_base` 输出，默认 1-based，可设为 0-based。Downstream 核对 sealed config/run/final manifest 的坐标身份；RawAdata 和 SingleCpG
+均跟随交付 base，两种 CpG 文件均直接链接导入。`RawAdata.uns["cpg_coordinate_base"]`
+标明实际位点坐标；1-based 每条染色体的索引 0 留空，其位点是 1 到 L。
+`uns.reference_sequences` 的 `reference_bp_length` 为真实染色体长度 L，
+`reference_seq_length` 为索引范围长度 `L+base`。QC 的 CpG/TSS 区间和 Gini 分箱自动适配
+实际 base，标准 BED 文件不变；直接调用其他 SnapATAC2 工具时须使用同一 base 的区间。
+`RawAdata.input_schema.json` 当前为 schema5；原有 RawAdata 在下一次 QC Processor 运行时
+自动失效重建，SingleCpG 则设置 `RECOMPUTE_SINGLECPG=True` 重建。缓存命中不解压、不建链接。
+QC 表不包含基因组坐标，TSS 图使用相对 TSS 距离，不加减 1。
 
 `resources/*_reference/` 是体积很大的 HPC 本地 reference，受仓库 `.gitignore`
 保护，不进入源代码包，也不应使用 `git add -f` 提交。普通 clone 在按根
@@ -183,8 +197,7 @@ Notebook 的 `FINAL_QC_MODE` 可选 `per_clone_samples` 或 `distribution`；前
 
 ## 指标与筛选
 
-20 列 QC 的分母、backend 原生 mapping 单位与 TAPS 控制含义的统一定义保留在开发仓库
-参数表。不同 backend 的
+20 列 QC 的分母、backend 原生 mapping 单位与 TAPS 控制含义的统一定义保留在开发仓库参数表。不同 backend 的
 `Native_Mapping%` 不视为同义指标；TAPS 的 `High_CpH_Flag_Rate%` 为缺失值；`Non_CpG_Methylation%` 默认显示可判链宿主分子的 CHG/CHH 原始转换率，零观测为缺失。该指标未经 SNP/测序错误校正，只代表可判链子集，不能直接解释为真实 mCH 或 cDNA 污染率。分项计数与判链分母见 final manifest/MultiQC。
 Gini 使用有覆盖 bins 的 coverage，不纳入未覆盖 bins；TSS count 为甲基化信号之和。
 

@@ -1,4 +1,4 @@
-# Alopex v14.10
+# Alopex v14.11
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -14,8 +14,7 @@ Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报
 [下游 README](downstream/README.md)，验证范围和升级说明见本版 Release。
 
 本仓库是 Alopex 的 GPL-3.0 公开发布副本，包含核心 workflow、Rust demultiplexer、下游 QC、
-Doctor 回归 fixture（真实 Cabernet 抽样与合成对照）和默认 Barcode Map。
-维护规范、内部文档、测试套件与 benchmark 归档不随公开副本分发；Doctor 可完整运行。
+Doctor 回归 fixture 和默认 Barcode Map。维护规范、内部文档、测试套件与 benchmark 归档不随公开副本分发。
 
 ## 1. 安装
 
@@ -222,7 +221,7 @@ stage 重试。已完成的快路只读退出；清理失败保留残留与告�
 └── run_manifest.json
 ```
 
-CpG 唯一格式为 `chrom, pos, methyl, unmethyl`，tab 分隔、pos 默认 1-based，计数为非负整数。`analysis.cpg_coordinate_base: 0` 可改为 0-based（仅接受整数 0/1，省略默认 1）。BED/VCF/BAM 仍按各自格式；下游根据 sealed 交付的坐标身份将输入归一化为 SnapATAC2 所需的 0-based。
+CpG 唯一格式为 `chrom, pos, methyl, unmethyl`，tab 分隔、pos 默认 1-based，计数为非负整数。`analysis.cpg_coordinate_base: 0` 可改为 0-based（仅接受整数 0/1，省略默认 1）。BED/VCF/BAM 仍按各自格式；下游 RawAdata 和 SingleCpG 按 sealed 交付的坐标身份直接使用同一 base。
 坏行会报告来源和行号并阻止提交；合法空结果保留表头。SRD 的 RNA FASTQ 和被筛除 BAM
 固定保存在 `02_work/RNA/{FASTQ,BAM}/`，不进入公开 inventory。
 
@@ -244,6 +243,9 @@ MultiQC 汇总原生 mapping、pair funnel、重复、过滤、对照和适用�
 `DNA_PROJECT_ROOT`、`DNA_PIPELINE_ROOT`。输出固定在当前交付的 `06_downstream/QC_Results_<生成时间>/`。
 Notebook 启动、20 列 QC、RawAdata/single-CpG、缓存重算和 RNA 关联均见
 [下游 README](downstream/README.md)。
+`SingleCpG_Adata.h5ad` 的位点坐标跟随交付中的 `analysis.cpg_coordinate_base`：
+0-based 为半开区间，1-based 为闭区间；AnnData 中记录坐标制。RawAdata 的实际位点同样跟随配置；
+下游按所选 base 适配参考区间和分箱，保证两种输出的甲基化矩阵数值一致。
 
 ## 许可证
 

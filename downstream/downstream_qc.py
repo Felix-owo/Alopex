@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import importlib.metadata
 import csv
+import gzip
 import hashlib
 import json
 import sys
@@ -1044,9 +1045,9 @@ QC_INFO_COLUMNS = (
     "Trim_Retention%",
     "Final_Pair_Yield%",
 )
-RAW_ADATA_SCHEMA_VERSION = 4
+RAW_ADATA_SCHEMA_VERSION = 5
 RAW_ADATA_SCHEMA_MODE = "strand_resolved_headered_empty_safe"
-RAW_ADATA_ALGORITHM_VERSION = "snapatac2_import_values_0based_v6"
+RAW_ADATA_ALGORITHM_VERSION = "snapatac2_import_values_configured_base_v1"
 EMPTY_CPG_SENTINEL_CONTIG = "__DNA_PIPELINE_EMPTY__"
 
 MAX_CPG_PROCESS_WORKERS = 32
@@ -1258,6 +1259,9 @@ def _raw_adata_schema_matches(
             return False
     reference_fai = schema_payload.get("reference_fai")
     cpg_files = schema_payload.get("cpg_files")
+    base = schema_payload.get("cpg_coordinate_base")
+    if type(base) is not int or base not in CPG_REPRESENTATIONS:
+        return False
     if (
         not isinstance(reference_fai, dict)
         or re.fullmatch(r"[0-9a-f]{64}", str(reference_fai.get("sha256", ""))) is None
@@ -1277,9 +1281,10 @@ def _raw_adata_schema_matches(
         and re.fullmatch(r"[0-9a-f]{64}", str(schema_payload.get("snapshot_id", "")))
         is not None
         and isinstance(schema_payload.get("sample_ids"), list)
-        and schema_payload.get("cpg_header") == "snapatac2_import_values_0based"
+        and schema_payload.get("cpg_header") == "chrom\tpos\tmethyl\tunmethyl"
+        and schema_payload.get("source_cpg_representation") == CPG_REPRESENTATIONS[base]
         and schema_payload.get("empty_cpg_sentinel")
-        == f"{EMPTY_CPG_SENTINEL_CONTIG}:0:0:1"
+        == f"{EMPTY_CPG_SENTINEL_CONTIG}:{base}:0:1"
     )
 
 
@@ -1386,6 +1391,36 @@ def _clean_cpg_table_name(filename: str) -> str:
     return filename
 
 
+def _source_cpg_coordinate_base(representation: str) -> int:
+    for base, name in CPG_REPRESENTATIONS.items():
+        if representation == name:
+            return base
+    raise ValueError(f"Unsupported sealed CpG representation: {representation!r}")
+
+
+def _raw_cpg_coordinate_base(adata) -> int:
+    base = adata.uns["cpg_coordinate_base"]
+    if isinstance(base, (bool, np.bool_)) or not isinstance(base, (int, np.integer)) or base not in (0, 1):
+        raise ValueError("RawAdata cpg_coordinate_base must be integer 0 or 1")
+    return int(base)
+
+
+def make_cpg_peak_matrix(adata, *, peak_file: Path, **kwargs):
+    """按 RawAdata 的实际坐标读取标准 0-based BED，保持原生计数与位点顺序。"""
+    base = _raw_cpg_coordinate_base(adata)
+    if base == 0:
+        return snap.pp.make_peak_matrix(adata, peak_file=str(peak_file), **kwargs)
+    opener = gzip.open if Path(peak_file).suffix == ".gz" else open
+    regions = []
+    with opener(peak_file, "rt") as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            chrom, start, end = line.rstrip("\n").split("\t")[:3]
+            regions.append(f"{chrom}:{int(start) + base}-{int(end) + base}")
+    return snap.pp.make_peak_matrix(adata, use_rep=regions, **kwargs)
+
+
 def load_or_create_raw_adata(
     selected_files: list[Path],
     out_file: Path,
@@ -1397,8 +1432,9 @@ def load_or_create_raw_adata(
     sealed_context: SealedQCContext,
     cpg_output_identities: Mapping[str, Mapping[str, object]],
 ):
-    """绑定 sealed inventory 复用 RawAdata；重建时将 1-based 输入临时流式转为 0-based。"""
+    """按 sealed 坐标直接导入 CpG；1-based 每条染色体为坐标 0 留空槽，保留真实长度。"""
     sealed_context.assert_current()
+    source_base = _source_cpg_coordinate_base(sealed_context.cpg_representation)
     expected = [str(value) for value in expected_sample_ids]
     zero_mapped = {str(value) for value in zero_mapped_sample_ids}
     if len(expected) != len(set(expected)):
@@ -1446,9 +1482,10 @@ def load_or_create_raw_adata(
         "algorithm_sha256": _algorithm_fingerprints()["raw"],
         "delivery_id": sealed_context.delivery_id,
         "snapshot_id": sealed_context.snapshot_id,
-        "cpg_header": "snapatac2_import_values_0based",
+        "cpg_header": "chrom\tpos\tmethyl\tunmethyl",
+        "cpg_coordinate_base": source_base,
         "source_cpg_representation": sealed_context.cpg_representation,
-        "empty_cpg_sentinel": f"{EMPTY_CPG_SENTINEL_CONTIG}:0:0:1",
+        "empty_cpg_sentinel": f"{EMPTY_CPG_SENTINEL_CONTIG}:{source_base}:0:1",
         "sample_ids": sorted(expected),
         "reference_fai": _content_binding(fai_path) if fai_path is not None else None,
         "cpg_files": cpg_bindings,
@@ -1486,7 +1523,7 @@ def load_or_create_raw_adata(
                 existing = None
                 return validated, set(cached_empty)
             raise ValueError(
-                "RawAdata does not match the current SnapATAC2 0-based four-column input schema"
+                "RawAdata does not match the current configured-base four-column input schema"
             )
         except Exception as e:
             sealed_context.assert_current()
@@ -1495,15 +1532,15 @@ def load_or_create_raw_adata(
             if existing is not None:
                 existing.close()
 
-    empty_cpg = {sample_id for sample_id, path in sources.items() if _cpg_table_is_empty(path)}
+    chrom_sizes = _read_chrom_sizes(fai_path) if fai_path is not None and fai_path.exists() else None
+    empty_cpg = {sample_id for sample_id, path in sources.items()
+                 if _validate_cpg_input(path, chrom_sizes, source_base)}
     sealed_context.assert_current()
     if zero_mapped - empty_cpg:
         raise ValueError("Zero-mapped cells must have an empty current CpG result")
     input_signature["empty_cpg_sample_ids"] = sorted(empty_cpg)
     if fai_path is None or not fai_path.exists():
         return None, empty_cpg
-
-    chrom_sizes = _read_chrom_sizes(fai_path)
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
     import_dir = Path(
@@ -1520,25 +1557,20 @@ def load_or_create_raw_adata(
             name = sample_id + ".tsv.zst"
             target = import_dir / name
             if sample_id not in empty_cpg:
-                if sealed_context.cpg_representation == CPG_REPRESENTATIONS[0]:
-                    os.symlink(source.resolve(), target)
-                elif sealed_context.cpg_representation == CPG_REPRESENTATIONS[1]:
-                    _write_zero_based_cpg_input(source, target, chrom_sizes)
-                else:
-                    raise ValueError("Unsupported sealed CpG representation")
+                os.symlink(source.resolve(), target)
                 continue
 
 
             target = import_dir / name.removesuffix(".zst")
             target.write_text(
                 "chrom\tpos\tmethyl\tunmethyl\n"
-                f"{EMPTY_CPG_SENTINEL_CONTIG}\t0\t0\t1\n",
+                f"{EMPTY_CPG_SENTINEL_CONTIG}\t{source_base}\t0\t1\n",
                 encoding="utf-8",
             )
 
         snap_data = snap.pp.import_values(
             str(import_dir),
-            chrom_sizes=chrom_sizes,
+            chrom_sizes={chrom: length + source_base for chrom, length in chrom_sizes.items()},
             file=str(temporary),
             backend="hdf5",
             chunk_size=8,
@@ -1557,6 +1589,13 @@ def load_or_create_raw_adata(
                 "New RawAdata Sample_ID set differs from current final manifest"
             )
         snap_data.obs_names = new_names
+        snap_data.uns["cpg_coordinate_base"] = source_base
+        snap_data.uns["source_cpg_representation"] = sealed_context.cpg_representation
+        snap_data.uns["reference_sequences"] = pl.DataFrame({
+            "reference_seq_name": list(chrom_sizes),
+            "reference_seq_length": [length + source_base for length in chrom_sizes.values()],
+            "reference_bp_length": list(chrom_sizes.values()),
+        }).with_columns(pl.col("reference_seq_length", "reference_bp_length").cast(pl.UInt64))
         snap_data.close()
         snap_data = None
         sealed_context.assert_current()
@@ -1655,61 +1694,6 @@ def _cache_identities(identity: Mapping[str, object], cfg, algorithms: Mapping[s
             for key, value in payloads.items()}
 
 
-def _write_zero_based_cpg_input(source: Path, target: Path, chrom_sizes: Mapping[str, int]) -> None:
-    executable = shutil.which("zstd")
-    if executable is None:
-        raise FileNotFoundError("zstd is required to normalize 1-based CpG inputs")
-    decoder, handle = _open_cpg_text(source)
-    encoder = None
-    stream_error = None
-    try:
-        with target.open("wb") as output:
-            encoder = subprocess.Popen(
-                [executable, "-q", "-T1", "-c"], stdin=subprocess.PIPE,
-                stdout=output, stderr=subprocess.PIPE, text=True,
-            )
-            if encoder.stdin is None:
-                raise RuntimeError("Cannot open normalized CpG compression stream")
-            if handle.readline().rstrip("\n") != "chrom\tpos\tmethyl\tunmethyl":
-                raise ValueError(f"CpG input has an invalid header: {source}")
-            encoder.stdin.write("chrom\tpos\tmethyl\tunmethyl\n")
-            for line_no, line in enumerate(handle, 2):
-                fields = line.rstrip("\n").split("\t")
-                if len(fields) != 4 or any(re.fullmatch(r"[0-9]+", value) is None for value in fields[1:]):
-                    raise ValueError(f"{source}:{line_no}: invalid CpG fields")
-                pos, methyl, unmethyl = map(int, fields[1:])
-                if (fields[0] not in chrom_sizes or not 1 <= pos <= chrom_sizes[fields[0]]
-                        or methyl + unmethyl <= 0 or methyl + unmethyl > 65535):
-                    raise ValueError(f"{source}:{line_no}: invalid CpG coordinate/counts")
-                encoder.stdin.write(f"{fields[0]}\t{pos - 1}\t{fields[2]}\t{fields[3]}\n")
-            encoder.stdin.close()
-            stderr = encoder.stderr.read() if encoder.stderr is not None else ""
-            if encoder.wait():
-                raise RuntimeError(f"zstd failed for {source}: {stderr.strip()}")
-    except BaseException as exc:
-        stream_error = exc
-        if decoder.poll() is None:
-            decoder.terminate()
-        if encoder is not None and encoder.poll() is None:
-            encoder.terminate()
-        raise
-    finally:
-        handle.close()
-        try:
-            _finish_cpg_process(decoder, source, stream_error)
-        finally:
-            if encoder is not None:
-                if encoder.stdin is not None and not encoder.stdin.closed:
-                    try:
-                        encoder.stdin.close()
-                    except BrokenPipeError:
-                        if stream_error is None:
-                            raise
-                if encoder.stderr is not None:
-                    encoder.stderr.close()
-                encoder.wait()
-
-
 def _open_cpg_text(path: Path):
 
     if path.name.endswith(".zst"):
@@ -1747,41 +1731,31 @@ def _finish_cpg_process(
         )
 
 
-def _cpg_table_is_empty(path: Path) -> bool:
-
+def _validate_cpg_input(path: Path, chrom_sizes: Mapping[str, int] | None, coordinate_base: int) -> bool:
     process, handle = _open_cpg_text(path)
-    stream_error: BaseException | None = None
+    stream_error = None
     found_data = False
     try:
-        header_seen = False
-        for line in handle:
-            if not line.strip():
-                continue
-            if not header_seen:
-                if line.rstrip("\n") != "chrom\tpos\tmethyl\tunmethyl":
-                    raise ValueError(f"CpG input has an invalid header: {path}")
-                header_seen = True
-                continue
+        if handle.readline().rstrip("\n") != "chrom\tpos\tmethyl\tunmethyl":
+            raise ValueError(f"CpG input has an invalid header: {path}")
+        for line_no, line in enumerate(handle, 2):
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 4 or any(re.fullmatch(r"[0-9]+", value) is None for value in fields[1:]):
+                raise ValueError(f"{path}:{line_no}: invalid CpG fields")
+            pos, methyl, unmethyl = map(int, fields[1:])
+            if (pos < coordinate_base or methyl + unmethyl <= 0 or methyl + unmethyl > 65535
+                    or (chrom_sizes is not None and (fields[0] not in chrom_sizes
+                        or pos >= chrom_sizes[fields[0]] + coordinate_base))):
+                raise ValueError(f"{path}:{line_no}: invalid CpG coordinate/counts")
             found_data = True
-            break
-        if not header_seen:
-            raise ValueError(f"CpG input has no header: {path}")
     except BaseException as exc:
         stream_error = exc
+        if process is not None and process.poll() is None:
+            process.terminate()
         raise
     finally:
         handle.close()
-        if found_data and process is not None:
-
-
-            if process.poll() is None:
-                process.terminate()
-            if process.stderr is not None:
-                process.stderr.read()
-                process.stderr.close()
-            process.wait()
-        else:
-            _finish_cpg_process(process, path, stream_error)
+        _finish_cpg_process(process, path, stream_error)
     return not found_data
 
 
@@ -2168,7 +2142,7 @@ def _aggregate_tss_matrix(
     )
 
 
-def _read_tss_offset_map(tss_bed_path: Path) -> pd.Series:
+def _read_tss_offset_map(tss_bed_path: Path, coordinate_base: int = 0) -> pd.Series:
     pos_df = pd.read_csv(tss_bed_path, sep="\t", header=None, comment="#")
     if pos_df.shape[1] < 9:
         raise ValueError(f"TSS BED must have at least 9 columns: {tss_bed_path}")
@@ -2186,9 +2160,9 @@ def _read_tss_offset_map(tss_bed_path: Path) -> pd.Series:
     region_keys = (
         pos_df.iloc[:, 0].astype(str)
         + ":"
-        + pos_df.iloc[:, 1].astype(str)
+        + (pos_df.iloc[:, 1].astype(np.int64) + coordinate_base).astype(str)
         + "-"
-        + pos_df.iloc[:, 2].astype(str)
+        + (pos_df.iloc[:, 2].astype(np.int64) + coordinate_base).astype(str)
     )
     if region_keys.duplicated().any():
         raise ValueError(f"TSS BED contains duplicate genomic intervals: {tss_bed_path}")
@@ -2296,6 +2270,7 @@ def compute_gini_index(
     recompute: bool,
     empty_cpg_sample_ids: set[str],
 ) -> pd.Series:
+    """按真实染色体长度分箱，以同一 base 的 coverage 计算 Gini；空细胞保留缺失值。"""
     expected_sample_ids = [str(value) for value in raw_adata.obs_names]
     if (not recompute) and cache_path.exists():
         cached = _validated_gini_cache(
@@ -2316,17 +2291,21 @@ def compute_gini_index(
     )
     adata_bin = None
     try:
-        adata_bin = snap.pp.add_tile_matrix(
-            raw_adata,
-            bin_size=bin_size,
-            value_type="total",
-            summary_type="sum",
-            exclude_chroms=[],
-            inplace=False,
-            file=str(temporary),
-            backend="hdf5",
-            chunk_size=4,
-        )
+        base = _raw_cpg_coordinate_base(raw_adata)
+        if base == 0:
+            adata_bin = snap.pp.add_tile_matrix(
+                raw_adata, bin_size=bin_size, value_type="total", summary_type="sum",
+                exclude_chroms=[], inplace=False, file=str(temporary), backend="hdf5", chunk_size=4,
+            )
+        else:
+            reference = raw_adata.uns["reference_sequences"]
+            regions = [f"{chrom}:{start + base}-{min(start + bin_size, int(length)) + base}"
+                       for chrom, length in zip(reference["reference_seq_name"], reference["reference_bp_length"], strict=True)
+                       for start in range(0, int(length), bin_size)]
+            adata_bin = snap.pp.make_peak_matrix(
+                raw_adata, use_rep=regions, value_type="total", summary_type="sum",
+                inplace=False, file=str(temporary), backend="hdf5", chunk_size=4,
+            )
         out = np.full(adata_bin.n_obs, np.nan, dtype=np.float64)
         for matrix, start, end in tqdm(
             adata_bin.chunked_X(4),
@@ -2407,7 +2386,7 @@ def compute_tss_profile(
             raise ValueError("Computed empty TSS profile violates the output contract")
         return validated
 
-    pos_series = _read_tss_offset_map(tss_bed_path)
+    pos_series = _read_tss_offset_map(tss_bed_path, _raw_cpg_coordinate_base(raw_adata))
 
     def make_and_aggregate(
         value_type: str, summary_type: str, value_name: str, aggregate: str
@@ -2417,10 +2396,10 @@ def compute_tss_profile(
         )
         matrix = None
         try:
-            matrix = snap.pp.make_peak_matrix(
+            matrix = make_cpg_peak_matrix(
                 raw_adata,
                 value_type=value_type,
-                peak_file=str(tss_bed_path),
+                peak_file=tss_bed_path,
                 summary_type=summary_type,
                 inplace=False,
                 file=str(temporary),
@@ -2737,7 +2716,7 @@ def _run_pipeline_impl(
     )
     if raw_adata is None or raw_adata_mode != RAW_ADATA_SCHEMA_MODE:
         raise RuntimeError(
-            "RawAdata is unavailable or does not use the current SnapATAC2 0-based four-column CpG "
+            "RawAdata is unavailable or does not use the current configured-base four-column CpG "
             f"schema (observed: {raw_adata_mode})"
         )
     identity["cache_identities"] = _cache_identities(identity, cfg, _algorithm_fingerprints())
@@ -4959,6 +4938,7 @@ def prepare_single_cpg_adata(
     """从当前 RawAdata 生成 single-CpG 矩阵，按细胞身份整合 QC 并关闭全部句柄。
 
     使用当前物种的 BED3、fraction/mean 和 chunk_size=500；保留全部细胞。
+    var_names 跟随 sealed CpG 坐标：0-based 半开区间或 1-based 闭区间；X 不变。
     已验证的矩阵可复用，仅 QC/HQ 改变时只更新 obs。未知或过期文件须显式
     recompute；新矩阵完成并关闭后才替换正式文件，不关闭其他 Notebook 的句柄。
     """
@@ -4969,6 +4949,12 @@ def prepare_single_cpg_adata(
     )
     if sealed.delivery_id != paths.delivery_id:
         raise ValueError("Delivery changed; rerun the Notebook from its first cell")
+    coordinate_base = _source_cpg_coordinate_base(sealed.cpg_representation)
+    coordinate_metadata = {
+        "cpg_coordinate_base": coordinate_base,
+        "cpg_interval_convention": "half-open" if coordinate_base == 0 else "closed",
+        "source_cpg_representation": sealed.cpg_representation,
+    }
     run_paths = build_paths(paths.project_dir, sealed.delivery_id)
     if run_paths.qc_results_dir != paths.qc_results_dir:
         raise ValueError("Notebook QC directory differs from the current delivery")
@@ -4993,12 +4979,14 @@ def prepare_single_cpg_adata(
     raw_schema = json.loads(raw_path.with_name("RawAdata.input_schema.json").read_text())
     if (not _raw_adata_schema_matches(raw_path, raw_schema)
             or raw_schema["delivery_id"] != sealed.delivery_id
+            or raw_schema.get("source_cpg_representation") != sealed.cpg_representation
             or set(raw_schema["sample_ids"]) != set(sample_ids)):
         raise ValueError("RawAdata is stale or unverified; rerun the QC Processor")
     genome = str(sealed.config["species"])
     bed = paths.pipeline_root / "resources" / f"{genome}_reference" / "cpg" / f"{genome}.single_cpg.bed.gz"
     signature = {
-        "algorithm": "single_cpg_fraction_mean_v1",
+        "algorithm": "single_cpg_fraction_mean_v3",
+        **coordinate_metadata,
         "snapatac2": importlib.metadata.version("snapatac2"),
         "delivery_id": sealed.delivery_id,
         "raw_generation": raw_schema["generation_id"],
@@ -5031,10 +5019,21 @@ def prepare_single_cpg_adata(
             _log("生成 single-CpG 矩阵：fraction/mean，chunk_size=500")
             raw = snap.read(str(raw_path), backed="r")
             _require_exact_sample_ids(qc, list(raw.obs_names), "RawAdata QC")
-            matrix = snap.pp.make_peak_matrix(
+            if _raw_cpg_coordinate_base(raw) != coordinate_base:
+                raise ValueError("RawAdata coordinates differ from the sealed CpG representation")
+            matrix = make_cpg_peak_matrix(
                 raw, value_type="fraction", summary_type="mean",
-                peak_file=str(bed), inplace=False, file=str(temporary), chunk_size=500,
+                peak_file=bed, inplace=False, file=str(temporary), chunk_size=500,
             )
+            if coordinate_base == 1:
+                feature_names = []
+                for name in matrix.var_names:
+                    chrom, interval = name.rsplit(":", 1)
+                    start, end = interval.split("-")
+                    feature_names.append(f"{chrom}:{start}-{int(end) - 1}")
+                matrix.var_names = feature_names
+            for key, value in coordinate_metadata.items():
+                matrix.uns[key] = value
         names = list(matrix.obs_names)
         aligned = _require_exact_sample_ids(qc, names, "SingleCpG QC")
         current = matrix.obs[:]
@@ -5042,6 +5041,7 @@ def prepare_single_cpg_adata(
         for column in aligned.columns:
             merged[column] = aligned[column].array
         updated = pl.from_pandas(merged)
+        sealed.assert_current()
         if not updated.equals(current):
             if reuse and not recompute:
                 matrix.close()
@@ -5052,6 +5052,7 @@ def prepare_single_cpg_adata(
             matrix.obs_names = names
         matrix.close()
         matrix = None
+        sealed.assert_current()
         if not reuse or recompute:
             _fsync_file(temporary)
             schema_path.unlink(missing_ok=True)
@@ -5059,7 +5060,7 @@ def prepare_single_cpg_adata(
         _atomic_write_json(
             {"input": signature, "h5ad": _raw_adata_stat_binding(output)}, schema_path
         )
-        _log(f"SingleCpG 已就绪，{len(names)} 个细胞，文件已关闭: {output}")
+        _log(f"SingleCpG 已就绪，{len(names)} 个细胞，{coordinate_base}-based，文件已关闭: {output}")
         return output
     finally:
         try:
