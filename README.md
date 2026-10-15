@@ -1,4 +1,4 @@
-# Alopex v14.12
+# Alopex v14.12.1
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
