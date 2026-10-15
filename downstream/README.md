@@ -1,4 +1,4 @@
-# Alopex v14.11 下游 QC 与可视化
+# Alopex v14.12 下游 QC 与可视化
 
 这套下游分析以当前 `Alopex` 的 sealed delivery 为输入，通过
 `03_results/run_manifest.json` 解析 immutable config snapshot、reference FAI、
@@ -180,13 +180,24 @@ QC 目录的时间为首次创建时的本地时间；同秒重名追加微秒�
 - `.cache/Gini_Index.csv`（内部缓存）
 - `plots/` 下的 PDF，包括 `WGBS_QC_Panel.pdf`、Final QC dashboards、
   `Plate_View_Native_Mapping%.pdf`、`CpG_Signal_Composition.pdf`、
-  `TSS_Profile.pdf`（可选）、`CpG_Density.pdf` 与 `Batch_Effect_PCA.pdf`。
+  `TSS_Profile.pdf`（可选）、`CpG_Density.pdf`、
+  `CpG_Density_Unique_vs_Input_Pairs.pdf` 与 `Batch_Effect_PCA.pdf`。
 
 `CpG_Density.pdf` 的输入由 Notebook 经 `downstream_qc.load_cpg_density_frame`
 合并三个来源：`Sample_ID`、`CloneID` 和 `Sample_Unique_CpG_Sites` 取自
 20 列 QC 表，pair 计数取自 sealed `03_results/QC_Results/sample_manifest.tsv`
 （`build_qc_records` 唯一加载链），`Sample_CpG_Signals` 取自
 `.cache/CpG_Signal_Composition.csv`；三个来源的样本集合必须完全一致。
+同一 `plot_cpg_density` 调用先展示逐样本散点图并保存为
+`CpG_Density_Unique_vs_Input_Pairs.pdf`：横轴为 trimming 前 input read pairs，
+纵轴为最终宿主 unique CpG sites，沿用 CloneID 配色，保留有限的正 input pairs
+与非负 unique sites；散点保留原始计数，不做深度归一化或异常点剔除。
+每个 CloneID 叠加同色过原点拟合线，图例标注斜率；直接复用原 input-pair 汇总
+的同一次拟合，使用相同的 unique sites 与 coverage signals 联合有效样本、异常点
+筛选及 `min_slope_ratio_change`；在保留样本上按 `slope = sum(x*y) / sum(x*x)`
+拟合 `y = slope*x`，斜率单位为 unique CpG sites / input pair。无有效拟合时不画线，
+图例标为 `slope=N/A`。
+随后展示并保存原有的 `CpG_Density.pdf` 斜率汇总。
 QC 表中的 `Sample_ID`、`CloneID`、`PlateID` 以及 TSS 的 `CloneID` 按字符串读取，保留 `001` 等前导零以及
 `NA`、`nan`、`None` 等合法名称；数值列仍按数值和缺失值解析，并保留 round-trip 浮点精度。
 

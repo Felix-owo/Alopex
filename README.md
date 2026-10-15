@@ -1,4 +1,4 @@
-# Alopex v14.11
+# Alopex v14.12
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -243,6 +243,7 @@ MultiQC 汇总原生 mapping、pair funnel、重复、过滤、对照和适用�
 `DNA_PROJECT_ROOT`、`DNA_PIPELINE_ROOT`。输出固定在当前交付的 `06_downstream/QC_Results_<生成时间>/`。
 Notebook 启动、20 列 QC、RawAdata/single-CpG、缓存重算和 RNA 关联均见
 [下游 README](downstream/README.md)。
+CpG density 绘图同时展示 input pairs 与 unique CpG sites 的逐样本散点图，按 CloneID 配色并单独保存 PDF；每组叠加与汇总一致的过原点拟合线，图例标注斜率。
 `SingleCpG_Adata.h5ad` 的位点坐标跟随交付中的 `analysis.cpg_coordinate_base`：
 0-based 为半开区间，1-based 为闭区间；AnnData 中记录坐标制。RawAdata 的实际位点同样跟随配置；
 下游按所选 base 适配参考区间和分箱，保证两种输出的甲基化矩阵数值一致。

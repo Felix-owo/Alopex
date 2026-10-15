@@ -4404,7 +4404,12 @@ def plot_cpg_density(
     out_path: Path = None,
     min_slope_ratio_change: float = CPG_SLOPE_RATIO_MIN_CHANGE,
 ):
-    """绘制 CpG 密度，并在异常点实质影响 slope ratio 时共同剔除。"""
+    """展示逐样本 input pairs–unique CpG 散点及密度汇总，分别保存 PDF。
+
+    散点保留有限的正 input pairs 与非负 unique sites；汇总仅在异常点
+    实质影响 slope ratio 时共同剔除，不改变散点中的原始计数。
+    每个 CloneID 的过原点拟合线与斜率标注复用 input-pair 汇总的同一次拟合。
+    """
     if min_slope_ratio_change < 0:
         raise ValueError('Minimum slope-ratio change must be non-negative')
 
@@ -4613,6 +4618,59 @@ def plot_cpg_density(
         add_panel_letter(ax, letter)
         _annotate_bars_h(ax, bars, ratio.to_numpy(dtype=float))
 
+    legend_levels = [clone_display_map.get(clone, clone) for clone in clones]
+    legend_color_map = {
+        clone_display_map.get(clone, clone): clone_color_map.get(clone, UNKNOWN_COLOR)
+        for clone in clones
+    }
+    input_slopes = calc_slopes_by_clone('Input_Read_Pairs')
+    scatter_legend_levels = []
+    scatter_legend_colors = {}
+    fig_scatter, ax_scatter = plt.subplots(figsize=(10, 7), dpi=PlotParams.DPI)
+    x = pd.to_numeric(plot_df['Input_Read_Pairs'], errors='coerce')
+    y = pd.to_numeric(plot_df[metric_a], errors='coerce')
+    valid = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y >= 0)
+    for clone in clones:
+        selected = valid & (plot_df['CloneID'] == clone)
+        ax_scatter.scatter(
+            x[selected], y[selected],
+            color=clone_color_map.get(clone, UNKNOWN_COLOR),
+            s=24, alpha=0.75, edgecolors='none',
+        )
+        slope = input_slopes[0].get(clone, np.nan)
+        if np.isfinite(slope) and selected.any():
+            line_x = np.array([0.0, float(x[selected].max())])
+            ax_scatter.plot(
+                line_x, slope * line_x,
+                color=clone_color_map.get(clone, UNKNOWN_COLOR),
+                linewidth=1.5, alpha=0.9,
+            )
+        slope_label = _format_slope_value(slope) if np.isfinite(slope) else 'N/A'
+        label = f'{clone_display_map.get(clone, clone)} (slope={slope_label})'
+        scatter_legend_levels.append(label)
+        scatter_legend_colors[label] = clone_color_map.get(clone, UNKNOWN_COLOR)
+    format_ax(
+        ax_scatter, title='Unique CpG Sites vs Input Pairs',
+        xlabel='Input read pairs', ylabel='Unique CpG sites',
+    )
+    ax_scatter.set_xlim(left=0)
+    ax_scatter.set_ylim(bottom=0)
+    add_right_legend(
+        fig_scatter, scatter_legend_levels, scatter_legend_colors, title='CloneID'
+    )
+    add_cloneid_omission_note(fig_scatter, omitted, y=0.015)
+    fig_scatter.tight_layout(rect=[0, 0.03, 0.80, 0.985])
+    if out_path:
+        scatter_path = Path(out_path)
+        fig_scatter.savefig(
+            scatter_path.with_name(
+                f'{scatter_path.stem}_Unique_vs_Input_Pairs{scatter_path.suffix}'
+            ),
+            bbox_inches='tight',
+        )
+    plt.show()
+    plt.close(fig_scatter)
+
     fig_h = max(28.0, 0.56 * len(clones) + 12.0)
     fig = plt.figure(figsize=(22, fig_h), dpi=PlotParams.DPI)
     gs = fig.add_gridspec(4, 2, height_ratios=[1.0, 1.2, 1.0, 1.2])
@@ -4623,7 +4681,7 @@ def plot_cpg_density(
         xlabel_denominator,
         ratio_prefix,
     ) in enumerate(denominator_groups):
-        slope_a, slope_b = calc_slopes_by_clone(x_col)
+        slope_a, slope_b = input_slopes if group_idx == 0 else calc_slopes_by_clone(x_col)
         row = group_idx * 2
         ax_a = fig.add_subplot(gs[row, 0])
         ax_b = fig.add_subplot(gs[row, 1])
@@ -4650,11 +4708,6 @@ def plot_cpg_density(
             next(panel_letters),
         )
 
-    legend_levels = [clone_display_map.get(clone, clone) for clone in clones]
-    legend_color_map = {
-        clone_display_map.get(clone, clone): clone_color_map.get(clone, UNKNOWN_COLOR)
-        for clone in clones
-    }
     add_right_legend(fig, legend_levels, legend_color_map, title='CloneID')
     add_cloneid_omission_note(fig, omitted, y=0.015)
     plt.tight_layout(rect=[0, 0, 0.885, 0.985], w_pad=2.6, h_pad=2.8)
