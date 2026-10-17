@@ -1,4 +1,6 @@
-# Alopex v14.13
+# Alopex v15
+
+- 发布版本：v15；正式源码以 Git tag `v15` 为准。
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -11,7 +13,7 @@ Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报
 
 用户入口只有 `core/doctor.sh`（构建与维护）和 `core/run_pipeline.sh`（项目运行）。
 完整配置及参数默认值见初始化项目生成的 `00_config/config.yaml`；下游用法见
-[下游 README](downstream/README.md)，验证范围和升级说明见本版 Release。
+[下游 README](downstream/README.md)，升级说明见[本版 Release](https://github.com/Felix-owo/Alopex/releases/tag/v15)。
 
 本仓库是 Alopex 的 GPL-3.0 公开发布副本，包含核心 workflow、Rust demultiplexer、下游 QC、
 Doctor 回归 fixture 和默认 Barcode Map。维护规范、内部文档、测试套件与 benchmark 归档不随公开副本分发。
@@ -76,7 +78,7 @@ Doctor 检查或修复环境、Rust demultiplexer、hg38/mm10 reference 和三�
 HPC 登录节点提交 Slurm workers；macOS 或已有 allocation 内串行运行。
 
 成功结尾为 `FINAL STATUS: READY`。日志在 `logs/doctor/`；成功清理沙箱，失败保留沙箱和诊断。
-Doctor 每次重跑三路线，READY 仅证明本次工具链及小样本回归通过；完整验证边界见本版 Release。
+Doctor 每次重跑三路线，READY 仅证明本次工具链及小样本回归通过，不代表真实全库科学等价或性能验证。
 
 可单独维护某一段，或先在登录节点填充下载缓存：
 
@@ -87,8 +89,10 @@ bash core/doctor.sh reference --check
 bash core/doctor.sh demux --check
 ```
 
-去掉 `--check` 即检查并按需修复。Conda 构建在 macOS 或 HPC 登录节点执行；已有 allocation
-允许只读 `conda --check`。环境与 reference 的角色及恢复机制由 Doctor 统一检查。
+去掉 `--check` 执行对应维护段；`demux` 段会测试并构建候选、核对源码指纹后原子替换
+`conda/rust/bin/demux_rs`。完整 Doctor 先运行只读检查，当前二进制匹配时直接复用。
+Conda 构建在 macOS 或 HPC 登录节点执行；已有 allocation
+允许只读 `conda --check`。环境与 reference 的完整性由 Doctor 统一检查。
 
 ## 4. 初始化与配置
 
@@ -132,7 +136,7 @@ Bismark 和 BISCUIT 参数放在 `common`；协议模块只写 backend 与差异
 `common.bismark.local_alignment: true` 对 Bismark 路线生效，
 `cabernet.bismark.local_alignment: false` 只覆盖 Cabernet。
 物种/reference、`analysis`、`runtime`、`slurm`、`retention` 为全局设置。
-当前只接受 schema 3 模块结构；完整参数、默认值与覆盖范围见初始化生成的 config 注释。
+当前只接受 schema 3 模块结构；完整参数、默认值与覆盖范围见初始化生成的 config 模板和内置 schema。
 
 - **Cabernet/SRD**：默认 Bismark，可选择 BISCUIT。Bismark 所有协议/模式固定 `--maxins 1000`；
   `local_alignment` 默认 `false`（combined-index end-to-end），`true` 使用 CT/GA local。
@@ -149,7 +153,7 @@ Bismark 和 BISCUIT 参数放在 `common`；协议模块只写 backend 与差异
   OT/OB 链支持评估。需要额外重分析时设置 `retention.keep_final_bam: true`。
 
 TAPS/Droplet 的 backend，以及 Droplet 的 spacer/library_type 属于固定策略，不接受 config
-声明；无差异时可写 `taps: {}`、`droplet: {}` 或省略模块。科学阈值见 config 注释；资源档位由 Pipeline 按输入规模自动选择。
+声明；无差异时可写 `taps: {}`、`droplet: {}` 或省略模块。科学阈值与资源档位见参数表。
 
 孔板 Barcode Map 至少含 `DNA_Barcode,PlateID,Cell_Order`，SRD 还需 `RNA_Barcode`。
 barcode 为 8 或 10 bp A/C/G/T，同长度序列间 Hamming distance 必须大于 2；PlateID 和
@@ -183,7 +187,8 @@ mate 支持 `R1/R2` 或 `1/2`，分隔符支持下划线、点、连字符；lan
 提示并跳过。**选样后再 refresh 会重新补登记有效输入。**
 
 Cabernet/TAPS 的 `rna_sample` 可关联外部 RNA_DARLIN 项目的原始 RNA basename；SRD 该列是
-本地 RNA-enrichment tube。DNA/RNA 对齐与 Droplet 的独立文库映射统一见
+本地 RNA-enrichment tube。refresh 不会把外部 RNA 同名的未登记 FASTQ 自动当作 DNA，
+即使原关联行的 DNA 输入已经缺失；需显式声明本地 DNA 输入才能使用该名称。DNA/RNA 对齐与 Droplet 的独立文库映射统一见
 [下游关联说明](downstream/README.md#关联-rna_darlin-结果)。
 
 ## 6. 运行与恢复
@@ -195,7 +200,7 @@ Cabernet/TAPS 的 `rna_sample` 可关联外部 RNA_DARLIN 项目的原始 RNA ba
 
 项目从当前目录向上定位。launcher 不接受额外 Snakemake flag 或 target；初始化、刷新和
 运行分别执行。macOS 使用 local executor；Linux 当前 shell/allocation 承载 controller，
-规则作业经 Slurm 提交。`runtime.*`/`slurm.*` 预算含义见 config 注释；失败任务最多执行三次，内存按首次请求的 1/1.5/2 倍重试。
+规则作业经 Slurm 提交。`runtime.*`/`slurm.*` 预算及重试策略见参数表。
 
 完整日志：`04_logs/controller/<run_id>.log`。终端每 60 秒、重定向时每 300 秒展示进度；
 逐规则证据在 `04_logs/rules/` 和 `04_logs/slurm/`，资源规则的
@@ -212,6 +217,9 @@ stage 重试。已完成的快路只读退出；清理失败保留残留与告�
 改回 `false` 后，成功发布会在同一个锁内清理当前 backend 活跃细胞的最终 BAM/索引；
 残留清理失败时，下次启动会重试。SRD 的 RNA BAM 不受此开关影响。
 下游读取期间若上游重新发布，旧交付 context 会拒绝继续读取或提交 QC，需要重新启动下游。
+发布前核对 delivery-ready 与 snapshot 的交付/项目绑定，失配时保留旧交付。
+Doctor 组装 reference 中断后会持锁恢复：FASTA/FAI 安装前恢复旧文件，完整安装后继续
+清理旧 index/TSS/CpG；未完成事务不报告 READY。构建与发布只清理本次调用的临时文件。
 
 ## 7. 结果与完成确认
 
@@ -235,7 +243,10 @@ CpG 唯一格式为 `chrom, pos, methyl, unmethyl`，tab 分隔、pos 默认 1-b
 3. 再次运行 launcher 显示 `Alopex delivery is complete and current`，不启动科学作业。
 
 MultiQC 汇总原生 mapping、pair funnel、重复、过滤、对照和适用的 M-bias；不同 backend
-的 mapping 分母不同。科学解释与空结果的判定见 config 注释及上文协议说明；已验证数据范围见本版 Release。
+的 mapping 分母不同。科学解释、空结果和已验证数据范围以参数表及 benchmark 为准。
+解复用拒绝非法 FASTQ 质量值，完整读取和 worker 成功后才写完成报告；孔板 ME 的 indel
+fallback 按实际锚点终点剪切。TAPS BAM 的所有 RG 必须绑定当前样本，pair funnel 拒绝
+负数、布尔值和非整数计数；Droplet calling 拒绝 counts 行列错位。
 超过 1,000 个活跃 DNA 细胞时，MultiQC 固定抽取 1,000 个细胞，所有逐细胞模块使用同一集合；
 较小项目保留全部输入。报告首页标明抽样范围，文库级解复用概要仍为全库计数。
 抽样只用于报告展示，最终样本清单、全部细胞的科学结果及 BAM 保留策略不变。
@@ -246,6 +257,8 @@ MultiQC 汇总原生 mapping、pair funnel、重复、过滤、对照和适用�
 `DNA_PROJECT_ROOT`、`DNA_PIPELINE_ROOT`。输出固定在当前交付的 `06_downstream/QC_Results_<生成时间>/`。
 TSS 默认每个 CloneID 抽检 10%（向上取整），不足 10 个全检、超过 1000 个固定抽 100 个；`TSS_SAMPLE_FRACTION=1.0` 可全量检查，完整 QC 和 adata 保留全部细胞。TSS 覆盖按 backed 行分批读取，避免反复读取整矩阵。
 RawAdata 重建仍完整校验 CpG，以 ASCII 数字检查减少逐行解析开销，不新增校验 worker。
+下游保留 FAI 的全部 contig；点号、`NA` 和前导零不改变染色体身份。
+科学缓存重算前撤销旧身份、成功导出后再提交，防止中断后复用其他参数的结果。
 Notebook 启动、20 列 QC、RawAdata/single-CpG、缓存重算和 RNA 关联均见
 [下游 README](downstream/README.md)。
 Final QC 默认按 CloneID 分面展示直方图，纵轴为样本数（Counts）；CpG sites 使用对数横轴，其他指标保持线性，100 分箱叠加平滑计数峰，支持选择 CloneID 与批量指标。

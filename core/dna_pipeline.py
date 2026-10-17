@@ -98,13 +98,15 @@ def stable_file_identity(
 
 
 def atomic_write_bytes(path: str | Path, data: bytes, *, mode: int | None = None) -> None:
-    """在目标路径旁写临时文件，再以一次原子 rename 发布。"""
+    """在目标路径旁写本次独占的临时文件，再以一次原子 rename 发布；仅清理本次创建的文件。"""
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
+    temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    created = False
     try:
-        with temporary.open("wb") as handle:
+        with temporary.open("xb") as handle:
+            created = True
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -112,7 +114,8 @@ def atomic_write_bytes(path: str | Path, data: bytes, *, mode: int | None = None
             os.chmod(temporary, mode)
         os.replace(temporary, destination)
     finally:
-        temporary.unlink(missing_ok=True)
+        if created:
+            temporary.unlink(missing_ok=True)
 
 
 def atomic_write_json(
@@ -197,7 +200,7 @@ def publish(
     bam_destination: Path | None,
     samtools: str,
 ) -> None:
-    """将文件组 staged 为 .partial 并校验；替换前撤销旧 commit_last，全部完成后最后提交它。"""
+    """将文件组写入本次独占 partial 并校验；替换前撤销旧 commit_last，全部完成后最后提交它。"""
     destinations = [destination for _source, destination in pairs]
     if len(destinations) != len(set(destinations)):
         raise ValueError("duplicate destination in atomic publish bundle")
@@ -206,7 +209,6 @@ def publish(
     if bam_destination is not None and bam_destination not in destinations:
         raise ValueError("--bam-destination must match one --file destination")
 
-    job_token = os.environ.get("SLURM_JOB_ID", "local")
     partials: dict[Path, Path] = {}
     try:
         for source, destination in pairs:
@@ -215,12 +217,8 @@ def publish(
             destination.parent.mkdir(parents=True, exist_ok=True)
 
 
-            for orphan in destination.parent.glob(f"{destination.name}.partial.*"):
-                if orphan.is_file() or orphan.is_symlink():
-                    orphan.unlink()
-
             partial = destination.with_name(
-                f"{destination.name}.partial.{job_token}.{os.getpid()}"
+                f"{destination.name}.partial.{os.getpid()}.{uuid.uuid4().hex}"
             )
             with source.open("rb") as reader, partial.open("xb") as writer:
                 partials[destination] = partial
@@ -288,13 +286,8 @@ def write_tsv_atomic(
     rows: Sequence[Mapping[str, object]],
     fieldnames: Sequence[str],
 ) -> None:
-    """先在最终路径旁写临时文件，再以一次原子 rename 发布小体积 manifest。"""
-
-    output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".tmp")
-    temporary.write_text(render_tsv(rows, fieldnames), encoding="utf-8")
-    temporary.replace(output)
+    """用本次独占的临时文件原子发布 manifest；失败保留旧文件并清理自己的临时文件。"""
+    atomic_write_bytes(path, render_tsv(rows, fieldnames).encode("utf-8"))
 
 
 def effective_cpu_count(requested: int = 0) -> int:
@@ -2529,13 +2522,6 @@ def resolve_single_pair_fastq_collisions(
             f"FASTQ collision normalization refused ({reason}); nothing was renamed"
         )
 
-    def _sha256(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
-
     for sample in sorted(sample_families):
         layout = sample_layouts[sample]
 
@@ -2580,7 +2566,7 @@ def resolve_single_pair_fastq_collisions(
         for mate in ("R1", "R2"):
             for parent in ordered_parents:
                 path = plain[parent][mate][0]
-                digests[mate][str(path)] = _sha256(path)
+                digests[mate][str(path)] = sha256_file(path, chunk_size=1024 * 1024)
             seen: dict[str, str] = {}
             for owner in sorted(digests[mate], key=str):
                 fingerprint = digests[mate][owner]
@@ -2916,9 +2902,6 @@ def _parse_project_sample_manifest(
     return rows
 
 
-MANIFEST_FIELDS = PROJECT_SAMPLE_MANIFEST_FIELDS
-
-
 def _read_existing_manifest_loose(path: Path) -> list[ProjectSampleRow]:
     if not path.is_file() or path.stat().st_size == 0:
         return []
@@ -2927,16 +2910,16 @@ def _read_existing_manifest_loose(path: Path) -> list[ProjectSampleRow]:
         fields = list(reader.fieldnames or [])
         if not fields:
             return []
-        if fields != list(MANIFEST_FIELDS):
+        if fields != list(PROJECT_SAMPLE_MANIFEST_FIELDS):
             raise ValueError(
                 f"Existing sample manifest {path} header/order does not match the current contract: "
-                f"expected={list(MANIFEST_FIELDS)!r}, observed={fields!r}"
+                f"expected={list(PROJECT_SAMPLE_MANIFEST_FIELDS)!r}, observed={fields!r}"
             )
         rows: list[ProjectSampleRow] = []
         for raw in reader:
             if None in raw:
                 raise ValueError(f"Existing sample manifest {path} line {reader.line_num} has too many fields")
-            row = {field: str(raw.get(field, "") or "").strip() for field in MANIFEST_FIELDS}
+            row = {field: str(raw.get(field, "") or "").strip() for field in PROJECT_SAMPLE_MANIFEST_FIELDS}
             if any(row.values()):
                 rows.append(row)
         return rows
@@ -2958,11 +2941,14 @@ def build_refreshed_rows(
     discovered_set = set(discovered)
     rows_by_id: dict[str, dict[str, str]] = {}
     raw_owners: dict[str, tuple[str, str]] = {}
+    external_rna: set[str] = set()
     for old in existing_rows:
         current_dna = str(
             old.get("dna_raw_sample", "") or ""
         ).strip()
         current_rna = str(old.get("rna_sample", "") or "").strip()
+        if current_rna and "rna_sample" not in input_columns:
+            external_rna.add(current_rna)
         kept_dna = current_dna if current_dna in discovered_set else ""
         kept_rna = current_rna if "rna_sample" not in input_columns or current_rna in discovered_set else ""
         if not kept_dna and not ("rna_sample" in input_columns and kept_rna):
@@ -3007,7 +2993,6 @@ def build_refreshed_rows(
 
     unmatched = [sample for sample in discovered if sample not in raw_owners]
     if "rna_sample" not in input_columns:
-        external_rna = {row["rna_sample"] for row in rows_by_id.values() if row["rna_sample"]}
         misplaced = sorted(set(unmatched) & external_rna)
         if misplaced:
             raise ValueError(
@@ -3055,7 +3040,7 @@ def _canonical_project_manifest_rows(
     for raw in rows:
         row = {
             field: str(raw.get(field, "") or "").strip()
-            for field in MANIFEST_FIELDS
+            for field in PROJECT_SAMPLE_MANIFEST_FIELDS
         }
         row["protocol"] = row["protocol"].lower()
         normalized.append(row)
@@ -3113,7 +3098,7 @@ def refresh_manifest(
         raise ValueError("Manifest refresh produced no rows")
 
 
-    new_text = render_tsv(rows, MANIFEST_FIELDS)
+    new_text = render_tsv(rows, PROJECT_SAMPLE_MANIFEST_FIELDS)
     validated = _parse_project_sample_manifest(
         io.StringIO(new_text), path=manifest_path, species=species, protocol=protocol
     )
@@ -3129,7 +3114,7 @@ def refresh_manifest(
                 if manifest_path.is_file() and existing_rows:
                     backup_path = manifest_path.with_name(f"{manifest_path.name}.bak")
                     shutil.copy2(manifest_path, backup_path)
-                write_tsv_atomic(manifest_path, rows, MANIFEST_FIELDS)
+                write_tsv_atomic(manifest_path, rows, PROJECT_SAMPLE_MANIFEST_FIELDS)
         except Exception:
             for source, target in reversed(fastq_renames):
                 target.rename(source)
@@ -3599,6 +3584,8 @@ def call_droplet_cells(
         if reader.fieldnames != ["barcode", "count", "below_q20", "q30"]:
             raise ValueError("Droplet counts require barcode/count/below_q20/q30 columns")
         for row in reader:
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f"Droplet count row columns disagree with header at {counts_path}:{reader.line_num}")
             barcode, count = row["barcode"], int(row["count"])
             if not re.fullmatch(r"[ACGT]{17}", barcode) or count < 1 or barcode in seen:
                 raise ValueError("Invalid or duplicate Droplet barcode count")
@@ -4474,8 +4461,7 @@ def collect_rna_fastq(
                 )
             destination = rna_fastq_collect_destination(Path(intermediate_dir), route_id, cell_id, mate)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(destination.name + f".tmp.{os.getpid()}")
-            temporary.unlink(missing_ok=True)
+            temporary = destination.with_name(destination.name + f".tmp.{os.getpid()}.{uuid.uuid4().hex}")
             try:
                 os.link(source, temporary)
                 os.replace(temporary, destination)
@@ -4485,15 +4471,7 @@ def collect_rna_fastq(
 
     payload = {"run_id": run_id, "collected_files": collected}
     marker_path = Path(marker)
-    marker_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = marker_path.with_name(marker_path.name + f".tmp.{os.getpid()}")
-    try:
-        temporary.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        os.replace(temporary, marker_path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_json(marker_path, payload)
     print(f"INFO: run={run_id} collected_rna_files={collected}")
     return collected
 
@@ -5125,6 +5103,22 @@ def _read_high_cph_summary(path: Path, sample: str, backend: str) -> dict[str, o
 BSCONV_P_COLUMNS = 9
 
 
+def read_pileup_variant_count(path: str | Path, sample: str) -> int:
+    """读取当前细胞的 pileup 计数；非法计数或身份不得触发空结果分支。"""
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
+            or value["schema_version"] != 1 or value.get("sample") != sample):
+        raise ValueError(f"BISCUIT pileup stats schema/sample mismatch: {path}")
+    for field in ("mapped_reads", "variant_records"):
+        if type(value.get(field)) is not int or value[field] < 0:
+            raise ValueError(f"BISCUIT pileup stats requires a nonnegative integer {field}: {path}")
+    if (type(value.get("empty")) is not bool
+            or value["empty"] != (value["variant_records"] == 0)
+            or (value["mapped_reads"] == 0 and value["variant_records"] != 0)):
+        raise ValueError(f"BISCUIT pileup stats empty/count accounting mismatch: {path}")
+    return value["variant_records"]
+
+
 def open_text(path: Path) -> TextIO:
     if str(path) == "-":
         return sys.stdin
@@ -5628,6 +5622,7 @@ def _read_biscuit_native_mapping(path: Path) -> dict[str, object]:
     if not rows:
         raise ValueError(f"BISCUIT MAPQ table lacks count rows: {path}")
     optimal = suboptimal = unaligned = 0
+    seen_mapq: set[str | int] = set()
     for line in rows:
         fields = line.split()
         if len(fields) != 2:
@@ -5639,14 +5634,21 @@ def _read_biscuit_native_mapping(path: Path) -> dict[str, object]:
             raise ValueError(f"Invalid BISCUIT MAPQ count in {path}: {line!r}") from exc
         if count < 0:
             raise ValueError(f"Negative BISCUIT MAPQ count in {path}: {line!r}")
+        label_key: str | int = label
+        if label != "unmapped":
+            try:
+                label_key = int(label)
+            except ValueError as exc:
+                raise ValueError(f"Invalid BISCUIT MAPQ label in {path}: {label!r}") from exc
+            if not 0 <= label_key <= 255:
+                raise ValueError(f"Invalid BISCUIT MAPQ range in {path}: {label!r}")
+        if label_key in seen_mapq:
+            raise ValueError(f"Duplicate BISCUIT MAPQ category in {path}: {label!r}")
+        seen_mapq.add(label_key)
         if label == "unmapped":
             unaligned += count
         else:
-            try:
-                mapq = int(label)
-            except ValueError as exc:
-                raise ValueError(f"Invalid BISCUIT MAPQ label in {path}: {label!r}") from exc
-            if mapq >= 40:
+            if label_key >= 40:
                 optimal += count
             else:
                 suboptimal += count
@@ -5890,17 +5892,35 @@ def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Pat
                 seen.add(first.query_name)
                 if (first.flag, second.flag) not in {(99, 147), (163, 83), (147, 99), (83, 163)}:
                     raise ValueError("Unexpected Bismark paired flags")
+                if (not first.has_tag("XG") or not second.has_tag("XG")
+                        or first.get_tag("XG") != second.get_tag("XG")):
+                    raise ValueError("Droplet mates disagree on Bismark genome conversion")
+                if (any(not record.has_tag("XR") for record in (first, second))
+                        or {first.get_tag("XR"), second.get_tag("XR")} != {"CT", "GA"}):
+                    raise ValueError("Droplet mates require complementary Bismark read conversions")
+                if (first.reference_id != second.reference_id
+                        or any(record.next_reference_id != mate.reference_id
+                               or record.next_reference_start != mate.reference_start
+                               for record, mate in ((first, second), (second, first)))):
+                    raise ValueError("Droplet mate coordinates disagree with the actual pair")
                 umi = first.query_name.rsplit(":", 1)[-1]
                 if not re.fullmatch(r"[ACGTN]{12}", umi):
                     raise ValueError("Droplet QNAME must end with a 12 bp UMI")
-                for mate, record in enumerate((first, second), 1):
+                for record in (first, second):
+                    mate = 1 if record.is_read1 else 2
                     contig = record.reference_name
                     if contig not in checked_contigs:
                         if contig not in reference_lengths or source.get_reference_length(contig) != reference_lengths[contig]:
                             raise ValueError(f"Droplet BAM/reference contig mismatch: {contig}")
                         checked_contigs.add(contig)
+                    if (record.reference_end is None
+                            or not 0 <= record.reference_start < record.reference_end <= reference_lengths[contig]):
+                        raise ValueError(f"Droplet alignment exceeds reference bounds: {contig}")
                     if any(not record.has_tag(tag) for tag in ("XM", "XR", "XG")):
                         raise ValueError("Bismark methylation tags missing")
+                    if (record.query_sequence is None or record.query_qualities is None
+                            or len(record.get_tag("XM")) != record.query_length):
+                        raise ValueError("Droplet calling requires sequence, base qualities and matching XM length")
                     if record.has_tag("UR") and record.get_tag("UR") != umi:
                         raise ValueError("Droplet UR tag disagrees with QNAME")
                     conversion = record.get_tag("XG")
@@ -6030,7 +6050,7 @@ def read_droplet_umi_qc(path: str | Path, sample: str) -> dict[str, Any]:
     for key, value in {"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY,
                        "min_mapq": DROPLET_MIN_MAPQ, "min_baseq": DROPLET_MIN_BASEQ,
                        "metric_unit": "cytosine_umi_consensus"}.items():
-        if data.get(key) != value:
+        if type(data.get(key)) is not type(value) or data.get(key) != value:
             raise ValueError(f"Invalid Droplet UMI QC {key}: {path}")
     for key in ("processed_pairs", "umi_with_n_pairs"):
         data[key] = _integer(data.get(key), key, Path(path))
@@ -6040,9 +6060,10 @@ def read_droplet_umi_qc(path: str | Path, sample: str) -> dict[str, Any]:
         values = data.get("contexts", {}).get(context, {})
         for key in ("methyl", "unmethyl", "read_observations", "umi_groups", "merged_umis", "ambiguous_umis", "strand_sites"):
             values[key] = _integer(values.get(key), key, Path(path))
-            if values[key] < 0:
-                raise ValueError("Negative Droplet UMI count")
         called = values["methyl"] + values["unmethyl"]
+        if ((data["processed_pairs"] == 0 and values["read_observations"] != 0)
+                or bool(called) != bool(values["strand_sites"])):
+            raise ValueError("Droplet UMI observations disagree with input pairs or called sites")
         if not (values["strand_sites"] <= called <= values["umi_groups"] <= values["read_observations"]):
             raise ValueError("Droplet UMI observation accounting is inconsistent")
         if values["umi_groups"] != called + values["merged_umis"] + values["ambiguous_umis"]:
@@ -6332,8 +6353,11 @@ def write_taps_alignment_qc(bam: str, samtools: str, scratch: str, sample: str, 
         header = source.header.to_dict()
         if header.get("HD", {}).get("SO") != "coordinate" or not source.has_index():
             raise ValueError("TAPS BAM must be coordinate sorted and indexed")
-        if not any(rg.get("SM") == sample for rg in header.get("RG", [])):
-            raise ValueError("TAPS BAM lacks the sample read group")
+        groups = header.get("RG", [])
+        group_ids = {rg.get("ID") for rg in groups}
+        if (not groups or None in group_ids or "" in group_ids or len(group_ids) != len(groups)
+                or any(rg.get("SM") != sample for rg in groups)):
+            raise ValueError("TAPS BAM requires unique read groups bound to the active sample")
     process = subprocess.Popen([samtools, "collate", "-O", "-u", "-T", str(Path(scratch) / "qc_collate"), bam], stdout=subprocess.PIPE)
     try:
         with pysam.AlignmentFile(process.stdout, "rb") as source:
@@ -6345,6 +6369,8 @@ def write_taps_alignment_qc(bam: str, samtools: str, scratch: str, sample: str, 
                 ):
                     raise ValueError(f"TAPS primary pair is incomplete or duplicated: {name}")
                 for r in records:
+                    if not r.has_tag("RG") or r.get_tag("RG") not in group_ids:
+                        raise ValueError(f"TAPS record has an unbound read group: {name}")
                     counts["bam_records"] += 1
                     counts["bam_primary_records"] += int(not r.is_secondary and not r.is_supplementary)
                     for key, flag in (("duplicate", r.is_duplicate), ("unmapped", r.is_unmapped),
@@ -6576,7 +6602,7 @@ def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str, 
 
 
 def emit_taps_snps(vcf: str, output: str, sample: str, *, reference: str) -> int:
-    """保留原生 PASS 非参考单碱基变异及注释，按调用参考校正 VCF contig 长度并建立索引。"""
+    """校验原生占位样本及候选位点参考，保留 PASS SNP 注释并绑定当前细胞、建立索引。"""
     import pysam
     import pysam.bcftools
 
@@ -6585,10 +6611,12 @@ def emit_taps_snps(vcf: str, output: str, sample: str, *, reference: str) -> int
         selected_vcf = str(Path(selected) / "variants.vcf")
         pysam.bcftools.view("--no-version", "--no-update", "--include", 'FILTER="PASS" && (GT="alt" || GT="mis")',
                             "--output-type", "v", "--output", selected_vcf, vcf, catch_stdout=False)
-        with pysam.VariantFile(selected_vcf) as source:
-            if len(source.header.samples) != 1:
-                raise ValueError("TAPS SNP VCF requires exactly one sample")
+        with pysam.VariantFile(selected_vcf) as source, pysam.FastaFile(reference) as ref:
+            if list(source.header.samples) != ["sample"]:
+                raise ValueError("TAPS SNP VCF requires the native Rastair placeholder sample")
             old_sample = next(iter(source.header.samples))
+            reference_lengths = dict(zip(ref.references, ref.lengths))
+            reference_bases = _TapsReferenceWindow(ref)
             header_text = str(source.header).rsplit("\t", 1)[0] + "\t" + sample + "\n"
             with pysam.BGZFile(output, "w") as target:
                 target.write(header_text.encode())
@@ -6599,6 +6627,11 @@ def emit_taps_snps(vcf: str, output: str, sample: str, *, reference: str) -> int
                             or any(len(a) != 1 or a not in "ACGT" for a in alleles)
                             or not any(a is not None and a > 0 for a in genotype)):
                         continue
+                    if (row.contig not in reference_lengths or row.start < 0
+                            or row.stop > reference_lengths[row.contig]):
+                        raise ValueError(f"TAPS SNP coordinate is outside reference FASTA: {row.contig}:{row.pos}")
+                    if reference_bases.fetch(row.contig, row.start, row.stop).upper() != row.ref:
+                        raise ValueError(f"TAPS SNP REF disagrees with reference FASTA: {row.contig}:{row.pos}")
                     target.write(str(row).encode())
                     count += 1
     with tempfile.TemporaryDirectory(prefix=".taps_snp.", dir=Path(output).parent) as scratch:
@@ -6660,12 +6693,12 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
             chrom = row[column["#chr"]]
             if chrom not in contigs:
                 raise ValueError(f"{label} contig {chrom!r} is absent from the reference FASTA")
-            try:
-                pos, end, mod, unmod, depth = (int(row[column[k]]) for k in ("start", "end", "mod", "unmod", "coverage"))
-            except ValueError as exc:
-                raise ValueError(f"{label} has non-integer coordinates/counts") from exc
-            if min(pos, mod, unmod, depth) < 0 or end != pos + 1 or mod + unmod > depth:
-                raise ValueError(f"Invalid Rastair coordinate/counts: {chrom}:{pos}")
+            numeric = [row[column[k]] for k in ("start", "end", "mod", "unmod", "coverage")]
+            if any(re.fullmatch(r"[0-9]+", value) is None for value in numeric):
+                raise ValueError(f"{label} has non-integer coordinates/counts (requires nonnegative ASCII integers)")
+            pos, end, mod, unmod, depth = map(int, numeric)
+            if end != pos + 1 or end > ref.get_reference_length(chrom) or mod + unmod > depth:
+                raise ValueError(f"{label}: Invalid Rastair coordinate/counts: {chrom}:{pos}")
             key = (contigs[chrom], pos)
             if previous is not None and key <= previous:
                 raise ValueError("Rastair BED is not ordered or contains duplicate positions")
@@ -7111,9 +7144,13 @@ def _taps_cell_metrics(
     qc = json.loads(paths["rastair_qc"].read_text())
     if qc["sample"] != cell_id or qc["backend"] != "rastair":
         raise ValueError("TAPS QC identity disagrees with the active cell")
+    for key in ("trimmed_pairs", "bam_primary_records", "backend_accepted_pairs", "backend_rejected_pairs",
+                "duplicate_pairs", "postdedup_pairs", "unmapped_pairs", "discordant_pairs", "quality_rejected_pairs"):
+        if type(qc[key]) is not int or qc[key] < 0:
+            raise ValueError(f"TAPS QC requires a nonnegative integer: {key}")
     if qc["trimmed_pairs"] != cutadapt["trimmed_pairs"] or qc["bam_primary_records"] != 2 * qc["trimmed_pairs"]:
         raise ValueError("TAPS BAM and Cutadapt pair counts disagree")
-    accepted, rejected, duplicates, postdedup = (int(qc[k]) for k in (
+    accepted, rejected, duplicates, postdedup = (qc[k] for k in (
         "backend_accepted_pairs", "backend_rejected_pairs", "duplicate_pairs", "postdedup_pairs"))
     if accepted + rejected != qc["trimmed_pairs"] or postdedup + duplicates != accepted:
         raise ValueError("TAPS pair funnel does not close")
@@ -8022,7 +8059,7 @@ def snapshot_input_path(snapshot: str | Path, key: str) -> Path:
 RUN_MANIFEST_SCHEMA_VERSION = 8
 
 
-DELIVERY_READY_SCHEMA_VERSION = 2
+DELIVERY_READY_SCHEMA_VERSION = 3
 
 
 _DELIVERY_DIR_NAMES = frozenset(PUBLIC_RESULT_DIR_NAMES)
@@ -8048,12 +8085,20 @@ def _check_result_directories(root: Path, relative: Path, *, label: str) -> None
             directory /= part
 
 
+def _staged_file_state(path: Path) -> dict[str, int]:
+    """绑定已哈希文件的 inode 与内容修改状态；硬链接改变 ctime，不用于恢复判定。"""
+    stat = path.stat()
+    return {"device": stat.st_dev, "inode": stat.st_ino,
+            "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
 def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
     manifest = Path("QC_Results/sample_manifest.tsv")
     declared = {manifest, Path("QC_Results/multiqc_report.html")}
     _check_result_directories(results, manifest, label="staged delivery")
     if (results / manifest).is_symlink():
         raise ValueError(f"staged result may not be a symlink: {results / manifest}")
+    manifest_state = _staged_file_state(results / manifest)
     with (results / manifest).open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {"sample_id", "cpg_path", "snp_path"}
@@ -8082,12 +8127,18 @@ def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
             raise ValueError(f"staged result may not be a symlink: {path}")
         if not path.is_file():
             raise FileNotFoundError(f"declared staged result is missing: {path}")
-        stat = path.stat()
+        state = _staged_file_state(path)
+        if relative == manifest and state != manifest_state:
+            raise ValueError(f"staged manifest changed during inventory: {path}")
+        digest = sha256_file(path)
+        if _staged_file_state(path) != state:
+            raise ValueError(f"staged output changed while hashing: {path}")
         records.append(
             {
                 "path": relative.as_posix(),
-                "size_bytes": stat.st_size,
-                "sha256": sha256_file(path),
+                "size_bytes": state["size_bytes"],
+                "sha256": digest,
+                "stage_identity": state,
             }
         )
     return records
@@ -8098,6 +8149,7 @@ def _validate_inventory(
     records: object,
     *,
     label: str,
+    staged: bool = False,
 ) -> list[dict[str, object]]:
     if not isinstance(records, list) or not records:
         raise ValueError(f"{label} inventory is empty or malformed")
@@ -8126,6 +8178,11 @@ def _validate_inventory(
         stat = path.stat()
         if stat.st_size != raw.get("size_bytes"):
             raise ValueError(f"{label} output size changed: {path}")
+        if staged:
+            state = raw.get("stage_identity")
+            if (not isinstance(state, dict) or any(type(value) is not int for value in state.values())
+                    or state != _staged_file_state(path)):
+                raise ValueError(f"staged output identity changed: {path}; regenerate delivery-ready")
         validated.append(dict(raw))
     return validated
 
@@ -8142,7 +8199,9 @@ def write_delivery_ready(
     结构上固定的路径（稳定 stage、公开目录）不落盘。
     """
     output = Path(out_json).expanduser().resolve()
-    stage_results = Path(staged_results_dir).expanduser().resolve()
+    stage_input = Path(staged_results_dir).expanduser().absolute()
+    _check_result_directories(stage_input.parent.parent, Path("02_work/results_stage/_"), label="staged delivery")
+    stage_results = stage_input.resolve()
     project = stage_results.parent.parent
     expected_publish_root = project / "05_tmp" / "finalize" / output.parent.name
     if output.parent != expected_publish_root.resolve(strict=False):
@@ -8188,13 +8247,14 @@ def load_delivery_ready(
     project = Path(str(payload.get("project_dir", ""))).expanduser().resolve()
 
 
-    stage = (project / "02_work" / "results_stage").resolve(strict=False)
+    stage = project / "02_work" / "results_stage"
+    _check_result_directories(project, Path("02_work/results_stage/_"), label="staged delivery")
     delivery_id = _delivery_id(payload.get("delivery_id", ""))
     expected_root = project / "05_tmp" / "finalize" / delivery_id
     if manifest.parent != expected_root.resolve(strict=False):
         raise ValueError("delivery-ready location and delivery_id disagree")
     if validate_staged:
-        _validate_inventory(stage, payload.get("outputs"), label="staged delivery")
+        _validate_inventory(stage, payload.get("outputs"), label="staged delivery", staged=True)
     return payload
 
 
@@ -8260,6 +8320,11 @@ def _run_manifest_payload(ready: Mapping[str, object], snapshot: Mapping[str, ob
     reference_record = basis.get("reference")
     if not all(isinstance(item, Mapping) for item in (pipeline_record, analysis_record, reference_record)):
         raise ValueError("run snapshot provenance identity is incomplete")
+    project_record = basis.get("project")
+    if (snapshot.get("snapshot_id") != ready["delivery_id"]
+            or not isinstance(project_record, Mapping)
+            or Path(str(project_record.get("path", ""))).resolve() != Path(str(ready["project_dir"])).resolve()):
+        raise ValueError("delivery-ready and run snapshot generation/project disagree")
     return {
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "project_dir": str(ready["project_dir"]),
@@ -8281,7 +8346,8 @@ def _run_manifest_payload(ready: Mapping[str, object], snapshot: Mapping[str, ob
             "snapshot_path": str(snapshot_path),
             "reference_path": str(Path(str(reference_record.get("resolved_path", ""))).resolve()),
         },
-        "outputs": [dict(item) for item in ready["outputs"]],
+        "outputs": [{key: item[key] for key in ("path", "size_bytes", "sha256")}
+                    for item in ready["outputs"]],
     }
 
 
@@ -8300,9 +8366,9 @@ def publish_delivery(ready_path: str | Path) -> Path:
     ready = load_delivery_ready(ready_manifest, validate_staged=False)
     project = Path(str(ready["project_dir"])).resolve()
     public = project / _PUBLIC_DIRNAME
-    stage = (project / "02_work" / "results_stage").resolve(strict=False)
+    stage = project / "02_work" / "results_stage"
 
-    outputs = _validate_inventory(stage, ready.get("outputs"), label="staged delivery")
+    outputs = _validate_inventory(stage, ready.get("outputs"), label="staged delivery", staged=True)
     snapshot_path = Path(str(ready["run_snapshot_path"])).resolve()
     snapshot = load_run_snapshot(snapshot_path)
     payload = _run_manifest_payload(ready, snapshot)
@@ -8324,7 +8390,12 @@ def publish_delivery(ready_path: str | Path) -> Path:
         _publish_hardlink(stage, public, relative)
 
     _prune_stale_public_files(public, allowed)
+    _validate_inventory(stage, outputs, label="staged delivery", staged=True)
     _validate_inventory(public, outputs, label="published delivery")
+    for record in outputs:
+        relative = Path(record["path"])
+        if not os.path.samefile(stage / relative, public / relative):
+            raise ValueError(f"published delivery is not the staged hardlink: {relative}")
 
     atomic_write_json(marker, payload)
 
@@ -8590,13 +8661,15 @@ def publish_release(current_s: str, target_s: str) -> None:
     if current.exists() and not current.is_symlink():
         raise ValueError(f"current path is not a symlink: {current}")
     current.parent.mkdir(parents=True, exist_ok=True)
-    temporary = current.with_name(f".{current.name}.publish.{os.getpid()}")
+    temporary = current.with_name(f".{current.name}.publish.{os.getpid()}.{uuid.uuid4().hex}")
+    created = False
     try:
-        temporary.unlink(missing_ok=True)
         os.symlink(str(target), temporary)
+        created = True
         os.replace(temporary, current)
     finally:
-        temporary.unlink(missing_ok=True)
+        if created:
+            temporary.unlink(missing_ok=True)
 
 
 def validate_release(current_s: str, expected_subdir: str, envs_path: str) -> None:
@@ -8651,7 +8724,7 @@ def environment_is_reusable(prefix_s: str, role: str, envs_path: str) -> None:
 
 def _atomic_text_path(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    return path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    return path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
 
 
 def _gtf_attributes(raw: str) -> dict[str, str]:
@@ -9408,6 +9481,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     atomic.add_argument("--samtools", default="samtools")
 
 
+    pileup_count = commands.add_parser("pileup-variant-count", help="校验当前细胞的 BISCUIT pileup 计数。")
+    pileup_count.add_argument("--stats", required=True)
+    pileup_count.add_argument("--sample", required=True)
+
     taps_insert = commands.add_parser("taps-bwa-insert-model", help="推断 TAPS BWA 插入分布并保留长片段。")
     for field in ("r1", "r2", "bwa", "prefix", "scratch"):
         taps_insert.add_argument("--" + field, required=True)
@@ -9642,6 +9719,8 @@ def main(argv: list[str] | None = None) -> int:
                 samtools=args.samtools,
             )
 
+        elif command == "pileup-variant-count":
+            print(read_pileup_variant_count(args.stats, args.sample))
         elif command == "call-droplet-cpg":
             call_droplet_cpg(args.bam, args.reference, args.coverage, args.qc, args.mbias, sample=args.sample, scratch=args.scratch, samtools=args.samtools, threads=args.threads)
         elif command == "call-droplet-cells":

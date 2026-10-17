@@ -65,28 +65,33 @@ txn_slurm_owner_alive() {
     return 0
 }
 
-# 仅按同主机死 PID 或 Slurm 作业死亡证据回收锁；无法证明时保持 busy。
-txn_try_remove_stale_lock() {
-    local lock_dir="$1" owner_host owner_pid owner_job owner_started_epoch alive
-    [[ -d "$lock_dir" ]] || return 1
-    owner_host="$(txn_read_owner_field "$lock_dir" host 2>/dev/null || true)"
-    owner_pid="$(txn_read_owner_field "$lock_dir" pid 2>/dev/null || true)"
+# 固定原锁目录后独占回收；仅按明确死亡证据隔离旧目录，不删除同路径后来建立的新锁。
+txn_try_remove_stale_lock() (
+    local lock_dir="$1" owner_host owner_pid owner_job="" owner_started_epoch alive signal_error quarantine=""
+    [[ -d "$lock_dir" && ! -L "$lock_dir" ]] || return 1
+    lock_dir="$(cd "$lock_dir" && pwd -P)" || return 1
+    cd "$lock_dir" || return 1
+    mkdir .reclaim 2>/dev/null || return 1
+    trap 'rmdir .reclaim 2>/dev/null || true; [[ -z "$quarantine" ]] || rm -rf -- "$quarantine"' EXIT
+    owner_host="$(txn_read_owner_field . host 2>/dev/null || true)"
+    owner_pid="$(txn_read_owner_field . pid 2>/dev/null || true)"
     [[ -n "$owner_host" && "$owner_pid" =~ ^[0-9]+$ ]] || return 1
     if [[ "$owner_host" == "$(txn_lock_hostname)" ]]; then
-        kill -0 "$owner_pid" 2>/dev/null && return 1
-        echo "WARNING: 回收已失效的事务锁： $lock_dir (host=$owner_host pid=$owner_pid)" >&2
-        rm -rf -- "$lock_dir"
-        return 0
+        if signal_error="$(LC_ALL=C kill -0 "$owner_pid" 2>&1)"; then return 1; fi
+        [[ "$signal_error" == *"No such process"* ]] || return 1
+    else
+        owner_job="$(txn_read_owner_field . slurm_job 2>/dev/null || true)"
+        [[ "$owner_job" =~ ^[0-9]+$ ]] || return 1
+        owner_started_epoch="$(txn_read_owner_field . started_epoch 2>/dev/null || true)"
+        alive="$(txn_slurm_owner_alive "$owner_job" "$owner_started_epoch")"
+        [[ "$alive" == "dead" ]] || return 1
     fi
-    owner_job="$(txn_read_owner_field "$lock_dir" slurm_job 2>/dev/null || true)"
-    [[ "$owner_job" =~ ^[0-9]+$ ]] || return 1
-    owner_started_epoch="$(txn_read_owner_field "$lock_dir" started_epoch 2>/dev/null || true)"
-    alive="$(txn_slurm_owner_alive "$owner_job" "$owner_started_epoch")"
-    [[ "$alive" == "dead" ]] || return 1
-    echo "WARNING: 回收已失效的事务锁： $lock_dir (host=$owner_host pid=$owner_pid slurm_job=$owner_job)" >&2
-    rm -rf -- "$lock_dir"
+    [[ "$lock_dir" -ef . ]] || return 1
+    quarantine="$(mktemp -d "${lock_dir}.reclaim.XXXXXX")" || return $?
+    mv -- "$lock_dir" "$quarantine/lock" || return $?
+    echo "WARNING: 回收已失效的事务锁： $lock_dir (host=$owner_host pid=$owner_pid${owner_job:+ slurm_job=$owner_job})" >&2
     return 0
-}
+)
 
 # mkdir 原子占位；成功后写 owner.tsv 并置 TXN_LOCK_HELD=1；忙锁返回 75。
 txn_acquire_lock() {
@@ -1139,6 +1144,7 @@ cleanup_stale_reference_builds() {
 
 reference_transaction_exit() {
     stop_reference_children
+    recover_assembled_commit || true
     recover_downstream_transactions || true
     recover_biscuit_commit || true
     recover_bwa_commit || true
@@ -1158,7 +1164,7 @@ with_transaction_lock_reference() {
     local rc
     txn_acquire_lock "$REFERENCE_LOCK" "reference build transaction" || return $?
     cleanup_stale_reference_builds
-    recover_downstream_transactions && recover_biscuit_commit && recover_bismark_commit && recover_bwa_commit || {
+    recover_assembled_commit && recover_downstream_transactions && recover_biscuit_commit && recover_bismark_commit && recover_bwa_commit || {
         txn_release_lock "$REFERENCE_LOCK"
         return 1
     }
@@ -1349,15 +1355,108 @@ assembled_reference_ready() {
 
 primary_contigs_ready() {
     local species="$1" fasta="$2"
+    [[ ! -e "$(assembled_commit_journal "$species")" ]] || return 1
     [[ -s "$fasta.fai" ]] || return 1
     fai_contract_check assembled "$species" "$fasta.fai" "$fasta"
 }
 
 clear_reference_derivatives() {
-    local fasta="$1" suffix
-    while IFS= read -r suffix; do rm -f -- "${fasta}${suffix}"; done < <(_biscuit_index_suffixes)
-    while IFS= read -r suffix; do rm -f -- "${fasta}${suffix}"; done < <(_biscuit_transient_suffixes)
+    local fasta="$1" suffix suffixes transient_suffixes
+    suffixes="$(_biscuit_index_suffixes)" || return $?
+    transient_suffixes="$(_biscuit_transient_suffixes)" || return $?
+    while IFS= read -r suffix; do
+        [[ -n "$suffix" && "$suffix" != .fai ]] || continue
+        rm -f -- "${fasta}${suffix}" || return $?
+    done <<< "$suffixes"
+    while IFS= read -r suffix; do
+        [[ -n "$suffix" && "$suffix" != .fai ]] || continue
+        rm -f -- "${fasta}${suffix}" || return $?
+    done <<< "$transient_suffixes"
     rm -rf -- "$fasta.bismark" "$fasta.bwa"
+}
+
+# 每个物种独占组装事务，未完成时拒绝 assembled readiness。
+assembled_commit_journal() {
+    case "$1" in hg38|mm10) ;; *) return 2 ;; esac
+    printf '%s/%s.fasta.COMMITTING\n' "$REFERENCE_BUILD_ROOT" "$1"
+}
+
+# 新 FASTA/FAI 安装前回滚旧文件，安装后继续清理旧派生产物；重复恢复保留未搬回的备份。
+recover_assembled_commit() {
+    local species journal fasta target name existed backup old_fasta old_fai
+    (( $# > 0 )) || set -- hg38 mm10
+    for species in "$@"; do
+        case "$species" in hg38) fasta="$HG38_REFERENCE" ;; mm10) fasta="$MM10_REFERENCE" ;; *) return 2 ;; esac
+        journal="$(assembled_commit_journal "$species")" || return $?
+        [[ -d "$journal" ]] || continue
+        if [[ ! -f "$journal/PREPARED" ]]; then
+            rm -rf -- "$journal" || return $?
+            continue
+        fi
+        [[ "$(cat "$journal/TARGET")" == "$fasta" ]] || {
+            echo "ERROR: 组装 journal TARGET 与受管 reference 不符：$journal" >&2
+            return 1
+        }
+        if [[ -f "$journal/INSTALLED" ]]; then
+            fai_contract_check assembled "$species" "$fasta.fai" "$fasta" || return $?
+            clear_reference_derivatives "$fasta" || return $?
+            downstream_reference_paths "$species" || return $?
+            rm -f -- "$DOWNSTREAM_TSS" "$DOWNSTREAM_SINGLE_CPG" || return $?
+        else
+            old_fasta="$(cat "$journal/fasta.existed")" || return $?
+            old_fai="$(cat "$journal/fai.existed")" || return $?
+            case "$old_fasta:$old_fai" in 0:0|0:1|1:0|1:1) ;; *) return 1 ;; esac
+            for name in fasta fai; do
+                target="$fasta"
+                existed="$old_fasta"
+                [[ "$name" == fasta ]] || { target="$fasta.fai"; existed="$old_fai"; }
+                backup="$journal/backup/$name"
+                if [[ "$existed" == 1 ]]; then
+                    if [[ -e "$backup" || -L "$backup" ]]; then
+                        rm -f -- "$target" || return $?
+                        mv -- "$backup" "$target" || return $?
+                    else
+                        [[ -e "$target" || -L "$target" ]] || return 1
+                    fi
+                else
+                    rm -f -- "$target" || return $?
+                fi
+            done
+        fi
+        rm -rf -- "$journal" || return $?
+    done
+}
+
+# 先完整安装经校验的 FASTA/FAI，再使旧 index/TSS/CpG 失效；失败保留独立于候选目录的 journal。
+commit_assembled_reference() {
+    local species="$1" candidate="$2" fasta="$3" journal name target existed rc expected
+    case "$species" in hg38) expected="$HG38_REFERENCE" ;; mm10) expected="$MM10_REFERENCE" ;; *) return 2 ;; esac
+    [[ "$fasta" == "$expected" ]] || return 2
+    journal="$(assembled_commit_journal "$species")" || return $?
+    [[ ! -e "$journal" ]] || return 1
+    mkdir -p "$journal/backup" || return $?
+    printf '%s\n' "$fasta" > "$journal/TARGET" || return $?
+    for name in fasta fai; do
+        target="$fasta"
+        [[ "$name" == fasta ]] || target="$fasta.fai"
+        existed=0
+        [[ ! -e "$target" && ! -L "$target" ]] || existed=1
+        printf '%s\n' "$existed" > "$journal/$name.existed" || return $?
+    done
+    : > "$journal/PREPARED" || return $?
+    for name in fasta fai; do
+        target="$fasta"
+        [[ "$name" == fasta ]] || target="$fasta.fai"
+        [[ "$(cat "$journal/$name.existed")" == 0 ]] || mv -- "$target" "$journal/backup/$name" || return $?
+    done
+    if mv -f -- "$candidate" "$fasta" && mv -f -- "$candidate.fai" "$fasta.fai"; then
+        : > "$journal/INSTALLED" || return $?
+        recover_assembled_commit "$species"
+    else
+        rc=$?
+        recover_assembled_commit "$species" || return $?
+        return "$rc"
+    fi
 }
 
 assemble_reference() {
@@ -1386,11 +1485,7 @@ assemble_reference() {
     }
 
     echo "临时组装的 $species FASTA 已通过校验，开始提交。"
-    clear_reference_derivatives "$output"
-    downstream_reference_paths "$species"
-    rm -f -- "$DOWNSTREAM_TSS" "$DOWNSTREAM_SINGLE_CPG"
-    mv -f -- "$tmp_fasta" "$output" || return $?
-    mv -f -- "$tmp_fasta.fai" "$output.fai" || return $?
+    commit_assembled_reference "$species" "$tmp_fasta" "$output" || return $?
     rm -rf -- "$build_dir"
 }
 
@@ -1591,6 +1686,9 @@ recover_bismark_commit() {
         return $?
     fi
     root="$(cat "$journal/TARGET")" || return $?
+    case "$root" in "$HG38_REFERENCE.bismark"|"$MM10_REFERENCE.bismark") ;;
+        *) echo "ERROR: Bismark journal TARGET 不属于受管 reference：$journal" >&2; return 1 ;;
+    esac
     [[ -n "$root" && -s "$journal/ENTRIES" ]] || return 1
     while IFS=$'\t' read -r relative existed; do
         case "$relative" in genome.fa|Bisulfite_Genome/CT_conversion|Bisulfite_Genome/GA_conversion|Bisulfite_Genome/Combined) ;; *) return 1 ;; esac
@@ -2404,9 +2502,11 @@ DEMUX_LOCK="$PIPELINE_ROOT/conda/.locks/demux-build.lock.d"
 DEMUX_BIN="$RUST_STATE_ROOT/bin/demux_rs"
 
 DEMUX_BUILD_CANDIDATE=""
+DEMUX_PUBLISH_TEMP=""
 
 cleanup_demux_build_candidate() {
-    rm -f -- "$DEMUX_BIN.tmp.$$" 2>/dev/null || true
+    [[ -z "$DEMUX_PUBLISH_TEMP" ]] || rm -f -- "$DEMUX_PUBLISH_TEMP" 2>/dev/null || true
+    DEMUX_PUBLISH_TEMP=""
     DEMUX_BUILD_CANDIDATE=""
 }
 
@@ -2537,20 +2637,23 @@ verify_built_binary() {
 
 # 在 demux 事务锁内复用构建缓存，路径按当前 RUST_STATE_ROOT 解析以保持沙箱隔离。
 prepare_demux_build_candidate() {
-    mkdir -p "$RUST_STATE_ROOT/candidates"
+    mkdir -p "$RUST_STATE_ROOT/candidates" || return $?
     DEMUX_BUILD_CANDIDATE="$RUST_STATE_ROOT/candidates/demux.target"
     export CARGO_TARGET_DIR="$DEMUX_BUILD_CANDIDATE"
 }
 
+# 显式传播发布失败，避免事务条件调用屏蔽 errexit 后覆盖旧二进制。
 publish_demux_binary() {
     local source_binary="$1" expected_revision="$2"
-    local destination="$DEMUX_BIN" temporary="$DEMUX_BIN.tmp.$$"
-    mkdir -p "$(dirname "$destination")"
-    rm -f -- "$temporary"
-    cp "$source_binary" "$temporary"
-    chmod +x "$temporary"
-    verify_built_binary "$expected_revision" "$temporary"
-    mv -f -- "$temporary" "$destination"
+    local destination="$DEMUX_BIN" temporary
+    mkdir -p "$(dirname "$destination")" || return $?
+    DEMUX_PUBLISH_TEMP="$(mktemp "$destination.tmp.XXXXXX")" || return $?
+    temporary="$DEMUX_PUBLISH_TEMP"
+    cp "$source_binary" "$temporary" || return $?
+    chmod +x "$temporary" || return $?
+    verify_built_binary "$expected_revision" "$temporary" || return $?
+    mv -f -- "$temporary" "$destination" || return $?
+    DEMUX_PUBLISH_TEMP=""
 }
 
 # 在候选目录中离线/在线 cargo test + build demux_rs，校验 identity 后原子发布二进制。
@@ -2567,9 +2670,9 @@ build_demux() {
         cargo_args+=(-j "$jobs")
     fi
 
-    cd "$DEMUX_ROOT"
-    prepare_demux_build_candidate
-    source_revision="$(demux_source_revision)"
+    cd "$DEMUX_ROOT" || return $?
+    prepare_demux_build_candidate || return $?
+    source_revision="$(demux_source_revision)" || return $?
     export DNA_PIPELINE_SOURCE_REVISION="$source_revision"
 
     echo "demux 源码身份： $DNA_PIPELINE_SOURCE_REVISION"
@@ -2598,8 +2701,8 @@ build_demux() {
         return 1
     fi
 
-    verify_built_binary "$source_revision" "$DEMUX_BUILD_CANDIDATE/release/demux_rs"
-    publish_demux_binary "$DEMUX_BUILD_CANDIDATE/release/demux_rs" "$source_revision"
+    verify_built_binary "$source_revision" "$DEMUX_BUILD_CANDIDATE/release/demux_rs" || return $?
+    publish_demux_binary "$DEMUX_BUILD_CANDIDATE/release/demux_rs" "$source_revision" || return $?
     cleanup_demux_build_candidate
     unset CARGO_TARGET_DIR
     printf 'Built: %s\n' "$DEMUX_BIN"
@@ -2663,7 +2766,7 @@ submit_slurm_build() {
 }
 
 demux_fetch_and_build() {
-    fetch_dependencies
+    fetch_dependencies || return $?
     build_demux 0
 }
 demux_offline_build() {

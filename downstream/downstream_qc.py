@@ -941,15 +941,21 @@ def _select_cpg_cache_state(
 
     if cached_mapping is None or cached_composition is None:
         return None
-    return cached_mapping.merge(
-        cached_composition.drop(
-            columns=["Signal_Composition_Rule", "Sample_CpG_Signals"],
-            errors="ignore",
-        ),
+    merged = cached_mapping.merge(
+        cached_composition,
         on="Sample_ID",
         how="left",
         validate="one_to_one",
     )
+    for prefix, rate in (("Sample", "Host"), ("Lambda", "Lambda"), ("pUC19", "pUC19")):
+        sites = merged[f"{prefix}_Unique_CpG_Sites"]
+        if ((sites == 0) != (merged[f"Signal_{rate}_Rate%"] == 0)).any():
+            return None
+    sites = merged["Sample_Unique_CpG_Sites"]
+    signals = merged["Sample_CpG_Signals"]
+    if ((signals < sites) | (signals > 65535 * sites)).any():
+        return None
+    return merged.drop(columns=["Signal_Composition_Rule", "Sample_CpG_Signals"])
 
 
 def build_config(
@@ -1082,9 +1088,9 @@ _THREAD_LIMIT_ENV_VARS = (
 
 @lru_cache(maxsize=4096)
 def _classify_seq_name(seq: str) -> tuple[bool, bool, bool, bool]:
-    seq = str(seq).strip()
-    is_lambda = bool(re.search(r"(?i)lambda", seq))
-    is_puc = bool(re.search(r"(?i)puc19", seq))
+    seq = str(seq)
+    is_lambda = seq == "lambda"
+    is_puc = seq == "pUC19"
     is_mt = bool(re.fullmatch(r"(?i)(chrM|MT|chrMT)", seq))
     is_host = seq.startswith("chr") and not (is_lambda or is_puc or is_mt)
     return is_lambda, is_puc, is_mt, is_host
@@ -1158,7 +1164,7 @@ def _process_map_ordered(function, tasks: list[tuple], worker_count: int) -> lis
                 os.environ[variable] = value
 
 
-def _atomic_write_csv(df: pd.DataFrame, path: Path) -> None:
+def _atomic_write_csv(df: pd.DataFrame, path: Path, *, before_commit=None) -> None:
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1177,6 +1183,8 @@ def _atomic_write_csv(df: pd.DataFrame, path: Path) -> None:
             df.to_csv(handle, index=False)
             handle.flush()
             os.fsync(handle.fileno())
+        if before_commit is not None:
+            before_commit()
         os.replace(temporary, path)
         temporary = None
         _fsync_directory(path.parent)
@@ -1194,7 +1202,7 @@ def _fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
-def _atomic_write_json(payload: dict, path: Path) -> None:
+def _atomic_write_json(payload: dict, path: Path, *, before_commit=None) -> None:
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1214,6 +1222,8 @@ def _atomic_write_json(payload: dict, path: Path) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if before_commit is not None:
+            before_commit()
         os.replace(temporary, path)
         temporary = None
         _fsync_directory(path.parent)
@@ -1367,8 +1377,6 @@ def _read_chrom_sizes(fai_path: Path) -> dict[str, int]:
                 )
 
 
-            if "." in chrom:
-                continue
             if chrom in chrom_sizes:
                 raise ValueError(f"{fai_path}:{line_no}: duplicate chromosome {chrom}")
             chrom_sizes[chrom] = length
@@ -1672,12 +1680,14 @@ def _algorithm_fingerprints() -> dict[str, str]:
         owner = node if owner is None else owner
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             bindings[node.name] = owner
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.Import, ast.ImportFrom)):
-            for child in ast.walk(node):
-                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-                    bindings[child.id] = owner
-                elif isinstance(child, ast.alias):
-                    bindings[child.asname or child.name.split(".")[0]] = owner
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                for child in ast.walk(target):
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                        bindings[child.id] = owner
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bindings[alias.asname or alias.name.split(".")[0]] = owner
         else:
             for child in ast.iter_child_nodes(node):
                 bind(child, owner)
@@ -1689,16 +1699,17 @@ def _algorithm_fingerprints() -> dict[str, str]:
     roots = {
         "input": ("build_qc_records", "source_identity"),
         "raw": ("load_or_create_raw_adata",),
-        "cpg": ("compute_methylation_statistics", "compute_cpg_signal_composition"),
+        "cpg": ("compute_methylation_statistics", "compute_cpg_signal_composition", "_read_chrom_sizes"),
         "gini": ("compute_gini_index",),
         "tss": ("compute_tss_profile",),
+        "single": ("prepare_single_cpg_adata",),
     }
     fingerprints = {}
     for stage, names in roots.items():
         pending, selected = list(names), {}
         while pending:
             name = pending.pop()
-            if name in selected or name not in bindings:
+            if name in selected or name not in bindings or name == "_algorithm_fingerprints":
                 continue
             node = bindings[name]
             selected[name] = ast.dump(node, include_attributes=False)
@@ -1715,8 +1726,10 @@ def _cache_identities(identity: Mapping[str, object], cfg, algorithms: Mapping[s
     payloads = {
         "cpg": {**common, "algorithm": algorithms["cpg"]},
         "gini": {**common, "algorithm": algorithms["gini"], "raw": algorithms["raw"],
+                 "raw_generation": identity["raw_generation"],
                  "bin_size": cfg.gini_bin_size},
         "tss": {**common, "algorithm": algorithms["tss"], "raw": algorithms["raw"],
+                "raw_generation": identity["raw_generation"],
                 "sample_fraction": cfg.tss_sample_fraction, "sample_seed": cfg.tss_sample_seed,
                 "tss_bed": _content_binding(cfg.tss_bed) if cfg.tss_bed is not None else None},
     }
@@ -1761,28 +1774,34 @@ def _finish_cpg_process(
         )
 
 
+def _iter_cpg_rows(handle, path: Path, chrom_sizes: Mapping[str, int] | None, coordinate_base: int):
+    if handle.readline().rstrip("\n") != "chrom\tpos\tmethyl\tunmethyl":
+        raise ValueError(f"CpG input has an invalid header: {path}")
+    last_positions: dict[str, int] = {}
+    for line_no, line in enumerate(handle, 2):
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 4:
+            raise ValueError(f"{path}:{line_no}: invalid CpG fields")
+        chrom, *numbers = fields
+        if not chrom or any(not (value.isascii() and value.isdecimal()) for value in numbers):
+            raise ValueError(f"{path}:{line_no}: invalid CpG fields")
+        pos, methyl, unmethyl = map(int, numbers)
+        length = chrom_sizes.get(chrom) if chrom_sizes is not None else None
+        if (pos < coordinate_base or not 0 < methyl + unmethyl <= 65535
+                or (chrom_sizes is not None and (length is None or pos >= length + coordinate_base))):
+            raise ValueError(f"{path}:{line_no}: invalid CpG coordinate/counts")
+        if chrom in last_positions and pos <= last_positions[chrom]:
+            raise ValueError(f"{path}:{line_no}: duplicate or out-of-order CpG position: {chrom}:{pos}")
+        last_positions[chrom] = pos
+        yield chrom, pos, methyl, unmethyl
+
+
 def _validate_cpg_input(path: Path, chrom_sizes: Mapping[str, int] | None, coordinate_base: int) -> bool:
     process, handle = _open_cpg_text(path)
     stream_error = None
     found_data = False
     try:
-        if handle.readline().rstrip("\n") != "chrom\tpos\tmethyl\tunmethyl":
-            raise ValueError(f"CpG input has an invalid header: {path}")
-        for line_no, line in enumerate(handle, 2):
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) != 4:
-                raise ValueError(f"{path}:{line_no}: invalid CpG fields")
-            chrom, pos_text, methyl_text, unmethyl_text = fields
-            if not (pos_text.isascii() and pos_text.isdecimal()
-                    and methyl_text.isascii() and methyl_text.isdecimal()
-                    and unmethyl_text.isascii() and unmethyl_text.isdecimal()):
-                raise ValueError(f"{path}:{line_no}: invalid CpG fields")
-            pos = int(pos_text)
-            coverage = int(methyl_text) + int(unmethyl_text)
-            length = chrom_sizes.get(chrom) if chrom_sizes is not None else None
-            if (pos < coordinate_base or not 0 < coverage <= 65535
-                    or (chrom_sizes is not None and (length is None or pos >= length + coordinate_base))):
-                raise ValueError(f"{path}:{line_no}: invalid CpG coordinate/counts")
+        for _ in _iter_cpg_rows(handle, path, chrom_sizes, coordinate_base):
             found_data = True
     except BaseException as exc:
         stream_error = exc
@@ -1804,7 +1823,8 @@ def _kahan_add(total: float, correction: float, value: float) -> tuple[float, fl
 def _stream_one_cpg_summary(
     path: Path,
     sample_id: str,
-    allowed_chroms: frozenset[str],
+    chrom_sizes: Mapping[str, int],
+    coordinate_base: int,
     allow_empty: bool = False,
 ) -> dict:
 
@@ -1823,33 +1843,10 @@ def _stream_one_cpg_summary(
     process, handle = _open_cpg_text(path)
     stream_error: BaseException | None = None
     try:
-        for line_no, line in enumerate(handle, 1):
-            fields = line.rstrip("\n").split("\t")
-            if not line.strip():
-                continue
-            if line_no == 1:
-                if fields != ["chrom", "pos", "methyl", "unmethyl"]:
-                    raise ValueError(f"{path}:{line_no}: invalid CpG header")
-                continue
-            if len(fields) != 4:
-                raise ValueError(f"{path}:{line_no}: expected 4 tab-separated fields")
-            chrom = fields[0].strip()
-            try:
-                position = int(fields[1])
-                methylated = int(fields[2])
-                unmethylated = int(fields[3])
-            except ValueError as exc:
-                raise ValueError(f"{path}:{line_no}: non-integer CpG field") from exc
+        for chrom, position, methylated, unmethylated in _iter_cpg_rows(
+            handle, path, chrom_sizes, coordinate_base
+        ):
             total = methylated + unmethylated
-            if position < 0 or methylated < 0 or unmethylated < 0 or total <= 0:
-                raise ValueError(f"{path}:{line_no}: invalid CpG counts")
-            if max(methylated, unmethylated, total) > 65535:
-                raise ValueError(
-                    f"{path}:{line_no}: CpG counts exceed the SnapATAC2 u16 range"
-                )
-
-            if chrom not in allowed_chroms:
-                continue
             is_lambda_comp, is_puc_comp, is_mt_comp, is_host_comp = (
                 _classify_seq_name(chrom)
             )
@@ -1863,13 +1860,8 @@ def _stream_one_cpg_summary(
             elif is_host_comp:
                 coverage["host_cov"] += total
 
-            is_lambda = chrom == "lambda"
-            is_puc = chrom == "pUC19"
-            is_host = chrom.startswith("chr") and not re.fullmatch(
-                r"(?i)(chrM|MT|chrMT)", chrom
-            )
             category = (
-                "lambda" if is_lambda else "pUC19" if is_puc else "host" if is_host else None
+                "lambda" if is_lambda_comp else "pUC19" if is_puc_comp else "host" if is_host_comp else None
             )
             if category is None:
                 continue
@@ -1884,6 +1876,8 @@ def _stream_one_cpg_summary(
             )
     except BaseException as exc:
         stream_error = exc
+        if process is not None and process.poll() is None:
+            process.terminate()
         raise
     finally:
         handle.close()
@@ -1913,7 +1907,8 @@ def compute_methylation_statistics(
     cpg_files: list[Path],
     sample_ids: list[str],
     *,
-    allowed_chroms: frozenset[str],
+    chrom_sizes: Mapping[str, int],
+    coordinate_base: int,
     workers: int,
     return_composition: bool = False,
     empty_cpg_sample_ids: set[str] | None = None,
@@ -1933,7 +1928,7 @@ def compute_methylation_statistics(
     rows = _process_map_ordered(
         _stream_one_cpg_summary,
         [
-            (path, sample_id, allowed_chroms, str(sample_id) in empty_cpg)
+            (path, sample_id, chrom_sizes, coordinate_base, str(sample_id) in empty_cpg)
             for path, sample_id in zip(cpg_files, sample_ids, strict=True)
         ],
         worker_count,
@@ -1954,7 +1949,7 @@ def _load_methyl_stats_cache(
     if not cache_path.exists():
         return None
     try:
-        df = pd.read_csv(cache_path, float_precision="round_trip")
+        df = pd.read_csv(cache_path, converters={"Sample_ID": str}, float_precision="round_trip")
     except Exception:
         return None
     if df.empty or tuple(df.columns) != MAPPING_STAT_COLUMNS:
@@ -2005,7 +2000,7 @@ def _validated_composition_cache(
     if not cache_path.is_file():
         return None
     try:
-        cached = pd.read_csv(cache_path, float_precision="round_trip")
+        cached = pd.read_csv(cache_path, converters={"Sample_ID": str}, float_precision="round_trip")
         if tuple(cached.columns) != COMPOSITION_CACHE_COLUMNS:
             return None
         cached = _require_exact_sample_ids(
@@ -2058,6 +2053,8 @@ def compute_cpg_signal_composition(
     cache_path: Path,
     composition_stats: pd.DataFrame,
     empty_cpg_sample_ids: set[str],
+    *,
+    before_commit=None,
 ) -> pd.DataFrame:
     if df_qc.empty:
         return df_qc
@@ -2115,7 +2112,7 @@ def compute_cpg_signal_composition(
     base["Signal_Host_Rate%"] = 100.0 * f_host
     base["Signal_Composition_Rule"] = "host_chr_prefix"
     comp_out = base[list(COMPOSITION_CACHE_COLUMNS)].copy()
-    _atomic_write_csv(comp_out, cache_path)
+    _atomic_write_csv(comp_out, cache_path, before_commit=before_commit)
 
     comp_merge = comp_out.drop(
         columns=["Signal_Composition_Rule", "Sample_CpG_Signals"], errors="ignore"
@@ -2184,7 +2181,8 @@ def _read_tss_offset_map(
     reference_ranges: Mapping[str, tuple[int, int]] | None = None,
 ) -> pd.Series:
     try:
-        pos_df = pd.read_csv(tss_bed_path, sep="\t", header=None, comment="#", usecols=[0, 1, 2, 8])
+        pos_df = pd.read_csv(tss_bed_path, sep="\t", header=None, comment="#", usecols=[0, 1, 2, 8],
+                             converters={0: str})
     except (ValueError, pd.errors.ParserError) as exc:
         raise ValueError(f"TSS BED must have at least 9 columns: {tss_bed_path}") from exc
 
@@ -2257,7 +2255,7 @@ def _validated_gini_cache(
     if not cache_path.is_file():
         return None
     try:
-        cached = pd.read_csv(cache_path, float_precision="round_trip")
+        cached = pd.read_csv(cache_path, converters={"Sample_ID": str}, float_precision="round_trip")
         if tuple(cached.columns) != GINI_CACHE_COLUMNS:
             return None
         cached = _require_exact_sample_ids(cached, sample_ids, "Gini cache")
@@ -2331,6 +2329,8 @@ def _validated_tss_cache(
             or (fractions > 1).any()
             or not np.isfinite(counts).all()
             or (counts < 0).any()
+            or not np.equal(counts, np.floor(counts)).all()
+            or np.any((counts == 0) != (fractions == 0))
         ):
             return None
         prof["Sample_ID"] = sample_values
@@ -2349,6 +2349,8 @@ def compute_gini_index(
     cache_path: Path,
     recompute: bool,
     empty_cpg_sample_ids: set[str],
+    *,
+    before_commit=None,
 ) -> pd.Series:
     """按真实染色体长度分箱，以同一 base 的 coverage 计算 Gini；空细胞保留缺失值。"""
     expected_sample_ids = [str(value) for value in raw_adata.obs_names]
@@ -2425,7 +2427,7 @@ def compute_gini_index(
             values[~empty_mask]
         ).all():
             raise ValueError("Computed Gini missingness differs from empty-CpG cells")
-        _atomic_write_csv(result, cache_path)
+        _atomic_write_csv(result, cache_path, before_commit=before_commit)
         return pd.Series(
             values,
             index=result["Sample_ID"].astype(str),
@@ -2487,6 +2489,7 @@ def compute_tss_profile(
     *,
     sample_fraction: float = 1.0,
     sample_seed: int = 0,
+    before_commit=None,
 ) -> pd.DataFrame:
     """仅计算传入 QC 子集的 TSS，先复制对应 RawAdata 行并在退出时清理临时矩阵。"""
     if set(empty_cpg_sample_ids) - set(df_qc["Sample_ID"].astype(str)):
@@ -2496,6 +2499,10 @@ def compute_tss_profile(
     empty_cpg = {str(value) for value in empty_cpg_sample_ids} & expected_sample_ids
     if (not recompute) and out_csv.exists():
         prof = _validated_tss_cache(out_csv, expected_sample_ids, empty_cpg)
+        if prof is not None and not prof.empty:
+            clones = df_qc.set_index("Sample_ID")["CloneID"].astype(str)
+            if not prof["CloneID"].astype(str).eq(prof["Sample_ID"].map(clones)).all():
+                prof = None
         if prof is not None:
             _log("命中 TSS Profile 缓存", level="DEBUG")
             return prof
@@ -2503,8 +2510,9 @@ def compute_tss_profile(
 
     _log("开始计算 TSS Profile", level="INFO")
     if expected_sample_ids == empty_cpg:
+        _read_tss_offset_map(tss_bed_path)
         prof = pd.DataFrame(columns=TSS_REQUIRED_COLUMNS)
-        _atomic_write_csv(prof, out_csv)
+        _atomic_write_csv(prof, out_csv, before_commit=before_commit)
         validated = _validated_tss_cache(out_csv, expected_sample_ids, empty_cpg)
         if validated is None:
             out_csv.unlink(missing_ok=True)
@@ -2557,7 +2565,7 @@ def compute_tss_profile(
         tss_regions = pos_series.index.to_list()
         if not tss_regions:
             prof = pd.DataFrame(columns=TSS_REQUIRED_COLUMNS)
-            _atomic_write_csv(prof, out_csv)
+            _atomic_write_csv(prof, out_csv, before_commit=before_commit)
             return prof
         frac_pl = make_and_aggregate("fraction", "mean", "meth_frac", "mean")
         count_pl = make_and_aggregate("target", "sum", "count", "sum")
@@ -2577,7 +2585,7 @@ def compute_tss_profile(
         how="left",
         validate="many_to_one",
     )
-    _atomic_write_csv(prof, out_csv)
+    _atomic_write_csv(prof, out_csv, before_commit=before_commit)
     prof = _validated_tss_cache(out_csv, expected_sample_ids, empty_cpg)
     if prof is None:
         out_csv.unlink(missing_ok=True)
@@ -2790,9 +2798,8 @@ def _export_qc(
         df_qc = _require_exact_sample_ids(
             df_qc, manifest_sample_ids, "Final QC output"
         )
-        sealed.assert_current()
-        _atomic_write_csv(df_qc, paths.qc_info)
-        _atomic_write_json(identity, paths.input_identity)
+        _atomic_write_csv(df_qc, paths.qc_info, before_commit=sealed.assert_current)
+        _atomic_write_json(identity, paths.input_identity, before_commit=sealed.assert_current)
 
 
 def _run_pipeline_impl(
@@ -2817,6 +2824,14 @@ def _run_pipeline_impl(
     sealed = sealed_context or load_sealed_qc_context(
         paths.project_dir, expected_pipeline_root=_pipeline_dir()
     )
+
+    def prepare_cache_commit():
+        # 自动修复缓存也须撤旧身份；交付换代后不得提交本次计算结果。
+        sealed.assert_current()
+        if paths.input_identity.exists():
+            paths.input_identity.unlink()
+            _fsync_directory(paths.input_identity.parent)
+
     records = build_qc_records(paths.project_dir, sealed_context=sealed)
     extra_identity_files = {"reference_fai": cfg.ref_fai}
     manifest_sample_ids = [str(record["sample_id"]) for record in records]
@@ -2870,6 +2885,9 @@ def _run_pipeline_impl(
             "RawAdata is unavailable or does not use the current configured-base four-column CpG "
             f"schema (observed: {raw_adata_mode})"
         )
+    identity["raw_generation"] = json.loads(
+        paths.raw_adata.with_name("RawAdata.input_schema.json").read_text(encoding="utf-8")
+    )["generation_id"]
     identity["cache_identities"] = _cache_identities(identity, cfg, _algorithm_fingerprints())
     previous = {}
     if paths.input_identity.is_file():
@@ -2886,6 +2904,9 @@ def _run_pipeline_impl(
     recompute_composition |= "cpg" in changed
     recompute_gini |= "gini" in changed
     recompute_tss |= "tss" in changed
+    if any((recompute_methyl_stats, recompute_composition, recompute_gini, recompute_tss)):
+        paths.input_identity.unlink(missing_ok=True)
+        _fsync_directory(paths.input_identity.parent)
     dt = timer.stop("adata")
     if dt is not None:
         _log(f"  done: {dt:.2f}s")
@@ -2933,13 +2954,13 @@ def _run_pipeline_impl(
         df_qc, composition_stats = compute_methylation_statistics(
             [cpg_by_sample[sid] for sid in sample_ids],
             sample_ids,
-            allowed_chroms=frozenset(_read_chrom_sizes(cfg.ref_fai)),
+            chrom_sizes=_read_chrom_sizes(cfg.ref_fai),
+            coordinate_base=_source_cpg_coordinate_base(sealed.cpg_representation),
             workers=workers,
             return_composition=True,
             empty_cpg_sample_ids=empty_cpg_sample_ids,
         )
-        sealed.assert_current()
-        _atomic_write_csv(df_qc, paths.methyl_stats_cache)
+        _atomic_write_csv(df_qc, paths.methyl_stats_cache, before_commit=prepare_cache_commit)
 
     dt = timer.stop("methyl_stats")
     if dt is not None:
@@ -2962,6 +2983,7 @@ def _run_pipeline_impl(
             cache_path=paths.composition_cache,
             composition_stats=composition_stats,
             empty_cpg_sample_ids=empty_cpg_sample_ids,
+            before_commit=prepare_cache_commit,
         )
     dt = timer.stop("composition")
     if dt is not None:
@@ -2982,6 +3004,7 @@ def _run_pipeline_impl(
             cache_path=paths.gini_cache,
             recompute=recompute_gini,
             empty_cpg_sample_ids=empty_cpg_sample_ids,
+            before_commit=prepare_cache_commit,
         )
         df_qc["Gini_Index"] = df_qc["Sample_ID"].astype(str).map(gini)
         gini_missing = set(
@@ -3006,6 +3029,7 @@ def _run_pipeline_impl(
                 empty_cpg_sample_ids=empty_cpg_sample_ids,
                 sample_fraction=cfg.tss_sample_fraction,
                 sample_seed=cfg.tss_sample_seed,
+                before_commit=prepare_cache_commit,
             )
         else:
             _log("TSS resources intentionally skipped; TSS CSV/PDF will not be generated", "WARNING")
@@ -4522,7 +4546,7 @@ def load_cpg_density_frame(
         raise FileNotFoundError(
             f"CpG composition cache is absent: {composition_cache_path}"
         )
-    composition = pd.read_csv(composition_cache_path, float_precision="round_trip")
+    composition = pd.read_csv(composition_cache_path, converters={"Sample_ID": str}, float_precision="round_trip")
     for column in ("Sample_ID", "Sample_CpG_Signals"):
         if column not in composition.columns:
             raise ValueError(f"CpG composition cache is missing column: {column}")
@@ -5195,7 +5219,9 @@ def prepare_single_cpg_adata(
     )
     raw_path = run_paths.raw_adata
     raw_schema = json.loads(raw_path.with_name("RawAdata.input_schema.json").read_text())
+    algorithms = _algorithm_fingerprints()
     if (not _raw_adata_schema_matches(raw_path, raw_schema)
+            or raw_schema.get("algorithm_sha256") != algorithms["raw"]
             or raw_schema["delivery_id"] != sealed.delivery_id
             or raw_schema.get("source_cpg_representation") != sealed.cpg_representation
             or set(raw_schema["sample_ids"]) != set(sample_ids)):
@@ -5203,7 +5229,7 @@ def prepare_single_cpg_adata(
     genome = str(sealed.config["species"])
     bed = paths.pipeline_root / "resources" / f"{genome}_reference" / "cpg" / f"{genome}.single_cpg.bed.gz"
     signature = {
-        "algorithm": "single_cpg_fraction_mean_v3",
+        "algorithm_sha256": algorithms["single"],
         **coordinate_metadata,
         "snapatac2": importlib.metadata.version("snapatac2"),
         "delivery_id": sealed.delivery_id,

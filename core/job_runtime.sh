@@ -115,14 +115,37 @@ dna_pipeline_install_scratch_cleanup() {
 dna_pipeline_cleanup_scratch() {
     local base="${DNA_PIPELINE_SCRATCH_BASE:-}"
     local scratch="${DNA_PIPELINE_SCRATCH_DIR:-}"
+    local parent relative namespace group leaf extra token
     [[ -n "$scratch" ]] || return 0
+    [[ "$base" == /* && "$base" != / ]] || return 2
     case "$scratch" in
-        "$base"/dna_pipeline/*/*/*) rm -rf -- "$scratch" ;;
+        "$base"/dna_pipeline/*/*/*) ;;
         *)
             echo "ERROR: refusing to clean unsafe scratch path: $scratch" >&2
             return 2
             ;;
     esac
+    relative="${scratch#"$base/dna_pipeline/"}"
+    IFS=/ read -r namespace group leaf extra <<< "$relative"
+    [[ -z "$extra" ]] || return 2
+    for token in "$namespace" "$group" "$leaf"; do
+        [[ -n "$token" && "$token" != . && "$token" != .. && "$token" != *[!A-Za-z0-9_.-]* ]] || return 2
+    done
+    # 清理前重验实际父目录，避免分配后路径被符号链接替换而删除外部内容。
+    parent="$scratch"
+    while [[ "$parent" != / ]]; do
+        [[ ! -L "$parent" && ( ! -e "$parent" || -d "$parent" ) ]] || {
+            echo "ERROR: refusing to clean scratch through a non-directory or symlink: $parent" >&2
+            return 2
+        }
+        parent="${parent%/*}"
+        [[ -n "$parent" ]] || parent=/
+    done
+    (
+        cd -- "${scratch%/*}" || exit $?
+        [[ "$(pwd -P)" == "${scratch%/*}" && ! -L "$leaf" ]] || exit 2
+        rm -rf -- "$leaf"
+    )
 }
 
 # trap 清理入口：保留原始退出码，执行 scratch 清理后按原码退出。
@@ -223,22 +246,6 @@ dna_pipeline_write_pileup_stats() {
         "$sample" "$mapped" "$variants" "$empty" > "$output"
 }
 
-# 读取 pileup stats 的指定计数字段；缺失或无效字段直接失败。
-dna_pipeline_pileup_stat() {
-    local path="$1" field="$2" value
-    case "$field" in
-        mapped_reads|variant_records)
-            value="$(sed -n "s/.*\\\"${field}\\\":[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$path")"
-            ;;
-        empty)
-            value="$(sed -n 's/.*"empty":[[:space:]]*\(true\|false\).*/\1/p' "$path")"
-            ;;
-        *) echo "ERROR: unsupported pileup stats field: $field" >&2; return 2 ;;
-    esac
-    [[ -n "$value" ]] || { echo "ERROR: malformed pileup stats: $path" >&2; return 1; }
-    printf '%s\n' "$value"
-}
-
 # JSON 由 cutadapt 自身写出并以退出码保证；发布侧 atomic-publish 再做 JSON 解析校验。
 dna_pipeline_run_cutadapt() {
     local cutadapt="$1" gzip_bin="$2" threads="$3" quality="$4" min_length="$5"
@@ -249,31 +256,28 @@ dna_pipeline_run_cutadapt() {
         --error-rate 0.25 \
         -q "$quality" -m "$min_length" -j "$threads" \
         -o "$r1_out" -p "$r2_out" --json "$json_out" \
-        "$r1_in" "$r2_in" >> "$log_file" 2>&1
+        "$r1_in" "$r2_in" >> "$log_file" 2>&1 || return $?
     "$gzip_bin" -t "$r1_out" "$r2_out" >> "$log_file" 2>&1
 }
 
-# 运行 high-CpH 分类：零读 BAM 直接产出空集合，否则 biscuit bsconv -p 流式进入解析器；两级 PIPESTATUS 任一非零即失败。
+# 运行 high-CpH 分类：零读 BAM 直接产出空集合，否则 biscuit bsconv -p 流式进入解析器；使用显式 backend Python，原生命令失败不能冒充零读。
 dna_pipeline_run_bsconv_classification() {
-    local samtools="$1" biscuit="$2" ref="$3" bam="$4" log_file="$5"
-    shift 5
+    local samtools="$1" biscuit="$2" ref="$3" bam="$4" log_file="$5" python="${6:?}"
+    shift 6
     local pipeline_src="${DNA_PIPELINE_ROOT:?}/core"
     local -a parser_args=("$@")
-    local total_reads
-    total_reads="$("$samtools" idxstats "$bam" | awk '{n += $3 + $4} END {print n + 0}')"
+    local total_reads idxstats_counts
+    idxstats_counts="$("$samtools" idxstats "$bam")" || return $?
+    total_reads="$(awk '{n += $3 + $4} END {print n + 0}' <<< "$idxstats_counts")" || return $?
     if [[ "$total_reads" -eq 0 ]]; then
         echo "WARNING: BAM contains zero reads; high-CpH classification is empty." >> "$log_file"
-        PYTHONPATH="$pipeline_src" python -m dna_pipeline extract-bsconv "${parser_args[@]}" < /dev/null >> "$log_file" 2>&1
+        PYTHONPATH="$pipeline_src" "$python" -m dna_pipeline extract-bsconv "${parser_args[@]}" < /dev/null >> "$log_file" 2>&1
     else
-        set +e
-        "$biscuit" bsconv -p "$ref" "$bam" 2>> "$log_file" | \
-            PYTHONPATH="$pipeline_src" python -m dna_pipeline extract-bsconv "${parser_args[@]}" >> "$log_file" 2>&1
-        local -a status=("${PIPESTATUS[@]}")
-        set -e
-        if (( ${status[0]:-99} != 0 || ${status[1]:-99} != 0 )); then
-            echo "ERROR: high-CpH stream failed: biscuit=${status[0]:-99} parser=${status[1]:-99}" >> "$log_file"
-            exit 1
-        fi
+        (
+            set -o pipefail
+            "$biscuit" bsconv -p "$ref" "$bam" 2>> "$log_file" | \
+                PYTHONPATH="$pipeline_src" "$python" -m dna_pipeline extract-bsconv "${parser_args[@]}" >> "$log_file" 2>&1
+        )
     fi
 }
 
@@ -294,7 +298,11 @@ dna_pipeline_emit_canonical_cpg() {
             start=$2+0; end=$3+0; m=$5+0; u=$6+0; pos=start+OFF;
             if (start > 9007199254740991 || end > 9007199254740991 || m > 9007199254740991 || u > 9007199254740991) invalid("integer exceeds exact range");
             if (pos < 0 || pos > 9007199254740991 || end < start) invalid("invalid coordinate interval");
-            if (m+u>0) print $1, pos, m, u;
+            if (m+u>0) {
+                if (($1 in last_pos) && pos <= last_pos[$1]) invalid("duplicate or out-of-order CpG position");
+                last_pos[$1]=pos;
+                print $1, pos, m, u;
+            }
         }'
     } | "$zstd" -q -T1 -c > "$out_tmp"
 }
@@ -303,11 +311,12 @@ dna_pipeline_emit_canonical_cpg() {
 dna_pipeline_coordinate_sort_and_stage() {
     local samtools="${1:?}" extra="${2:?}" src="${3:?}"
     local tmp_bam="${4:?}" tmp_bai="${5:?}" final_bam="${6:?}" final_bai="${7:?}"
-    mkdir -p "$(dirname "$final_bam")"
-    "$samtools" sort -@ "$extra" -o "$tmp_bam" "$src"
-    "$samtools" index -@ "$extra" "$tmp_bam"
-    "$samtools" quickcheck -v "$tmp_bam"
-    python -m dna_pipeline atomic-publish \
+    local python="${8:?}"
+    mkdir -p "$(dirname "$final_bam")" || return $?
+    "$samtools" sort -@ "$extra" -o "$tmp_bam" "$src" || return $?
+    "$samtools" index -@ "$extra" "$tmp_bam" || return $?
+    "$samtools" quickcheck -v "$tmp_bam" || return $?
+    "$python" -m dna_pipeline atomic-publish \
         --samtools "$samtools" \
         --bam-destination "$final_bam" \
         --commit-last "$final_bam" \

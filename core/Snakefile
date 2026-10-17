@@ -825,13 +825,13 @@ checkpoint demux:
 
         dna_final={params.dna_dir:q}
         rna_final={params.rna_dir:q}
-        dna_tmp="${{dna_final}}.tmp.$$"
-        rna_tmp="${{rna_final}}.tmp.$$"
-        report_tmp={output.json_report:q}.tmp.$$
-        mqc_tmp={output.json_mqc:q}.tmp.$$
-        manifest_tmp={output.manifest:q}.tmp.$$
+        dna_tmp="$(mktemp -d "${{dna_final}}.tmp.XXXXXX")"
+        rna_tmp="$(mktemp -d "${{rna_final}}.tmp.XXXXXX")"
+        report_tmp="$(mktemp {output.json_report:q}.tmp.XXXXXX)"
+        mqc_tmp="$(mktemp {output.json_mqc:q}.tmp.XXXXXX)"
+        manifest_tmp="$(mktemp {output.manifest:q}.tmp.XXXXXX)"
         completion_final={output.completion:q}
-        completion_tmp={output.completion:q}.tmp.$$
+        completion_tmp="$(mktemp {output.completion:q}.tmp.XXXXXX)"
         backup_suffix=".backup"
         publish_in_progress=0
         demux_scratch_active=0
@@ -890,8 +890,6 @@ checkpoint demux:
         }}
         trap cleanup_demux_tmp EXIT
 
-        rm -rf -- "$dna_tmp" "$rna_tmp"
-        mkdir -p "$dna_tmp" "$rna_tmp"
 
         dna_write_tmp="$dna_tmp"
         rna_write_tmp="$rna_tmp"
@@ -1311,7 +1309,7 @@ if METHYLATION_BACKEND == "biscuit":
 
                 dna_pipeline_run_bsconv_classification \
                     {params.samtools:q} {params.biscuit:q} {input.ref:q} {input.bam:q} \
-                    {log.classify:q} "${{common_extract_args[@]}}"
+                    {log.classify:q} {RULE_PYTHON:q} "${{common_extract_args[@]}}"
 
                 if [ ! -s "$tmp_names" ]; then
                     echo "INFO: no high-CpH reads detected; copying complete aligned BAM." >> {log.filter:q}
@@ -1391,9 +1389,9 @@ if METHYLATION_BACKEND == "biscuit":
                     {params.resource_log:q} {resources.attempt_no} {threads} \
                     {resources.mem_mb} {resources.runtime} >> {log:q}
 
-                tmp_names={output.names:q}.tmp.$$
-                tmp_summary={output.summary:q}.tmp.$$
-                tmp_mqc={output.mqc:q}.tmp.$$
+                tmp_names="$(mktemp {output.names:q}.tmp.XXXXXX)"
+                tmp_summary="$(mktemp {output.summary:q}.tmp.XXXXXX)"
+                tmp_mqc="$(mktemp {output.mqc:q}.tmp.XXXXXX)"
                 cleanup_bsconv_filter_tmp() {{
                     rm -f -- "$tmp_names" "$tmp_summary" "$tmp_mqc"
                 }}
@@ -1415,7 +1413,7 @@ if METHYLATION_BACKEND == "biscuit":
 
                 dna_pipeline_run_bsconv_classification \
                     {params.samtools:q} {params.biscuit:q} {input.ref:q} {input.bam:q} \
-                    {log:q} "${{common_extract_args[@]}}"
+                    {log:q} {RULE_PYTHON:q} "${{common_extract_args[@]}}"
 
 
                 mv "$tmp_names" {output.names:q}
@@ -1461,7 +1459,7 @@ if METHYLATION_BACKEND == "biscuit":
                     {params.resource_log:q} {resources.attempt_no} {threads} \
                     {resources.mem_mb} {resources.runtime} >> {log:q}
 
-                tmp_bam={output.dna:q}.tmp.$$
+                tmp_bam="$(mktemp {output.dna:q}.tmp.XXXXXX)"
                 tmp_bai="$tmp_bam.bai"
                 cleanup_dna_bam_tmp() {{ rm -f -- "$tmp_bam" "$tmp_bai"; }}
                 trap cleanup_dna_bam_tmp EXIT
@@ -1534,7 +1532,7 @@ if METHYLATION_BACKEND == "biscuit":
                 printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
                     {params.resource_log:q} {resources.attempt_no} {threads} \
                     {resources.mem_mb} {resources.runtime} >> {log:q}
-                tmp_bam={output.rna_bam:q}.tmp.$$
+                tmp_bam="$(mktemp {output.rna_bam:q}.tmp.XXXXXX)"
                 cleanup_rna_bam_tmp() {{ rm -f -- "$tmp_bam" "$tmp_bam.bai"; }}
                 trap cleanup_rna_bam_tmp EXIT
 
@@ -1604,8 +1602,8 @@ if METHYLATION_BACKEND == "biscuit":
                 {params.resource_log:q} {resources.attempt_no} {threads} \
                 {resources.mem_mb} {resources.runtime} >> {log:q}
 
-            tmp_vcf={output.vcf:q}.tmp.$$.vcf.gz
-            tmp_stats={output.stats:q}.tmp.$$
+            tmp_vcf="$(mktemp {output.vcf:q}.tmp.XXXXXX)"
+            tmp_stats="$(mktemp {output.stats:q}.tmp.XXXXXX)"
             tmp_count="${{tmp_stats}}.count"
             cleanup_pileup_tmp() {{ rm -f -- "$tmp_vcf" "$tmp_stats" "$tmp_count"; }}
             trap cleanup_pileup_tmp EXIT
@@ -1654,7 +1652,7 @@ if METHYLATION_BACKEND == "biscuit":
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
-            scientific_identity = scientific_code_identity((), ('dna_pipeline_emit_canonical_cpg', 'dna_pipeline_pileup_stat')),
+            scientific_identity = scientific_code_identity(('read_pileup_variant_count',), ('dna_pipeline_emit_canonical_cpg',)),
             cpg_offset = CPG_COORDINATE_BASE,
             biscuit = BISCUIT,
             zstd = ZSTD,
@@ -1672,10 +1670,10 @@ if METHYLATION_BACKEND == "biscuit":
                 {params.resource_log:q} {resources.attempt_no} {threads} \
                 {resources.mem_mb} {resources.runtime} >> {log:q}
 
-            tmp_cpg={output.cpg:q}.tmp.$$.zst
+            tmp_cpg="$(mktemp {output.cpg:q}.tmp.XXXXXX)"
             cleanup_cpg_tmp() {{ rm -f -- "$tmp_cpg"; }}
             trap cleanup_cpg_tmp EXIT
-            variant_rows=$(dna_pipeline_pileup_stat {input.stats:q} variant_records)
+            variant_rows=$({RULE_PYTHON:q} -m dna_pipeline pileup-variant-count --stats {input.stats:q} --sample={wildcards.demux_sample:q})
             if [ "$variant_rows" -eq 0 ]; then
                 dna_pipeline_emit_canonical_cpg {params.zstd:q} {params.cpg_offset} "$tmp_cpg" {input.vcf:q} < /dev/null
                 echo "WARNING: pileup VCF has no records; publishing a header-only SnapATAC2 CpG table." >> {log:q}
@@ -1716,7 +1714,7 @@ if METHYLATION_BACKEND == "biscuit":
                 ),
                 attempt_no = lambda wildcards, attempt: int(attempt)
             params:
-                scientific_identity = scientific_code_identity((), ('dna_pipeline_pileup_stat',)),
+                scientific_identity = scientific_code_identity(('read_pileup_variant_count',), ()),
                 biscuit = BISCUIT,
                 bgzip = BGZIP,
                 tabix = TABIX,
@@ -1732,12 +1730,12 @@ if METHYLATION_BACKEND == "biscuit":
                 printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
                     {params.resource_log:q} {resources.attempt_no} {threads} \
                     {resources.mem_mb} {resources.runtime} >> {log:q}
-                tmp_snp={output.snp:q}.tmp.$$.bed.gz
+                tmp_snp="$(mktemp {output.snp:q}.tmp.XXXXXX)"
                 tmp_tbi="$tmp_snp.tbi"
                 cleanup_snp_tmp() {{ rm -f -- "$tmp_snp" "$tmp_tbi"; }}
                 trap cleanup_snp_tmp EXIT
 
-                variant_rows=$(dna_pipeline_pileup_stat {input.stats:q} variant_records)
+                variant_rows=$({RULE_PYTHON:q} -m dna_pipeline pileup-variant-count --stats {input.stats:q} --sample={wildcards.demux_sample:q})
                 if [ "$variant_rows" -eq 0 ]; then
                     echo "WARNING: pileup VCF has no records; publishing an empty SNP BED." >> {log:q}
                     : | {params.bgzip:q} -@ {params.bgzip_threads} -c > "$tmp_snp"
@@ -1783,7 +1781,7 @@ if METHYLATION_BACKEND == "biscuit":
             attempt_no = lambda wildcards, attempt: int(attempt)
         conda: ENVIRONMENT_YAML
         params:
-            scientific_identity = scientific_code_identity((), ('dna_pipeline_pileup_stat',)),
+            scientific_identity = scientific_code_identity(('read_pileup_variant_count',), ()),
             sample_name = lambda wc: wc.demux_sample.replace(os.sep, "_"),
             biscuit = BISCUIT,
             samtools = SAMTOOLS,
@@ -1898,7 +1896,7 @@ EOF_DUP
 
             base_conv="$qc_tmp/${{sample_name}}_totalBaseConversionRate.txt"
             echo "BISCUITqc Conversion Rate by Base Average Table" > "$base_conv"
-            variant_rows=$(dna_pipeline_pileup_stat {input.stats:q} variant_records)
+            variant_rows=$({RULE_PYTHON:q} -m dna_pipeline pileup-variant-count --stats {input.stats:q} --sample={wildcards.demux_sample:q})
             if [ "$variant_rows" -eq 0 ]; then
                 printf 'CA\tCC\tCG\tCT\n-1\t-1\t-1\t-1\n' >> "$base_conv"
             else
@@ -2382,14 +2380,14 @@ else:
                 printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
                     {params.resource_log:q} {resources.attempt_no} {threads} \
                     {resources.mem_mb} {resources.runtime} >> {log:q}
-                tmp_bam={output.bam:q}.tmp.$$
+                tmp_bam="$(mktemp {output.bam:q}.tmp.XXXXXX)"
                 tmp_bai="$tmp_bam.bai"
                 trap 'rm -f -- "$tmp_bam" "$tmp_bai"' EXIT
                 sam_extra=$(({threads} > 1 ? {threads} - 1 : 0))
                 dna_pipeline_coordinate_sort_and_stage \
                     {params.samtools:q} "$sam_extra" {input.bam:q} \
                     "$tmp_bam" "$tmp_bai" \
-                    {output.bam:q} {output.bai:q} >> {log:q} 2>&1
+                    {output.bam:q} {output.bai:q} {RULE_PYTHON:q} >> {log:q} 2>&1
                 rm -f -- "$tmp_bam" "$tmp_bai"
                 trap - EXIT
                 """
@@ -2523,7 +2521,7 @@ else:
                 >> {log:q}
             exec 2>> {log:q}
 
-            tmp_cpg={output.cpg:q}.tmp.$$.zst
+            tmp_cpg="$(mktemp {output.cpg:q}.tmp.XXXXXX)"
             cleanup_cpg_tmp() {{ rm -f -- "$tmp_cpg"; }}
             trap cleanup_cpg_tmp EXIT
             {params.gzip:q} -t {input.cov:q}

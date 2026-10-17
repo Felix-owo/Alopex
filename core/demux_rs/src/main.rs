@@ -486,6 +486,7 @@ mod fastq_io {
         trim_start: usize,
         umi: Option<&[u8]>,
         trim: bool,
+        keep_comment: bool,
     ) -> Result<()> {
         output.push(b'@');
         if let Some(umi_seq) = umi {
@@ -493,8 +494,10 @@ mod fastq_io {
             output.push(b':');
             output.extend_from_slice(umi_seq);
             let header = id.trim_ascii_start();
-            if let Some(comment_start) = header.iter().position(u8::is_ascii_whitespace) {
-                output.extend_from_slice(&header[comment_start..]);
+            if keep_comment {
+                if let Some(comment_start) = header.iter().position(u8::is_ascii_whitespace) {
+                    output.extend_from_slice(&header[comment_start..]);
+                }
             }
         } else {
             output.extend_from_slice(id);
@@ -553,6 +556,12 @@ mod fastq_io {
         Ok(r1_normalized)
     }
 
+    pub(super) fn validate_fastq_quality(seq: &[u8], qual: &[u8]) -> Result<()> {
+        anyhow::ensure!(seq.len() == qual.len(), "FASTQ sequence/quality length mismatch");
+        anyhow::ensure!(qual.iter().all(|q| (33..=126).contains(q)), "Invalid FASTQ Phred+33 quality");
+        Ok(())
+    }
+
     pub(super) fn read_fastq_pairs(
         r1_paths: &[PathBuf],
         r2_paths: &[PathBuf],
@@ -607,6 +616,8 @@ mod fastq_io {
                         let r2_seq = r2.seq();
                         let r1_qual = r1.qual().context("R1 record is missing quality scores")?;
                         let r2_qual = r2.qual().context("R2 record is missing quality scores")?;
+                        validate_fastq_quality(r1_seq.as_ref(), r1_qual)?;
+                        validate_fastq_quality(r2_seq.as_ref(), r2_qual)?;
 
                         current_chunk.push_pair(
                             r1.id(),
@@ -888,7 +899,7 @@ mod matcher {
                 if barcode_start <= barcode_end && barcode_end <= r1.len() {
                     let observed = &r1[barcode_start..barcode_end];
                     let barcode_match = dna_idx.match_cascade(observed);
-                    let payload_start = pos + ME_SEQ.len() + LEN_GAP_AFTER_ME;
+                    let payload_start = alignment.end + LEN_GAP_AFTER_ME;
                     if payload_start < r1.len() {
                         if let BarcodeMatch::Unique { id } = barcode_match {
                             return Some(ProcResult::assigned(
@@ -1380,6 +1391,7 @@ mod output {
         tx_acc_recycle: Sender<AccumulationBuffer>,
         paths: OutputPaths,
         cell_rows: Vec<CellRow>,
+        completion: Receiver<bool>,
     ) -> JoinHandle<Result<u64>> {
         std::thread::spawn(move || {
             let buckets = paths.dna_cell_ids.len() + paths.rna_cell_ids.len();
@@ -1387,9 +1399,9 @@ mod output {
             if droplet_stage::writer_shards(paths.mode) > 1
                 && writer_pair_budget(paths.mode, buckets, detect_soft_open_file_limit()) >= buckets
             {
-                writer_loop_parallel(rx_write, tx_acc_recycle, paths, cell_rows, writeback)
+                writer_loop_parallel(rx_write, tx_acc_recycle, paths, cell_rows, writeback, completion)
             } else {
-                writer_loop(rx_write, tx_acc_recycle, paths, cell_rows, writeback)
+                writer_loop(rx_write, tx_acc_recycle, paths, cell_rows, writeback, completion)
             }
         })
     }
@@ -1555,6 +1567,7 @@ mod output {
         paths: OutputPaths,
         cell_rows: Vec<CellRow>,
         writeback: Option<WritebackGuard>,
+        completion: Receiver<bool>,
     ) -> Result<u64> {
         let mut writers = WriterCache::new(
             paths.mode,
@@ -1634,6 +1647,7 @@ mod output {
             fate_matched
         );
         }
+        anyhow::ensure!(completion.recv().context("Missing demux input completion")?, "Demux input processing failed");
         write_report(&paths, &cell_rows, &stats, fate_counts)?;
         Ok(matched_reads)
     }
@@ -1644,6 +1658,7 @@ mod output {
         paths: OutputPaths,
         rows: Vec<CellRow>,
         writeback: Option<WritebackGuard>,
+        completion: Receiver<bool>,
     ) -> Result<u64> {
         let partitions = droplet_stage::writer_shards(paths.mode);
         let mut senders = Vec::new();
@@ -1740,6 +1755,7 @@ mod output {
             "DROPLET_WRITER_PROFILE {}",
             serde_json::json!({"partitions":partitions,"chunks":dispatch,"dispatch_wait_seconds":queue_seconds})
         );
+        anyhow::ensure!(completion.recv().context("Missing demux input completion")?, "Demux input processing failed");
         write_report(&paths, &rows, &stats, fates)?;
         Ok(matched)
     }
@@ -2301,14 +2317,7 @@ mod droplet {
                 let qual = record
                     .qual()
                     .context("R1 must contain FASTQ quality scores")?;
-                anyhow::ensure!(
-                    seq.len() == qual.len(),
-                    "FASTQ sequence/quality length mismatch"
-                );
-                anyhow::ensure!(
-                    qual.iter().all(|q| (33..=126).contains(q)),
-                    "Invalid FASTQ Phred+33 quality"
-                );
+                validate_fastq_quality(seq.as_ref(), qual)?;
                 normalize_read_id(record.id())?;
                 batch.push((seq.to_vec(), qual.to_vec()));
                 if batch.len() == DEFAULT_CHUNK_SIZE {
@@ -2354,8 +2363,11 @@ mod droplet {
 
     pub(super) fn molecule_key(layout: &Layout<'_>, seq: &[u8]) -> Option<u128> {
         let insert = seq.get(layout.trim_start..layout.trim_start + 32)?;
-        layout
-            .umi
+        encode_molecule(layout.umi, insert)
+    }
+
+    pub(super) fn encode_molecule(umi: &[u8], insert: &[u8]) -> Option<u128> {
+        umi
             .iter()
             .chain(insert)
             .try_fold(0u128, |key, base| {
@@ -2431,10 +2443,8 @@ mod droplet {
             while let Some(record) = reader.next() {
                 let record = record?;
                 let seq = record.seq();
-                anyhow::ensure!(
-                    record.qual().is_some_and(|q| q.len() == seq.len()),
-                    "Molecule evidence requires FASTQ sequence/quality pairs"
-                );
+                let quality = record.qual().context("Molecule evidence requires FASTQ sequence/quality pairs")?;
+                validate_fastq_quality(seq.as_ref(), quality)?;
                 normalize_read_id(record.id())?;
                 batch.push(seq.to_vec());
                 if batch.len() == DEFAULT_CHUNK_SIZE {
@@ -3445,7 +3455,8 @@ fn run_pipeline(
         config.mode,
     );
 
-    let writer_handle = spawn_writer(rx_write, tx_acc_recycle, paths, cell_rows);
+    let (tx_completion, rx_completion) = bounded(1);
+    let writer_handle = spawn_writer(rx_write, tx_acc_recycle, paths, cell_rows, rx_completion);
 
     let read_result = read_fastq_pairs(
         &config.r1,
@@ -3466,6 +3477,7 @@ fn run_pipeline(
         Ok(result) => result,
         Err(err) => Err(err),
     };
+    let _ = tx_completion.send(read_result.is_ok() && worker_result.is_ok());
     let writer_result = match join_thread(writer_handle, "writer") {
         Ok(result) => result,
         Err(err) => Err(err),
@@ -3595,24 +3607,17 @@ fn process_chunk(
 
         write_fastq_record(
             &mut bucket.r1_raw,
-            if demux_mode == DemuxMode::DnaOnlyDroplet {
-                normalize_read_id(&input.r1_ids[r1_id_start..r1_id_end])?
-            } else {
-                &input.r1_ids[r1_id_start..r1_id_end]
-            },
+            &input.r1_ids[r1_id_start..r1_id_end],
             r1_seq,
             &input.r1_quals[r1_start..r1_end],
             result.trim_start,
             result.output_umi(),
             result.is_valid,
+            demux_mode != DemuxMode::DnaOnlyDroplet,
         )?;
         write_fastq_record(
             &mut bucket.r2_raw,
-            if demux_mode == DemuxMode::DnaOnlyDroplet {
-                normalize_read_id(&input.r2_ids[r2_id_start..r2_id_end])?
-            } else {
-                &input.r2_ids[r2_id_start..r2_id_end]
-            },
+            &input.r2_ids[r2_id_start..r2_id_end],
             &input.r2_seqs[r2_start..r2_end],
             &input.r2_quals[r2_start..r2_end],
             if demux_mode == DemuxMode::DnaOnlyDroplet {
@@ -3622,6 +3627,7 @@ fn process_chunk(
             },
             result.output_umi(),
             demux_mode == DemuxMode::DnaOnlyDroplet,
+            demux_mode != DemuxMode::DnaOnlyDroplet,
         )?;
     }
     Ok(())
@@ -4017,6 +4023,7 @@ mod tests {
                     0,
                     Some(b"ACGTACGT"),
                     false,
+                    true,
                 )
                 .expect("valid RNA FASTQ");
                 assert_eq!(
@@ -4138,6 +4145,22 @@ mod tests {
             DemuxMode::DnaOnlyTaps,
         );
         assert!(!result.is_valid);
+    }
+
+    #[test]
+    fn dna_indel_fallback_trims_at_actual_anchor_end() {
+        init_tables();
+        let index = BarcodeIndex::from_barcodes(["ACGTACGT".to_string()], 8, Modality::Dna);
+        for lut in [DNA_NATIVE_TABLE.get().unwrap(), DNA_BISULFITE_TABLE.get().unwrap()] {
+            for insertion in [true, false] {
+                let mut anchor = ME_SEQ.to_vec();
+                if insertion { anchor.insert(8, b'C'); } else { anchor.remove(8); }
+                let read = [b"ACGTACGT".as_slice(), &anchor, b"NNNNNNNNN", b"GACTACGT"].concat();
+                let assigned = match_dna_read(&read, &index, lut, 0).unwrap();
+                assert!(assigned.is_valid);
+                assert_eq!(&read[assigned.trim_start..], b"GACTACGT", "insertion={insertion}");
+            }
+        }
     }
 
     #[test]
@@ -4515,12 +4538,8 @@ mod droplet_stage {
                         count.below_q20[j] += u64::from(*q < 53);
                         count.q30[j] += u64::from(*q >= 63);
                     }
-                    let id1 = normalize_read_id(
-                        &input.r1_ids[input.r1_id_offsets[i]..input.r1_id_offsets[i + 1]],
-                    )?;
-                    let id2 = normalize_read_id(
-                        &input.r2_ids[input.r2_id_offsets[i]..input.r2_id_offsets[i + 1]],
-                    )?;
+                    let id1 = &input.r1_ids[input.r1_id_offsets[i]..input.r1_id_offsets[i + 1]];
+                    let id2 = &input.r2_ids[input.r2_id_offsets[i]..input.r2_id_offsets[i + 1]];
                     let out = &mut raw[shard(layout.barcode, shards)];
                     append_u32(out, i)?;
                     out.extend_from_slice(layout.barcode);
@@ -4539,9 +4558,10 @@ mod droplet_stage {
                         layout.trim_start,
                         Some(layout.umi),
                         true,
+                        false,
                     )?;
                     let second = out.len();
-                    write_fastq_record(out, id2, r2, q2, 9, Some(layout.umi), true)?;
+                    write_fastq_record(out, id2, r2, q2, 9, Some(layout.umi), true, false)?;
                     let n1 = u32::try_from(second - first)?;
                     let n2 = u32::try_from(out.len() - second)?;
                     out[length_at..length_at + 4].copy_from_slice(&n1.to_le_bytes());
@@ -4993,15 +5013,36 @@ mod droplet_stage {
         r1: &'a [u8],
         r2: &'a [u8],
     }
+
+    // CRC 只证明压缩字节完整；重放和分子证据还须核对内部 FASTQ 结构与身份。
+    fn spool_fastq(data: &[u8]) -> Result<(&[u8], &[u8])> {
+        let mut lines = data.split(|b| *b == b'\n');
+        let id = lines.next().context("missing spool FASTQ header")?;
+        let seq = lines.next().context("missing spool FASTQ sequence")?;
+        let plus = lines.next().context("missing spool FASTQ separator")?;
+        let qual = lines.next().context("missing spool FASTQ quality")?;
+        anyhow::ensure!(
+            id.starts_with(b"@") && id.len() > 1 && !id.iter().any(u8::is_ascii_whitespace)
+                && plus == b"+" && !seq.is_empty()
+                && lines.next() == Some(b"".as_slice()) && lines.next().is_none(),
+            "invalid spool FASTQ structure"
+        );
+        validate_fastq_quality(seq, qual)?;
+        Ok((&id[1..], seq))
+    }
+
     fn walk(data: &[u8], mut consume: impl FnMut(RawRecord<'_>) -> Result<()>) -> Result<()> {
         let mut at = 0usize;
         while at < data.len() {
             anyhow::ensure!(data.len() - at >= 47, "truncated record header");
             let ordinal = u32::from_le_bytes(data[at..at + 4].try_into()?);
             let barcode = &data[at + 4..at + 21];
+            anyhow::ensure!(barcode.iter().all(|b| b"ACGT".contains(b)), "invalid spool barcode");
+            anyhow::ensure!(data[at + 21] <= 1 && data[at + 22] <= 1, "invalid spool boolean flag");
             let short_r2 = data[at + 21] != 0;
-            let key = (data[at + 22] != 0)
-                .then(|| u128::from_le_bytes(data[at + 23..at + 39].try_into().unwrap()));
+            let encoded = u128::from_le_bytes(data[at + 23..at + 39].try_into()?);
+            let key = (data[at + 22] != 0).then_some(encoded);
+            anyhow::ensure!(key.is_some() || encoded == 0, "invalid absent spool molecule key");
             let n1 = u32::from_le_bytes(data[at + 39..at + 43].try_into()?) as usize;
             let n2 = u32::from_le_bytes(data[at + 43..at + 47].try_into()?) as usize;
             at += 47;
@@ -5010,13 +5051,23 @@ mod droplet_stage {
                 .and_then(|x| x.checked_add(n2))
                 .context("record length overflow")?;
             anyhow::ensure!(end <= data.len(), "truncated record body");
+            let r1 = &data[at..at + n1];
+            let r2 = &data[at + n1..end];
+            let (id1, seq1) = spool_fastq(r1)?;
+            let (id2, _) = spool_fastq(r2)?;
+            anyhow::ensure!(id1 == id2, "spool mate QNAME mismatch");
+            let umi_start = id1.iter().rposition(|b| *b == b':').context("missing spool UMI")?;
+            let umi = &id1[umi_start + 1..];
+            anyhow::ensure!(umi_start > 0 && umi.len() == 12 && umi.iter().all(|b| b"ACGTN".contains(b)), "invalid spool UMI");
+            let expected = seq1.get(..32).and_then(|insert| droplet::encode_molecule(umi, insert));
+            anyhow::ensure!(key == expected, "spool molecule key disagrees with FASTQ");
             consume(RawRecord {
                 ordinal,
                 barcode,
                 short_r2,
                 key,
-                r1: &data[at..at + n1],
-                r2: &data[at + n1..end],
+                r1,
+                r2,
             })?;
             at = end;
         }
@@ -5322,7 +5373,8 @@ mod droplet_stage {
             json_report: private_report.clone(),
             ..paths
         };
-        let writer = spawn_writer(rx, tx_recycle, paths, rows);
+        let (tx_completion, rx_completion) = bounded(1);
+        let writer = spawn_writer(rx, tx_recycle, paths, rows, rx_completion);
         let start = Instant::now();
         let mut total = ReplayTimings::default();
         let mut released = vec![0u64; readers.len()];
@@ -5380,6 +5432,7 @@ mod droplet_stage {
             Ok(())
         })();
         drop(tx);
+        let _ = tx_completion.send(processing.is_ok());
         let written = writer
             .join()
             .map_err(|_| anyhow::anyhow!("replay writer panic"));
