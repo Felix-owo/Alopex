@@ -402,8 +402,8 @@ mod cli {
         )]
         pub(crate) r2: Vec<PathBuf>,
 
-        #[arg(long, hide = true, conflicts_with = "evidence_pairs")]
-        pub(crate) fastq_stream: bool,
+        #[arg(long, hide = true, conflicts_with = "count_only")]
+        pub(crate) droplet_spool: Option<PathBuf>,
 
         #[arg(long, requires = "counts_output")]
         pub(crate) count_only: bool,
@@ -962,6 +962,9 @@ mod output {
     use std::fs::{File, OpenOptions};
     use std::io::{BufWriter, Write};
     use std::process::Command;
+    use std::sync::{Mutex, Weak};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
 
     pub(super) fn compress_accumulation(acc: &mut AccumulationBuffer) -> Result<()> {
         let mut compressor =
@@ -1005,6 +1008,19 @@ mod output {
         Ok(())
     }
 
+    pub(super) fn compress_stage_shards(raw: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        raw.par_iter()
+            .map(|plain| {
+                let mut out = Vec::new();
+                if !plain.is_empty() {
+                    let mut compressor = Compressor::new(CompressionLvl::new(1).unwrap());
+                    compress_plain_buffer(&mut compressor, plain, &mut out, "raw barcode shard")?;
+                }
+                Ok(out)
+            })
+            .collect()
+    }
+
     fn compress_buffer(
         compressor: &mut Compressor,
         input: &[u8],
@@ -1020,17 +1036,367 @@ mod output {
         )
     }
 
+
+    struct WritebackState {
+        files: Mutex<VecDeque<Weak<WritebackFile>>>,
+        max_entries: usize,
+        pressure: Option<(PathBuf, u64)>,
+        stopped: AtomicBool,
+        failed: AtomicBool,
+        failure: Mutex<Option<String>>,
+        written: AtomicU64,
+        settled: AtomicU64,
+        cycles: AtomicU64,
+        synced_files: AtomicU64,
+        sync_nanos: AtomicU64,
+        peak_dirty: AtomicU64,
+    }
+
+    struct WritebackFile {
+        file: File,
+        written: AtomicU64,
+        synced: AtomicU64,
+        state: Weak<WritebackState>,
+    }
+
+    impl Drop for WritebackFile {
+        fn drop(&mut self) {
+            if let Some(state) = self.state.upgrade() {
+                state.settled.fetch_add(
+                    self.written.load(Ordering::Acquire)
+                        .saturating_sub(self.synced.load(Ordering::Acquire)),
+                    Ordering::Release,
+                );
+            }
+        }
+    }
+
+    pub(super) struct OutputFile {
+        target: Arc<WritebackFile>,
+        state: Option<Arc<WritebackState>>,
+    }
+
+    impl OutputFile {
+        fn new(file: File, state: Option<Arc<WritebackState>>) -> Result<Self> {
+            let target = Arc::new(WritebackFile {
+                file,
+                written: AtomicU64::new(0),
+                synced: AtomicU64::new(0),
+                state: state.as_ref().map(Arc::downgrade).unwrap_or_default(),
+            });
+            if let Some(state) = &state {
+                let mut files = state.files.lock().map_err(|_| anyhow::anyhow!("writeback registry poisoned"))?;
+                if files.len() >= state.max_entries {
+                    files.retain(|entry| entry.strong_count() > 0);
+                }
+                files.push_back(Arc::downgrade(&target));
+            }
+            Ok(Self { target, state })
+        }
+    }
+
+    pub(super) fn spool_output(file: File, guard: Option<&WritebackGuard>) -> Result<OutputFile> {
+        OutputFile::new(file, guard.map(|guard| guard.state.clone()))
+    }
+
+    impl OutputFile {
+        pub(super) fn sync_spool(&self) -> std::io::Result<()> {
+            self.target.file.sync_all()?;
+            release_output_cache(&self.target.file);
+            Ok(())
+        }
+    }
+
+    impl Write for OutputFile {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(state) = &self.state {
+                if state.failed.load(Ordering::Acquire) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, state.error_message()));
+                }
+            }
+            let count = (&self.target.file).write(bytes)?;
+            if let Some(state) = &self.state {
+                self.target.written.fetch_add(count as u64, Ordering::Release);
+                state.written.fetch_add(count as u64, Ordering::Release);
+            }
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            (&self.target.file).flush()
+        }
+    }
+
+    type FastqWriter = BufWriter<OutputFile>;
+
+    fn memory_limit(text: &str) -> Option<u64> {
+        text.trim().parse::<u64>().ok().filter(|value| *value > 0)
+    }
+
+    fn writeback_pressure() -> Option<(PathBuf, u64)> {
+        let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let relative = membership.lines().find_map(|line| line.strip_prefix("0::"))?;
+        let base = Path::new("/sys/fs/cgroup");
+        let current = base.join(relative.trim_start_matches('/'));
+        if current.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+            return None;
+        }
+        let mut selected: Option<(PathBuf, u64)> = None;
+        for directory in current.ancestors().take_while(|path| path.starts_with(base)) {
+            for name in ["memory.max", "memory.high"] {
+                let limit = std::fs::read_to_string(directory.join(name)).ok().and_then(|text| memory_limit(&text));
+                if let Some(limit) = limit {
+                    if selected.as_ref().map_or(true, |(_, old)| limit < *old) {
+                        selected = Some((directory.join("memory.stat"), limit));
+                    }
+                }
+            }
+        }
+        selected.map(|(path, limit)| (path, (limit / 4).clamp(64 * 1024 * 1024, 6 * 1024 * 1024 * 1024)))
+    }
+
+    fn dirty_bytes(text: &str) -> Option<u64> {
+        text.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next()? == "file_dirty").then(|| fields.next()?.parse().ok()).flatten()
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn release_output_cache(file: &File) {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn posix_fadvise(fd: i32, offset: i64, length: i64, advice: i32) -> i32;
+        }
+        unsafe { let _ = posix_fadvise(file.as_raw_fd(), 0, 0, 4); }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn release_output_cache(_file: &File) {}
+
+    impl WritebackState {
+        fn new(max_streams: usize, pressure: Option<(PathBuf, u64)>) -> Self {
+            Self {
+                files: Mutex::new(VecDeque::new()),
+                max_entries: max_streams.saturating_add(128).max(256),
+                pressure,
+                stopped: AtomicBool::new(false), failed: AtomicBool::new(false),
+                failure: Mutex::new(None), written: AtomicU64::new(0), settled: AtomicU64::new(0),
+                cycles: AtomicU64::new(0), synced_files: AtomicU64::new(0),
+                sync_nanos: AtomicU64::new(0), peak_dirty: AtomicU64::new(0),
+            }
+        }
+
+        fn error_message(&self) -> String {
+            self.failure.lock().ok().and_then(|error| error.clone())
+                .unwrap_or_else(|| "output writeback failed".to_string())
+        }
+
+        fn pressured(&self) -> bool {
+            if let Some((path, threshold)) = &self.pressure {
+                if let Some(dirty) = std::fs::read_to_string(path).ok().and_then(|text| dirty_bytes(&text)) {
+                    self.peak_dirty.fetch_max(dirty, Ordering::Relaxed);
+                    if dirty >= *threshold { return true; }
+                }
+            }
+            self.written.load(Ordering::Acquire).saturating_sub(self.settled.load(Ordering::Acquire)) >= 512 * 1024 * 1024
+        }
+
+        fn sync_file(&self, entry: &Weak<WritebackFile>) -> Result<()> {
+            let Some(target) = entry.upgrade() else { return Ok(()); };
+            let written = target.written.load(Ordering::Acquire);
+            let previous = target.synced.load(Ordering::Acquire);
+            if written == previous { return Ok(()); }
+            let at = std::time::Instant::now();
+            target.file.sync_data().context("Failed writing back Droplet FASTQ data")?;
+            release_output_cache(&target.file);
+            target.synced.store(written, Ordering::Release);
+            self.settled.fetch_add(written.saturating_sub(previous), Ordering::Release);
+            self.synced_files.fetch_add(1, Ordering::Relaxed);
+            self.sync_nanos.fetch_add(at.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn pending_bytes(entry: &Weak<WritebackFile>) -> u64 {
+            entry.upgrade().map(|target| target.written.load(Ordering::Acquire)
+                .saturating_sub(target.synced.load(Ordering::Acquire))).unwrap_or(0)
+        }
+
+        fn run(&self) -> Result<()> {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(4).thread_name(|index| format!("droplet-wb-{index}")).build()
+                .context("Cannot initialize Droplet writeback workers")?;
+            while !self.stopped.load(Ordering::Acquire) {
+                if self.pressured() {
+                    let batch = {
+                        let mut files = self.files.lock().map_err(|_| anyhow::anyhow!("writeback registry poisoned"))?;
+                        let mut ranked = files.drain(..).map(|entry| {
+                            let pending = Self::pending_bytes(&entry);
+                            (entry, pending)
+                        }).filter(|(entry, _)| entry.strong_count() > 0).collect::<Vec<_>>();
+                        ranked.sort_unstable_by_key(|(_, pending)| std::cmp::Reverse(*pending));
+                        let count = ranked.partition_point(|(_, pending)| *pending > 0).min(1024);
+                        let rest = ranked.split_off(count);
+                        files.extend(rest.into_iter().map(|(entry, _)| entry));
+                        ranked.into_iter().map(|(entry, _)| entry).collect::<Vec<_>>()
+                    };
+                    pool.install(|| batch.par_iter().try_for_each(|entry| self.sync_file(entry)))?;
+                    let mut files = self.files.lock().map_err(|_| anyhow::anyhow!("writeback registry poisoned"))?;
+                    files.extend(batch.into_iter().filter(|entry| entry.strong_count() > 0));
+                    self.cycles.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::park_timeout(Duration::from_millis(250));
+            }
+            Ok(())
+        }
+    }
+
+    pub(super) struct WritebackGuard {
+        state: Arc<WritebackState>,
+        thread: Option<JoinHandle<Result<()>>>,
+    }
+
+    impl WritebackGuard {
+        pub(super) fn start(mode: DemuxMode, max_streams: usize) -> Result<Option<Self>> {
+            if mode != DemuxMode::DnaOnlyDroplet || !cfg!(target_os = "linux") {
+                return Ok(None);
+            }
+            Self::spawn(Arc::new(WritebackState::new(max_streams, writeback_pressure()))).map(Some)
+        }
+
+        fn spawn(state: Arc<WritebackState>) -> Result<Self> {
+            let worker = state.clone();
+            let thread = std::thread::Builder::new().name("droplet-writeback".to_string()).spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run()))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("Droplet writeback worker panicked")));
+                if let Err(error) = &result {
+                    if let Ok(mut stored) = worker.failure.lock() { *stored = Some(format!("{error:#}")); }
+                    worker.failed.store(true, Ordering::Release);
+                }
+                result
+            }).context("Cannot start Droplet writeback coordinator")?;
+            Ok(Self { state, thread: Some(thread) })
+        }
+
+        pub(super) fn finish(mut self) -> Result<()> {
+            self.state.stopped.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.thread().unpark();
+                thread.join().map_err(|_| anyhow::anyhow!("Droplet writeback coordinator panicked"))??;
+            }
+            eprintln!("DROPLET_WRITEBACK_PROFILE {}", serde_json::json!({
+                "cycles":self.state.cycles.load(Ordering::Relaxed),
+                "files_synced":self.state.synced_files.load(Ordering::Relaxed),
+                "sync_seconds_sum":self.state.sync_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+                "peak_observed_dirty_bytes":self.state.peak_dirty.load(Ordering::Relaxed),
+                "dirty_trigger_bytes":self.state.pressure.as_ref().map(|(_, value)| value),
+                "timing_note":"background intervals overlap scientific processing"
+            }));
+            Ok(())
+        }
+    }
+
+    impl Drop for WritebackGuard {
+        fn drop(&mut self) {
+            self.state.stopped.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.thread().unpark();
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[test]
+    fn writeback_preserves_bytes_and_releases_weak_handles() {
+        let root = std::env::temp_dir().join(format!("demux-writeback-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("output.gz");
+        let state = Arc::new(WritebackState::new(8, None));
+        let mut output = BufWriter::with_capacity(8, OutputFile::new(File::create(&path).unwrap(), Some(state.clone())).unwrap());
+        output.write_all(b"first gzip member").unwrap();
+        output.write_all(b"second gzip member").unwrap();
+        output.flush().unwrap();
+        let entry = state.files.lock().unwrap().front().unwrap().clone();
+        state.sync_file(&entry).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first gzip membersecond gzip member");
+        assert_eq!(state.written.load(Ordering::Acquire), state.settled.load(Ordering::Acquire));
+        output.write_all(b"tail").unwrap();
+        output.flush().unwrap();
+        drop(output);
+        assert!(entry.upgrade().is_none());
+        assert_eq!(state.written.load(Ordering::Acquire), state.settled.load(Ordering::Acquire));
+        assert_eq!(std::fs::read(&path).unwrap(), b"first gzip membersecond gzip membertail");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writeback_registry_does_not_retain_evicted_output_fds() {
+        let root = std::env::temp_dir().join(format!("demux-writeback-weak-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("output.gz");
+        let state = Arc::new(WritebackState::new(8, None));
+        for _ in 0..600 {
+            let output = OutputFile::new(File::create(&path).unwrap(), Some(state.clone())).unwrap();
+            assert_eq!(Arc::strong_count(&output.target), 1);
+            drop(output);
+        }
+        assert!(state.files.lock().unwrap().len() <= state.max_entries);
+        assert!(state.files.lock().unwrap().iter().all(|entry| entry.upgrade().is_none()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writeback_pressure_and_failure_propagate_before_completion() {
+        assert_eq!(memory_limit("max\n"), None);
+        assert_eq!(memory_limit("17179869184\n"), Some(16 * 1024 * 1024 * 1024));
+        assert_eq!(dirty_bytes("anon 20\nfile_dirty 34\nfile_writeback 9\n"), Some(34));
+        assert_eq!(dirty_bytes("anon 20\n"), None);
+        let root = std::env::temp_dir().join(format!("demux-writeback-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let pressure = root.join("memory.stat");
+        std::fs::write(&pressure, b"file_dirty 100\n").unwrap();
+        let low_dirty = Arc::new(WritebackState::new(8, Some((pressure.clone(), 1000))));
+        assert!(!low_dirty.pressured());
+        low_dirty.written.store(512 * 1024 * 1024, Ordering::Release);
+        assert!(low_dirty.pressured());
+        low_dirty.settled.store(512 * 1024 * 1024, Ordering::Release);
+        assert!(!low_dirty.pressured());
+        let state = Arc::new(WritebackState::new(8, Some((pressure, 1))));
+        let mut sink = OutputFile::new(File::open("/dev/null").unwrap(), Some(state.clone())).unwrap();
+        sink.target.written.store(1, Ordering::Release);
+        state.written.store(1, Ordering::Release);
+        let guard = WritebackGuard::spawn(state.clone()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !state.failed.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let error = guard.finish().unwrap_err();
+        assert!(format!("{error:#}").contains("Failed writing back Droplet FASTQ data"));
+        assert!(sink.write_all(b"must not be accepted").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     pub(super) fn spawn_writer(
         rx_write: Receiver<CompletedChunk>,
         tx_acc_recycle: Sender<AccumulationBuffer>,
         paths: OutputPaths,
         cell_rows: Vec<CellRow>,
     ) -> JoinHandle<Result<u64>> {
-        std::thread::spawn(move || writer_loop(rx_write, tx_acc_recycle, paths, cell_rows))
+        std::thread::spawn(move || {
+            let buckets = paths.dna_cell_ids.len() + paths.rna_cell_ids.len();
+            let writeback = WritebackGuard::start(paths.mode, writer_pair_budget(paths.mode, buckets, detect_soft_open_file_limit()).saturating_mul(2))?;
+            if droplet_stage::writer_shards(paths.mode) > 1
+                && writer_pair_budget(paths.mode, buckets, detect_soft_open_file_limit()) >= buckets
+            {
+                writer_loop_parallel(rx_write, tx_acc_recycle, paths, cell_rows, writeback)
+            } else {
+                writer_loop(rx_write, tx_acc_recycle, paths, cell_rows, writeback)
+            }
+        })
     }
 
     struct WriterCache {
-        writers: AHashMap<BucketKey, (BufWriter<File>, BufWriter<File>)>,
+        writers: AHashMap<BucketKey, (FastqWriter, FastqWriter)>,
+        writeback: Option<Arc<WritebackState>>,
         order: VecDeque<BucketKey>,
         max_pairs: usize,
         all_buckets_fit: bool,
@@ -1074,7 +1440,15 @@ mod output {
         } else {
             MAX_OPEN_BUCKETS
         };
-        let available = safe_writer_pair_limit(requested, soft_limit);
+        let reader_budget = if mode == DemuxMode::DnaOnlyDroplet {
+            64
+        } else {
+            0
+        };
+        let available = safe_writer_pair_limit(
+            requested,
+            soft_limit.map(|limit| limit.saturating_sub(reader_budget)),
+        );
         if available < buckets {
             available.min(MAX_OPEN_BUCKETS)
         } else {
@@ -1085,9 +1459,9 @@ mod output {
     #[test]
     fn droplet_writer_budget_retains_all_or_uses_bounded_fallback() {
         let mode = DemuxMode::DnaOnlyDroplet;
-        assert_eq!(writer_pair_budget(mode, 6000, Some(12064)), 6000);
-        assert_eq!(writer_pair_budget(mode, 6000, Some(12063)), 128);
-        assert_eq!(writer_pair_budget(mode, 6000, Some(256)), 96);
+        assert_eq!(writer_pair_budget(mode, 6000, Some(12128)), 6000);
+        assert_eq!(writer_pair_budget(mode, 6000, Some(12127)), 128);
+        assert_eq!(writer_pair_budget(mode, 6000, Some(256)), 64);
         assert_eq!(writer_pair_budget(mode, 6000, None), 128);
         assert_eq!(writer_pair_budget(mode, 13203, Some(65536)), 13203);
         assert_eq!(writer_pair_budget(mode, 40000, Some(65536)), 128);
@@ -1099,7 +1473,7 @@ mod output {
     }
 
     impl WriterCache {
-        fn new(mode: DemuxMode, buckets: usize) -> Self {
+        fn new(mode: DemuxMode, buckets: usize, writeback: Option<Arc<WritebackState>>) -> Self {
             let soft_limit = detect_soft_open_file_limit();
             let max_pairs = MAX_OPEN_BUCKETS;
             let effective_max_pairs = writer_pair_budget(mode, buckets, soft_limit);
@@ -1119,6 +1493,7 @@ mod output {
             );
             Self {
                 writers: AHashMap::new(),
+                writeback,
                 order: VecDeque::new(),
                 max_pairs: effective_max_pairs,
                 all_buckets_fit: mode == DemuxMode::DnaOnlyDroplet
@@ -1140,7 +1515,7 @@ mod output {
             &mut self,
             key: &BucketKey,
             paths: &OutputPaths,
-        ) -> Result<&mut (BufWriter<File>, BufWriter<File>)> {
+        ) -> Result<&mut (FastqWriter, FastqWriter)> {
             if !self.writers.contains_key(key) {
                 while self.writers.len() >= self.max_pairs {
                     let old_key = self
@@ -1157,7 +1532,7 @@ mod output {
                     }
                 }
                 self.writers
-                    .insert(key.clone(), create_fastq_writers(key, paths)?);
+                    .insert(key.clone(), create_fastq_writers(key, paths, self.writeback.clone())?);
             }
             self.touch(key);
             self.writers
@@ -1179,10 +1554,12 @@ mod output {
         tx_acc_recycle: Sender<AccumulationBuffer>,
         paths: OutputPaths,
         cell_rows: Vec<CellRow>,
+        writeback: Option<WritebackGuard>,
     ) -> Result<u64> {
         let mut writers = WriterCache::new(
             paths.mode,
             paths.dna_cell_ids.len() + paths.rna_cell_ids.len(),
+            writeback.as_ref().map(|guard| guard.state.clone()),
         );
         let mut stats: AHashMap<BucketKey, u64> = AHashMap::new();
         let mut matched_reads = 0u64;
@@ -1190,10 +1567,14 @@ mod output {
 
         let mut pending = BTreeMap::new();
         let mut next_chunk_id = 0u64;
+        let profile_enabled = paths.mode == DemuxMode::DnaOnlyDroplet;
+        let mut write_seconds = 0f64;
+        let mut output_chunks = 0u64;
         for (chunk_id, buffer) in rx_write {
             for mut buffer in
                 insert_completed_chunk(&mut pending, &mut next_chunk_id, chunk_id, buffer)?
             {
+                let write_start = std::time::Instant::now();
                 fate_counts.add_assign(buffer.fates);
                 for (key, bucket) in buffer.map.iter_mut() {
                     if bucket.count == 0 {
@@ -1218,6 +1599,8 @@ mod output {
                         .with_context(|| format!("Failed writing R2 output for {}", key.label()))?;
                 }
 
+                write_seconds += write_start.elapsed().as_secs_f64();
+                output_chunks += 1;
                 buffer.clear();
                 tx_acc_recycle
                     .send(buffer)
@@ -1230,7 +1613,18 @@ mod output {
         );
         }
 
+        let flush_start = std::time::Instant::now();
         writers.flush_all()?;
+        if let Some(writeback) = writeback { writeback.finish()?; }
+        if profile_enabled {
+            eprintln!(
+                "DROPLET_WRITER_PROFILE {}",
+                serde_json::json!({
+                    "chunks":output_chunks, "write_and_accounting_seconds":write_seconds,
+                    "final_flush_seconds":flush_start.elapsed().as_secs_f64()
+                })
+            );
+        }
 
         let fate_matched = fate_counts.matched_read_pairs();
         if fate_matched != matched_reads {
@@ -1244,10 +1638,134 @@ mod output {
         Ok(matched_reads)
     }
 
+    fn writer_loop_parallel(
+        rx: Receiver<CompletedChunk>,
+        recycle: Sender<AccumulationBuffer>,
+        paths: OutputPaths,
+        rows: Vec<CellRow>,
+        writeback: Option<WritebackGuard>,
+    ) -> Result<u64> {
+        let partitions = droplet_stage::writer_shards(paths.mode);
+        let mut senders = Vec::new();
+        let mut workers = Vec::new();
+        for partition in 0..partitions {
+            let (tx, rx) = bounded::<(u64, Vec<(BucketKey, FastqBucket)>)>(2);
+            senders.push(tx);
+            let paths = paths.clone();
+            let buckets = rows.len();
+            let writeback_state = writeback.as_ref().map(|guard| guard.state.clone());
+            workers.push(std::thread::spawn(move|| -> Result<()> {
+                let mut cache=WriterCache::new(paths.mode,buckets,writeback_state);let mut next=0u64;let mut elapsed=0.0;
+                for (id,groups) in rx {
+                    anyhow::ensure!(id==next,"writer partition sequence mismatch");next+=1;let at=std::time::Instant::now();
+                    for (key,bucket) in groups {
+                        let pair=cache.get_or_open(&key,&paths)?;
+                        pair.0.write_all(&bucket.r1_gzip).with_context(||format!("R1 partition write failed: {}",key.label()))?;
+                        pair.1.write_all(&bucket.r2_gzip).with_context(||format!("R2 partition write failed: {}",key.label()))?;
+                    }
+                    elapsed+=at.elapsed().as_secs_f64();
+                }
+                let at=std::time::Instant::now();cache.flush_all()?;
+                eprintln!("DROPLET_WRITER_PARTITION_PROFILE {}",serde_json::json!({"partition":partition,"blocks":next,"write_seconds":elapsed,"flush_seconds":at.elapsed().as_secs_f64()}));Ok(())
+            }));
+        }
+        let mut stats: AHashMap<BucketKey, u64> = AHashMap::new();
+        let mut fates = FateCounts::default();
+        let mut matched = 0u64;
+        let mut pending = BTreeMap::new();
+        let mut next = 0u64;
+        let mut dispatch = 0u64;
+        let mut queue_seconds = 0.0;
+        let processing = (|| -> Result<()> {
+            for (id, buffer) in rx {
+                for mut buffer in insert_completed_chunk(&mut pending, &mut next, id, buffer)? {
+                    fates.add_assign(buffer.fates);
+                    let mut groups: Vec<Vec<(BucketKey, FastqBucket)>> =
+                        (0..partitions).map(|_| Vec::new()).collect();
+                    for (key, bucket) in buffer.map.drain() {
+                        if bucket.count == 0 {
+                            continue;
+                        }
+                        *stats.entry(key.clone()).or_default() += bucket.count;
+                        if !key.is_matched() {
+                            continue;
+                        }
+                        matched += bucket.count;
+                        let mut hash = 0xcbf29ce484222325u64;
+                        for byte in key.label().bytes() {
+                            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+                        }
+                        groups[(hash as usize) % partitions].push((key, bucket));
+                    }
+                    let at = std::time::Instant::now();
+                    for (tx, groups) in senders.iter().zip(groups) {
+                        tx.send((dispatch, groups))?;
+                    }
+                    queue_seconds += at.elapsed().as_secs_f64();
+                    dispatch += 1;
+                    buffer.clear();
+                    recycle.send(buffer)?;
+                }
+            }
+            anyhow::ensure!(pending.is_empty(), "missing parallel writer block");
+            Ok(())
+        })();
+        drop(senders);
+        let mut failure = None;
+        for worker in workers {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+                Err(_) => {
+                    if failure.is_none() {
+                        failure = Some(anyhow::anyhow!("writer partition panic"));
+                    }
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        processing?;
+        if let Some(writeback) = writeback { writeback.finish()?; }
+        anyhow::ensure!(
+            fates.matched_read_pairs() == matched,
+            "parallel writer pair accounting mismatch"
+        );
+        eprintln!(
+            "DROPLET_WRITER_PROFILE {}",
+            serde_json::json!({"partitions":partitions,"chunks":dispatch,"dispatch_wait_seconds":queue_seconds})
+        );
+        write_report(&paths, &rows, &stats, fates)?;
+        Ok(matched)
+    }
+
+    fn droplet_writer_buffer_capacity(outputs: usize, dirty_threshold: Option<u64>) -> usize {
+        let budget = dirty_threshold.map(|threshold| (threshold / 2)
+            .clamp(512 * 1024 * 1024, 2 * 1024 * 1024 * 1024))
+            .unwrap_or(512 * 1024 * 1024);
+        (budget as usize / outputs.max(1)).clamp(8 * 1024, 256 * 1024)
+    }
+
+    #[test]
+    fn droplet_buffer_budget_is_bounded_and_scales_for_large_cell_sets() {
+        assert_eq!(droplet_writer_buffer_capacity(26406, None), 512 * 1024 * 1024 / 26406);
+        let large = droplet_writer_buffer_capacity(26406, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(large, 2 * 1024 * 1024 * 1024 / 26406);
+        assert!(large * 26406 <= 2 * 1024 * 1024 * 1024);
+        assert_eq!(droplet_writer_buffer_capacity(2, Some(4 * 1024 * 1024 * 1024)), 256 * 1024);
+        assert_eq!(droplet_writer_buffer_capacity(1_000_000, Some(64 * 1024 * 1024)), 8 * 1024);
+    }
+
     fn create_fastq_writers(
         key: &BucketKey,
         paths: &OutputPaths,
-    ) -> Result<(BufWriter<File>, BufWriter<File>)> {
+        writeback: Option<Arc<WritebackState>>,
+    ) -> Result<(FastqWriter, FastqWriter)> {
         let dir = key.output_dir(paths)?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("Cannot create output directory: {}", dir.display()))?;
@@ -1264,7 +1782,19 @@ mod output {
             .append(true)
             .open(&r2_path)
             .with_context(|| format!("Cannot open R2 output file: {}", r2_path.display()))?;
-        Ok((BufWriter::new(r1), BufWriter::new(r2)))
+        let dirty_threshold = writeback.as_ref().and_then(|state| state.pressure.as_ref()).map(|(_, limit)| *limit);
+        let r1 = OutputFile::new(r1, writeback.clone())?;
+        let r2 = OutputFile::new(r2, writeback)?;
+        if paths.mode == DemuxMode::DnaOnlyDroplet {
+            let outputs = (paths.dna_cell_ids.len() + paths.rna_cell_ids.len()).max(1) * 2;
+            let capacity = droplet_writer_buffer_capacity(outputs, dirty_threshold);
+            Ok((
+                BufWriter::with_capacity(capacity, r1),
+                BufWriter::with_capacity(capacity, r2),
+            ))
+        } else {
+            Ok((BufWriter::new(r1), BufWriter::new(r2)))
+        }
     }
 
     fn write_report(
@@ -1700,22 +2230,22 @@ mod droplet {
 
     #[derive(Default, Serialize, serde::Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct CountMetrics {
-        input_reads: u64,
-        structured_reads: u64,
-        ambiguous: u64,
-        unmatched: u64,
-        short: u64,
-        barcode_with_c: u64,
-        umi_with_n: u64,
-        unique_barcodes: usize,
+    pub(super) struct CountMetrics {
+        pub(super) input_reads: u64,
+        pub(super) structured_reads: u64,
+        pub(super) ambiguous: u64,
+        pub(super) unmatched: u64,
+        pub(super) short: u64,
+        pub(super) barcode_with_c: u64,
+        pub(super) umi_with_n: u64,
+        pub(super) unique_barcodes: usize,
     }
 
     #[derive(Default)]
-    struct BarcodeCount {
-        count: u64,
-        below_q20: [u64; 17],
-        q30: [u64; 17],
+    pub(super) struct BarcodeCount {
+        pub(super) count: u64,
+        pub(super) below_q20: [u64; 17],
+        pub(super) q30: [u64; 17],
     }
 
     pub(super) fn count_barcodes(args: &Args) -> Result<()> {
@@ -1790,7 +2320,18 @@ mod droplet {
         write_counts(counts, metrics, counts_path, metrics_path)
     }
 
-    fn write_counts(
+    pub(super) fn write_count_row<W: std::io::Write>(
+        out: &mut W, barcode: &[u8], count: &BarcodeCount,
+    ) -> Result<()> {
+        let list = |values: &[u64; 17]| {
+            values.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
+        };
+        writeln!(out, "{}\t{}\t{}\t{}", std::str::from_utf8(barcode)?,
+                 count.count, list(&count.below_q20), list(&count.q30))?;
+        Ok(())
+    }
+
+    pub(super) fn write_counts(
         counts: AHashMap<Vec<u8>, BarcodeCount>,
         mut metrics: CountMetrics,
         counts_path: &Path,
@@ -1802,21 +2343,7 @@ mod droplet {
         let mut out = std::io::BufWriter::new(std::fs::File::create(counts_path)?);
         writeln!(out, "barcode\tcount\tbelow_q20\tq30")?;
         for (barcode, count) in rows {
-            let list = |values: &[u64; 17]| {
-                values
-                    .iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
-            writeln!(
-                out,
-                "{}\t{}\t{}\t{}",
-                std::str::from_utf8(&barcode)?,
-                count.count,
-                list(&count.below_q20),
-                list(&count.q30)
-            )?;
+            write_count_row(&mut out, &barcode, &count)?;
         }
         out.flush()?;
         std::fs::write(metrics_path, serde_json::to_vec_pretty(&metrics)?)?;
@@ -1825,7 +2352,7 @@ mod droplet {
 
     const MOLECULE_CAP: usize = 4096;
 
-    fn molecule_key(layout: &Layout<'_>, seq: &[u8]) -> Option<u128> {
+    pub(super) fn molecule_key(layout: &Layout<'_>, seq: &[u8]) -> Option<u128> {
         let insert = seq.get(layout.trim_start..layout.trim_start + 32)?;
         layout
             .umi
@@ -1843,7 +2370,7 @@ mod droplet {
             })
     }
 
-    fn molecule_rank(key: u128) -> (u64, u128) {
+    pub(super) fn molecule_rank(key: u128) -> (u64, u128) {
         let mix = |mut x: u64| {
             x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
             x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
@@ -1853,14 +2380,14 @@ mod droplet {
     }
 
     #[derive(Default)]
-    struct Molecules {
-        reads: u64,
-        saturated: bool,
-        keys: std::collections::BTreeSet<(u64, u128)>,
+    pub(super) struct Molecules {
+        pub(super) reads: u64,
+        pub(super) saturated: bool,
+        pub(super) keys: std::collections::BTreeSet<(u64, u128)>,
     }
 
     impl Molecules {
-        fn add(&mut self, key: u128) {
+        pub(super) fn add(&mut self, key: u128) {
             self.reads += 1;
             let ranked = molecule_rank(key);
             if self.keys.len() < MOLECULE_CAP
@@ -2125,10 +2652,10 @@ impl Config {
             );
         }
         for path in &args.r1 {
-            ensure_fastq_input(path, "--r1", args.fastq_stream)?;
+            ensure_fastq_input(path, "--r1")?;
         }
         for path in &args.r2 {
-            ensure_fastq_input(path, "--r2", args.fastq_stream)?;
+            ensure_fastq_input(path, "--r2")?;
         }
         let barcode_map = args
             .barcode_map
@@ -2731,27 +3258,33 @@ fn main() {
 fn run() -> Result<()> {
     init_tables();
 
+    if std::env::args().nth(1).as_deref() == Some("droplet-stage") {
+        return droplet_stage::stage();
+    }
     let args = Args::parse();
+    let droplet_spool = args.droplet_spool.clone();
+    anyhow::ensure!(
+        droplet_spool.is_none() || args.mode == DemuxMode::DnaOnlyDroplet,
+        "staged reads require dna-only-droplet"
+    );
     if args.threads == 0 {
         anyhow::bail!("--threads must be greater than 0");
     }
-    if args.fastq_stream {
-        anyhow::ensure!(
-            args.mode == DemuxMode::DnaOnlyDroplet,
-            "FASTQ streams require dna-only-droplet"
-        );
-        for path in args.r1.iter().chain(args.r2.iter()) {
-            ensure_fastq_input(path, "FASTQ stream", true)?;
-        }
-    }
     rayon::ThreadPoolBuilder::new()
-        .num_threads(args.threads)
+        .num_threads(
+            args.threads
+                .saturating_sub(if droplet_spool.is_some() { 4 } else { 0 })
+                .max(1),
+        )
         .build_global()
         .context("Cannot initialize Rayon global thread pool")?;
     if args.count_only {
         return droplet::count_barcodes(&args);
     }
     if args.evidence_pairs.is_some() {
+        if let Some(spool) = droplet_spool {
+            return droplet_stage::evidence(&args, &spool);
+        }
         return droplet::molecule_evidence(&args);
     }
     let config = Config::from_args(args)?;
@@ -2857,6 +3390,9 @@ fn run() -> Result<()> {
         input_fastq_pairs: config.r1.len(),
     };
 
+    if let Some(spool) = droplet_spool {
+        return droplet_stage::replay(&config, cell_rows, dna_indices, paths, &spool);
+    }
     run_pipeline(config, cell_rows, dna_indices, rna_idx, paths)
 }
 
@@ -3131,26 +3667,7 @@ fn init_tables() {
     });
 }
 
-fn ensure_fastq_input(path: &Path, label: &str, stream: bool) -> Result<()> {
-    if stream {
-        use std::os::unix::fs::FileTypeExt;
-        anyhow::ensure!(
-            path.parent() == Some(Path::new("/dev/fd"))
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(|name| name.parse::<u32>().ok())
-                    .is_some()
-                && std::fs::File::open(path)
-                    .and_then(|file| file.metadata())
-                    .with_context(|| format!("Cannot inspect {} inherited pipe: {}", label, path.display()))?
-                    .file_type().is_fifo(),
-            "{} must be an inherited pipe: {}",
-            label,
-            path.display()
-        );
-        return Ok(());
-    }
+fn ensure_fastq_input(path: &Path, label: &str) -> Result<()> {
     ensure_readable_file(path, label)?;
     let name = path
         .file_name()
@@ -3319,47 +3836,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn inherited_pipe_validation_survives_concurrent_processes() {
-        use std::fs::File;
-        use std::io::{Read, Write};
-        use std::os::fd::AsRawFd;
-        use std::process::Command;
-        const CHILD: &str = "ALOPEX_PIPE_VALIDATION_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let children: Vec<_> = (0..8)
-                .map(|_| {
-                    Command::new(std::env::current_exe().unwrap())
-                        .args(["--exact", "tests::inherited_pipe_validation_survives_concurrent_processes", "--nocapture"])
-                        .env(CHILD, "1")
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn().unwrap()
-                })
-                .collect();
-            let results: Vec<_> = children.into_iter().map(|p| p.wait_with_output().unwrap()).collect();
-            for result in results {
-                assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
-            }
-            return;
-        }
-        let (mut reader, mut writer) = std::io::pipe().unwrap();
-        writer.write_all(b"@pair\nACGT\n+\nIIII\n").unwrap();
-        drop(writer);
-        let path = PathBuf::from(format!("/dev/fd/{}", reader.as_raw_fd()));
-        for _ in 0..4096 {
-            ensure_fastq_input(&path, "--r1", true).unwrap();
-        }
-        let mut content = String::new();
-        reader.read_to_string(&mut content).unwrap();
-        assert_eq!(content, "@pair\nACGT\n+\nIIII\n");
-        let file = File::open(std::env::current_exe().unwrap()).unwrap();
-        for invalid in ["/dev/null".to_string(), "/dev/fd/invalid".to_string(),
-                        "/dev/fd/2147483647".to_string(), format!("/dev/fd/{}", file.as_raw_fd())] {
-            assert!(ensure_fastq_input(Path::new(&invalid), "--r1", true).is_err());
-        }
-    }
 
     #[test]
     fn input_contract_requires_gzip_fastq_suffix_and_magic_on_both_mates() {
@@ -3759,5 +4235,1253 @@ mod tests {
             match_dna_read(&no_insert, &index, lut, 0).expect("insert should complete layout");
         assert!(assigned.is_valid);
         assert_eq!(assigned.fate, TerminalFate::DnaAssigned);
+    }
+}
+
+mod droplet_stage {
+    use super::*;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+    use std::time::Instant;
+
+    pub(super) fn writer_shards(mode: DemuxMode) -> usize {
+        if mode == DemuxMode::DnaOnlyDroplet {
+            4
+        } else {
+            1
+        }
+    }
+
+    #[derive(Parser, Debug)]
+    struct StageArgs {
+        #[arg(long, required = true)]
+        r1: Vec<PathBuf>,
+        #[arg(long, required = true)]
+        r2: Vec<PathBuf>,
+        #[arg(long)]
+        spool: PathBuf,
+        #[arg(long)]
+        counts_output: PathBuf,
+        #[arg(long)]
+        count_metrics: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        threads: usize,
+        #[arg(long, default_value_t = 64)]
+        shards: usize,
+        #[arg(long, default_value_t = 100_000)]
+        batch_pairs: usize,
+        #[arg(long)]
+        decoder_python: PathBuf,
+    }
+    #[derive(Serialize, serde::Deserialize, Clone)]
+    struct Segment {
+        offset: u64,
+        bytes: u64,
+        raw_bytes: u64,
+    }
+    #[derive(Serialize, serde::Deserialize, Clone)]
+    struct Block {
+        id: u64,
+        pairs: u64,
+        base_ambiguous: u64,
+        base_unmatched: u64,
+        base_short: u64,
+        segments: Vec<Segment>,
+    }
+    #[derive(Serialize, serde::Deserialize)]
+    struct Manifest {
+        version: u32,
+        shards: usize,
+        blocks: u64,
+        pairs: u64,
+        input_fastq_pairs: usize,
+    }
+    enum QualityCounts {
+        Small([u8; 34]),
+        Wide(Box<[u64; 34]>),
+    }
+
+    struct CompactCount {
+        count: u64,
+        quality: QualityCounts,
+    }
+
+    impl Default for CompactCount {
+        fn default() -> Self { Self { count: 0, quality: QualityCounts::Small([0; 34]) } }
+    }
+
+    impl CompactCount {
+        fn merge(&mut self, added: &droplet::BarcodeCount) -> Result<()> {
+            let total = self.count.checked_add(added.count).context("barcode count overflow")?;
+            if let QualityCounts::Small(values) = &self.quality {
+                let increments = added.below_q20.iter().chain(added.q30.iter());
+                if values.iter().zip(increments).any(|(old, add)| *add > u64::from(u8::MAX - *old)) {
+                    self.quality = QualityCounts::Wide(Box::new(std::array::from_fn(|i| u64::from(values[i]))));
+                }
+            }
+            match &mut self.quality {
+                QualityCounts::Small(values) => {
+                    for (old, add) in values.iter_mut().zip(added.below_q20.iter().chain(added.q30.iter())) {
+                        *old += u8::try_from(*add)?;
+                    }
+                }
+                QualityCounts::Wide(values) => {
+                    for (old, add) in values.iter_mut().zip(added.below_q20.iter().chain(added.q30.iter())) {
+                        *old = old.checked_add(*add).context("barcode quality count overflow")?;
+                    }
+                }
+            }
+            self.count = total;
+            Ok(())
+        }
+
+        fn expanded(&self) -> droplet::BarcodeCount {
+            let get = |i| match &self.quality {
+                QualityCounts::Small(values) => u64::from(values[i]),
+                QualityCounts::Wide(values) => values[i],
+            };
+            droplet::BarcodeCount { count: self.count,
+                below_q20: std::array::from_fn(|i| get(i)),
+                q30: std::array::from_fn(|i| get(i + 17)) }
+        }
+    }
+
+    struct CountTable {
+        parts: [AHashMap<[u8; 17], CompactCount>; 64],
+    }
+
+    impl Default for CountTable {
+        fn default() -> Self { Self { parts: std::array::from_fn(|_| AHashMap::new()) } }
+    }
+
+    impl CountTable {
+        fn merge(&mut self, barcode: [u8; 17], value: &droplet::BarcodeCount) -> Result<()> {
+            self.parts[shard(&barcode, self.parts.len())].entry(barcode).or_default().merge(value)
+        }
+        fn get(&self, barcode: &[u8; 17]) -> &CompactCount {
+            &self.parts[shard(barcode, self.parts.len())][barcode]
+        }
+        fn len(&self) -> usize { self.parts.iter().map(|part| part.len()).sum() }
+        fn iter(&self) -> impl Iterator<Item = (&[u8; 17], &CompactCount)> {
+            self.parts.iter().flat_map(|part| part.iter())
+        }
+    }
+
+    fn write_compact_counts(
+        counts: CountTable, mut metrics: droplet::CountMetrics,
+        counts_path: &Path, metrics_path: &Path,
+    ) -> Result<()> {
+        metrics.unique_barcodes = counts.len();
+        let mut rows = counts.iter().map(|(key, count)| (*key, count.count)).collect::<Vec<_>>();
+        rows.par_sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut out = BufWriter::with_capacity(1024 * 1024, File::create(counts_path)?);
+        writeln!(out, "barcode\tcount\tbelow_q20\tq30")?;
+        for (barcode, _) in rows {
+            droplet::write_count_row(&mut out, &barcode, &counts.get(&barcode).expanded())?;
+        }
+        out.flush()?;
+        std::fs::write(metrics_path, serde_json::to_vec_pretty(&metrics)?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compact_count_promotes_losslessly_and_rejects_overflow() {
+        assert!(std::mem::size_of::<CompactCount>() <= 48);
+        let mut value = CompactCount::default();
+        value.merge(&droplet::BarcodeCount { count: 255, below_q20: [254; 17], q30: [1; 17] }).unwrap();
+        assert!(matches!(value.quality, QualityCounts::Small(_)));
+        value.merge(&droplet::BarcodeCount { count: 5, below_q20: [2; 17], q30: [3; 17] }).unwrap();
+        assert!(matches!(value.quality, QualityCounts::Wide(_)));
+        let expanded = value.expanded();
+        assert_eq!(expanded.count, 260); assert_eq!(expanded.below_q20, [256; 17]); assert_eq!(expanded.q30, [4; 17]);
+        value.count = u64::MAX;
+        assert!(value.merge(&droplet::BarcodeCount { count: 1, ..Default::default() }).is_err());
+    }
+
+    #[test]
+    fn compact_count_output_matches_u64_reference_including_ties() {
+        let root = std::env::temp_dir().join(format!("demux-compact-counts-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut old = AHashMap::new(); let mut new = CountTable::default();
+        for (index, count) in [1u64, 254, 255, 256, 999, 999, u32::MAX as u64 + 10].into_iter().enumerate() {
+            let mut key = [b'A'; 17]; key[16] = b'A' + index as u8;
+            let value = droplet::BarcodeCount { count, below_q20: [count / 3; 17], q30: [count - count / 3; 17] };
+            new.merge(key, &value).unwrap(); old.insert(key.to_vec(), value);
+        }
+        droplet::write_counts(old, Default::default(), &root.join("old.tsv"), &root.join("old.json")).unwrap();
+        write_compact_counts(new, Default::default(), &root.join("new.tsv"), &root.join("new.json")).unwrap();
+        assert_eq!(std::fs::read(root.join("old.tsv")).unwrap(), std::fs::read(root.join("new.tsv")).unwrap());
+        assert_eq!(std::fs::read(root.join("old.json")).unwrap(), std::fs::read(root.join("new.json")).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn count_table_rehash_keeps_all_counts_and_global_order() {
+        let root = std::env::temp_dir().join(format!("demux-sharded-counts-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut expected = AHashMap::new(); let mut actual = CountTable::default();
+        for i in 0..20_000u64 {
+            let mut key = [b'A'; 17]; let mut number = i;
+            for base in &mut key { *base = b"AGT"[(number % 3) as usize]; number /= 3; }
+            let value = droplet::BarcodeCount { count: i % 1000 + 1, below_q20: [i % 300; 17], q30: [i % 700; 17] };
+            actual.merge(key, &value).unwrap(); actual.merge(key, &value).unwrap();
+            expected.insert(key.to_vec(), droplet::BarcodeCount { count: value.count * 2,
+                below_q20: value.below_q20.map(|v| v * 2), q30: value.q30.map(|v| v * 2) });
+        }
+        assert_eq!(actual.len(), 20_000); assert!(actual.parts.iter().all(|part| !part.is_empty()));
+        droplet::write_counts(expected, Default::default(), &root.join("old.tsv"), &root.join("old.json")).unwrap();
+        write_compact_counts(actual, Default::default(), &root.join("new.tsv"), &root.join("new.json")).unwrap();
+        assert_eq!(std::fs::read(root.join("old.tsv")).unwrap(), std::fs::read(root.join("new.tsv")).unwrap());
+        assert_eq!(std::fs::read(root.join("old.json")).unwrap(), std::fs::read(root.join("new.json")).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "Linux16GiB高基数内存压力验收，普通回归不分配10GiB"]
+    fn count_table_large_cardinality_under_memory_limit() {
+        let mut ballast = vec![0u8; 10usize * 1024 * 1024 * 1024];
+        for byte in ballast.iter_mut().step_by(4096) { *byte = 1; }
+        let mut counts = CountTable::default();
+        let added = droplet::BarcodeCount { count: 1, below_q20: [0; 17], q30: [1; 17] };
+        for i in 0..40_000_000u64 {
+            let mut key = [b'A'; 17]; let mut number = i;
+            for base in &mut key { *base = b"AGT"[(number % 3) as usize]; number /= 3; }
+            counts.merge(key, &added).unwrap();
+        }
+        assert_eq!(counts.len(), 40_000_000);
+        assert!(counts.iter().all(|(_, value)| value.count == 1 && value.expanded().q30 == [1; 17]));
+        std::hint::black_box(&ballast); std::hint::black_box(&counts);
+        eprintln!("DROPLET_COUNT_MEMORY_STRESS entries={} ballast_bytes={} shards={}", counts.len(), ballast.len(), counts.parts.len());
+    }
+
+    struct Staged {
+        parse_seconds: f64,
+        compress_seconds: f64,
+        input: InputChunk,
+        metrics: droplet::CountMetrics,
+        counts: AHashMap<[u8; 17], droplet::BarcodeCount>,
+        block: Block,
+        compressed: Vec<Vec<u8>>,
+    }
+    fn shard(barcode: &[u8], n: usize) -> usize {
+        let mut h = 0xcbf29ce484222325u64;
+        for base in barcode {
+            h = (h ^ u64::from(*base)).wrapping_mul(0x100000001b3);
+        }
+        (h as usize) % n
+    }
+    fn append_u32(out: &mut Vec<u8>, n: usize) -> Result<()> {
+        out.extend_from_slice(&u32::try_from(n)?.to_le_bytes());
+        Ok(())
+    }
+    fn stage_batch(id: u64, input: InputChunk, shards: usize) -> Result<Staged> {
+        let started = Instant::now();
+        let mut raw: Vec<Vec<u8>> = (0..shards).map(|_| Vec::new()).collect();
+        let mut counts: AHashMap<[u8; 17], droplet::BarcodeCount> = AHashMap::new();
+        let mut metrics = droplet::CountMetrics::default();
+        let mut block = Block {
+            id,
+            pairs: input.count as u64,
+            base_ambiguous: 0,
+            base_unmatched: 0,
+            base_short: 0,
+            segments: Vec::new(),
+        };
+        for i in 0..input.count {
+            let seq = &input.r1_seqs[input.r1_offsets[i]..input.r1_offsets[i + 1]];
+            let qual = &input.r1_quals[input.r1_offsets[i]..input.r1_offsets[i + 1]];
+            let r2 = &input.r2_seqs[input.r2_offsets[i]..input.r2_offsets[i + 1]];
+            let q2 = &input.r2_quals[input.r2_offsets[i]..input.r2_offsets[i + 1]];
+            anyhow::ensure!(
+                seq.len() == qual.len() && r2.len() == q2.len(),
+                "sequence/quality mismatch"
+            );
+            anyhow::ensure!(
+                qual.iter().chain(q2).all(|q| (33..=126).contains(q)),
+                "invalid quality"
+            );
+            metrics.input_reads += 1;
+            match droplet::extract(seq) {
+                Ok(layout) => {
+                    metrics.structured_reads += 1;
+                    metrics.barcode_with_c += u64::from(layout.barcode.contains(&b'C'));
+                    metrics.umi_with_n += u64::from(layout.umi.contains(&b'N'));
+                    let count = counts.entry(layout.barcode.try_into()?).or_default();
+                    count.count += 1;
+                    for (j, q) in qual[layout.barcode_start..layout.barcode_start + 17]
+                        .iter()
+                        .enumerate()
+                    {
+                        count.below_q20[j] += u64::from(*q < 53);
+                        count.q30[j] += u64::from(*q >= 63);
+                    }
+                    let id1 = normalize_read_id(
+                        &input.r1_ids[input.r1_id_offsets[i]..input.r1_id_offsets[i + 1]],
+                    )?;
+                    let id2 = normalize_read_id(
+                        &input.r2_ids[input.r2_id_offsets[i]..input.r2_id_offsets[i + 1]],
+                    )?;
+                    let out = &mut raw[shard(layout.barcode, shards)];
+                    append_u32(out, i)?;
+                    out.extend_from_slice(layout.barcode);
+                    out.push(u8::from(r2.len() <= 9));
+                    let key = droplet::molecule_key(&layout, seq);
+                    out.push(u8::from(key.is_some()));
+                    out.extend_from_slice(&key.unwrap_or(0).to_le_bytes());
+                    let length_at = out.len();
+                    out.extend_from_slice(&[0; 8]);
+                    let first = out.len();
+                    write_fastq_record(
+                        out,
+                        id1,
+                        seq,
+                        qual,
+                        layout.trim_start,
+                        Some(layout.umi),
+                        true,
+                    )?;
+                    let second = out.len();
+                    write_fastq_record(out, id2, r2, q2, 9, Some(layout.umi), true)?;
+                    let n1 = u32::try_from(second - first)?;
+                    let n2 = u32::try_from(out.len() - second)?;
+                    out[length_at..length_at + 4].copy_from_slice(&n1.to_le_bytes());
+                    out[length_at + 4..length_at + 8].copy_from_slice(&n2.to_le_bytes());
+                }
+                Err(fate) => {
+                    match fate {
+                        TerminalFate::Ambiguous => metrics.ambiguous += 1,
+                        TerminalFate::Short => metrics.short += 1,
+                        _ => metrics.unmatched += 1,
+                    }
+                    if seq.len() < MIN_R1_LEN || fate == TerminalFate::Short {
+                        block.base_short += 1;
+                    } else if fate == TerminalFate::Ambiguous {
+                        block.base_ambiguous += 1;
+                    } else {
+                        block.base_unmatched += 1;
+                    }
+                }
+            }
+        }
+        let parse_seconds = started.elapsed().as_secs_f64();
+        let compressed_at = Instant::now();
+        let compressed = compress_stage_shards(&raw);
+        block.segments = raw
+            .iter()
+            .map(|x| Segment {
+                offset: 0,
+                bytes: 0,
+                raw_bytes: x.len() as u64,
+            })
+            .collect();
+        let compressed = compressed?;
+        Ok(Staged {
+            input,
+            metrics,
+            counts,
+            block,
+            compressed,
+            parse_seconds,
+            compress_seconds: compressed_at.elapsed().as_secs_f64(),
+        })
+    }
+    struct MateBatch {
+        ids: Vec<u8>,
+        seqs: Vec<u8>,
+        quals: Vec<u8>,
+        offsets: Vec<usize>,
+        id_offsets: Vec<usize>,
+        count: usize,
+        lane: usize,
+    }
+    impl MateBatch {
+        fn new() -> Self {
+            Self {
+                ids: Vec::new(),
+                seqs: Vec::new(),
+                quals: Vec::new(),
+                offsets: vec![0],
+                id_offsets: vec![0],
+                count: 0,
+                lane: 0,
+            }
+        }
+        fn clear(&mut self) {
+            self.ids.clear();
+            self.seqs.clear();
+            self.quals.clear();
+            self.offsets.truncate(1);
+            self.id_offsets.truncate(1);
+            self.count = 0;
+        }
+        fn swap_into(&mut self, chunk: &mut InputChunk, mate: usize) {
+            let (ids, seqs, quals, offsets, id_offsets) = if mate == 1 {
+                (
+                    &mut chunk.r1_ids,
+                    &mut chunk.r1_seqs,
+                    &mut chunk.r1_quals,
+                    &mut chunk.r1_offsets,
+                    &mut chunk.r1_id_offsets,
+                )
+            } else {
+                (
+                    &mut chunk.r2_ids,
+                    &mut chunk.r2_seqs,
+                    &mut chunk.r2_quals,
+                    &mut chunk.r2_offsets,
+                    &mut chunk.r2_id_offsets,
+                )
+            };
+            std::mem::swap(ids, &mut self.ids);
+            std::mem::swap(seqs, &mut self.seqs);
+            std::mem::swap(quals, &mut self.quals);
+            std::mem::swap(offsets, &mut self.offsets);
+            std::mem::swap(id_offsets, &mut self.id_offsets);
+            self.clear();
+        }
+    }
+    struct DecoderChild(Option<std::process::Child>);
+    impl Drop for DecoderChild {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    fn read_mate(
+        paths: Vec<PathBuf>,
+        mate: usize,
+        batch: usize,
+        decoder_python: PathBuf,
+        decoder_threads: usize,
+        tx: Sender<MateBatch>,
+        recycle: Receiver<MateBatch>,
+    ) -> Result<u64> {
+        let started = Instant::now();
+        let mut send_seconds = 0.0;
+        let mut parse_seconds = 0.0;
+        let mut total = 0u64;
+        for (lane, path) in paths.into_iter().enumerate() {
+            ensure_fastq_input(&path, if mate == 1 { "R1" } else { "R2" })?;
+            let mut child = DecoderChild(None);
+            let decoder_threads = decoder_threads.to_string();
+            let mut process = std::process::Command::new(&decoder_python)
+                .args([
+                    "-c",
+                    "import rapidgzip; raise SystemExit(rapidgzip.cli())",
+                    "-P",
+                    &decoder_threads,
+                    "--io-read-method",
+                    "sequential",
+                    "--verify",
+                    "-d",
+                    "-c",
+                ])
+                .arg(&path)
+                .stdout(std::process::Stdio::piped())
+                .spawn()?;
+            let output = process.stdout.take().context("missing rapidgzip stdout")?;
+            child.0 = Some(process);
+            let mut reader = needletail::parse_fastx_reader(output)?;
+            let mut ended = false;
+            while !ended {
+                let mut chunk = recycle.try_recv().unwrap_or_else(|_| MateBatch::new());
+                chunk.clear();
+                chunk.lane = lane;
+                let at = Instant::now();
+                while chunk.count < batch {
+                    match reader.next() {
+                        Some(record) => {
+                            let record = record?;
+                            let seq = record.seq();
+                            let qual = record.qual().context("missing FASTQ quality")?;
+                            anyhow::ensure!(seq.len() == qual.len(), "sequence/quality mismatch");
+                            chunk.ids.extend_from_slice(record.id());
+                            chunk.seqs.extend_from_slice(seq.as_ref());
+                            chunk.quals.extend_from_slice(qual);
+                            chunk.offsets.push(chunk.seqs.len());
+                            chunk.id_offsets.push(chunk.ids.len());
+                            chunk.count += 1;
+                            total += 1;
+                        }
+                        None => {
+                            ended = true;
+                            break;
+                        }
+                    }
+                }
+                parse_seconds += at.elapsed().as_secs_f64();
+                if chunk.count > 0 {
+                    let at = Instant::now();
+                    tx.send(chunk)?;
+                    send_seconds += at.elapsed().as_secs_f64();
+                }
+            }
+            drop(reader);
+
+            if let Some(mut process) = child.0.take() {
+                anyhow::ensure!(
+                    process.wait()?.success(),
+                    "rapidgzip failed for {}",
+                    path.display()
+                );
+            }
+        }
+        eprintln!(
+            "DROPLET_READER_PROFILE {}",
+            serde_json::json!({"mode":"parallel_mate","mate":mate,"pairs":total,"wall_seconds":started.elapsed().as_secs_f64(),"parse_seconds":parse_seconds,"send_wait_seconds":send_seconds})
+        );
+        Ok(total)
+    }
+    fn produce_parallel(
+        args: &StageArgs,
+        recycle: Receiver<InputChunk>,
+        tx: Sender<(u64, InputChunk)>,
+    ) -> Result<u64> {
+        let (tx1, rx1) = bounded(2);
+        let (tx2, rx2) = bounded(2);
+        let (pool1, free1) = crossbeam_channel::unbounded();
+        let (pool2, free2) = crossbeam_channel::unbounded();
+        let r1 = args.r1.clone();
+        let r2 = args.r2.clone();
+        let batch = args.batch_pairs;
+        let rapid1 = args.decoder_python.clone();
+        let rapid2 = args.decoder_python.clone();
+        let decoder_threads = (args.threads / 4).clamp(1, 4);
+        let first = std::thread::spawn(move || {
+            read_mate(r1, 1, batch, rapid1, decoder_threads, tx1, free1)
+        });
+        let second = std::thread::spawn(move || {
+            read_mate(r2, 2, batch, rapid2, decoder_threads, tx2, free2)
+        });
+        let mut total = 0u64;
+        let mut block = 0u64;
+        let started = Instant::now();
+        let mut receive = 0.0;
+        let mut downstream = 0.0;
+        let result = (|| -> Result<()> {
+            loop {
+                let at = Instant::now();
+                let a = rx1.recv();
+                let b = rx2.recv();
+                receive += at.elapsed().as_secs_f64();
+                match (a, b) {
+                    (Ok(mut a), Ok(mut b)) => {
+                        anyhow::ensure!(
+                            a.lane == b.lane && a.count == b.count,
+                            "unpaired mate lane/batch"
+                        );
+                        for i in 0..a.count {
+                            validate_paired_read_ids(
+                                &a.ids[a.id_offsets[i]..a.id_offsets[i + 1]],
+                                &b.ids[b.id_offsets[i]..b.id_offsets[i + 1]],
+                            )?;
+                        }
+                        let at = Instant::now();
+                        let mut chunk = recycle.recv()?;
+                        chunk.count = a.count;
+                        total += a.count as u64;
+                        a.swap_into(&mut chunk, 1);
+                        b.swap_into(&mut chunk, 2);
+                        let _ = pool1.send(a);
+                        let _ = pool2.send(b);
+                        tx.send((block, chunk))?;
+                        block += 1;
+                        downstream += at.elapsed().as_secs_f64();
+                    }
+                    (Err(_), Err(_)) => break,
+                    _ => anyhow::bail!("unpaired mate EOF"),
+                }
+            }
+            Ok(())
+        })();
+        drop(rx1);
+        drop(rx2);
+        drop(pool1);
+        drop(pool2);
+        let left = first
+            .join()
+            .map_err(|_| anyhow::anyhow!("R1 reader panic"))?;
+        let right = second
+            .join()
+            .map_err(|_| anyhow::anyhow!("R2 reader panic"))?;
+        result?;
+        anyhow::ensure!(left? == total && right? == total, "mate total mismatch");
+        eprintln!(
+            "DROPLET_PAIR_PROFILE {}",
+            serde_json::json!({"pairs":total,"blocks":block,"wall_seconds":started.elapsed().as_secs_f64(),"receive_wait_seconds":receive,"downstream_wait_seconds":downstream})
+        );
+        Ok(total)
+    }
+
+    pub(super) fn stage() -> Result<()> {
+        let mut argv: Vec<_> = std::env::args_os().collect();
+        argv.remove(1);
+        let args = StageArgs::parse_from(argv);
+        anyhow::ensure!(
+            args.threads > 0 && args.shards > 0 && args.batch_pairs > 0,
+            "invalid stage budgets"
+        );
+        anyhow::ensure!(
+            !args.r1.is_empty() && args.r1.len() == args.r2.len(),
+            "paired input list mismatch"
+        );
+        let compute_threads = args.threads.saturating_sub(13).max(1);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(compute_threads)
+            .build_global()?;
+        std::fs::create_dir(&args.spool)?;
+        let capacity = compute_threads.saturating_add(1).max(2);
+        let (tx_recycle, rx_recycle) = bounded(capacity);
+        let (tx_work, rx_work) = bounded(capacity);
+        let (tx_done, rx_done) = bounded::<(u64, Staged)>(capacity);
+        for _ in 0..capacity {
+            tx_recycle.send(InputChunk::new(args.batch_pairs))?;
+        }
+        let shards = args.shards;
+        let reader_args = StageArgs::parse_from({
+            let mut a: Vec<_> = std::env::args_os().collect();
+            a.remove(1);
+            a
+        });
+        let reader =
+            std::thread::spawn(move || produce_parallel(&reader_args, rx_recycle, tx_work));
+        let worker = std::thread::spawn(move || -> Result<()> {
+            rx_work
+                .into_iter()
+                .par_bridge()
+                .try_for_each_with(tx_done, |tx, (id, input)| {
+                    tx.send((id, stage_batch(id, input, shards)?))?;
+                    Ok::<(), anyhow::Error>(())
+                })?;
+            Ok(())
+        });
+        let (tx_spool, rx_spool) = bounded::<(Block, Vec<Vec<u8>>, InputChunk)>(2);
+        let spool_path = args.spool.clone();
+        let spool_recycle = tx_recycle.clone();
+        let spool_writer = std::thread::spawn(move || -> Result<u64> {
+            let writeback = output::WritebackGuard::start(DemuxMode::DnaOnlyDroplet, shards)?;
+            let mut writers: Vec<_> = (0..shards)
+                .map(|i| {
+                    let file = File::create(spool_path.join(format!("{i:04}.pack")))?;
+                    Ok(BufWriter::with_capacity(1024 * 1024, output::spool_output(file, writeback.as_ref())?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut index = BufWriter::new(File::create(spool_path.join("index.jsonl"))?);
+            let mut offsets = vec![0u64; shards];
+            let mut next = 0u64;
+            let mut write_seconds = 0.0;
+            for (mut block, data, mut input) in rx_spool {
+                anyhow::ensure!(block.id == next, "spool block order mismatch");
+                next += 1;
+                let at = Instant::now();
+                for (i, data) in data.into_iter().enumerate() {
+                    block.segments[i].offset = offsets[i];
+                    block.segments[i].bytes = data.len() as u64;
+                    writers[i].write_all(&data)?;
+                    offsets[i] += data.len() as u64;
+                }
+                serde_json::to_writer(&mut index, &block)?;
+                index.write_all(b"\n")?;
+                write_seconds += at.elapsed().as_secs_f64();
+                input.clear();
+                let _ = spool_recycle.send(input);
+            }
+            let at = Instant::now();
+            for writer in &mut writers {
+                writer.flush()?;
+                writer.get_ref().sync_spool()?;
+            }
+            if let Some(guard) = writeback { guard.finish()?; }
+            index.flush()?;
+            index.get_ref().sync_all()?;
+            eprintln!(
+                "DROPLET_SPOOL_WRITER_PROFILE {}",
+                serde_json::json!({"blocks":next,"write_seconds":write_seconds,"flush_sync_seconds":at.elapsed().as_secs_f64(),"spool_bytes":offsets.iter().sum::<u64>()})
+            );
+            Ok(next)
+        });
+        let mut fixed_counts = CountTable::default();
+        let mut metrics = droplet::CountMetrics::default();
+        let mut pending = BTreeMap::new();
+        let mut next = 0u64;
+        let start = Instant::now();
+        let mut worker_parse = 0.0;
+        let mut worker_compress = 0.0;
+        let mut merge_seconds = 0.0;
+        let mut write_seconds = 0.0;
+        let mut receive_seconds = 0.0;
+        let consumed = (|| -> Result<()> {
+            while let Ok((id, item)) = {
+                let at = Instant::now();
+                let result = rx_done.recv();
+                receive_seconds += at.elapsed().as_secs_f64();
+                result
+            } {
+                for item in insert_completed_chunk(&mut pending, &mut next, id, item)? {
+                    worker_parse += item.parse_seconds;
+                    worker_compress += item.compress_seconds;
+                    let at = Instant::now();
+                    for (bc, stat) in item.counts {
+                        fixed_counts.merge(bc, &stat)?;
+                    }
+                    merge_seconds += at.elapsed().as_secs_f64();
+                    metrics.input_reads += item.metrics.input_reads;
+                    metrics.structured_reads += item.metrics.structured_reads;
+                    metrics.ambiguous += item.metrics.ambiguous;
+                    metrics.unmatched += item.metrics.unmatched;
+                    metrics.short += item.metrics.short;
+                    metrics.barcode_with_c += item.metrics.barcode_with_c;
+                    metrics.umi_with_n += item.metrics.umi_with_n;
+                    let at = Instant::now();
+                    tx_spool.send((item.block, item.compressed, item.input))?;
+                    write_seconds += at.elapsed().as_secs_f64();
+                    if next % 25 == 0 {
+                        log::info!(
+                            "raw stage pairs={} wall={:.3}",
+                            metrics.input_reads,
+                            start.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })();
+        drop(rx_done);
+        drop(tx_spool);
+        drop(tx_recycle);
+        let written = spool_writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("spool writer panic"));
+        let read_result = reader.join().map_err(|_| anyhow::anyhow!("reader panic"));
+        let work_result = worker.join().map_err(|_| anyhow::anyhow!("worker panic"));
+        anyhow::ensure!(written?? == next, "spool block count mismatch");
+        consumed?;
+        anyhow::ensure!(pending.is_empty(), "missing staged block");
+        let total = read_result??;
+        work_result??;
+        anyhow::ensure!(total == metrics.input_reads, "stage count mismatch");
+        let at = Instant::now();
+        write_compact_counts(fixed_counts, metrics, &args.counts_output, &args.count_metrics)?;
+        eprintln!(
+            "DROPLET_STAGE_PROFILE {}",
+            serde_json::json!({"compute_threads":compute_threads,"inflight_chunks":capacity,"inline_count_bytes":std::mem::size_of::<CompactCount>(),"count_table_shards":64,"batch_pairs":args.batch_pairs,"rank_key_bytes":std::mem::size_of::<([u8;17],u64)>(),"pairs":total,"blocks":next,"wall_seconds":start.elapsed().as_secs_f64(),"worker_parse_seconds_sum":worker_parse,"worker_compress_seconds_sum":worker_compress,"main_count_merge_seconds":merge_seconds,"main_spool_queue_wait_seconds":write_seconds,"main_receive_wait_seconds":receive_seconds,"final_counts_seconds":at.elapsed().as_secs_f64()})
+        );
+        let manifest = Manifest {
+            version: 1,
+            shards,
+            blocks: next,
+            pairs: total,
+            input_fastq_pairs: args.r1.len(),
+        };
+        let temp = args.spool.join("manifest.json.tmp");
+        std::fs::write(&temp, serde_json::to_vec_pretty(&manifest)?)?;
+        File::open(&temp)?.sync_all()?;
+        std::fs::rename(temp, args.spool.join("manifest.json"))?;
+        log::info!(
+            "raw stage complete pairs={total} blocks={next} wall={:.3}",
+            start.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+    struct RawRecord<'a> {
+        ordinal: u32,
+        barcode: &'a [u8],
+        short_r2: bool,
+        key: Option<u128>,
+        r1: &'a [u8],
+        r2: &'a [u8],
+    }
+    fn walk(data: &[u8], mut consume: impl FnMut(RawRecord<'_>) -> Result<()>) -> Result<()> {
+        let mut at = 0usize;
+        while at < data.len() {
+            anyhow::ensure!(data.len() - at >= 47, "truncated record header");
+            let ordinal = u32::from_le_bytes(data[at..at + 4].try_into()?);
+            let barcode = &data[at + 4..at + 21];
+            let short_r2 = data[at + 21] != 0;
+            let key = (data[at + 22] != 0)
+                .then(|| u128::from_le_bytes(data[at + 23..at + 39].try_into().unwrap()));
+            let n1 = u32::from_le_bytes(data[at + 39..at + 43].try_into()?) as usize;
+            let n2 = u32::from_le_bytes(data[at + 43..at + 47].try_into()?) as usize;
+            at += 47;
+            let end = at
+                .checked_add(n1)
+                .and_then(|x| x.checked_add(n2))
+                .context("record length overflow")?;
+            anyhow::ensure!(end <= data.len(), "truncated record body");
+            consume(RawRecord {
+                ordinal,
+                barcode,
+                short_r2,
+                key,
+                r1: &data[at..at + n1],
+                r2: &data[at + n1..end],
+            })?;
+            at = end;
+        }
+        Ok(())
+    }
+    fn blocks(spool: &Path) -> Result<(Manifest, Vec<Block>)> {
+        let manifest: Manifest =
+            serde_json::from_slice(&std::fs::read(spool.join("manifest.json"))?)?;
+        anyhow::ensure!(
+            manifest.version == 1 && manifest.shards > 0,
+            "unsupported spool"
+        );
+        let mut out = Vec::new();
+        for line in BufReader::new(File::open(spool.join("index.jsonl"))?).lines() {
+            let block: Block = serde_json::from_str(&line?)?;
+            anyhow::ensure!(
+                block.id == out.len() as u64 && block.segments.len() == manifest.shards,
+                "invalid block sequence"
+            );
+            out.push(block);
+        }
+        anyhow::ensure!(
+            out.len() as u64 == manifest.blocks
+                && out.iter().map(|b| b.pairs).sum::<u64>() == manifest.pairs,
+            "invalid spool totals"
+        );
+        for shard in 0..manifest.shards {
+            let mut offset = 0;
+            for block in &out {
+                anyhow::ensure!(
+                    block.segments[shard].offset == offset,
+                    "noncontiguous shard"
+                );
+                offset += block.segments[shard].bytes;
+            }
+            anyhow::ensure!(
+                std::fs::metadata(spool.join(format!("{shard:04}.pack")))?.len() == offset,
+                "shard size mismatch"
+            );
+        }
+        Ok((manifest, out))
+    }
+    fn decode(spool: &Path, shard: usize, segment: &Segment) -> Result<Vec<u8>> {
+        if segment.bytes == 0 {
+            anyhow::ensure!(segment.raw_bytes == 0, "empty compressed segment");
+            return Ok(Vec::new());
+        }
+        anyhow::ensure!(
+            segment.raw_bytes <= 1024 * 1024 * 1024 && segment.bytes <= 1024 * 1024 * 1024,
+            "oversized segment"
+        );
+        let mut f = File::open(spool.join(format!("{shard:04}.pack")))?;
+        f.seek(SeekFrom::Start(segment.offset))?;
+        let mut gz = vec![0u8; segment.bytes as usize];
+        f.read_exact(&mut gz)?;
+        let mut raw = vec![0u8; segment.raw_bytes as usize];
+        let n = libdeflate::Decompressor::new().gzip_decompress(&gz, &mut raw)?;
+        anyhow::ensure!(n == raw.len(), "decompressed size mismatch");
+        Ok(raw)
+    }
+    fn compress_parallel(acc: &mut AccumulationBuffer, threads: usize) -> Result<()> {
+        let mut buckets: Vec<_> = std::mem::take(&mut acc.map).into_iter().collect();
+        let group = (buckets.len() + threads - 1) / threads;
+        buckets.par_chunks_mut(group.max(1)).try_for_each(|group| {
+            let mut compressor = Compressor::new(CompressionLvl::new(1).unwrap());
+            for (key, bucket) in group {
+                if bucket.count == 0 || !key.is_matched() {
+                    continue;
+                }
+                compress_plain_buffer(
+                    &mut compressor,
+                    &bucket.r1_raw,
+                    &mut bucket.r1_gzip,
+                    "R1 replay",
+                )?;
+                compress_plain_buffer(
+                    &mut compressor,
+                    &bucket.r2_raw,
+                    &mut bucket.r2_gzip,
+                    "R2 replay",
+                )?;
+                bucket.r1_raw = Vec::new();
+                bucket.r2_raw = Vec::new();
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
+        acc.map = buckets.into_iter().collect();
+        Ok(())
+    }
+    #[derive(Default, Serialize)]
+    struct ReplayTimings {
+        decode_match_seconds: f64,
+        assemble_seconds: f64,
+        compression_seconds: f64,
+        queue_wait_seconds: f64,
+        blocks: u64,
+    }
+    fn consumed_spool_range(previous: u64, end: u64, force: bool) -> Option<(u64, u64)> {
+        let through = end & !4095;
+        let length = through.checked_sub(previous)?;
+        if length == 0 || (!force && length < 8 * 1024 * 1024) { return None; }
+        i64::try_from(previous).ok()?;
+        i64::try_from(length).ok()?;
+        Some((previous, length))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn release_consumed_spool(file: &File, offset: u64, bytes: u64) -> bool {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn posix_fadvise(fd: i32, offset: i64, length: i64, advice: i32) -> i32;
+        }
+        unsafe { posix_fadvise(file.as_raw_fd(), offset as i64, bytes as i64, 4) == 0 }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn release_consumed_spool(_file: &File, _offset: u64, _bytes: u64) -> bool { true }
+
+    #[test]
+    fn consumed_spool_cache_ranges_wait_for_complete_batches_and_full_pages() {
+        assert_eq!(consumed_spool_range(0, 4095, true), None);
+        assert_eq!(consumed_spool_range(0, 8193, false), None);
+        assert_eq!(consumed_spool_range(0, 8193, true), Some((0, 8192)));
+        assert_eq!(consumed_spool_range(8192, 4096, true), None);
+        assert_eq!(consumed_spool_range(0, 8 * 1024 * 1024 + 12, false), Some((0, 8 * 1024 * 1024)));
+        assert_eq!(consumed_spool_range(u64::MAX - 4095, u64::MAX, true), None);
+    }
+
+    fn prepare_replay_block(
+        block: &Block,
+        readers: &[std::sync::Mutex<File>],
+        indices: &Arc<Vec<BarcodeIndex>>,
+        barcode_ids: &AHashMap<&str, usize>,
+        barcode_list: &[String],
+        threads: usize,
+    ) -> Result<(u64, AccumulationBuffer, ReplayTimings)> {
+        let mut timing = ReplayTimings::default();
+        let start = Instant::now();
+        let selected: Result<Vec<_>> = block
+            .segments
+            .par_iter()
+            .enumerate()
+            .map(|(shard, segment)| {
+                let raw = {
+                    if segment.bytes == 0 {
+                        anyhow::ensure!(segment.raw_bytes == 0, "empty compressed segment");
+                        Vec::new()
+                    } else {
+                        anyhow::ensure!(
+                            segment.raw_bytes <= 1024 * 1024 * 1024
+                                && segment.bytes <= 1024 * 1024 * 1024,
+                            "oversized segment"
+                        );
+                        let mut gz = vec![0u8; segment.bytes as usize];
+                        {
+                            let mut file = readers[shard]
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("poisoned spool reader"))?;
+                            file.seek(SeekFrom::Start(segment.offset))?;
+                            file.read_exact(&mut gz)?;
+                        }
+                        let mut raw = vec![0u8; segment.raw_bytes as usize];
+                        let n = libdeflate::Decompressor::new().gzip_decompress(&gz, &mut raw)?;
+                        anyhow::ensure!(n == raw.len(), "decompressed size mismatch");
+                        raw
+                    }
+                };
+                let mut selected = Vec::new();
+                let mut fates = FateCounts::default();
+                let mut seen = 0u64;
+                walk(&raw, |record| {
+                    anyhow::ensure!(
+                        u64::from(record.ordinal) < block.pairs,
+                        "ordinal outside block"
+                    );
+                    seen += 1;
+                    match indices[0].match_simple(record.barcode) {
+                        BarcodeMatch::Unique { id } if !record.short_r2 => {
+                            fates.dna_assigned += 1;
+                            let first = record.r1.as_ptr() as usize - raw.as_ptr() as usize;
+                            let second = record.r2.as_ptr() as usize - raw.as_ptr() as usize;
+                            selected.push((
+                                record.ordinal,
+                                barcode_ids[id],
+                                shard,
+                                first,
+                                record.r1.len(),
+                                second,
+                                record.r2.len(),
+                            ));
+                        }
+                        BarcodeMatch::Unique { .. } => fates.short += 1,
+                        BarcodeMatch::Ambiguous => fates.ambiguous += 1,
+                        BarcodeMatch::None => fates.unmatched += 1,
+                    }
+                    Ok(())
+                })?;
+                Ok((selected, fates, seen, raw))
+            })
+            .collect();
+        let selected = selected?;
+        timing.decode_match_seconds = start.elapsed().as_secs_f64();
+        let start = Instant::now();
+        let mut acc = AccumulationBuffer::new();
+        acc.fates.ambiguous = block.base_ambiguous;
+        acc.fates.unmatched = block.base_unmatched;
+        acc.fates.short = block.base_short;
+        let mut records = Vec::new();
+        let mut seen = block.base_ambiguous + block.base_unmatched + block.base_short;
+        let mut raw_shards = Vec::new();
+        for (mut selected, fates, n, raw) in selected {
+            acc.fates.add_assign(fates);
+            seen += n;
+            records.append(&mut selected);
+            raw_shards.push(raw);
+        }
+        anyhow::ensure!(
+            seen == block.pairs && acc.fates.input_read_pairs() == block.pairs,
+            "replay pair conservation"
+        );
+        records.sort_unstable_by_key(|r| r.0);
+        anyhow::ensure!(
+            records.windows(2).all(|w| w[0].0 < w[1].0),
+            "duplicate selected ordinal"
+        );
+        let mut groups: Vec<Vec<_>> = (0..barcode_list.len()).map(|_| Vec::new()).collect();
+        for record in records {
+            groups[record.1].push(record);
+        }
+        let buckets: Vec<_> = groups
+            .into_par_iter()
+            .enumerate()
+            .filter(|(_, group)| !group.is_empty())
+            .map(|(bc, group)| {
+                let mut bucket = FastqBucket::new();
+                bucket.count = group.len() as u64;
+                bucket.r1_raw.reserve(group.iter().map(|r| r.4).sum());
+                bucket.r2_raw.reserve(group.iter().map(|r| r.6).sum());
+                for (_, _, shard, first, n1, second, n2) in group {
+                    bucket
+                        .r1_raw
+                        .extend_from_slice(&raw_shards[shard][first..first + n1]);
+                    bucket
+                        .r2_raw
+                        .extend_from_slice(&raw_shards[shard][second..second + n2]);
+                }
+                (BucketKey::Dna(barcode_list[bc].clone()), bucket)
+            })
+            .collect();
+        for (key, bucket) in buckets {
+            acc.map.insert(key, bucket);
+        }
+        acc.bucket_mut(BucketKey::Unmatched).count = acc.fates.ambiguous + acc.fates.unmatched;
+        timing.assemble_seconds = start.elapsed().as_secs_f64();
+        let start = Instant::now();
+        compress_parallel(&mut acc, threads)?;
+        timing.compression_seconds = start.elapsed().as_secs_f64();
+        timing.blocks = 1;
+        Ok((block.id, acc, timing))
+    }
+    pub(super) fn replay(
+        config: &Config,
+        rows: Vec<CellRow>,
+        indices: Arc<Vec<BarcodeIndex>>,
+        paths: OutputPaths,
+        spool: &Path,
+    ) -> Result<()> {
+        let (manifest, blocks) = blocks(spool)?;
+        anyhow::ensure!(
+            config.mode == DemuxMode::DnaOnlyDroplet
+                && manifest.input_fastq_pairs == paths.input_fastq_pairs,
+            "replay input mismatch"
+        );
+        let readers = (0..manifest.shards)
+            .map(|shard| {
+                File::open(spool.join(format!("{shard:04}.pack"))).map(std::sync::Mutex::new)
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let max_raw = blocks
+            .iter()
+            .map(|b| b.segments.iter().map(|s| s.raw_bytes).sum::<u64>())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let window =
+            (2usize * 1024 * 1024 * 1024 / (max_raw as usize).saturating_mul(4).max(1)).clamp(1, 4);
+        let (tx, rx) = bounded(2);
+        let (tx_recycle, rx_recycle) = bounded(2);
+        let barcode_list: Vec<_> = rows.iter().map(|r| r.dna_barcode.clone()).collect();
+        let barcode_ids: AHashMap<_, _> = barcode_list
+            .iter()
+            .enumerate()
+            .map(|(i, bc)| (bc.as_str(), i))
+            .collect();
+        let drain = std::thread::spawn(move || {
+            for buffer in rx_recycle {
+                drop(buffer);
+            }
+        });
+        let final_report = paths.json_report.clone();
+        let private_report = final_report.with_extension("droplet_stage.partial");
+        let paths = OutputPaths {
+            json_report: private_report.clone(),
+            ..paths
+        };
+        let writer = spawn_writer(rx, tx_recycle, paths, rows);
+        let start = Instant::now();
+        let mut total = ReplayTimings::default();
+        let mut released = vec![0u64; readers.len()];
+        let mut cache_requested = 0u64;
+        let mut cache_calls = 0u64;
+        let mut cache_failed = 0u64;
+        let processing = (|| -> Result<()> {
+            for batch in blocks.chunks(window) {
+                let prepared: Result<Vec<_>> = batch
+                    .par_iter()
+                    .map(|block| {
+                        prepare_replay_block(
+                            block,
+                            &readers,
+                            &indices,
+                            &barcode_ids,
+                            &barcode_list,
+                            config.threads,
+                        )
+                    })
+                    .collect();
+                let prepared = prepared?;
+                if cfg!(target_os = "linux") {
+                    let last = batch.last().unwrap();
+                    for (shard, segment) in last.segments.iter().enumerate() {
+                        let Some(end) = segment.offset.checked_add(segment.bytes) else { continue; };
+                        if let Some((offset, length)) = consumed_spool_range(released[shard], end, last.id + 1 == manifest.blocks) {
+                            if let Ok(file) = readers[shard].lock() {
+                                cache_calls += 1;
+                                cache_requested += length;
+                                if !release_consumed_spool(&file, offset, length) { cache_failed += 1; }
+                            }
+                            released[shard] = offset + length;
+                        }
+                    }
+                }
+                for (id, acc, timing) in prepared {
+                    total.decode_match_seconds += timing.decode_match_seconds;
+                    total.assemble_seconds += timing.assemble_seconds;
+                    total.compression_seconds += timing.compression_seconds;
+                    total.blocks += 1;
+                    let before = Instant::now();
+                    tx.send((id, acc))?;
+                    total.queue_wait_seconds += before.elapsed().as_secs_f64();
+                }
+                if total.blocks % 100 == 0 {
+                    eprintln!(
+                        "DROPLET_REPLAY_PROGRESS blocks={} total={} wall={:.3}",
+                        total.blocks,
+                        manifest.blocks,
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            Ok(())
+        })();
+        drop(tx);
+        let written = writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("replay writer panic"));
+        let drained = drain.join().map_err(|_| anyhow::anyhow!("recycle panic"));
+        written??;
+        processing?;
+        drained?;
+        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&private_report)?)?;
+        anyhow::ensure!(
+            report["input_read_pairs"].as_u64() == Some(manifest.pairs),
+            "final replay pair mismatch"
+        );
+        std::fs::rename(private_report, final_report)?;
+        eprintln!(
+            "DROPLET_REPLAY_PROFILE {}",
+            serde_json::json!({
+                 "window":window, "wall_seconds":start.elapsed().as_secs_f64(),
+                "spool_cache_advice_requested_bytes":cache_requested,
+                "spool_cache_advice_calls":cache_calls, "spool_cache_advice_failed":cache_failed,
+                "block_timings":total, "timing_note":"sums of block wall intervals overlap when window>1"
+            })
+        );
+        Ok(())
+    }
+    pub(super) fn evidence(args: &Args, spool: &Path) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct Pair {
+            barcode: String,
+            parent: String,
+        }
+        let pairs: Vec<Pair> =
+            serde_json::from_slice(&std::fs::read(args.evidence_pairs.as_ref().unwrap())?)?;
+        anyhow::ensure!(!pairs.is_empty(), "empty evidence request");
+        let (manifest, blocks) = blocks(spool)?;
+        let mut children: AHashMap<Vec<u8>, droplet::Molecules> = AHashMap::new();
+        for pair in &pairs {
+            anyhow::ensure!(
+                children
+                    .insert(
+                        pair.barcode.as_bytes().to_vec(),
+                        droplet::Molecules::default()
+                    )
+                    .is_none(),
+                "duplicate child"
+            );
+        }
+        let scan =
+            |selected: &AHashSet<Vec<u8>>, consume: &mut dyn FnMut(&[u8], u128)| -> Result<()> {
+                let wanted: AHashSet<_> = selected
+                    .iter()
+                    .map(|bc| shard(bc, manifest.shards))
+                    .collect();
+                for block in &blocks {
+                    for shard in &wanted {
+                        let raw = decode(spool, *shard, &block.segments[*shard])?;
+                        walk(&raw, |record| {
+                            if selected.contains(record.barcode) {
+                                if let Some(key) = record.key {
+                                    consume(record.barcode, key);
+                                }
+                            }
+                            Ok(())
+                        })?;
+                    }
+                }
+                Ok(())
+            };
+        scan(&children.keys().cloned().collect(), &mut |bc, key| {
+            children.get_mut(bc).unwrap().add(key)
+        })?;
+        let mut targets: AHashMap<Vec<u8>, AHashMap<u128, Vec<usize>>> = AHashMap::new();
+        let mut parent_reads: AHashMap<Vec<u8>, u64> = AHashMap::new();
+        let mut shared: Vec<AHashSet<u128>> = pairs.iter().map(|_| AHashSet::new()).collect();
+        for (i, pair) in pairs.iter().enumerate() {
+            let lookup = targets.entry(pair.parent.as_bytes().to_vec()).or_default();
+            parent_reads
+                .entry(pair.parent.as_bytes().to_vec())
+                .or_default();
+            for (_, key) in &children[pair.barcode.as_bytes()].keys {
+                lookup.entry(*key).or_default().push(i);
+            }
+        }
+        scan(&targets.keys().cloned().collect(), &mut |bc, key| {
+            *parent_reads.get_mut(bc).unwrap() += 1;
+            if let Some(ids) = targets[bc].get(&key) {
+                for id in ids {
+                    shared[*id].insert(key);
+                }
+            }
+        })?;
+        let evidence:BTreeMap<_,_>=pairs.iter().enumerate().map(|(i,pair)| {
+            let child=&children[pair.barcode.as_bytes()]; let mut keys:Vec<_>=shared[i].iter().copied().collect(); keys.sort_unstable();
+            (pair.barcode.clone(),serde_json::json!({"parent":pair.parent,"child_eligible_reads":child.reads,
+                "child_sampled_signatures":child.keys.len(),"child_saturated":child.saturated,
+                "parent_eligible_reads":parent_reads[pair.parent.as_bytes()],
+                "shared_signatures":keys.into_iter().map(|key|format!("{key:022x}")).collect::<Vec<_>>()}))
+        }).collect();
+        std::fs::write(
+            args.evidence_output.as_ref().unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+            "signature":"exact_umi12_insert32","child_cap":4096,"parent_scan":"complete","pairs":evidence}))?,
+        )?;
+        Ok(())
     }
 }

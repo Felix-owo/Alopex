@@ -722,6 +722,18 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="TSS window BED; defaults to Pipeline resources/<species>_reference/tss.",
     )
     parser.add_argument(
+        "--tss-sample-fraction",
+        type=float,
+        default=0.1,
+        help="TSS sampling fraction per CloneID; <10 cells use all, otherwise cap at 100. 1 uses all.",
+    )
+    parser.add_argument(
+        "--tss-sample-seed",
+        type=int,
+        default=0,
+        help="Nonnegative seed for reproducible TSS cell sampling; default: 0.",
+    )
+    parser.add_argument(
         "--skip-tss",
         action="store_true",
         help="Generate all non-TSS outputs when TSS resources are intentionally unavailable.",
@@ -782,6 +794,8 @@ class RunConfig:
     ref_fai: Path
     tss_bed: Path | None
     gini_bin_size: int = 500000
+    tss_sample_fraction: float = 0.1
+    tss_sample_seed: int = 0
 
 
 class Timer:
@@ -943,9 +957,12 @@ def build_config(
     *,
     tss_bed_override: Path | None = None,
     skip_tss: bool = False,
+    tss_sample_fraction: float = 0.1,
+    tss_sample_seed: int = 0,
 ) -> RunConfig:
     """解析 reference FAI，并在需要时强制检查共享 TSS 输入。"""
     config = sealed.config
+    _validate_tss_sampling(tss_sample_fraction, tss_sample_seed)
     project_dir = sealed.project_dir
     genome = str(config.get("species") or "").strip()
     if not genome:
@@ -965,6 +982,8 @@ def build_config(
         genome=genome,
         ref_fai=ref_fai,
         tss_bed=tss_bed,
+        tss_sample_fraction=tss_sample_fraction,
+        tss_sample_seed=tss_sample_seed,
     )
     required_paths: list[tuple[str, Path | None]] = [("reference .fai", cfg.ref_fai)]
     if not skip_tss:
@@ -1047,7 +1066,7 @@ QC_INFO_COLUMNS = (
 )
 RAW_ADATA_SCHEMA_VERSION = 5
 RAW_ADATA_SCHEMA_MODE = "strand_resolved_headered_empty_safe"
-RAW_ADATA_ALGORITHM_VERSION = "snapatac2_import_values_configured_base_v1"
+RAW_ADATA_ALGORITHM_VERSION = "snapatac2_import_values_native_reference_v2"
 EMPTY_CPG_SENTINEL_CONTIG = "__DNA_PIPELINE_EMPTY__"
 
 MAX_CPG_PROCESS_WORKERS = 32
@@ -1432,7 +1451,11 @@ def load_or_create_raw_adata(
     sealed_context: SealedQCContext,
     cpg_output_identities: Mapping[str, Mapping[str, object]],
 ):
-    """按 sealed 坐标直接导入 CpG；1-based 每条染色体为坐标 0 留空槽，保留真实长度。"""
+    """按 sealed 坐标导入 CpG，保留原生染色体索引顺序并按名称补充真实长度。
+
+    reference_sequences 的行序决定全局稀疏列偏移，不得用 FAI 行序重建；
+    1-based 每条染色体为坐标 0 留空槽，不改变真实参考长度。
+    """
     sealed_context.assert_current()
     source_base = _source_cpg_coordinate_base(sealed_context.cpg_representation)
     expected = [str(value) for value in expected_sample_ids]
@@ -1591,11 +1614,17 @@ def load_or_create_raw_adata(
         snap_data.obs_names = new_names
         snap_data.uns["cpg_coordinate_base"] = source_base
         snap_data.uns["source_cpg_representation"] = sealed_context.cpg_representation
-        snap_data.uns["reference_sequences"] = pl.DataFrame({
-            "reference_seq_name": list(chrom_sizes),
-            "reference_seq_length": [length + source_base for length in chrom_sizes.values()],
-            "reference_bp_length": list(chrom_sizes.values()),
-        }).with_columns(pl.col("reference_seq_length", "reference_bp_length").cast(pl.UInt64))
+        reference = snap_data.uns["reference_sequences"]
+        reference_names = reference["reference_seq_name"].to_list()
+        if (len(reference_names) != len(chrom_sizes)
+                or len(set(reference_names)) != len(reference_names)
+                or dict(zip(reference_names, reference["reference_seq_length"].to_list()))
+                != {chrom: length + source_base for chrom, length in chrom_sizes.items()}):
+            raise ValueError("Native RawAdata chromosome index differs from the reference")
+        snap_data.uns["reference_sequences"] = reference.with_columns(pl.Series(
+            "reference_bp_length", [chrom_sizes[chrom] for chrom in reference_names],
+            dtype=pl.UInt64,
+        ))
         snap_data.close()
         snap_data = None
         sealed_context.assert_current()
@@ -1688,6 +1717,7 @@ def _cache_identities(identity: Mapping[str, object], cfg, algorithms: Mapping[s
         "gini": {**common, "algorithm": algorithms["gini"], "raw": algorithms["raw"],
                  "bin_size": cfg.gini_bin_size},
         "tss": {**common, "algorithm": algorithms["tss"], "raw": algorithms["raw"],
+                "sample_fraction": cfg.tss_sample_fraction, "sample_seed": cfg.tss_sample_seed,
                 "tss_bed": _content_binding(cfg.tss_bed) if cfg.tss_bed is not None else None},
     }
     return {key: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
@@ -1740,12 +1770,18 @@ def _validate_cpg_input(path: Path, chrom_sizes: Mapping[str, int] | None, coord
             raise ValueError(f"CpG input has an invalid header: {path}")
         for line_no, line in enumerate(handle, 2):
             fields = line.rstrip("\n").split("\t")
-            if len(fields) != 4 or any(re.fullmatch(r"[0-9]+", value) is None for value in fields[1:]):
+            if len(fields) != 4:
                 raise ValueError(f"{path}:{line_no}: invalid CpG fields")
-            pos, methyl, unmethyl = map(int, fields[1:])
-            if (pos < coordinate_base or methyl + unmethyl <= 0 or methyl + unmethyl > 65535
-                    or (chrom_sizes is not None and (fields[0] not in chrom_sizes
-                        or pos >= chrom_sizes[fields[0]] + coordinate_base))):
+            chrom, pos_text, methyl_text, unmethyl_text = fields
+            if not (pos_text.isascii() and pos_text.isdecimal()
+                    and methyl_text.isascii() and methyl_text.isdecimal()
+                    and unmethyl_text.isascii() and unmethyl_text.isdecimal()):
+                raise ValueError(f"{path}:{line_no}: invalid CpG fields")
+            pos = int(pos_text)
+            coverage = int(methyl_text) + int(unmethyl_text)
+            length = chrom_sizes.get(chrom) if chrom_sizes is not None else None
+            if (pos < coordinate_base or not 0 < coverage <= 65535
+                    or (chrom_sizes is not None and (length is None or pos >= length + coordinate_base))):
                 raise ValueError(f"{path}:{line_no}: invalid CpG coordinate/counts")
             found_data = True
     except BaseException as exc:
@@ -2142,12 +2178,17 @@ def _aggregate_tss_matrix(
     )
 
 
-def _read_tss_offset_map(tss_bed_path: Path, coordinate_base: int = 0) -> pd.Series:
-    pos_df = pd.read_csv(tss_bed_path, sep="\t", header=None, comment="#")
-    if pos_df.shape[1] < 9:
-        raise ValueError(f"TSS BED must have at least 9 columns: {tss_bed_path}")
+def _read_tss_offset_map(
+    tss_bed_path: Path, coordinate_base: int = 0, *,
+    covered_positions: np.ndarray | None = None,
+    reference_ranges: Mapping[str, tuple[int, int]] | None = None,
+) -> pd.Series:
+    try:
+        pos_df = pd.read_csv(tss_bed_path, sep="\t", header=None, comment="#", usecols=[0, 1, 2, 8])
+    except (ValueError, pd.errors.ParserError) as exc:
+        raise ValueError(f"TSS BED must have at least 9 columns: {tss_bed_path}") from exc
 
-    positions = pd.to_numeric(pos_df.iloc[:, 8], errors="coerce")
+    positions = pd.to_numeric(pos_df[8], errors="coerce")
     values = positions.to_numpy(dtype=float)
     if (
         not np.isfinite(values).all()
@@ -2157,16 +2198,55 @@ def _read_tss_offset_map(tss_bed_path: Path, coordinate_base: int = 0) -> pd.Ser
     ):
         raise ValueError(f"TSS BED offset must be a finite 32-bit integer: {tss_bed_path}")
 
-    region_keys = (
-        pos_df.iloc[:, 0].astype(str)
-        + ":"
-        + (pos_df.iloc[:, 1].astype(np.int64) + coordinate_base).astype(str)
-        + "-"
-        + (pos_df.iloc[:, 2].astype(np.int64) + coordinate_base).astype(str)
-    )
-    if region_keys.duplicated().any():
+    starts = pos_df[1].to_numpy(dtype=float)
+    ends = pos_df[2].to_numpy(dtype=float)
+    if (not np.isfinite(starts).all() or not np.isfinite(ends).all()
+            or not np.equal(starts, np.floor(starts)).all()
+            or not np.equal(ends, np.floor(ends)).all()
+            or (ends >= float(np.iinfo(np.int64).max)).any()
+            or (starts < 0).any() or (ends <= starts).any()):
+        raise ValueError(f"TSS BED must contain nonempty nonnegative intervals: {tss_bed_path}")
+    starts, ends = starts.astype(np.int64), ends.astype(np.int64)
+    pos_df[1], pos_df[2] = starts, ends
+    if pos_df.duplicated(subset=[0, 1, 2]).any():
         raise ValueError(f"TSS BED contains duplicate genomic intervals: {tss_bed_path}")
+    if covered_positions is not None:
+        if reference_ranges is None:
+            raise ValueError("TSS covered positions require reference ranges")
+        offsets = pos_df[0].map({chrom: offset for chrom, (offset, _) in reference_ranges.items()})
+        lengths = pos_df[0].map({chrom: length for chrom, (_, length) in reference_ranges.items()})
+        known = offsets.notna().to_numpy()
+        keep = np.zeros(len(pos_df), dtype=bool)
+        if len(covered_positions) and known.any():
+            global_starts = offsets[known].to_numpy(dtype=np.int64) + starts[known] + coordinate_base
+            global_ends = offsets[known].to_numpy(dtype=np.int64) + np.minimum(
+                ends[known] + coordinate_base, lengths[known].to_numpy(dtype=np.int64))
+            indices = np.searchsorted(covered_positions, global_starts)
+            keep[known] = ((indices < len(covered_positions))
+                           & (covered_positions[np.minimum(indices, len(covered_positions) - 1)] < global_ends))
+        pos_df = pos_df.loc[keep]
+        values = values[keep]
+    region_keys = (
+        pos_df[0].astype(str)
+        + ":"
+        + (pos_df[1].astype(np.int64) + coordinate_base).astype(str)
+        + "-"
+        + (pos_df[2].astype(np.int64) + coordinate_base).astype(str)
+    )
     return pd.Series(values.astype(np.int32), index=region_keys, name="position_coarse")
+
+
+def _tss_covered_positions(raw_adata) -> tuple[np.ndarray, dict[str, tuple[int, int]]]:
+    covered = np.empty(0, dtype=np.int64)
+    for matrix, _, _ in raw_adata.obsm.el("__values__").chunked(4):
+        covered = np.union1d(covered, matrix.indices)
+    ranges = {}
+    offset = 0
+    reference = raw_adata.uns["reference_sequences"]
+    for chrom, length in zip(reference["reference_seq_name"], reference["reference_seq_length"], strict=True):
+        ranges[str(chrom)] = (offset, int(length))
+        offset += int(length)
+    return covered, ranges
 
 
 def _validated_gini_cache(
@@ -2357,6 +2437,46 @@ def compute_gini_index(
         temporary.unlink(missing_ok=True)
 
 
+def _validate_tss_sampling(fraction: float, seed: int) -> None:
+    if (isinstance(fraction, (bool, np.bool_))
+            or not isinstance(fraction, (int, float, np.integer, np.floating))
+            or not np.isfinite(fraction) or not 0 < fraction <= 1):
+        raise ValueError("TSS sample fraction must be finite and in (0, 1]")
+    if isinstance(seed, (bool, np.bool_)) or not isinstance(seed, (int, np.integer)) or seed < 0:
+        raise ValueError("TSS sample seed must be a nonnegative integer")
+
+
+def _select_tss_cells(df_qc: pd.DataFrame, fraction: float, seed: int) -> tuple[pd.DataFrame, dict]:
+    _validate_tss_sampling(fraction, seed)
+    sample_ids = df_qc["Sample_ID"].astype(str).tolist()
+    if len(sample_ids) != len(set(sample_ids)):
+        raise ValueError("TSS sampling requires unique Sample_ID values")
+    clones = df_qc["CloneID"]
+    if clones.isna().any() or clones.astype(str).str.strip().eq("").any():
+        raise ValueError("TSS sampling requires nonempty CloneID values")
+    selected_ids = []
+    clone_counts = []
+    for clone, group in df_qc.groupby("CloneID", sort=True):
+        ids = group["Sample_ID"].astype(str).tolist()
+        count = len(ids) if len(ids) < 10 or fraction == 1 else min(100, int(np.ceil(len(ids) * fraction)))
+        ranked = sorted(ids, key=lambda sid: (
+            hashlib.sha256(json.dumps([int(seed), sid], ensure_ascii=True).encode()).hexdigest(), sid
+        ))
+        selected_ids.extend(ranked[:count])
+        clone_counts.append({"clone_id": str(clone), "total_cells": len(ids), "selected_cells": count})
+    selected_ids.sort()
+    selected = df_qc.set_index("Sample_ID", drop=False).loc[selected_ids].reset_index(drop=True)
+    return selected, {
+        "method": "clone_stratified_sha256_small10_cap100_v1",
+        "fraction": float(fraction),
+        "seed": int(seed),
+        "total_cells": len(sample_ids),
+        "selected_cells": len(selected_ids),
+        "sample_ids": selected_ids,
+        "clones": clone_counts,
+    }
+
+
 def compute_tss_profile(
     raw_adata: ad.AnnData,
     df_qc: pd.DataFrame,
@@ -2364,11 +2484,16 @@ def compute_tss_profile(
     out_csv: Path,
     recompute: bool,
     empty_cpg_sample_ids: set[str],
+    *,
+    sample_fraction: float = 1.0,
+    sample_seed: int = 0,
 ) -> pd.DataFrame:
-    expected_sample_ids = set(df_qc["Sample_ID"].astype(str))
-    empty_cpg = {str(value) for value in empty_cpg_sample_ids}
-    if empty_cpg - expected_sample_ids:
+    """仅计算传入 QC 子集的 TSS，先复制对应 RawAdata 行并在退出时清理临时矩阵。"""
+    if set(empty_cpg_sample_ids) - set(df_qc["Sample_ID"].astype(str)):
         raise ValueError("Empty-CpG Sample_ID set differs from QC table")
+    df_qc, _ = _select_tss_cells(df_qc, sample_fraction, sample_seed)
+    expected_sample_ids = set(df_qc["Sample_ID"].astype(str))
+    empty_cpg = {str(value) for value in empty_cpg_sample_ids} & expected_sample_ids
     if (not recompute) and out_csv.exists():
         prof = _validated_tss_cache(out_csv, expected_sample_ids, empty_cpg)
         if prof is not None:
@@ -2386,8 +2511,6 @@ def compute_tss_profile(
             raise ValueError("Computed empty TSS profile violates the output contract")
         return validated
 
-    pos_series = _read_tss_offset_map(tss_bed_path, _raw_cpg_coordinate_base(raw_adata))
-
     def make_and_aggregate(
         value_type: str, summary_type: str, value_name: str, aggregate: str
     ) -> pl.DataFrame:
@@ -2396,10 +2519,10 @@ def compute_tss_profile(
         )
         matrix = None
         try:
-            matrix = make_cpg_peak_matrix(
+            matrix = snap.pp.make_peak_matrix(
                 raw_adata,
                 value_type=value_type,
-                peak_file=tss_bed_path,
+                use_rep=tss_regions,
                 summary_type=summary_type,
                 inplace=False,
                 file=str(temporary),
@@ -2410,12 +2533,40 @@ def compute_tss_profile(
                 matrix, pos_series, value_name, aggregate, chunk_size=4
             )
         finally:
-            if matrix is not None:
-                matrix.close()
-            temporary.unlink(missing_ok=True)
+            try:
+                if matrix is not None:
+                    matrix.close()
+            finally:
+                temporary.unlink(missing_ok=True)
 
-    frac_pl = make_and_aggregate("fraction", "mean", "meth_frac", "mean")
-    count_pl = make_and_aggregate("target", "sum", "count", "sum")
+    subset_file = out_csv.with_name(f".tss-cells.{os.getpid()}.{time.time_ns()}.h5ad")
+    selected_raw = None
+    try:
+        raw_ids = [str(value) for value in raw_adata.obs_names]
+        if len(raw_ids) != len(set(raw_ids)) or expected_sample_ids - set(raw_ids):
+            raise ValueError("TSS Sample_ID set differs from RawAdata")
+        if expected_sample_ids != set(raw_ids):
+            selected_raw = raw_adata.subset(
+                obs_indices=[index for index, sid in enumerate(raw_ids) if sid in expected_sample_ids],
+                out=str(subset_file), inplace=False, backend="hdf5",
+            )
+            raw_adata = selected_raw
+        covered, ranges = _tss_covered_positions(raw_adata)
+        pos_series = _read_tss_offset_map(tss_bed_path, _raw_cpg_coordinate_base(raw_adata),
+                                        covered_positions=covered, reference_ranges=ranges)
+        tss_regions = pos_series.index.to_list()
+        if not tss_regions:
+            prof = pd.DataFrame(columns=TSS_REQUIRED_COLUMNS)
+            _atomic_write_csv(prof, out_csv)
+            return prof
+        frac_pl = make_and_aggregate("fraction", "mean", "meth_frac", "mean")
+        count_pl = make_and_aggregate("target", "sum", "count", "sum")
+    finally:
+        try:
+            if selected_raw is not None:
+                selected_raw.close()
+        finally:
+            subset_file.unlink(missing_ok=True)
 
     prof = frac_pl.join(
         count_pl, on=["Sample_ID", "position_coarse"], how="full", coalesce=True
@@ -2840,6 +2991,12 @@ def _run_pipeline_impl(
             raise ValueError("Gini missingness differs from empty-CpG cells")
 
         if cfg.tss_bed is not None:
+            _, sampling = _select_tss_cells(df_qc, cfg.tss_sample_fraction, cfg.tss_sample_seed)
+            identity["tss_sampling"] = sampling
+            _log(f"TSS 按 CloneID 抽检: {sampling['selected_cells']}/{sampling['total_cells']} cells; "
+                 f"fraction={sampling['fraction']}, seed={sampling['seed']}")
+            for clone in sampling["clones"]:
+                _log(f"  CloneID={clone['clone_id']}: {clone['selected_cells']}/{clone['total_cells']} cells")
             tss_profile = compute_tss_profile(
                 raw_adata=raw_adata,
                 df_qc=df_qc,
@@ -2847,6 +3004,8 @@ def _run_pipeline_impl(
                 out_csv=paths.tss_info,
                 recompute=recompute_tss,
                 empty_cpg_sample_ids=empty_cpg_sample_ids,
+                sample_fraction=cfg.tss_sample_fraction,
+                sample_seed=cfg.tss_sample_seed,
             )
         else:
             _log("TSS resources intentionally skipped; TSS CSV/PDF will not be generated", "WARNING")
@@ -2947,6 +3106,8 @@ def main() -> None:
         sealed,
         tss_bed_override=Path(args.tss_bed) if args.tss_bed else None,
         skip_tss=bool(args.skip_tss),
+        tss_sample_fraction=args.tss_sample_fraction,
+        tss_sample_seed=args.tss_sample_seed,
     )
 
     _log_config_summary(paths, cfg)
@@ -3520,6 +3681,49 @@ def _format_metric_stat(value) -> str:
     return f'{value:.3f}'
 
 
+def _final_qc_histogram_bins(values, use_log):
+    scale = 'log' if use_log and np.all(values > 0) else 'log1p' if use_log else 'linear'
+    transformed = (np.log10(values) if scale == 'log' else
+                   np.sign(values) * np.log1p(np.abs(values)) if scale == 'log1p' else values)
+    edges = np.histogram_bin_edges(transformed, bins=100)
+    edges = (np.power(10.0, edges) if scale == 'log' else
+             np.sign(edges) * np.expm1(np.abs(edges)) if scale == 'log1p' else edges)
+    if values.min() != values.max():
+        edges[0], edges[-1] = values.min(), values.max()
+    return edges, scale
+
+
+def _draw_final_qc_histogram(ax, counts, edges, scale, color):
+    transformed = (np.log10(edges) if scale == 'log' else
+                   np.sign(edges) * np.log1p(np.abs(edges)) if scale == 'log1p' else edges)
+    offsets = np.arange(-6, 7, dtype=float)
+    kernel = np.exp(-0.5 * (offsets / 1.5) ** 2)
+    kernel /= kernel.sum()
+    smoothed = np.convolve(np.pad(np.asarray(counts, dtype=float), 6, mode='symmetric'), kernel, mode='valid')
+    positions = np.linspace(0, len(counts), len(counts) * 8 + 1)
+    curve_x = np.interp(positions, np.arange(len(edges)), transformed)
+    curve_x = (np.power(10.0, curve_x) if scale == 'log' else
+               np.sign(curve_x) * np.expm1(np.abs(curve_x)) if scale == 'log1p' else curve_x)
+    curve_y = np.interp(positions, np.arange(len(counts)) + 0.5, smoothed)
+    ax.stairs(counts, edges, fill=True, color=color, alpha=0.16, linewidth=0)
+    ax.fill_between(curve_x, curve_y, color=color, alpha=0.32, linewidth=0)
+    ax.plot(curve_x, curve_y, color=color, linewidth=1.6)
+    if scale == 'log':
+        ax.set_xscale('log')
+    elif scale == 'log1p':
+        ax.set_xscale('function', functions=(
+            lambda x: np.sign(x) * np.log1p(np.abs(x)),
+            lambda x: np.sign(x) * np.expm1(np.abs(x)),
+        ))
+    if scale == 'log':
+        ax.xaxis.set_major_locator(ticker.LogLocator(base=10, subs=(1, 2, 5), numticks=7))
+        ax.xaxis.set_minor_formatter(ticker.NullFormatter())
+        ax.xaxis.set_major_formatter(ticker.FuncFormatter(
+            lambda x, _: f'{x / 1e6:g}M' if x >= 1e6 else f'{x / 1e3:g}K' if x >= 1e3 else f'{x:g}'
+        ))
+    ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+
+
 def plot_final_qc_dashboard(
     df: pd.DataFrame,
     group_col: str = 'CloneID',
@@ -3529,9 +3733,8 @@ def plot_final_qc_dashboard(
     clone_color_map: dict = None,
     out_path: Path = None,
     figsize: tuple = (16.5, 12),
-    simplify_sample_ids: bool = True,
 ):
-    """按 CloneID 样本或分布模式绘制所选 QC 指标面板。"""
+    """按 CloneID 绘制 100 分箱及平滑计数峰；CpG 横轴用对数，含零值时保留并用 log1p。"""
     if df.empty or group_col not in df.columns:
         print(f"Error: column '{group_col}' not found.")
         return
@@ -3611,7 +3814,7 @@ def plot_final_qc_dashboard(
             display_name, use_log = metric_configs[metric_name]
 
             xvals = pd.to_numeric(plot_df[metric_name], errors='coerce')
-            panel_df = plot_df.loc[xvals.notna(), [f'{group_col}_Display', metric_name]].copy()
+            panel_df = plot_df.loc[np.isfinite(xvals), [f'{group_col}_Display', metric_name]].copy()
             panel_df[metric_name] = pd.to_numeric(panel_df[metric_name], errors='coerce')
             panel_df = panel_df.dropna(subset=[metric_name])
 
@@ -3623,6 +3826,7 @@ def plot_final_qc_dashboard(
                 ax.set_axis_off()
                 continue
 
+            bin_edges, scale = _final_qc_histogram_bins(panel_df[metric_name].to_numpy(dtype=float), use_log)
             for display_group in display_levels:
                 sub = panel_df[panel_df[f'{group_col}_Display'] == display_group]
                 if sub.empty:
@@ -3630,18 +3834,8 @@ def plot_final_qc_dashboard(
                 vals = sub[metric_name].dropna()
                 if len(vals) == 0:
                     continue
-                sns.histplot(
-                    vals,
-                    bins=30,
-                    stat='count',
-                    element='step',
-                    fill=True,
-                    alpha=0.18 if not selected_clone_ids or len(selected_clone_ids) > 1 else 0.24,
-                    linewidth=1.15 if not selected_clone_ids or len(selected_clone_ids) > 1 else 1.35,
-                    color=color_map.get(display_group, UNKNOWN_COLOR),
-                    ax=ax,
-                    log_scale=(use_log, False),
-                )
+                counts, _ = np.histogram(vals, bins=bin_edges)
+                _draw_final_qc_histogram(ax, counts, bin_edges, scale, color_map.get(display_group, UNKNOWN_COLOR))
 
             median_val = panel_df[metric_name].median()
             ax.axvline(median_val, ls='--', lw=1.0, color=Colors.MEDIAN, alpha=0.9, zorder=5)
@@ -3654,8 +3848,8 @@ def plot_final_qc_dashboard(
             format_ax(
                 ax,
                 title=display_name,
-                xlabel=f"{display_name}{(' (Log Scale)' if use_log else '')}",
-                ylabel='Count',
+                xlabel=f"{display_name}{' (log scale)' if scale == 'log' else ' (log1p scale)' if scale == 'log1p' else ''}",
+                ylabel='Counts',
             )
             add_panel_letter(ax, panel_label(i))
 
@@ -3694,10 +3888,6 @@ def plot_final_qc_dashboard(
         print("Error: unsupported mode. Use 'distribution' or 'per_clone_samples'.")
         return
 
-    if 'Sample_ID' not in plot_df.columns:
-        print("Error: 'Sample_ID' column is required for mode='per_clone_samples'.")
-        return
-
     if metric not in metric_configs:
         print(f"Error: unsupported metric '{metric}'.")
         print("Supported metrics:")
@@ -3710,6 +3900,12 @@ def plot_final_qc_dashboard(
         return
 
     display_name, use_log = metric_configs[metric]
+    plot_df[metric] = pd.to_numeric(plot_df[metric], errors='coerce')
+    plot_df = plot_df.loc[np.isfinite(plot_df[metric])].copy()
+    if plot_df.empty:
+        print(f"Error: no finite values for metric '{metric}'.")
+        return
+    bin_edges, scale = _final_qc_histogram_bins(plot_df[metric].to_numpy(dtype=float), use_log)
     clones = group_ids
     clone_display_map, omitted = make_cloneid_diff_labels(clones)
 
@@ -3720,77 +3916,39 @@ def plot_final_qc_dashboard(
     n_rows = max(1, math.ceil(len(clones) / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 4.9 * n_rows), dpi=PlotParams.DPI)
     axes = np.array(axes).reshape(-1)
-    sample_label_note_needed = False
-
     for i, clone in enumerate(clones):
         ax = axes[i]
-        sub = plot_df.loc[plot_df[group_col] == clone, ['Sample_ID', metric]].copy()
-        sub[metric] = pd.to_numeric(sub[metric], errors='coerce')
-        sub = sub.dropna(subset=['Sample_ID', metric])
+        values = plot_df.loc[plot_df[group_col] == clone, metric]
 
-        if sub.empty:
+        if values.empty:
             ax.axis('off')
             continue
 
-        sub['Sample_ID'] = sub['Sample_ID'].astype(str)
+        counts, _ = np.histogram(values.to_numpy(dtype=float), bins=bin_edges)
+        _draw_final_qc_histogram(ax, counts, bin_edges, scale, clone_color_map.get(clone, UNKNOWN_COLOR))
 
-        if simplify_sample_ids:
-            sample_label_map, sample_omitted = get_diff_only_label_map(sub['Sample_ID'].tolist())
-            sub['Sample_ID_Display'] = sub['Sample_ID'].map(sample_label_map)
-            if sample_omitted.get('prefix') or sample_omitted.get('suffix'):
-                sample_label_note_needed = True
-        else:
-            sub['Sample_ID_Display'] = sub['Sample_ID']
-
-        sub = sub.sort_values(metric, ascending=False).reset_index(drop=True)
-
-        bar_color = clone_color_map.get(clone, UNKNOWN_COLOR)
-        ax.bar(
-            np.arange(len(sub)),
-            sub[metric].to_numpy(dtype=float),
-            color=bar_color,
-            alpha=0.85,
-            edgecolor='white',
-            linewidth=0.4,
-        )
-
-        median_val = sub[metric].median()
-        ax.axhline(median_val, ls='--', lw=1.0, color=Colors.MEDIAN, alpha=0.9, zorder=4)
+        median_val = values.median()
+        ax.axvline(median_val, ls='--', lw=1.0, color=Colors.MEDIAN, alpha=0.9, zorder=4)
         ax.text(
-            0.02, 0.975, f'Median: {_format_metric_stat(median_val)}',
+            0.02, 0.975, f'n = {len(values)} | Median: {_format_metric_stat(median_val)}',
             transform=ax.transAxes, ha='left', va='top',
             fontsize=10.2, color=Colors.ANNOT,
         )
 
-        ax.set_xticks(np.arange(len(sub)))
-        n_samples = len(sub)
-        if n_samples > 60:
-            ax.set_xticklabels([])
-        else:
-            ax.set_xticklabels(sub['Sample_ID_Display'].tolist(), rotation=90, fontsize=5.8, color=Colors.TICK)
-
-        if use_log and (sub[metric] > 0).all():
-            ax.set_yscale('log')
-            ylabel = f'{display_name} (Log Scale)'
-        else:
-            ylabel = display_name
-
         format_ax(
             ax,
             title=f"{clone_display_map.get(clone, clone)} - {display_name}",
-            xlabel='',
-            ylabel=ylabel,
+            xlabel=f"{display_name}{' (log scale)' if scale == 'log' else ' (log1p scale)' if scale == 'log1p' else ''}",
+            ylabel='Counts',
         )
+        ax.set_xlim(bin_edges[0], bin_edges[-1])
+        ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
         add_panel_letter(ax, panel_label(i))
 
     for j in range(len(clones), len(axes)):
         axes[j].axis('off')
 
-    note_text = _panel_omission_note(
-        sample_label_note_needed,
-        cloneid_omission_note(omitted),
-        include_clone_note=not selected_clone_ids,
-    )
+    note_text = cloneid_omission_note(omitted) if not selected_clone_ids else ''
 
     if note_text:
         fig.text(0.5, 0.01, note_text, ha='center', fontsize=10, color=Colors.ANNOT, style='italic')
@@ -4797,7 +4955,6 @@ def plot_final_qc_dashboard_batch(
     filename_prefix: str = 'Final_QC_Dashboard',
     mode: str = 'per_clone_samples',
     figsize: tuple = (16.5, 12),
-    simplify_sample_ids: bool = True,
 ):
     """为指标列表生成一个或多个最终 QC 面板。"""
     metric_list = normalize_metric_list(metrics)
@@ -4833,7 +4990,6 @@ def plot_final_qc_dashboard_batch(
             clone_color_map=clone_color_map,
             out_path=out_path,
             figsize=figsize,
-            simplify_sample_ids=simplify_sample_ids,
         )
 
 
@@ -4934,6 +5090,8 @@ def run_qc_processor(
     *,
     tss_bed: str | Path | None = None,
     skip_tss: bool = False,
+    tss_sample_fraction: float = 0.1,
+    tss_sample_seed: int = 0,
     recompute_raw_adata: bool = False,
     recompute_methyl_stats: bool = False,
     recompute_composition: bool = False,
@@ -4945,7 +5103,10 @@ def run_qc_processor(
     worker 与 native 线程共同受进程 affinity 和 Slurm allocation 的 CPU 预算约束；
     recompute 开关透传 CLI 的 --recompute-* 重算参数，其中 raw_adata 强制
     从 sealed CpG 重建 RawAdata.h5ad，其余默认按缓存身份自动判定复用。
+    TSS 默认每个 CloneID 抽检 10%（不足 10 个全检，最多 100 个）；
+    比例设为 1.0 时全量检查，比例与种子只影响 TSS 缓存。
     """
+    _validate_tss_sampling(tss_sample_fraction, tss_sample_seed)
     if skip_tss and tss_bed is not None:
         raise ValueError("skip_tss cannot be combined with an explicit TSS bed")
     processor = paths.pipeline_root / "downstream" / "downstream_qc.py"
@@ -4959,6 +5120,10 @@ def run_qc_processor(
         str(paths.project_dir),
         "--workers",
         worker_count,
+        "--tss-sample-fraction",
+        str(tss_sample_fraction),
+        "--tss-sample-seed",
+        str(tss_sample_seed),
     ]
     if tss_bed is not None:
         command.extend(["--tss-bed", str(tss_bed)])

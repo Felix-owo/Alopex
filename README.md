@@ -1,4 +1,4 @@
-# Alopex v14.12.1
+# Alopex v14.13
 
 Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、MultiQC 报告和可追溯的完整交付。
 
@@ -138,6 +138,9 @@ Bismark 和 BISCUIT 参数放在 `common`；协议模块只写 backend 与差异
   `local_alignment` 默认 `false`（combined-index end-to-end），`true` 使用 CT/GA local。
 - **Droplet**：`analysis.protocol: droplet`，自动采用 Bismark non-directional、spacer=0；
   无需 Barcode Map，`rna_sample` 留空。初始化前已有 Droplet config 时跳过 Barcode Map。
+  进入Bismark前先一次配对解析并计数/暂存，再calling和并行重放；每文库以原生Slurm作业组一次申请32CPU，顺序运行calling、身份表与demux，
+  calling至少16GiB并保留大库外推余量，demux 16GiB，两次重试只增加内存。
+  demux成功提交后自动回收暂存；日常运行不增加实验用逐FASTQ独立hash验收。
   non-conversion 过滤后按胞嘧啶/UMI 汇集共识；BAM 仍保留 PCR 复制，独立分子计数见 CpG。
   `Duplicate_Pair_Rate%` 不适用，保留 NaN；MAPQ≥10、baseQ≥20，未解决的平票不调用。
 - **TAPS**：`analysis.protocol: taps`，自动采用 Rastair，生成 SNP VCF/索引和 Non-CpG QC。
@@ -241,13 +244,21 @@ MultiQC 汇总原生 mapping、pair funnel、重复、过滤、对照和适用�
 
 使用 `conda/current/notebook` 环境打开 `downstream/DNA_QC_Visualization.ipynb`，填写
 `DNA_PROJECT_ROOT`、`DNA_PIPELINE_ROOT`。输出固定在当前交付的 `06_downstream/QC_Results_<生成时间>/`。
+TSS 默认每个 CloneID 抽检 10%（向上取整），不足 10 个全检、超过 1000 个固定抽 100 个；`TSS_SAMPLE_FRACTION=1.0` 可全量检查，完整 QC 和 adata 保留全部细胞。TSS 覆盖按 backed 行分批读取，避免反复读取整矩阵。
+RawAdata 重建仍完整校验 CpG，以 ASCII 数字检查减少逐行解析开销，不新增校验 worker。
 Notebook 启动、20 列 QC、RawAdata/single-CpG、缓存重算和 RNA 关联均见
 [下游 README](downstream/README.md)。
+Final QC 默认按 CloneID 分面展示直方图，纵轴为样本数（Counts）；CpG sites 使用对数横轴，其他指标保持线性，100 分箱叠加平滑计数峰，支持选择 CloneID 与批量指标。
 CpG density 绘图同时展示 input pairs 与 unique CpG sites 的逐样本散点图，按 CloneID 配色并单独保存 PDF；每组叠加与汇总一致的过原点拟合线，图例标注斜率。
 `SingleCpG_Adata.h5ad` 的位点坐标跟随交付中的 `analysis.cpg_coordinate_base`：
 0-based 为半开区间，1-based 为闭区间；AnnData 中记录坐标制。RawAdata 的实际位点同样跟随配置；
 下游按所选 base 适配参考区间和分箱，保证两种输出的甲基化矩阵数值一致。
+RawAdata 必须保留 SnapATAC2 原生染色体索引表的行序与索引长度，真实长度按名称补充，
+不得按 FAI 重排而改变位点归属。生物学真实性优先于性能与代码简化；导入算法修复后，
+重跑 QC Processor 重建 RawAdata/Gini/TSS，再设置 `RECOMPUTE_SINGLECPG=True` 重建矩阵。
 
 ## 许可证
 
 Alopex 以 [GPL-3.0](LICENSE) 发布。本仓库为公开发布副本，与开发仓库按发布版本同步。
+
+Droplet 优先在节点 scratch 完成 FASTQ，再将完整文件物化到共享暂存后提交 completion：目录只建一次、大文件优先，Linux 用最多4个有界复制 worker 并尽力释放已消费页缓存；无缓存提示的平台保留原生文件复制。scratch 不可用时直接写共享盘。stage采用可无损提升的紧凑整数质量计数及轻量排序索引（64个独立增长计数分区，默认100k pairs/block、32CPU时20个输入块），避免大库宽统计表同时驻留；calling首次内存max(16GiB,ceil(原R1计数请求/4)+4GiB)，demux首次16GiB，均32CPU，超大库仍随输入增长，重试1.5/2倍。Shell科学身份提取隔离用户profile/rc和BASH_ENV/ENV；workflow仅清理本进程继承的Shell启动变量及SSH远程启动标识，规则子进程不隐式重跑用户rc。Linux Droplet按有效回写阈值的一半分配512MiB–2GiB总写缓冲，按积压字节优先回写；replay批次读取结束后每8MiB尽力回收已消费spool完整页缓存。stage pack与replay FASTQ共用内置有界回写与干净缓存回收，按作业内存约束提前处理脏页积压；不依赖额外监控脚本或全局缓存设置。两阶段仍按原事务保留失败传播与成功清理。

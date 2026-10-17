@@ -12,6 +12,7 @@ Doctor 维护：finalize_release、build_downstream_references、stage_route_con
 协议声明产物需求，backend 实现科学计算；完成边界与恢复共用生产 DAG。
 """
 from __future__ import annotations
+import stat
 import argparse
 import ast
 import bisect
@@ -28,18 +29,18 @@ import os
 import re
 import shlex
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TextIO, TypedDict, cast
@@ -377,9 +378,10 @@ def scientific_code_identity(python: tuple[str, ...] = (), shell: tuple[str, ...
                        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load))
     shell_code = ""
     if shell:
+        identity_env = {key: value for key, value in os.environ.items() if key not in {"BASH_ENV", "ENV"}}
         shell_code = subprocess.check_output(
-            ["bash", "-c", 'source "$1"; shift; declare -f "$@"', "_",
-             str(Path(__file__).with_name("job_runtime.sh")), *shell], text=True,
+            ["bash", "--noprofile", "--norc", "-c", 'source "$1"; shift; declare -f "$@"', "_",
+             str(Path(__file__).with_name("job_runtime.sh")), *shell], text=True, env=identity_env,
         )
     return sha256_bytes(json.dumps({"python": selected, "shell": shell_code}, sort_keys=True).encode())
 
@@ -470,9 +472,8 @@ class _StaticRuleRequest:
 STATIC_RESOURCE_REQUESTS: Mapping[str, _StaticRuleRequest] = MappingProxyType(
     {
         "demux": _StaticRuleRequest((4, 4, 4, 4), (4, 8, 12, 12), (120, 360, 720, 1440)),
-        "demux_index": _StaticRuleRequest((32, 32, 32, 32), (16, 16, 16, 16), (1440, 1440, 1440, 1440)),
-        "demux_chunk": _StaticRuleRequest((6, 6, 6, 6), (8, 8, 8, 8), (120, 120, 120, 120)),
-        "demux_merge": _StaticRuleRequest((8, 8, 8, 8), (16, 16, 16, 16), (1440, 1440, 1440, 1440)),
+        "droplet_calling": _StaticRuleRequest((32, 32, 32, 32), (16, 16, 16, 16), (1440, 1440, 1440, 1440)),
+        "droplet_demux": _StaticRuleRequest((32, 32, 32, 32), (16, 16, 16, 16), (1440, 1440, 1440, 1440)),
         "cutadapt": _StaticRuleRequest((4, 4, 4, 4), (2, 2, 2, 4), (30, 45, 60, 90)),
         "align_sort_dedup": _StaticRuleRequest(
             (16, 16, 16, 16), (24, 32, 40, 40), (120, 180, 240, 240)
@@ -521,7 +522,6 @@ STATIC_SCRATCH_GIB: Mapping[str, tuple[int, int, int, int]] = MappingProxyType(
         "preprocess_alignment": (16, 32, 64, 64),
         "high_cph_filter": (8, 16, 24, 48),
         "bismark_extract": (8, 16, 24, 48),
-        "demux_chunk": (24, 24, 24, 24),
     }
 )
 
@@ -594,8 +594,8 @@ def demux_resource_request(total_bytes: object, attempt: int = 1, count_only: bo
     ``count_only=True``（droplet 细胞调用的全条码计数）按实测斜率外推：峰值内存 ≈
     2 GiB + 0.048×输入GiB（F-real-2609SG，619 GiB R1 实测 29.5 GiB、12.04B reads），
     请求值乘 1.3 余量；runtime 按 1.1 min/GiB。``count_only=False`` 用表内保守值，
-    XL 与 L 内存同档。字节数不可得时沿用表内 XL 保底值；Droplet 配对阶段使用
-    demux_index/demux_chunk/demux_merge 三条独立固定资源策略。
+    XL 与 L 内存同档。字节数不可得时沿用表内 XL 保底值；Droplet 配对阶段由
+    droplet_resource_request 给出独立阶段预算。
     """
 
     attempt_no = _attempt_number(attempt)
@@ -620,6 +620,18 @@ def demux_resource_request(total_bytes: object, attempt: int = 1, count_only: bo
         mem_mb=mem_mb,
         runtime_min=runtime_min,
     )
+
+
+def droplet_resource_request(total_r1_bytes: object, stage: str, attempt: int = 1) -> ResourceRequest:
+    """按紧凑计数的大库斜率与配对缓冲请求 Droplet 单库资源，保留两次内存重试。"""
+    if stage not in {"calling", "demux"}:
+        raise ValueError("Droplet stage must be calling or demux")
+    request = resource_request("droplet_" + stage, attempt=1)
+    base_mem = request.mem_mb
+    if stage == "calling":
+        count = demux_resource_request(total_r1_bytes, count_only=True)
+        base_mem = max(base_mem, math.ceil(count.mem_mb / 4) + 4 * 1024)
+    return replace(request, tier=demux_size_tier(total_r1_bytes), mem_mb=_attempt_memory_mb(base_mem, _attempt_number(attempt)))
 
 
 MULTIQC_MAX_CELLS = 1000
@@ -3228,6 +3240,12 @@ def demux_source_revision(source_root: str | Path, *, count_only: bool = False) 
             _, droplet_marker, after = output_and_rest.partition(b"\nmod droplet {\n")
             if not output_marker or not droplet_marker:
                 raise ValueError("cannot locate Rust output and droplet module boundaries")
+            stage, replay_marker, replay_and_evidence = after.partition(b"\n    fn compress_parallel(")
+            if replay_marker:
+                _, evidence_marker, evidence = replay_and_evidence.partition(b"\n    pub(super) fn evidence(")
+                if not evidence_marker:
+                    raise ValueError("cannot locate Rust replay/evidence module boundaries")
+                after = stage + evidence_marker + evidence
             data = before + droplet_marker + after
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
@@ -3447,421 +3465,114 @@ def _parse_demux_report(raw: object, source: Path) -> DemuxReport:
     return cast(DemuxReport, report)
 
 
-DEMUX_CHUNK_READ_PAIRS = 50_000_000
-
-
-DEMUX_CHUNK_RAW_BYTES = 16 * 1024 ** 3
-
-
-def _rapidgzip_command(*arguments: str) -> list[str]:
-    return [sys.executable, "-c", "import rapidgzip; raise SystemExit(rapidgzip.cli())", *map(str, arguments)]
-
-
-def _read_gzip_line_index(path: Path) -> tuple[list[int], list[int], list[int], int, int]:
-    lines, offsets, positions = [], [], []
-    with path.open("rb", buffering=8 * 1024**2) as handle:
-        if handle.read(20) != b"\0" * 8 + b"gzipindX" + b"\0" * 4:
-            raise ValueError(f"invalid gzip line index: {path}")
-        count, complete = struct.unpack(">QQ", handle.read(16))
-        if count != complete or count > path.stat().st_size // 32:
-            raise ValueError(f"incomplete gzip line index: {path}")
-        previous_compressed = -1
-        for _ in range(count):
-            positions.append(handle.tell())
-            offset, compressed, bits, window = struct.unpack(">QQII", handle.read(24))
-            if bits > 7 or compressed * 8 - bits <= previous_compressed:
-                raise ValueError(f"invalid gzip seek point: {path}")
-            previous_compressed = compressed * 8 - bits
-            handle.seek(window, os.SEEK_CUR)
-            line = struct.unpack(">Q", handle.read(8))[0] - 1
-            if line < 0 or (lines and (line < lines[-1] or offset < offsets[-1])):
-                raise ValueError(f"unordered gzip line index: {path}")
-            lines.append(line)
-            offsets.append(offset)
-        positions.append(handle.tell())
-        raw_bytes, newlines = struct.unpack(">QQ", handle.read(16))
-        if handle.read(1) or (lines and (newlines < lines[-1] or raw_bytes < offsets[-1])):
-            raise ValueError(f"invalid gzip line index footer: {path}")
-    if not lines or lines[0] != 0 or offsets[0] != 0:
-        raise ValueError(f"gzip line index lacks the first record: {path}")
-    lines.append(newlines)
-    offsets.append(raw_bytes)
-    return lines, offsets, positions, raw_bytes, newlines
-
-
-def _write_gzip_range_index(source: Path, destination: Path, lines: Sequence[int], positions: Sequence[int],
-                            start_pair: int, read_pairs: int) -> None:
-    begin = max(0, bisect.bisect_left(lines, start_pair * 4) - 2)
-    end = min(len(positions) - 1, bisect.bisect_left(lines, (start_pair + read_pairs) * 4) + 3)
-    with source.open("rb", buffering=64 * 1024) as origin, destination.open("xb") as output:
-        output.write(origin.read(20))
-        count = end - begin + int(begin > 0)
-        output.write(struct.pack(">QQ", count, count))
-        ranges = ([(positions[0], positions[1])] if begin else []) + [(positions[begin], positions[end])]
-        for start, stop in ranges:
-            origin.seek(start)
-            remaining = stop - start
-            while remaining:
-                block = origin.read(min(remaining, 1024 ** 2))
-                if not block:
-                    raise ValueError(f"truncated gzip line index: {source}")
-                output.write(block)
-                remaining -= len(block)
-        origin.seek(positions[-1])
-        footer = origin.read(16)
-        if len(footer) != 16:
-            raise ValueError(f"truncated gzip line index footer: {source}")
-        output.write(footer)
-
-
-def _plan_demux_pair_chunks(data: Sequence[tuple[dict[str, Any], list[int], list[int], list[int]]],
-                            destination: Path, source_number: int, chunk_offset: int) -> list[dict[str, Any]]:
-    chunks = []
-    pairs = data[0][0]["read_pairs"]
-    start = 0
-    while start < pairs:
-        end = min(pairs, start + DEMUX_CHUNK_READ_PAIRS)
-        lower = []
-        for metadata, lines, offsets, positions in data:
-            before = max(0, bisect.bisect_left(lines, start * 4) - 1)
-            lower.append(offsets[before])
-            limit = bisect.bisect_right(offsets, offsets[before] + DEMUX_CHUNK_RAW_BYTES // 2) - 1
-            end = min(end, lines[limit] // 4)
-        if end <= start:
-            raise ValueError("FASTQ records or gzip index spacing exceed the chunk scratch bound")
-        upper = sum(offsets[bisect.bisect_left(lines, end * 4)] - lo
-                    for (_, lines, offsets, _), lo in zip(data, lower, strict=True))
-        entry = dict(id=f"{chunk_offset + len(chunks):06d}", source=source_number, start_pair=start,
-                     read_pairs=end-start, raw_bytes=upper)
-        for mate, (metadata, lines, offsets, positions) in enumerate(data, 1):
-            name = f"{entry['id']}.R{mate}.gzi"
-            _write_gzip_range_index(destination / metadata["index"], destination / name,
-                                    lines, positions, start, end - start)
-            entry[f"r{mate}_index"] = name
-        chunks.append(entry)
-        start = end
-    for metadata, _, _, _ in data:
-        (destination / metadata.pop("index")).unlink()
-    return chunks
-
-
-def index_demux_fastqs(r1: Sequence[str], r2: Sequence[str], output: str | Path, *, threads: int) -> None:
-    """顺序读取压缩流并行校验 gzip，裁剪区段索引；不复制或重压缩 FASTQ。"""
+def stage_droplet_reads(r1: Sequence[str | Path], r2: Sequence[str | Path], spool: str | Path,
+                        counts: str | Path, structure: str | Path, *, binary: str | Path,
+                        decoder_python: str | Path, threads: int) -> None:
+    """配对扫描一次并提交原始条码暂存及完整计数，任一解码或写出失败不提交暂存边界。"""
     if not r1 or len(r1) != len(r2) or threads < 1:
-        raise ValueError("demux index requires equally sized, non-empty R1/R2 lists and positive threads")
-    for value in (*r1, *r2):
-        source = Path(value)
-        if not source.name.lower().endswith((".fastq.gz", ".fq.gz")):
-            raise ValueError(f"demux index requires a gzip FASTQ suffix: {source}")
-        with source.open("rb") as handle:
-            if handle.read(2) != b"\x1f\x8b":
-                raise ValueError(f"demux index input lacks gzip magic: {source}")
-    destination = Path(output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.mkdir()
-    committed = False
-    inputs, chunks = [], []
-    decoders = max(2, (int(threads) - 2) // 2)
-
-    def build_index(item: tuple[int, int, str]) -> tuple[dict[str, Any], list[int], list[int], list[int]]:
-        number, mate, value = item
-        path = Path(value).resolve()
-        before = path.stat()
-        name = f"source{number:06d}.R{mate}.gzi"
-        index = destination / name
-        subprocess.run(_rapidgzip_command("-P", str(decoders), "--io-read-method", "sequential", "--verify", "--export-index", str(index),
-                       "--index-format", "gztool-with-lines", str(path)), check=True)
-        lines, offsets, positions, raw_bytes, newlines = _read_gzip_line_index(index)
-        if raw_bytes:
-            tail = subprocess.check_output(_rapidgzip_command("-P", "2", "--import-index", str(index),
-                "-d", "-c", "--ranges", f"1@{raw_bytes - 1}", str(path)))
-            if len(tail) != 1:
-                raise ValueError(f"cannot verify final FASTQ line: {path}")
-            newlines += int(tail != b"\n")
-            lines[-1] = newlines
-        if newlines % 4:
-            raise ValueError(f"FASTQ does not contain complete four-line records: {path}")
-        after = path.stat()
-        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-            raise ValueError(f"raw FASTQ changed while indexing: {path}")
-        return dict(path=str(path), bytes=before.st_size, mtime_ns=before.st_mtime_ns,
-                    index=name, raw_bytes=raw_bytes, read_pairs=newlines // 4), lines, offsets, positions
-
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            for number, pair in enumerate(zip(r1, r2, strict=True)):
-                data = list(pool.map(build_index, [(number, mate, value) for mate, value in enumerate(pair, 1)]))
-                if data[0][0]["read_pairs"] != data[1][0]["read_pairs"]:
-                    raise ValueError("paired FASTQ inputs are not in sync")
-                inputs.append({"r1": data[0][0], "r2": data[1][0]})
-                chunks.extend(_plan_demux_pair_chunks(data, destination, number, len(chunks)))
-        if not chunks:
-            raise ValueError("demux index found no complete FASTQ records")
-        manifest = dict(schema_version=1, input_fastq_pairs=len(inputs), inputs=inputs, chunks=chunks,
-                        input_read_pairs=sum(row["read_pairs"] for row in chunks))
-        atomic_write_json(destination / "manifest.json", manifest)
-        read_demux_chunks(destination)
-        committed = True
-        print(f"Demux index: {manifest['input_read_pairs']} pairs, {len(chunks)} independent chunks", flush=True)
-    finally:
-        if not committed:
-            shutil.rmtree(destination)
+        raise ValueError("Droplet stage requires ordered paired FASTQs and positive threads")
+    spool, counts, structure = map(Path, (spool, counts, structure))
+    spool.parent.mkdir(parents=True, exist_ok=True)
+    counts.parent.mkdir(parents=True, exist_ok=True)
+    structure.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".droplet_stage.", dir=spool.parent) as root:
+        root = Path(root)
+        staged = root / "spool"
+        command = [str(binary), "droplet-stage", "--spool", str(staged), "--counts-output", str(root / "counts.tsv"),
+                   "--count-metrics", str(root / "structure.json"), "--decoder-python", str(decoder_python), "--threads", str(threads)]
+        for flag, paths in (("--r1", r1), ("--r2", r2)):
+            for path in paths:
+                command.extend((flag, str(path)))
+        subprocess.run(command, check=True)
+        plan = json.loads((staged / "manifest.json").read_text())
+        metrics = json.loads((root / "structure.json").read_text())
+        if plan["version"] != 1 or plan["input_fastq_pairs"] != len(r1) or plan["pairs"] != metrics["input_reads"]:
+            raise ValueError("Droplet staged pair accounting differs from structure counts")
+        os.replace(root / "counts.tsv", counts)
+        os.replace(root / "structure.json", structure)
+        backup = root / "previous"
+        if spool.exists():
+            spool.rename(backup)
+        try:
+            staged.rename(spool)
+        except BaseException:
+            if backup.exists():
+                backup.rename(spool)
+            raise
 
 
-def read_demux_chunks(directory: str | Path) -> dict[str, Any]:
-    """加载索引分块清单，核对来源身份、连续区段、scratch 上限和全库配对守恒。"""
-    source = Path(directory) / "manifest.json"
-    data = json.loads(source.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("schema_version") != 1:
-        raise ValueError(f"invalid demux index manifest: {source}")
-    inputs, chunks = data.get("inputs"), data.get("chunks")
-    if not isinstance(inputs, list) or not inputs or data.get("input_fastq_pairs") != len(inputs):
-        raise ValueError(f"demux index lacks physical FASTQ pairs: {source}")
-    for number, pair in enumerate(inputs):
-        for mate in (1, 2):
-            row = pair.get(f"r{mate}", {})
-            if not isinstance(row.get("path"), str) or not Path(row["path"]).is_absolute():
-                raise ValueError(f"invalid demux index source: {source}")
-            for field in ("bytes", "mtime_ns", "raw_bytes", "read_pairs"):
-                _integer(row.get(field), f"input.{field}", source)
-        if pair["r1"]["read_pairs"] != pair["r2"]["read_pairs"]:
-            raise ValueError(f"unpaired demux index source: {source}")
-    if not isinstance(chunks, list) or not chunks:
-        raise ValueError(f"demux index has no chunks: {source}")
-    covered = [0] * len(inputs)
-    previous = 0
-    for index, row in enumerate(chunks):
-        if not isinstance(row, dict) or row.get("id") != f"{index:06d}":
-            raise ValueError(f"demux chunk order/identity is invalid: {source}")
-        if any(row.get(f"r{mate}_index") != f"{index:06d}.R{mate}.gzi" for mate in (1, 2)):
-            raise ValueError(f"invalid demux chunk index: {source}")
-        for field in ("read_pairs", "raw_bytes", "source", "start_pair"):
-            _integer(row.get(field), f"chunk.{field}", source)
-        number = row["source"]
-        if number < previous or number >= len(inputs) or row["start_pair"] != covered[number]:
-            raise ValueError(f"demux index has overlapping or missing ranges: {source}")
-        if row["raw_bytes"] > DEMUX_CHUNK_RAW_BYTES or row["read_pairs"] > DEMUX_CHUNK_READ_PAIRS:
-            raise ValueError(f"demux chunk exceeds its scratch bound: {source}")
-        if not row["read_pairs"] and (len(chunks) != 1 or row["raw_bytes"]):
-            raise ValueError(f"unexpected empty demux chunk: {source}")
-        covered[number] += row["read_pairs"]
-        previous = number
-    if covered != [pair["r1"]["read_pairs"] for pair in inputs] or _integer(data.get("input_read_pairs"), "input_read_pairs", source) != sum(covered):
-        raise ValueError(f"demux index pair accounting mismatch: {source}")
-    return data
+def droplet_output_disk_mb(spool: str | Path) -> int:
+    """按已提交暂存压缩量预留输出 scratch；给副本和压缩差异留余量，不进入分析配置。"""
+    spool = Path(spool)
+    plan = json.loads((spool / "manifest.json").read_text())
+    total = sum((spool / f"{i:04}.pack").stat().st_size for i in range(plan["shards"]))
+    return max(1024, math.ceil(total * 2 / 1024 ** 2) + 512)
 
 
-def _run_indexed_demux(index_dir: str | Path, chunk: str, command: list[str]) -> dict[str, Any]:
-    plan = read_demux_chunks(index_dir)
-    if not re.fullmatch(r"[0-9]{6}", chunk) or int(chunk) >= len(plan["chunks"]):
-        raise ValueError(f"unknown demux chunk: {chunk!r}")
-    entry = plan["chunks"][int(chunk)]
-    sources = plan["inputs"][entry["source"]]
-    readers, read_fds = [], []
-    consumer = None
-    try:
-        command = [*command, "--fastq-stream"]
-        for mate in (1, 2):
-            row = sources[f"r{mate}"]
-            path = Path(row["path"])
-            state = path.stat()
-            if (state.st_size, state.st_mtime_ns) != (row["bytes"], row["mtime_ns"]):
-                raise ValueError(f"raw FASTQ changed since indexing: {path}")
-            read_fd, write_fd = os.pipe()
-            read_fds.append(read_fd)
-            try:
-                reader = subprocess.Popen(_rapidgzip_command("-P", "1", "--import-index", str(Path(index_dir) / entry[f"r{mate}_index"]),
-                    "-d", "-c", "--ranges", f"{entry['read_pairs']*4}L@{entry['start_pair']*4}L", str(path)), stdout=write_fd)
-                readers.append(reader)
-            finally:
-                os.close(write_fd)
-            command.extend((f"--r{mate}", f"/dev/fd/{read_fd}"))
-        consumer = subprocess.Popen(command, pass_fds=tuple(read_fds))
-        for fd in read_fds:
-            os.close(fd)
-        read_fds.clear()
-        if consumer.wait() != 0:
-            raise subprocess.CalledProcessError(consumer.returncode, command)
-        for reader in readers:
-            if reader.wait() != 0:
-                raise subprocess.CalledProcessError(reader.returncode, reader.args)
-    finally:
-        for fd in read_fds:
-            os.close(fd)
-        for process in [consumer, *readers]:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-    return entry
-
-
-def run_demux_chunk(index_dir: str | Path, chunk: str, *, binary: str, barcode_map: str,
-                    sample: str, scratch: str, pack: str, metadata: str, threads: int) -> None:
-    """在 job scratch 解复用一个配对块，保留非零细胞并打包 gzip；metadata 最后提交。"""
-    work = Path(scratch)
-    work.mkdir(parents=True, exist_ok=True)
-    dna = work / "DNA"
-    report_file = work / "report.json"
-    if dna.exists() or report_file.exists():
-        raise FileExistsError("demux chunk requires an unused job scratch directory")
-    command = [str(binary), "--barcode-map", str(barcode_map), "--sample-name=" + sample,
-               "--dna-out-dir", str(dna), "--rna-out-dir", str(work / "RNA"),
-               "--json-report", str(report_file), "--mode", "dna-only-droplet",
-               "--min-matched-read-pairs", "1", "--threads", str(max(1, int(threads) - 4))]
-    entry = _run_indexed_demux(index_dir, chunk, command)
-    report = read_demux_report(report_file)
-    if report["input_read_pairs"] != entry["read_pairs"]:
-        raise ValueError(f"demux chunk {chunk} lost or duplicated input pairs")
-    destination, commit = Path(pack), Path(metadata)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    commit.parent.mkdir(parents=True, exist_ok=True)
-    token = ".tmp." + uuid.uuid4().hex
-    pack_tmp, metadata_tmp = Path(str(destination) + token), Path(str(commit) + token)
-    members = []
-    try:
-        with pack_tmp.open("xb", buffering=1024**2) as writer:
-            for row in report["samples"]:
-                member = []
-                for mate in (1, 2):
-                    offset = writer.tell()
-                    if row["dna_read_count"]:
-                        path = dna / row["cell_sample_id"] / f"{row['cell_sample_id']}_R{mate}.fastq.gz"
-                        with path.open("rb") as reader:
-                            shutil.copyfileobj(reader, writer, length=1024**2)
-                        if writer.tell() - offset != path.stat().st_size or writer.tell() == offset:
-                            raise ValueError(f"incomplete chunk output: {path}")
-                    member.extend((offset, writer.tell() - offset))
-                members.append(member)
-            size = writer.tell()
-            writer.flush()
-            os.fsync(writer.fileno())
-        metadata_tmp.write_text(json.dumps({"schema_version": 1, "chunk": chunk, "pack_bytes": size,
-                                           "report": report, "members": members}, separators=(",", ":")) + "\n", encoding="utf-8")
-        commit.unlink(missing_ok=True)
-        os.replace(pack_tmp, destination)
-        os.replace(metadata_tmp, commit)
-    finally:
-        pack_tmp.unlink(missing_ok=True)
-        metadata_tmp.unlink(missing_ok=True)
-
-
-def merge_demux_chunks(index_dir: str | Path, packs_dir: str | Path, dna_dir: str | Path,
-                       report_path: str | Path, *, threshold: int, threads: int) -> None:
-    """按细胞组连续读取 pack 并保持原始块序；受句柄预算约束，关闭全部输出后提交报告。"""
-    import resource
-
-    soft_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-    fd_budget = max(1, (1024 if soft_limit == resource.RLIM_INFINITY else soft_limit) - 64)
-    pack_batch_size = min(64, max(1, fd_budget // 2))
-    workers = min(8, int(threads), max(1, (fd_budget - pack_batch_size) // 2))
-    cells_per_group = min(32, max(1, (fd_budget - pack_batch_size) // (2 * max(1, workers))))
-    plan = read_demux_chunks(index_dir)
-    packs, destination = Path(packs_dir), Path(dna_dir)
-    if threshold < 0 or threads < 1:
-        raise ValueError("demux merge requires non-negative threshold and positive threads")
+def copy_demux_fastq(source: str | Path, destination: str | Path, workers: int = 1) -> dict[str, object]:
+    """按完整文件物化 FASTQ；有界复制并尽力释放已消费缓存，失败仍由调用事务回滚。"""
+    started = time.monotonic()
+    source, destination = Path(source), Path(destination)
+    if source.is_symlink() or destination.is_symlink() or source.resolve() == destination.resolve():
+        raise ValueError("FASTQ materialization requires distinct real directories")
     destination.mkdir(parents=True, exist_ok=True)
     if any(destination.iterdir()):
-        raise FileExistsError(f"demux merge destination is not empty: {destination}")
-    aggregate = None
-    identity = None
-    for entry in plan["chunks"]:
-        source = packs / (entry["id"] + ".json")
-        data = json.loads(source.read_text(encoding="utf-8"))
-        if data.get("schema_version") != 1 or data.get("chunk") != entry["id"]:
-            raise ValueError(f"demux chunk metadata identity mismatch: {source}")
-        report = _parse_demux_report(data.get("report"), source)
-        if report["mode"] != "dna-only-droplet" or report["retention_threshold"] != 1 or report["input_fastq_pairs"] != 1:
-            raise ValueError(f"demux chunk used a wrong protocol or per-chunk filter: {source}")
-        if report["input_read_pairs"] != entry["read_pairs"]:
-            raise ValueError(f"demux chunk read-pair accounting mismatch: {source}")
-        fixed = {key: report[key] for key in ("schema_version", "build_version", "source_revision", "mode", "retention_policy")}
-        fixed["samples"] = [{key: value for key, value in row.items()
-                              if key not in {"dna_read_count", "rna_read_count", "dna_status", "rna_status"}}
-                             for row in report["samples"]]
-        if identity is not None and identity != fixed:
-            raise ValueError(f"demux chunks disagree on implementation or cell identities: {source}")
-        identity = fixed
-        members = data.get("members")
-        if not isinstance(members, list) or len(members) != len(report["samples"]):
-            raise ValueError(f"demux pack member count mismatch: {source}")
-        offset = 0
-        for row, member in zip(report["samples"], members, strict=True):
-            if not isinstance(member, list) or len(member) != 4:
-                raise ValueError(f"invalid demux pack member: {source}")
-            for position, length in (member[:2], member[2:]):
-                _integer(position, "member.offset", source)
-                _integer(length, "member.length", source)
-                if position != offset or bool(length) != bool(row["dna_read_count"]):
-                    raise ValueError(f"demux pack offset/count mismatch: {source}")
-                offset += length
-        if offset != _integer(data.get("pack_bytes"), "pack_bytes", source) or offset != (packs / (entry["id"] + ".pack")).stat().st_size:
-            raise ValueError(f"demux pack is truncated or has trailing bytes: {source}")
-        if aggregate is None:
-            aggregate = copy.deepcopy(report)
+        raise ValueError("FASTQ materialization destination must be empty")
+    paths = []
+    for path in source.rglob("*"):
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        if not stat.S_ISREG(info.st_mode) or not path.name.endswith(".fastq.gz"):
+            raise ValueError(f"Unexpected demux output: {path}")
+        paths.append((path, path.relative_to(source), info.st_size))
+    paths.sort(key=lambda record: (-record[2], str(record[1])))
+    for parent in sorted({relative.parent for _, relative, _ in paths}, key=lambda p: (len(p.parts), str(p))):
+        (destination / parent).mkdir(parents=True, exist_ok=True)
+    advise = getattr(os, "posix_fadvise", None)
+    discard = getattr(os, "POSIX_FADV_DONTNEED", None)
+    streamed = callable(advise) and discard is not None
+    limit = 4 if streamed else 8
+    count = min(limit, effective_cpu_count(workers))
+    def release(fd: int, offset: int, length: int) -> None:
+        try:
+            advise(fd, offset, length, discard)
+        except OSError:
+            pass
+    def one(record: tuple[Path, Path, int]) -> int:
+        path, relative, size = record
+        target = destination / relative
+        if streamed:
+            copied = 0
+            advised = 0
+            buffer = bytearray(1024 * 1024)
+            with path.open("rb", buffering=0) as incoming, target.open("xb", buffering=0) as outgoing:
+                while n := incoming.readinto(buffer):
+                    view = memoryview(buffer)[:n]
+                    while view:
+                        written = os.write(outgoing.fileno(), view)
+                        if written <= 0:
+                            raise OSError(f"Incomplete demux FASTQ write: {target}")
+                        view = view[written:]
+                    copied += n
+                    if copied - advised >= 8 * 1024 * 1024:
+                        release(incoming.fileno(), advised, copied - advised)
+                        release(outgoing.fileno(), advised, copied - advised)
+                        advised = copied
+                release(incoming.fileno(), advised, 0)
+                release(outgoing.fileno(), advised, 0)
+            if copied != size:
+                raise OSError(f"Incomplete demux FASTQ read: {path}")
         else:
-            for field in ("input_read_pairs", "usable_read_pairs", "matched_reads"):
-                aggregate[field] += report[field]
-            for field in _FATE_FIELDS:
-                aggregate["read_fates"][field] += report["read_fates"][field]
-            for total, row in zip(aggregate["samples"], report["samples"], strict=True):
-                total["dna_read_count"] += row["dna_read_count"]
-    assert aggregate is not None
-    aggregate["retention_threshold"] = threshold
-    aggregate["input_fastq_pairs"] = plan["input_fastq_pairs"]
-    for row in aggregate["samples"]:
-        row["dna_status"] = cell_status(row["dna_read_count"], threshold)
-    _parse_demux_report(aggregate, Path(report_path))
-    if aggregate["input_read_pairs"] != plan["input_read_pairs"]:
-        raise ValueError("merged demux input pairs do not match the complete index manifest")
-    passing = [(index, row["cell_sample_id"]) for index, row in enumerate(aggregate["samples"]) if row["dna_status"] == "Pass"]
-    for _, cell in passing:
-        (destination / cell).mkdir()
-    for batch_start in range(0, len(plan["chunks"]), pack_batch_size):
-        batch = plan["chunks"][batch_start:batch_start + pack_batch_size]
-        with ExitStack() as opened:
-            inputs = []
-            for entry in batch:
-                metadata = json.loads((packs / (entry["id"] + ".json")).read_text(encoding="utf-8"))
-                reader = opened.enter_context((packs / (entry["id"] + ".pack")).open("rb", buffering=0))
-                inputs.append((reader.fileno(), metadata["members"]))
+            shutil.copyfile(path, target)
+        if target.stat().st_size != size:
+            raise OSError(f"Incomplete demux FASTQ copy: {path}")
+        return size
+    with ThreadPoolExecutor(max_workers=count) as pool:
+        copied = sum(pool.map(one, paths))
+    return {"files": len(paths), "bytes": copied, "copy_seconds": time.monotonic() - started,
+            "copy_workers": count, "copy_strategy": "bounded_stream" if streamed else "native_copy"}
 
-            def merge_cells(items: list[tuple[int, str]]) -> None:
-                with ExitStack() as outputs:
-                    writers = []
-                    for index, cell in items:
-                        pair = []
-                        for mate in (1, 2):
-                            target = destination / cell / f"{cell}_R{mate}.fastq.gz"
-                            pair.append(outputs.enter_context(target.open(
-                                "wb" if batch_start == 0 else "ab", buffering=1024**2)))
-                        writers.append((index, cell, pair))
-                    for fd, members in inputs:
-                        for index, cell, pair in writers:
-                            for mate, writer in enumerate(pair):
-                                offset, remaining = members[index][mate*2:(mate+1)*2]
-                                while remaining:
-                                    data = os.pread(fd, min(1024**2, remaining), offset)
-                                    if not data:
-                                        raise ValueError(f"demux pack became truncated while merging {cell}")
-                                    writer.write(data)
-                                    offset += len(data)
-                                    remaining -= len(data)
-                    for _, _, pair in writers:
-                        for writer in pair:
-                            writer.flush()
-
-            groups = [passing[i:i+cells_per_group] for i in range(0, len(passing), cells_per_group)]
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                for _ in pool.map(merge_cells, groups):
-                    pass
-        print(f"Demux merge: completed blocks {batch_start + 1}-{batch_start + len(batch)} / {len(plan['chunks'])}", flush=True)
-    result = Path(report_path)
-    result.parent.mkdir(parents=True, exist_ok=True)
-    result.write_text(json.dumps(aggregate, indent=2) + "\n", encoding="utf-8")
 
 
 @lru_cache(maxsize=1)
@@ -3877,6 +3588,7 @@ def droplet_design_barcodes() -> frozenset[str]:
 def call_droplet_cells(
     counts_path: str | Path, output: str | Path, metrics_path: str | Path,
     *, r1: Sequence[str | Path] = (), demux_binary: str | Path | None = None, threads: int = 1,
+    spool: str | Path | None = None,
 ) -> None:
     """按固定谷底及质量/共享分子筛查调用，再限定为设计条码并记录被排除的原始身份。"""
     rows = []
@@ -3996,6 +3708,8 @@ def call_droplet_cells(
                 pair_file.write_text(json.dumps(selected))
                 command = [str(demux_binary), "--mode", "dna-only-droplet", "--threads", str(threads),
                            "--evidence-pairs", str(pair_file), "--evidence-output", str(evidence_file)]
+                if spool is not None:
+                    command.extend(["--droplet-spool", str(spool)])
                 for path in r1:
                     command.extend(["--r1", str(path)])
                 subprocess.run(command, check=True)
@@ -4095,11 +3809,16 @@ def write_initial_cell_manifest(
     species: str,
     protocol: str,
     called_cells: Sequence[Sequence[str]] = (),
+    project_sample_id: str | None = None,
 ) -> None:
-    """按孔板 map 或逐文库 called cells 展开规范 cell 身份，写出初始 manifest。"""
+    """按孔板 map 或 called cells 展开身份，可只写指定的已登记 Droplet 文库。"""
     project_rows = read_project_sample_manifest(
         Path(project_manifest), species=species, protocol=protocol
     )
+    if project_sample_id is not None:
+        if protocol != "droplet" or project_sample_id not in {r["sample_id"] for r in project_rows}:
+            raise ValueError("Per-library cell manifest requires a registered Droplet sample")
+        project_rows = [row for row in project_rows if row["sample_id"] == project_sample_id]
     called = dict(called_cells)
     if protocol == "droplet":
         if len(called) != len(called_cells) or set(called) != {r["sample_id"] for r in project_rows}:
@@ -7242,6 +6961,7 @@ def _plan_expected_runs(
                 "project_sample_id": project_id,
                 "route_id": route_id,
                 "raw_sample": raw_sample,
+                "protocol": protocol,
             }
             if expected_runs.setdefault(run_id, expected) != expected:
                 raise ValueError(f"Demux run_id={run_id!r} has conflicting project sample routes")
@@ -7290,8 +7010,16 @@ def _merge_committed_generations(
         committed = read_demux_generation(
             completion,
             expected_manifest_path=manifest,
-            expected_cell_manifest_path=initial_cell_manifest,
+            expected_cell_manifest_path=(demux_state.parent / "calling" / run_id / "cell_manifest.tsv")
+            if expected_run["protocol"] == "droplet" else initial_cell_manifest,
         )
+        if expected_run["protocol"] == "droplet":
+            local_cells = read_cell_identity_manifest(committed["_cell_manifest_path"])
+            expected_cells = {cell_id: {key: str(row[key]) for key in INITIAL_CELL_MANIFEST_FIELDS}
+                              for cell_id, row in cells.items()
+                              if row["project_sample_id"] == expected_run["project_sample_id"]}
+            if local_cells != expected_cells:
+                raise ValueError(f"Droplet library identity differs from project cell manifest: {run_id!r}")
         if committed.get("run_id") != run_id:
             raise ValueError(
                 f"Demux completion {completion} declares run_id={committed.get('run_id')!r}; "
@@ -9697,6 +9425,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         write_initial.add_argument(field)
     write_initial.add_argument("--species", required=True)
     write_initial.add_argument("--protocol", required=True)
+    write_initial.add_argument("--project-sample-id")
     write_initial.add_argument("--called-cells", action="append", type=lambda value: value.split(":", 1), default=[])
     umi = commands.add_parser("call-droplet-cpg", help="按胞嘧啶位点与 UMI 调用分子共识。")
     for field in ("bam", "reference", "coverage", "qc", "mbias", "scratch", "samtools", "sample"):
@@ -9708,20 +9437,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     calling.add_argument("--r1", action="append", required=True)
     calling.add_argument("--demux-binary", required=True)
     calling.add_argument("--threads", type=int, default=1)
-    index_demux = commands.add_parser("index-demux-fastq", help="为原始 Droplet gzip 建立可直接并行读取的区段索引。")
-    index_demux.add_argument("--r1", action="append", required=True)
-    index_demux.add_argument("--r2", action="append", required=True)
-    index_demux.add_argument("--output", required=True)
-    index_demux.add_argument("--threads", type=int, required=True)
-    chunk_demux = commands.add_parser("demux-chunk", help="在 job scratch 解复用一个块并发布打包结果。")
-    for field in ("index-dir", "chunk", "binary", "barcode-map", "sample", "scratch", "pack", "metadata"):
-        chunk_demux.add_argument("--" + field, required=True)
-    chunk_demux.add_argument("--threads", type=int, required=True)
-    merge_demux = commands.add_parser("merge-demux-chunks", help="按块序合并结果并执行全库细胞保留阈值。")
-    for field in ("index-dir", "packs-dir", "dna-dir", "report"):
-        merge_demux.add_argument("--" + field, required=True)
-    merge_demux.add_argument("--threshold", type=int, required=True)
-    merge_demux.add_argument("--threads", type=int, required=True)
+    calling.add_argument("--spool")
+    stage_droplet = commands.add_parser("stage-droplet-reads", help="配对解析并提交原始条码暂存与完整计数。")
+    for mate in ("r1", "r2"):
+        stage_droplet.add_argument("--" + mate, action="append", required=True)
+    for field in ("spool", "counts", "structure", "binary", "decoder-python"):
+        stage_droplet.add_argument("--" + field, required=True)
+    stage_droplet.add_argument("--threads", type=int, required=True)
     write_metadata = commands.add_parser("write-demux-metadata", help="demux 事务内写出 MQC 与 manifest。")
     for arg in ("report_path", "mqc_path", "manifest_path", "dna_dir", "rna_dir",
                 "pipeline_mode", "route_id", "downstream_dna", "raw_sample", "cell_manifest_path"):
@@ -9766,6 +9488,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     split.add_argument("--excluded-contigs-json", required=True)
     for field in ('--input-bam', '--bio', '--excluded'):
         split.add_argument(field, type=Path, required=True)
+    disk = commands.add_parser("droplet-output-disk-mb", help="估算 Droplet 完整文件输出 scratch。")
+    disk.add_argument("--spool", required=True, type=Path)
+    copy_fastq = commands.add_parser("copy-demux-fastq", help="将完整 FASTQ 从节点 scratch 复制到共享暂存。")
+    copy_fastq.add_argument("source", type=Path)
+    copy_fastq.add_argument("destination", type=Path)
+    copy_fastq.add_argument("--workers", type=int, default=1)
     demux_identity = commands.add_parser("demux-identity", help="计算源码指纹或校验 demux_rs 编译期身份。")
     demux_identity.add_argument("operation", choices=("revision", "verify-binary"))
     demux_identity.add_argument("path")
@@ -9917,19 +9645,15 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "call-droplet-cpg":
             call_droplet_cpg(args.bam, args.reference, args.coverage, args.qc, args.mbias, sample=args.sample, scratch=args.scratch, samtools=args.samtools, threads=args.threads)
         elif command == "call-droplet-cells":
-            call_droplet_cells(args.counts, args.output, args.metrics, r1=args.r1, demux_binary=args.demux_binary, threads=args.threads)
-        elif command == "index-demux-fastq":
-            index_demux_fastqs(args.r1, args.r2, args.output, threads=args.threads)
-        elif command == "demux-chunk":
-            run_demux_chunk(args.index_dir, args.chunk, binary=args.binary, barcode_map=args.barcode_map,
-                            sample=args.sample, scratch=args.scratch, pack=args.pack, metadata=args.metadata, threads=args.threads)
-        elif command == "merge-demux-chunks":
-            merge_demux_chunks(args.index_dir, args.packs_dir, args.dna_dir, args.report,
-                               threshold=args.threshold, threads=args.threads)
+            call_droplet_cells(args.counts, args.output, args.metrics, r1=args.r1, demux_binary=args.demux_binary, threads=args.threads, spool=args.spool)
+        elif command == "stage-droplet-reads":
+            stage_droplet_reads(args.r1, args.r2, args.spool, args.counts, args.structure,
+                                binary=args.binary, decoder_python=args.decoder_python, threads=args.threads)
         elif command == "write-cell-manifest":
             write_initial_cell_manifest(
                 args.project_manifest, args.barcode_map, args.out_tsv,
                 species=args.species, protocol=args.protocol, called_cells=args.called_cells,
+                project_sample_id=args.project_sample_id,
             )
         elif command == "write-demux-metadata":
             write_run_metadata(
@@ -9980,6 +9704,10 @@ def main(argv: list[str] | None = None) -> int:
             run_bsconv_extraction(args)
         elif command == "split-bismark-pairs":
             return run_bismark_pair_split(args)
+        elif command == "droplet-output-disk-mb":
+            print(droplet_output_disk_mb(args.spool))
+        elif command == "copy-demux-fastq":
+            print(json.dumps(copy_demux_fastq(args.source, args.destination, args.workers)))
         elif command == "demux-identity":
             if args.operation == "revision":
                 if args.expected_revision is not None:

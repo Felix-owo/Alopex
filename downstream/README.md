@@ -1,4 +1,4 @@
-# Alopex v14.12.1 下游 QC 与可视化
+# Alopex v14.13 下游 QC 与可视化
 
 这套下游分析以当前 `Alopex` 的 sealed delivery 为输入，通过
 `03_results/run_manifest.json` 解析 immutable config snapshot、reference FAI、
@@ -45,8 +45,27 @@ CpG 输入身份复用 sealed inventory 中的 size/hash，不重复读取所有
 设为 `True`；它从 sealed CpG 重建 `RawAdata.h5ad`，结果仍只写入 `06_downstream/`。
 
 RawAdata 的 schema、文件身份、样本集合及当前 sealed 输入全部匹配时，直接复用其空 CpG 集合，不逐细胞启动解压或创建临时链接。失配时完整检查表头、整数计数、所选 base 的真实坐标边界、解压退出码和空表，确认 zero-mapped cells 为空后再导入；两种 base 都只在重建时创建源文件链接，实际坐标身份参与缓存绑定。导入算法更新仍触发正常重建，不复用旧算法身份。
+逐行数字限定 ASCII 十进制并允许前导零，使用直接字符检查、单次 coverage 求和及 contig 长度查询，减少解析开销；仍保留每条错误的行号、完整计数/边界及解压退出检查，不增加校验 worker。
 命令行对应 `--recompute-raw-adata`；其余开关对应 `--recompute-methyl-stats`、
 `--recompute-composition`、`--recompute-gini`、`--recompute-tss`。
+
+TSS 默认在每个 CloneID 内抽检 10%。第二格 `TSS_SAMPLE_FRACTION=0.10`、
+`TSS_SAMPLE_SEED=0` 分别对应 CLI `--tss-sample-fraction`、`--tss-sample-seed`；
+比例限定 `(0,1]`、种子为非负整数，设比例 `1.0` 即取消抽检、所有克隆全量。
+默认每个克隆少于 10 个细胞时全部检查，10–1000 个时取 `ceil(N*0.10)` 个，
+超过 1000 个固定抽 100 个；可调比例时取 `min(100,ceil(N*比例))` 个，小克隆仍全检。
+按种子与原始 Sample_ID 的 SHA256 在每个 CloneID 内排序，行顺序不影响名单；
+包含空 CpG 细胞，不按覆盖筛选，CloneID 保留前导零和合法 `NA`/`nan`/`None` 身份。
+两份 TSS 矩阵只计算选中细胞，临时 backed 子集在成功或失败时均清理。
+`.cache/DNAme_QC_Input_Identity.json` 的 `tss_sampling` 保存比例、种子、总数、各克隆总数/抽检数及选中名单；
+CSV 仅记录选中且有覆盖的 bins，因此 CSV 中的细胞数可能更少。
+改变比例、种子或抽样算法只失效 TSS 缓存，RawAdata、完整 QC、Gini 和 SingleCpG
+继续保留全部细胞；第一次从全量切换到抽检会自动重算 TSS，无须打开强制重算开关。
+
+TSS BED 只解析一次所需的区间与 offset 四列，完整校验后，仅将与抽检细胞 CpG
+覆盖并集相交的区间送入两份原生 SnapATAC2 矩阵。覆盖并集通过 `obsm.el("__values__").chunked(4)` 每批懒读取 4 个细胞，避免各批重复读取整矩阵，
+适配 sealed 坐标并限制染色体索引边界；无覆盖区间没有 profile 贡献，零甲基化且有
+coverage 的区间仍保留。两份矩阵共用同一批区间，甲基化比例与信号数的公式不变。
 
 显式指定 Pipeline 路径也要求项目的交付状态为 `complete`、Pipeline 身份有效。
 Processor 子进程沿用 Notebook 的 Python，运行前请使用上述专用 kernel。
@@ -126,6 +145,10 @@ CpG 二核苷酸 `[C, G+1)`，不含 lambda/pUC19。Notebook 最后一格从已�
 `uns.reference_sequences` 的 `reference_bp_length` 为真实染色体长度 L，
 `reference_seq_length` 为索引范围长度 `L+base`。QC 的 CpG/TSS 区间和 Gini 分箱自动适配
 实际 base，标准 BED 文件不变；直接调用其他 SnapATAC2 工具时须使用同一 base 的区间。
+原生 `reference_sequences` 的行序与索引长度决定 values 的染色体归属，必须保持不变；
+真实长度只按该表的染色体名称补充，不按 FAI 顺序重建。导入采用
+`snapatac2_import_values_native_reference_v2`，旧导入身份拒绝复用，Gini/TSS 同步失效；
+受影响的现有矩阵须从 sealed CpG 重建，不能只修改 metadata 作为修复。
 `RawAdata.input_schema.json` 当前为 schema5；原有 RawAdata 在下一次 QC Processor 运行时
 自动失效重建，SingleCpG 则设置 `RECOMPUTE_SINGLECPG=True` 重建。缓存命中不解压、不建链接。
 QC 表不包含基因组坐标，TSS 图使用相对 TSS 距离，不加减 1。
@@ -148,8 +171,8 @@ Notebook 首格也提供 `TSS_BED` 和 `SKIP_TSS` 设置。默认
 资源。TSS BED 必须与 sealed delivery 使用同一 reference build。其它 species 确实
 没有 TSS 资源时，才显式设置 `SKIP_TSS=True` 或使用 CLI `--skip-tss`。
 
-TSS profile 只记录有覆盖的 bins。有 CpG 的 cell 也可能没有 TSS 覆盖；全体无覆盖时生成并复用仅表头 CSV，其他 QC 正常完成，并清理旧 TSS PDF。显式跳过 TSS 时同时清理该交付的旧 TSS CSV/PDF，避免旧曲线被误认为本次结果。真实覆盖且甲基化为零的 bin 保留数值 `0`。
-外部 TSS BED 的 genomic interval 必须唯一，第 9 列 offset 必须为有限的 32-bit 整数；重复 interval 或错误 offset 会被明确拒绝。
+TSS profile 只记录抽检细胞中有覆盖的 bins。有 CpG 的 cell 也可能没有 TSS 覆盖；抽检集合全体无覆盖时生成并复用仅表头 CSV，其他 QC 正常完成，并清理旧 TSS PDF。显式跳过 TSS 时同时清理该交付的旧 TSS CSV/PDF，避免旧曲线被误认为本次结果。真实覆盖且甲基化为零的 bin 保留数值 `0`。
+外部 TSS BED 的 genomic interval 必须是非负整数端点的非空区间且唯一，第 9 列 offset 必须为有限的 32-bit 整数；全部区间先校验再筛选覆盖，重复 interval、错误坐标或 offset 会被明确拒绝。
 
 ## 输出
 
@@ -204,6 +227,12 @@ QC 表中的 `Sample_ID`、`CloneID`、`PlateID` 以及 TSS 的 `CloneID` 按字
 RawAdata 的样本集合以 sealed final manifest 为准；临时 CpG 导入文件只调整格式后缀，样本名内部的 `.cpg.` 原样保留。
 
 Notebook 的 `FINAL_QC_MODE` 可选 `per_clone_samples` 或 `distribution`；前者的 `FINAL_QC_METRIC` 可填单个指标或指标列表。
+`per_clone_samples` 每个 CloneID 一个面板，`distribution` 叠加各组；两者均使用 100 个分箱。
+CpG sites 用对数横轴与对数等距分箱，其他指标保持线性；同一指标在所选组间共用边界。
+若 CpG 包含零值或负值，则明确标注并使用带符号 log1p 横轴及其等距分箱，保留零值。
+纵轴为样本数 `Counts`：浅色直方图展示实际计数，叠加平滑计数峰，保持总计数；
+平滑仅辅助观察，不转为概率密度、不参与 QC 筛选。忽略缺失、非数值及无穷值。
+每个面板标注有效样本数和中位数竖线；`FINAL_QC_CLONE_ID` 选择范围，指标列表逐项展示并保存 PDF。
 
 
 ## 指标与筛选
