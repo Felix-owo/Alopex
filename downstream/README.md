@@ -1,20 +1,17 @@
-# Alopex v15 下游 QC 与可视化
+# Alopex v15.1 下游 QC 与可视化
 
-- 发布版本：v15；正式源码以 Git tag `v15` 为准，操作与科学参数见 [主文档](../README.md)。
+正式源码以 Git tag `v15.1` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
 
-这套下游分析以当前 `Alopex` 的 sealed delivery 为输入，通过
-`03_results/run_manifest.json` 解析 immutable config snapshot、reference FAI、
-`03_results/QC_Results/sample_manifest.tsv` 与其声明的 `03_results/CpG/` 文件。
-主 Pipeline 已把下游需要的 normalized QC 指标写入 final manifest，因此 Downstream
-只依赖 sealed `03_results/` 与 reference；`02_work/` 是否保留不影响下游结果。
-
-Processor 复用统一配置加载链与 `get_backend`，按 sealed `analysis.protocol` 选择 backend；TAPS/Droplet 的固定 backend 由内部协议策略提供。三条链都从
-final manifest 的 canonical read-pair funnel 进入相同计算；backend 原生 MAPQ、比对
-报告和 M-bias 等诊断仍保留在主 Pipeline 的 backend-specific MultiQC section，分别标注其原生口径。
+| 输入边界 | 要求 |
+| --- | --- |
+| 完整交付 | `03_results/run_manifest.json` 必须为当前 complete 交付；从其解析 final manifest、CpG inventory 与绑定的配置快照 |
+| 快照与路径 | 交付绑定的 snapshot/config（通常在 `04_logs/provenance/`）及 reference/FAI 须在记录路径可读，项目/Pipeline 路径须匹配；只复制 `03_results/` 不能完成迁移 |
+| 可清理中间件 | 下游不依赖 `02_work/` 中的 BAM、demux FASTQ 等中间结果 |
+| 写出边界 | 只写 `06_downstream/`，不修改公开科学结果；上游重发布后须重新启动下游 |
 
 ## 运行
 
-Notebook/Downstream 使用 Doctor 管理的 `conda/current/notebook` 环境，规格唯一定义在 `core/envs.yaml`。可直接执行：
+使用 Doctor 管理的 `conda/current/notebook` 环境（规格在 `core/envs.yaml`）：
 
 ```bash
 PIPELINE=/path/to/Alopex
@@ -23,89 +20,20 @@ PIPELINE=/path/to/Alopex
   --project-dir /path/to/Patient001
 ```
 
-`--workers=0` 自动选择 CpG worker 数（最多 32）；显式值同样受 affinity、Slurm allocation
-和调用方预算限制，每个 worker 内 native 线程固定为 1。Notebook 启动器使用同一 CPU 预算规则。
+Processor 完成 QC 后，可打开 `downstream/DNA_QC_Visualization.ipynb` 绘图；Notebook 也可直接启动 Processor。交互式运行前先按下节注册并选择专用 kernel，子进程沿用 Notebook 的 Python。
 
-完成后打开 `downstream/DNA_QC_Visualization.ipynb`。第一格包含可编辑参数。
-Pipeline 与项目通常不在同一目录时，直接填写两个绝对路径；显式值优先于环境变量，
-且不会静默回退到其他目录：
-
-```python
-DNA_PROJECT_ROOT = Path("/path/to/Patient001")
-DNA_PIPELINE_ROOT = Path("/path/to/Alopex")
-```
-
-也可以改为导出同名环境变量。两者都留空时，Notebook 先检查 Jupyter 当前目录及父目录中的
-completed delivery，再通过 sealed run manifest 解析 Pipeline。
-
-### 缓存与强制重算
-
-Notebook 第二格的 `RECOMPUTE_RAW_ADATA`、`RECOMPUTE_METHYL_STATS`、
-`RECOMPUTE_COMPOSITION`、`RECOMPUTE_GINI`、`RECOMPUTE_TSS` 默认均为 `False`，
-按输入和算法身份自动复用缓存，CSV 中的科学浮点值读回时保持原精度。RawAdata 与统计缓存的
-CpG 输入身份复用 sealed inventory 中的 size/hash，不重复读取所有 CpG 计算哈希。需要强制重建 AnnData 时将 `RECOMPUTE_RAW_ADATA`
-设为 `True`；它从 sealed CpG 重建 `RawAdata.h5ad`，新 generation 同时使 Gini/TSS 重算，canonical CpG 统计缓存仍独立复用；结果只写入 `06_downstream/`。
-
-RawAdata 的 schema、文件身份、样本集合及当前 sealed 输入全部匹配时，直接复用其空 CpG 集合，不逐细胞启动解压或创建临时链接。失配时完整检查表头、整数计数、所选 base 的真实坐标边界、解压退出码和空表，确认 zero-mapped cells 为空后再导入；两种 base 都只在重建时创建源文件链接，实际坐标身份参与缓存绑定。导入算法更新仍触发正常重建，不复用旧算法身份。
-Raw 导入与 CpG 流式统计共用逐行解析：数字限定 ASCII 十进制并允许前导零，按 sealed base 和 FAI 长度核坐标/coverage；未知 contig、空行、缺表头或解压失败均报错，不静默跳过。
-FAI 中的全部 contig 均保留，不按名称含点号筛除；TSS BED 的 chromosome 按原始字符串
-读取，`NA` 和前导零均参与精确匹配。宿主/control 的统计分类规则保持原有定义。
-科学 CSV 因参数/算法变化、强制重算或缺失/损坏而自动补算时，替换前撤销旧缓存身份，成功导出后再提交；每次提交前复验 sealed 交付。缓存身份列显式按字符串读回，TSS 还核对当前 CloneID 与非负整数信号计数。
-中断后的下一次运行重新计算，避免把新参数缓存误认为旧参数；全部缓存命中的导出失败
-保留有效缓存。指纹不登记推导式局部变量，FAI 读取逻辑变化同时失效 CpG 统计。
-命令行对应 `--recompute-raw-adata`；其余开关对应 `--recompute-methyl-stats`、
-`--recompute-composition`、`--recompute-gini`、`--recompute-tss`。
-
-TSS 默认在每个 CloneID 内抽检 10%。第二格 `TSS_SAMPLE_FRACTION=0.10`、
-`TSS_SAMPLE_SEED=0` 分别对应 CLI `--tss-sample-fraction`、`--tss-sample-seed`；
-比例限定 `(0,1]`、种子为非负整数，设比例 `1.0` 即取消抽检、所有克隆全量。
-默认每个克隆少于 10 个细胞时全部检查，10–1000 个时取 `ceil(N*0.10)` 个，
-超过 1000 个固定抽 100 个；可调比例时取 `min(100,ceil(N*比例))` 个，小克隆仍全检。
-按种子与原始 Sample_ID 的 SHA256 在每个 CloneID 内排序，行顺序不影响名单；
-包含空 CpG 细胞，不按覆盖筛选，CloneID 保留前导零和合法 `NA`/`nan`/`None` 身份。
-两份 TSS 矩阵只计算选中细胞，临时 backed 子集在成功或失败时均清理。
-`.cache/DNAme_QC_Input_Identity.json` 的 `tss_sampling` 保存比例、种子、总数、各克隆总数/抽检数及选中名单；
-CSV 仅记录选中且有覆盖的 bins，因此 CSV 中的细胞数可能更少。
-改变比例、种子或抽样算法只失效 TSS 缓存，RawAdata、完整 QC、Gini 和 SingleCpG
-继续保留全部细胞；第一次从全量切换到抽检会自动重算 TSS，无须打开强制重算开关。
-
-TSS BED 只解析一次所需的区间与 offset 四列，完整校验后，仅将与抽检细胞 CpG
-覆盖并集相交的区间送入两份原生 SnapATAC2 矩阵。覆盖并集通过 `obsm.el("__values__").chunked(4)` 每批懒读取 4 个细胞，避免各批重复读取整矩阵，
-适配 sealed 坐标并限制染色体索引边界；无覆盖区间没有 profile 贡献，零甲基化且有
-coverage 的区间仍保留。两份矩阵共用同一批区间，甲基化比例与信号数的公式不变。
-
-显式指定 Pipeline 路径也要求项目的交付状态为 `complete`、Pipeline 身份有效。
-Processor 子进程沿用 Notebook 的 Python，运行前请使用上述专用 kernel。
-
-### 保存供下游复用的 single-CpG 矩阵
-
-运行 Notebook 最后一格会调用 `prepare_single_cpg_adata(PATHS, df_qc)`，自动使用当前物种的
-single-CpG BED 和本次交付的 `RawAdata.h5ad`，生成同目录的 `SingleCpG_Adata.h5ad`。
-固定参数为 `value_type="fraction"`、`summary_type="mean"`、`chunk_size=500`、`inplace=False`。
-位点标识 `var_names` 跟随当前 sealed 交付的 `analysis.cpg_coordinate_base`，无需另填参数：
-0-based 使用半开区间（如 `chr1:0-2`），1-based 使用闭区间（如 `chr1:1-2`），
-两者表示同一个 CpG，矩阵数值和列顺序相同。`uns["cpg_coordinate_base"]`、
-`uns["cpg_interval_convention"]` 与 `uns["source_cpg_representation"]` 记录实际坐标制。
-1-based 位点标识用于下游展示和导出；传给要求 BED/0-based 的其他工具时须先归一化。
-保留全部细胞，按 `Sample_ID` 严格对齐并保存完整 QC、`HQ` 及自行添加的注释，不按 HQ 筛选。
-不要修改 `df_qc` 的原有 QC 列；它们会与磁盘上的当前 QC 表校验。
-
-首次运行需要完成矩阵计算。再次运行按交付、RawAdata generation、BED 内容、参数与
-SnapATAC2 版本复用矩阵，只有注释变化时仅更新 `obs`。已有文件未经验证或来源变化时会提示；
-坐标身份也参与复用判断；升级前已生成的 SingleCpG 文件须显式重建，不能直接当作新坐标结果。
-需要替换它时设置 `RECOMPUTE_SINGLECPG=True`，完成后恢复 `False`。新矩阵先写临时文件，
-关闭后替换正式文件；`SingleCpG_Adata.input_schema.json` 是配套的完成及复用记录。
-函数返回路径并关闭自身打开的全部句柄，不保留 `DNA_ADATA_CpG` 活跃写句柄。
-
-下游把打印出的 `SINGLECPG_ADATA_PATH` 用于 `snap.read(..., backed="r")` 即可读取。
-只读 SnapATAC2 对象不能回填标签；修改标签应使用独立可写副本或合适大小的内存子集。
-MethylTree 分箱后仍须检查并按细胞 ID 对齐 obs，该预生成步骤不修改外部 MethylTree 的转换行为。
+| Notebook 第一格 | 设置与定位 |
+| --- | --- |
+| `DNA_PROJECT_ROOT` | 建议填写 `Path("/path/to/Patient001")`；显式值优先于同名环境变量，错误时不回退 |
+| `DNA_PIPELINE_ROOT` | 建议填写 `Path("/path/to/Alopex")`；显式指定仍须通过交付与 Pipeline 身份验证 |
+| 两根留空 | 项目从 Jupyter 当前目录及父目录查找 complete delivery，Pipeline 从 sealed `source_root` 定位；先检查同名环境变量 |
+| `TSS_BED=None` | 自动使用当前物种的 TSS reference；可指定同一 genome build 的外部 BED |
+| `SKIP_TSS=False` | 确实无需 TSS 时显式改为 `True`；不能同时指定外部 `TSS_BED` |
+| CLI `--workers=0` | 自动选择，最多32；显式值同样受 affinity、Slurm allocation 与调用方预算限制，每个 worker 内 native 线程为1 |
 
 ### Jupyter / VS Code kernel
 
-QC Notebook 元数据要求名为 `alopex-qc` 的 kernel。交互式运行前把它注册到当前用户的
-Jupyter kernel 目录；argv 经由 `conda/current` 符号链接指向 Doctor 管理的 notebook 环境，
-后续环境重建不需要重新注册。Pipeline 迁移目录后应重新注册并在 Notebook 中选择 `Alopex QC`；确认新 kernel 可启动后移除指向旧目录的专用 kernel。以下命令自动选择当前系统的 Jupyter 数据目录：
+Notebook 使用名为 `alopex-qc`、显示为 `Alopex QC` 的 kernel。以下命令将启动路径固定到 `conda/current`，环境重建后无需重新注册；Pipeline 迁移目录后重新注册并选择 kernel。
 
 ```bash
 PIPELINE=/path/to/Alopex
@@ -127,161 +55,154 @@ kernel.mkdir(parents=True, exist_ok=True)
 PY_KERNEL
 ```
 
-命令行执行已有 delivery 时直接用 nbconvert：`jupyter nbconvert --to notebook --execute --inplace <notebook>`，
-并把工作目录放在项目 `03_results/` 下以便第一格自动发现 project root。
+### 缓存与强制重算
+
+默认按 sealed 输入、参数与算法身份复用缓存，以下开关均为 `False`。强制重算只影响下游；新 Raw generation 会使 Gini/TSS 重算，canonical CpG 统计仍可独立复用。
+
+| Notebook 开关 | CLI 对应项 | 重建对象 |
+| --- | --- | --- |
+| `RECOMPUTE_RAW_ADATA` | `--recompute-raw-adata` | 从 sealed CpG 重建 `RawAdata.h5ad` |
+| `RECOMPUTE_METHYL_STATS` | `--recompute-methyl-stats` | CpG 位点/甲基化统计（`Mapping_Stats.csv`） |
+| `RECOMPUTE_COMPOSITION` | `--recompute-composition` | CpG 信号组成 |
+| `RECOMPUTE_GINI` | `--recompute-gini` | Gini |
+| `RECOMPUTE_TSS` | `--recompute-tss` | TSS profile |
+| `RECOMPUTE_SINGLECPG` | 无；Notebook 最后一格使用 | `SingleCpG_Adata.h5ad`；完成后恢复 `False` |
+
+| 情况 | 正确处理 |
+| --- | --- |
+| 正常重复运行 | 自动复用；输入身份复用 sealed inventory，不为 hash 再次遍历全部 CpG |
+| 调整 TSS BED、比例或种子 | 仅 TSS 自动失效，无需强制重建 Raw/QC/Gini/Single |
+| Raw 输入或算法身份过期 | 先运行 Processor 完成 Raw 必要重建，再处理 SingleCpG；不能仅改 metadata 或用 Single 强制开关绕过 |
+| SingleCpG 来源未知或身份变化 | 按提示设置 `RECOMPUTE_SINGLECPG=True`；身份绑定交付、Raw generation、BED、参数、算法与科学库版本 |
+| 仅细胞注释变化 | 矩阵可复用，只更新 SingleCpG `obs`；原有 QC 列仍须与当前磁盘 QC 一致 |
+| 科学统计重算中断 | 旧完成身份撤销，下一次重新计算；有效 Raw 仍可复用。全部缓存命中时的导出失败不破坏有效缓存 |
+| 缓存计数自相矛盾 | 零位点/零 coverage 必须一致，宿主 coverage 须在 `sites` 至 `65535×sites`；异常从 canonical CpG 重算，不静默接受 |
+
+| 科学输入校验 | 保留的含义 |
+| --- | --- |
+| CpG 四列 | `chrom, pos, methyl, unmethyl`；位置与计数为 ASCII 十进制整数，计数非负，coverage 为正且不超过65535 |
+| 位点与 reference | 按 sealed base 和 FAI 校验真实边界；每条染色体位置严格递增，重复/乱序、未知 contig、缺表头、空行或解压失败均拒绝 |
+| 合法空细胞 | 允许仅表头的空 CpG；不把格式失败当作 zero-mapped，缓存命中不重复解压 |
+| contig 分类 | 保留 FAI 全部原名，包括点号、`NA` 与前导零；controls 仅精确匹配 `lambda` / `pUC19`，含其子串的宿主 chr 不算 controls；mt 按 chrM/MT/chrMT 分类，其他 decoy 仅进 total |
+| 身份与缺失 | `Sample_ID/CloneID/PlateID` 按字符串保留 `001`、`NA`、`nan`、`None`；数值列按数值/缺失解析，浮点缓存保持 round-trip 精度 |
+
+### 保存供下游复用的 single-CpG 矩阵
+
+运行 Notebook 最后一格生成 `SingleCpG_Adata.h5ad`，CLI Processor 不生成它。矩阵保留全部细胞，按 `Sample_ID` 严格对齐完整 QC、`HQ` 与自定义注释，不按 HQ 筛选。
+
+| 对象 | 使用与科学边界 |
+| --- | --- |
+| 计算 | `prepare_single_cpg_adata(PATHS, df_qc)`；固定 `value_type="fraction"`、`summary_type="mean"`、`chunk_size=500`、`inplace=False` |
+| 完成记录 | `SingleCpG_Adata.input_schema.json` 与矩阵配套提交；未知/失配来源须显式重建 |
+| 坐标 | 跟随 sealed `analysis.cpg_coordinate_base`；0-based `chr1:0-2` 为半开区间，1-based `chr1:1-2` 为闭区间，表示同一 CpG，数值和列顺序相同 |
+| 坐标 metadata | `uns["cpg_coordinate_base"]`、`uns["cpg_interval_convention"]`、`uns["source_cpg_representation"]` 记录实际表示；传给 BED/0-based 工具前须转换 |
+| Raw 索引 | 真实长度 `reference_bp_length=L`，索引长度 `reference_seq_length=L+base`，base1 时索引0留空；原生 `reference_sequences` 行序与索引长度决定染色体归属，不可按 FAI 重排 |
+| 读取 | helper 返回路径并关闭自身句柄；用打印出的 `SINGLECPG_ADATA_PATH` 执行 `snap.read(..., backed="r")` |
+| 后续注释 | 只读对象不能回填标签；使用独立可写副本或合适大小的内存子集。MethylTree 分箱后仍按细胞 ID 核对并对齐 `obs` |
 
 ### TSS profile
 
-Processor 会按项目 `species` 在 `resources/hg38_reference/tss/` 等现有 reference
-目录中寻找以下文件，并生成 TSS CSV/PDF：
-
-```text
-hg38_TSS_2000_2000_20.bed
-```
-
-`core/doctor.sh reference` 会从 `resources/reference_source/hg38.genes.gtf`（GENCODE
-v48）或 `mm10.genes.gtf`（GENCODE M25）的 protein-coding `gene` 记录自动构建唯一的
-TSS BED（链方向一致的 `±2000 bp / 20 bp` bins，第 9 列为 offset）。脚本还会生成
-`resources/<genome>_reference/cpg/<genome>.single_cpg.bed.gz`，供 SnapATAC2
-按需 `make_peak_matrix(..., peak_file=...)` 使用的 BED3：0-based、half-open，每条记录覆盖一个
-CpG 二核苷酸 `[C, G+1)`，不含 lambda/pUC19。Notebook 最后一格从已导入 values 生成 single-CpG matrix；命令行 QC Processor 不执行这一步。Pipeline 的 `03_results/CpG/*.cpg.tsv.zst`
-则直接采用 SnapATAC2 `pp.import_values` 四列输入：`chrom, pos, methyl, unmethyl`，其中
-`pos` 按 `analysis.cpg_coordinate_base` 输出，默认 1-based，可设为 0-based。Downstream 核对 sealed config/run/final manifest 的坐标身份；RawAdata 和 SingleCpG
-均跟随交付 base，两种 CpG 文件均直接链接导入。`RawAdata.uns["cpg_coordinate_base"]`
-标明实际位点坐标；1-based 每条染色体的索引 0 留空，其位点是 1 到 L。
-`uns.reference_sequences` 的 `reference_bp_length` 为真实染色体长度 L，
-`reference_seq_length` 为索引范围长度 `L+base`。QC 的 CpG/TSS 区间和 Gini 分箱自动适配
-实际 base，标准 BED 文件不变；直接调用其他 SnapATAC2 工具时须使用同一 base 的区间。
-原生 `reference_sequences` 的行序与索引长度决定 values 的染色体归属，必须保持不变；
-真实长度只按该表的染色体名称补充，不按 FAI 顺序重建。导入采用
-`snapatac2_import_values_native_reference_v2`，旧导入身份拒绝复用，Gini/TSS 同步失效；
-受影响的现有矩阵须从 sealed CpG 重建，不能只修改 metadata 作为修复。
-`RawAdata.input_schema.json` 当前为 schema5；原有 RawAdata 在下一次 QC Processor 运行时
-自动失效重建，SingleCpG 则设置 `RECOMPUTE_SINGLECPG=True` 重建。缓存命中不解压、不建链接。
-QC 表不包含基因组坐标，TSS 图使用相对 TSS 距离，不加减 1。
-
-`resources/*_reference/` 是体积很大的 HPC 本地 reference，受仓库 `.gitignore`
-保护，不进入源代码包，也不应使用 `git add -f` 提交。普通 clone 在按根
-README 准备 4 个 FASTA 与 2 个 GTF 后运行 Doctor，即会构建这些资源；本 Pipeline
-不会自动下载 reference。
-
-要覆盖其它 genome build 或外部资源，可显式提供与当前 reference 匹配的 TSS BED：
-
-```bash
-"$PIPELINE/conda/current/notebook/bin/python" "$PIPELINE/downstream/downstream_qc.py" \
-  --project-dir /path/to/Patient001 \
-  --tss-bed /path/to/genome_TSS_2000_2000_20.bed
-```
-
-Notebook 首格也提供 `TSS_BED` 和 `SKIP_TSS` 设置。默认
-`TSS_BED=None`、`SKIP_TSS=False`，即自动使用当前 species 的 Pipeline
-资源。TSS BED 必须与 sealed delivery 使用同一 reference build。其它 species 确实
-没有 TSS 资源时，才显式设置 `SKIP_TSS=True` 或使用 CLI `--skip-tss`。
-
-TSS profile 只记录抽检细胞中有覆盖的 bins。有 CpG 的 cell 也可能没有 TSS 覆盖；抽检集合全体无覆盖时生成并复用仅表头 CSV，其他 QC 正常完成，并清理旧 TSS PDF。显式跳过 TSS 时同时清理该交付的旧 TSS CSV/PDF，避免旧曲线被误认为本次结果。真实覆盖且甲基化为零的 bin 保留数值 `0`。
-外部 TSS BED 的 genomic interval 必须是非负整数端点的非空区间且唯一，第 9 列 offset 必须为有限的 32-bit 整数；全部区间先校验再筛选覆盖，重复 interval、错误坐标或 offset 会被明确拒绝。
-
-| 科学输入与缓存 | 必须保持的边界 |
+| reference / 参数 | 约定 |
 | --- | --- |
-| CpG输入 | 每条染色体位置严格递增，重复/乱序在Raw导入与统计共同入口拒绝；不静默累加或丢弃 |
-| contig归属 | 位点数与coverage共用原始名称；controls只认精确`lambda`/`pUC19`，含这些子串的chr仍属宿主，其他decoy仅进total分母。分类修正只重算CpG统计，不重建Raw/Gini/TSS/Single |
-| CpG缓存恢复 | 零位点与零coverage比例必须一致，宿主coverage在sites至65535×sites之间；矛盾从原始CpG重算。重算中断撤旧完成身份，有效Raw仍复用 |
-| SingleCpG复用 | 身份绑定实际算法AST/依赖和科学库版本；算法变更须`RECOMPUTE_SINGLECPG=True`，Raw过期仍须先跑Processor |
-| 比率与零值 | QC是已覆盖胞嘧啶的fraction均值，Single是参考CpG区间内已覆盖位点的fraction均值；都不是合并reads的比率。有覆盖全unmethyl保显式0，缺覆盖不补0；TSS比例/甲基化信号数的零状态必须一致 |
+| 默认 TSS BED | `resources/<genome>_reference/tss/<genome>_TSS_2000_2000_20.bed`；链方向一致的 ±2000 bp / 20 bp bins，第9列为 offset |
+| 构建来源 | Doctor 从 hg38 GENCODE v48 或 mm10 GENCODE M25 的 protein-coding `gene` 记录生成；原始 FASTA/GTF 按主 README 准备，不自动下载 |
+| single-CpG BED | `resources/<genome>_reference/cpg/<genome>.single_cpg.bed.gz`，BED3 / 0-based half-open `[C, G+1)`，不含 lambda/pUC19 |
+| 资源分发 | 生成的 `resources/*_reference/` 留在目标平台，不进入源码包或强制提交 Git |
+| 外部资源 | CLI `--tss-bed /path/to/genome_TSS_2000_2000_20.bed` 或 Notebook `TSS_BED`；须匹配 sealed reference build |
+| BED 校验 | genomic interval 非负整数、非空且唯一，第9列 offset 为有限32-bit整数；先检查全部行，再筛实际覆盖 |
+| 显式跳过 | `--skip-tss` 或 `SKIP_TSS=True`；清理该交付旧 TSS CSV/PDF，避免把旧曲线当作新结果 |
 
-| 指标 | 分母与零值 |
+Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对应 CLI `--tss-sample-fraction` / `--tss-sample-seed`。比例须有限且在 `(0,1]`，种子为非负整数。
+
+| 每克隆细胞数 N | 默认10% | 调整比例后的规则 |
+| --- | --- | --- |
+| N<10 | 全部 | 仍全部 |
+| 10≤N≤1000 | `ceil(N×0.10)` | `min(100, ceil(N×fraction))` |
+| N>1000 | 100 | `min(100, ceil(N×fraction))` |
+| 任意 N，fraction=1.0 | — | 全部，不受100上限限制 |
+
+| 抽检与结果 | 解读 |
 | --- | --- |
-| QC三参考Meth_CpG_Rate% | 分别取宿主/lambda/pUC19已覆盖位点m/(m+u)的算术均值×100；零位点为NaN |
-| SingleCpG X | 参考CpG区间内已覆盖C/G位点的fraction均值；缺覆盖为缺项，有覆盖全unmethyl保显式0 |
-| TSS | 同offset有覆盖bin的fraction均值；count为甲基化信号之和，无覆盖不出行 |
-| TAPS native controls | lambda假阳性/pUC19转换取总mod/总(mod+unmod)，同时报告观测数；与QC位点均值分母不同，不能直接混用为化学效率 |
+| 选样 | 每个原始 CloneID 内按 `SHA256(seed, Sample_ID)` 排序；行序不影响名单，含空 CpG 细胞，不按 coverage 选样 |
+| 影响范围 | 仅 TSS 用选中细胞；Raw、完整 QC、Gini、SingleCpG 均保留全部细胞 |
+| 抽检记录 | `.cache/DNAme_QC_Input_Identity.json` 的 `tss_sampling` 保存方法、比例、种子、逐克隆数量与选中 ID |
+| profile 行数 | CSV 仅记录选中且有覆盖的 bins，细胞数可小于抽检数；全体无覆盖时仅表头 CSV 合法并可复用，旧 PDF 清理 |
+| 零值与坐标 | 有 coverage 而甲基化为0仍保留；无覆盖不补0。区间自动适配 sealed base，标准 BED 不变，相对 TSS 距离不加减1 |
 
 ## 输出
 
-输出写入与当前交付绑定的
-`<project>/06_downstream/QC_Results_YYYYMMDD_HHMMSS/`（例如 `QC_Results_20261010_153000`），不会修改 sealed
-`03_results/`。
+输出目录为 `<project>/06_downstream/QC_Results_YYYYMMDD_HHMMSS/`，时间取首次创建的本地时间，同秒冲突加微秒。`.delivery.json` 绑定交付：同交付复用目录/cache，新交付新建；多个匹配会拒绝，不按 mtime 或目录名猜测。
 
-QC 目录的时间为首次创建时的本地时间；同秒重名追加微秒。同一交付再次运行会复用该目录，缓存位于目录内 `.cache/`。内部 `.delivery.json` 用于匹配交付，Notebook 与 RNA 整合自动定位，无需手动填写长哈希目录。
+| 文件 / 目录 | 用途 |
+| --- | --- |
+| `DNAme_QC_Information.csv` | 下游与 adata 合并的唯一 QC 表，固定20列，见下表 |
+| `TSS_Profile_Information.csv` | 未跳过 TSS 时生成，有覆盖的抽检 bins |
+| `RawAdata.h5ad` / `RawAdata.input_schema.json` | 全细胞 canonical CpG 导入矩阵与复用记录 |
+| `SingleCpG_Adata.h5ad` / `SingleCpG_Adata.input_schema.json` | Notebook 最后一格生成的全细胞 single-CpG 矩阵与完成记录 |
+| `.cache/` | `Mapping_Stats.csv`、`CpG_Signal_Composition.csv`、`Gini_Index.csv`、`DNAme_QC_Input_Identity.json` 等内部缓存，不手动改写 |
+| `plots/` | QC、Final QC、孔板、信号组成、TSS、CpG density 与 PCA 等 PDF |
 
-目录内容：
+| QC 分组 | 列名（实际列序由 `QC_INFO_COLUMNS` 定义） |
+| --- | --- |
+| 身份 | `Sample_ID`、`CloneID`、`PlateID` |
+| mapping | `Native_Mapping%` |
+| 宿主 | `Sample_Unique_CpG_Sites`、`Sample_Meth_CpG_Rate%` |
+| lambda | `Lambda_Unique_CpG_Sites`、`Lambda_Meth_CpG_Rate%` |
+| pUC19 | `pUC19_Unique_CpG_Sites`、`pUC19_Meth_CpG_Rate%` |
+| CpH | `Non_CpG_Methylation%`、`High_CpH_Flag_Rate%` |
+| 信号组成 | `Signal_Host_Rate%`、`Signal_Lambda_Rate%`、`Signal_pUC19_Rate%`、`Signal_mtDNA_Rate%` |
+| 均匀度 | `Gini_Index` |
+| pair 指标 | `Duplicate_Pair_Rate%`、`Trim_Retention%`、`Final_Pair_Yield%` |
 
-- `DNAme_QC_Information.csv`：下游与 adata 合并的唯一 QC 表，固定 20 列且
-  列序唯一出自 `downstream_qc.QC_INFO_COLUMNS`：`Sample_ID`、`CloneID`、`PlateID`、
-  `Native_Mapping%`、`Sample_Unique_CpG_Sites`、`Sample_Meth_CpG_Rate%`、
-  `Lambda_Unique_CpG_Sites`、`Lambda_Meth_CpG_Rate%`、`pUC19_Unique_CpG_Sites`、
-  `pUC19_Meth_CpG_Rate%`、`Non_CpG_Methylation%`、`High_CpH_Flag_Rate%`、
-  `Signal_Host_Rate%`、`Signal_Lambda_Rate%`、`Signal_pUC19_Rate%`、
-  `Signal_mtDNA_Rate%`、`Gini_Index`、`Duplicate_Pair_Rate%`、`Trim_Retention%`、
-  `Final_Pair_Yield%`。完整 read-pair funnel 与 backend policy/unit 诊断不复制进
-  本表，保留在主 Pipeline 的 MultiQC 报告。Droplet 的 `Duplicate_Pair_Rate%` 为 NaN，
-  `Non_CpG_Methylation%` 来自过滤后 CHG/CHH 的胞嘧啶/UMI 共识；分子观测数保留在
-  final manifest 与 MultiQC，不与 read-pair 数混算。默认 HQ 判定不使用 pair 去重率。
-- `TSS_Profile_Information.csv`（仅未跳过 TSS 时）
-- `RawAdata.h5ad`
-- `SingleCpG_Adata.h5ad` 与 `SingleCpG_Adata.input_schema.json`（运行 Notebook 最后一格后）
-- `.cache/Mapping_Stats.csv`（内部缓存）
-- `.cache/CpG_Signal_Composition.csv`（内部缓存）
-- `.cache/Gini_Index.csv`（内部缓存）
-- `plots/` 下的 PDF，包括 `WGBS_QC_Panel.pdf`、Final QC dashboards、
-  `Plate_View_Native_Mapping%.pdf`、`CpG_Signal_Composition.pdf`、
-  `TSS_Profile.pdf`（可选）、`CpG_Density.pdf`、
-  `CpG_Density_Unique_vs_Input_Pairs.pdf` 与 `Batch_Effect_PCA.pdf`。
-
-`CpG_Density.pdf` 的输入由 Notebook 经 `downstream_qc.load_cpg_density_frame`
-合并三个来源：`Sample_ID`、`CloneID` 和 `Sample_Unique_CpG_Sites` 取自
-20 列 QC 表，pair 计数取自 sealed `03_results/QC_Results/sample_manifest.tsv`
-（`build_qc_records` 唯一加载链），`Sample_CpG_Signals` 取自
-`.cache/CpG_Signal_Composition.csv`；三个来源的样本集合必须完全一致。
-同一 `plot_cpg_density` 调用先展示逐样本散点图并保存为
-`CpG_Density_Unique_vs_Input_Pairs.pdf`：横轴为 trimming 前 input read pairs，
-纵轴为最终宿主 unique CpG sites，沿用 CloneID 配色，保留有限的正 input pairs
-与非负 unique sites；散点保留原始计数，不做深度归一化或异常点剔除。
-每个 CloneID 叠加同色过原点拟合线，图例标注斜率；直接复用原 input-pair 汇总
-的同一次拟合，使用相同的 unique sites 与 coverage signals 联合有效样本、异常点
-筛选及 `min_slope_ratio_change`；在保留样本上按 `slope = sum(x*y) / sum(x*x)`
-拟合 `y = slope*x`，斜率单位为 unique CpG sites / input pair。无有效拟合时不画线，
-图例标为 `slope=N/A`。
-随后展示并保存原有的 `CpG_Density.pdf` 斜率汇总。
-QC 表中的 `Sample_ID`、`CloneID`、`PlateID` 以及 TSS 的 `CloneID` 按字符串读取，保留 `001` 等前导零以及
-`NA`、`nan`、`None` 等合法名称；数值列仍按数值和缺失值解析，并保留 round-trip 浮点精度。
-
-RawAdata 的样本集合以 sealed final manifest 为准；临时 CpG 导入文件只调整格式后缀，样本名内部的 `.cpg.` 原样保留。
-
-Notebook 的 `FINAL_QC_MODE` 可选 `per_clone_samples` 或 `distribution`；前者的 `FINAL_QC_METRIC` 可填单个指标或指标列表。
-`per_clone_samples` 每个 CloneID 一个面板，`distribution` 叠加各组；两者均使用 100 个分箱。
-CpG sites 用对数横轴与对数等距分箱，其他指标保持线性；同一指标在所选组间共用边界。
-若 CpG 包含零值或负值，则明确标注并使用带符号 log1p 横轴及其等距分箱，保留零值。
-纵轴为样本数 `Counts`：浅色直方图展示实际计数，叠加平滑计数峰，保持总计数；
-平滑仅辅助观察，不转为概率密度、不参与 QC 筛选。忽略缺失、非数值及无穷值。
-每个面板标注有效样本数和中位数竖线；`FINAL_QC_CLONE_ID` 选择范围，指标列表逐项展示并保存 PDF。
-
+完整 read-pair funnel 与 backend policy/unit 保留在主 Pipeline final manifest/MultiQC，不重复塞入20列表。Droplet 的 `Duplicate_Pair_Rate%` 为 NaN；Non-CpG 来自过滤后 CHG/CHH 胞嘧啶/UMI 共识，分子观测数不与 read-pair 数混算。
 
 ## 指标与筛选
 
-20 列 QC 保留各 backend 原生 mapping 单位及 TAPS 控制含义。不同 backend 的
-`Native_Mapping%` 不视为同义指标；TAPS 的 `High_CpH_Flag_Rate%` 为缺失值；`Non_CpG_Methylation%` 默认显示可判链宿主分子的 CHG/CHH 原始转换率，零观测为缺失。该指标未经 SNP/测序错误校正，只代表可判链子集，不能直接解释为真实 mCH 或 cDNA 污染率。分项计数与判链分母见 final manifest/MultiQC。
-Gini 使用有覆盖 bins 的 coverage，不纳入未覆盖 bins；TSS count 为甲基化信号之和。
+| 指标 | 分母与零值含义 |
+| --- | --- |
+| QC 甲基化率 | 宿主、lambda、pUC19 分别对已覆盖位点的 `m/(m+u)` 取均值再×100；无观测为 NaN，不是合并 reads 的比例 |
+| SingleCpG | 参考区间内已覆盖位点的 fraction 均值；如 `1/4` 与 `9/12` 的均值为0.5，不是 `10/16`；有覆盖全 unmethyl 保显式0，缺覆盖不补0 |
+| TSS | 每个 offset 对有覆盖 bins 的 fraction 取均值；count 为甲基化信号之和，不是 read pairs 或总 coverage |
+| Gini | 用有覆盖 bins 的 `m+u`，不纳入未覆盖 bins；有 coverage 的零甲基化不等同缺失 |
+| 信号组成 | host/lambda/pUC19/mtDNA coverage 各除以全部 contig 的总 coverage 再×100，其他 decoy 只进分母；不是位点比例 |
+| 原生 mapping | 各 backend 单位/分母不同，不视为同义指标或默认跨 backend HQ 阈值 |
+| TAPS controls | lambda 假阳性 / pUC19 转换率为 `sum(mod)/sum(mod+unmod)`，须同时报告观测数；与 QC 位点均值不同，不混用为化学效率 |
+| TAPS Non-CpG | 可判链宿主分子的 CHG/CHH 原始转换率；零观测缺失，未经 SNP/测序错误校正，不能直接解释为真实 mCH 或 cDNA 污染率；High-CpH 为 NaN |
 
-Notebook 默认 HQ 使用 Lambda methylation `< 10`、pUC19 methylation `> 90`、unique CpG
-sites `> 500000` 且 Gini `< 0.5`；mapping 默认不参与统一 HQ，只有完成对应数据回归后才设置
-`MAPPING_THRESHOLD`。Doctor 和合成边界回归仅覆盖相应测试输入，不代表真实全库科学等价或性能验证。
+上表保留各指标的分母与零值含义。Doctor 与合成边界回归仅覆盖其测试输入，不代表真实全库科学等价或性能验证。
+
+| 默认 HQ 条件（同时满足） | 阈值 |
+| --- | --- |
+| Lambda methylation | `<10%` |
+| pUC19 methylation | `>90%` |
+| 宿主 unique CpG sites | `>500000` |
+| Gini | `<0.5` |
+| mapping | 默认不参与；对应数据完成验证后才设置 `MAPPING_THRESHOLD` |
+| pair 去重率 | 默认不参与，Droplet 为 NaN |
+
+| 图 / Notebook 控制 | 解读与输出 |
+| --- | --- |
+| Final QC | `FINAL_QC_MODE=per_clone_samples` 按 CloneID 分面，`distribution` 叠加；`FINAL_QC_METRIC` 支持单指标/列表，`FINAL_QC_CLONE_ID` 选组，逐项展示并保存 PDF |
+| Final QC 横纵轴 | 100 bins、组间共用边界；CpG 正值用 log 横轴，含非正值改 signed-log1p 并标明，其他指标线性；纵轴 Counts，保留有效 N/中位数，平滑保总计数且不参与 QC 筛选，仅排缺失/非数值/无穷 |
+| `CpG_Density_Unique_vs_Input_Pairs.pdf` | 横轴 trimming 前 input pairs，纵轴最终宿主 unique CpG sites，CloneID 配色；散点用原始计数，不作深度归一化或异常点剔除 |
+| 拟合与 `CpG_Density.pdf` | 散点拟合线与斜率汇总共用联合有效样本、异常点筛选及 `min_slope_ratio_change`；过原点 `slope=sum(x*y)/sum(x*x)`，单位 sites/input pair，不能拟合则 N/A |
+| density 输入 | QC 身份/sites、sealed final manifest pairs、composition cache host signals 的样本集合须完全一致，不静默取交集 |
+| 其他图 | `WGBS_QC_Panel.pdf`、`Plate_View_Native_Mapping%.pdf`、`CpG_Signal_Composition.pdf`、可选 `TSS_Profile.pdf`、`Batch_Effect_PCA.pdf` |
 
 ## 关联 RNA_DARLIN 结果
 
-Cabernet/TAPS 的 DNA 项目 manifest 可填写外部 `rna_sample`，值与 RNA_DARLIN 项目的
-原始 RNA basename 一致；两边 `sample_id` 可独立命名。Alopex 只处理本地
-`dna_raw_sample`，将关联保存在最终 `03_results/QC_Results/sample_manifest.tsv`。
-先完成 DNA 发布及本 downstream，再在 RNA notebook 填写 `DNA_PROJECT_ROOT`。
-RNA Processor 从当前 complete DNA delivery 读取 sealed manifest 与同代际本表，
-用 RNA.h5ad 的 `rna_sample → sample_id` 和 PlateID 对齐，发布 RNA 侧
-`Integrated_QC_Information.csv`。SRD 的本地 `rna_sample` 不参与外部桥接。
-文库映射须一对一、参与细胞集合须相等，身份/条码/Cell_Order 冲突直接报错；
-不会读取未发布的 config 修改或选择 mtime 较新的旧 QC。DNA 20 列 QC 不增加关联列，
-实际文库映射及输入哈希保存在 RNA `analysis_summary.json`。更新关联后先重跑 DNA 发布
-和当前代际 downstream，再重新整合。
+| 孔板 / 协议 | 操作与校验 |
+| --- | --- |
+| Cabernet / TAPS | DNA manifest 的可选 `rna_sample` 填 RNA_DARLIN **原始 RNA basename**；两边 `sample_id` 可独立命名，Alopex 只处理本地 DNA |
+| 执行顺序 | 完成 DNA 发布及同代 downstream，再在 RNA Notebook 填 `DNA_PROJECT_ROOT` |
+| 对齐来源 | 当前 complete DNA 的 sealed manifest + 同代 DNA QC；RNA.h5ad 的 `rna_sample → canonical sample_id → PlateID` 一对一关联，不读取未发布 config 或挑最新 mtime |
+| 失败边界 | 参与细胞集合须相等；多对一、缺失/多余细胞、barcode/Cell_Order 或身份冲突直接失败，不静默取交集 |
+| SRD / 无外部关联 | 用共享项目 sample_id 与 PlateID；SRD 本地 `rna_sample` 不参与外部桥接 |
+| RNA 输出 | `Integrated_QC_Information.csv` 整合 RNA 13列与 DNA 20列并保留 RNA 身份；实际映射和输入哈希写 `analysis_summary.json`，DNA QC 不增加关联列 |
+| 修改关联 | 先重发布 DNA 和当前代际 downstream，再重新整合 RNA |
 
-Droplet 的配套 RNA 独立进行细胞调用与 QC。RNA 项目用
-`00_config/dna_rna_library_map.tsv` 指定 DNA/RNA 文库，再按完整 CB17 关联；DNA manifest 的
-`rna_sample` 留空。RNA 侧输出双方细胞全集 `DNA_RNA_cell_links.csv`，整合 QC 只含共同且双方
-QC 可用的细胞；文库冲突或错误交付代际直接失败。Droplet 的独立 calling 不要求两侧细胞集合相等；孔板仍要求完整细胞集合对应。
+| Droplet 独立关联 | 操作与校验 |
+| --- | --- |
+| 文库映射 | DNA `rna_sample` 留空；RNA 项目 `00_config/dna_rna_library_map.tsv` 指定 DNA/RNA 文库，按完整 CB17 关联 |
+| 细胞集合 | 两边独立 calling/QC；`DNA_RNA_cell_links.csv` 保留双方全集，整合 QC 只含共同且双方 QC 可用的细胞 |
+| 身份冲突 | 文库冲突或错误交付代际失败；不套用孔板的细胞集合相等约束，未配对不补科学零值 |
