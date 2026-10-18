@@ -1,6 +1,6 @@
-# Alopex v15.1 下游 QC 与可视化
+# Alopex v15.2 下游 QC 与可视化
 
-正式源码以 Git tag `v15.1` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
+正式源码以 Git tag `v15.2` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
 
 | 输入边界 | 要求 |
 | --- | --- |
@@ -62,8 +62,7 @@ PY_KERNEL
 | Notebook 开关 | CLI 对应项 | 重建对象 |
 | --- | --- | --- |
 | `RECOMPUTE_RAW_ADATA` | `--recompute-raw-adata` | 从 sealed CpG 重建 `RawAdata.h5ad` |
-| `RECOMPUTE_METHYL_STATS` | `--recompute-methyl-stats` | CpG 位点/甲基化统计（`Mapping_Stats.csv`） |
-| `RECOMPUTE_COMPOSITION` | `--recompute-composition` | CpG 信号组成 |
+| `RECOMPUTE_CPG_STATS` | `--recompute-cpg-stats` | 同时重建 CpG 位点/甲基化统计及信号组成；任一缓存缺失/损坏也会自动联合重建 |
 | `RECOMPUTE_GINI` | `--recompute-gini` | Gini |
 | `RECOMPUTE_TSS` | `--recompute-tss` | TSS profile |
 | `RECOMPUTE_SINGLECPG` | 无；Notebook 最后一格使用 | `SingleCpG_Adata.h5ad`；完成后恢复 `False` |
@@ -183,7 +182,7 @@ Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对�
 | 图 / Notebook 控制 | 解读与输出 |
 | --- | --- |
 | Final QC | `FINAL_QC_MODE=per_clone_samples` 按 CloneID 分面，`distribution` 叠加；`FINAL_QC_METRIC` 支持单指标/列表，`FINAL_QC_CLONE_ID` 选组，逐项展示并保存 PDF |
-| Final QC 横纵轴 | 100 bins、组间共用边界；CpG 正值用 log 横轴，含非正值改 signed-log1p 并标明，其他指标线性；纵轴 Counts，保留有效 N/中位数，平滑保总计数且不参与 QC 筛选，仅排缺失/非数值/无穷 |
+| Final QC 横纵轴 | 100 bins、组间共用边界；CpG 正值用 log 横轴，含非正值改 signed-log1p 并标明，其他指标线性；纵轴 Counts，保留有效 N/中位数，实际直方图加 sigma=1.5、半径6、对称边界的高斯平滑，在变换空间插值；平滑保总计数且不参与 QC 筛选，仅排缺失/非数值/无穷 |
 | `CpG_Density_Unique_vs_Input_Pairs.pdf` | 横轴 trimming 前 input pairs，纵轴最终宿主 unique CpG sites，CloneID 配色；散点用原始计数，不作深度归一化或异常点剔除 |
 | 拟合与 `CpG_Density.pdf` | 散点拟合线与斜率汇总共用联合有效样本、异常点筛选及 `min_slope_ratio_change`；过原点 `slope=sum(x*y)/sum(x*x)`，单位 sites/input pair，不能拟合则 N/A |
 | density 输入 | QC 身份/sites、sealed final manifest pairs、composition cache host signals 的样本集合须完全一致，不静默取交集 |

@@ -2969,9 +2969,6 @@ doctor_terminate_pid_bounded() {
     txn_terminate_pid_bounded "$1" "$2" "${DOCTOR_TERMINATION_GRACE_SECONDS:-15}" "${3:-0}" \
         >> "$DETAIL_LOG" 2>&1
 }
-doctor_signal_process_tree() {
-    txn_signal_process_tree "$1" "$2"
-}
 stop_active_command() {
     local active_pid="${DOCTOR_ACTIVE_COMMAND_PID:-}"
     DOCTOR_ACTIVE_COMMAND_PID=""
@@ -2990,7 +2987,7 @@ stop_active_routes() {
         [[ "$active_pid" =~ ^[0-9]+$ ]] || continue
         if txn_pid_is_running "$active_pid"; then
             printf '向活动 Doctor route（pid=%s）发送 TERM\n' "$active_pid" >> "$DETAIL_LOG"
-            doctor_signal_process_tree "$active_pid" TERM
+            txn_signal_process_tree "$active_pid" TERM
         fi
     done
     for active_pid in ${DOCTOR_ACTIVE_ROUTE_PIDS:-}; do

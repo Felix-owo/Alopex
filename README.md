@@ -1,6 +1,6 @@
-# Alopex v15.1
+# Alopex v15.2
 
-正式源码以 Git tag `v15.1` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v15.2` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 | 协议 / `analysis.protocol` | 后端 | 主要处理 |
 | --- | --- | --- |
@@ -13,7 +13,7 @@
 | --- | --- |
 | 配置默认值与可调参数 | 初始化生成的 `00_config/config.yaml` 与内置 schema |
 | Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
-| 升级说明与验证边界 | [本版 Release](https://github.com/Felix-owo/Alopex/releases/tag/v15.1) |
+| 升级说明与验证边界 | [本版 Release](https://github.com/Felix-owo/Alopex/releases/tag/v15.2) |
 
 ## 1. 安装
 
@@ -204,7 +204,7 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 | 输出代际 | 写入 `06_downstream/QC_Results_<生成时间>/`；同交付复用目录/cache，新交付新建，不按 mtime 猜测输入，不写回公开结果 |
 | TSS 抽检 | 默认按 CloneID 抽10%，不足10个全检、超过1000个取100；`TSS_SAMPLE_SEED=0` 可复现，`TSS_SAMPLE_FRACTION=1.0` 全检；抽样只影响 TSS，Raw/QC/Gini/Single 仍处理全部细胞 |
 | 矩阵与零值 | 位点坐标跟随交付；有覆盖全 unmethyl 保留显式0，缺覆盖不补0；QC 位点均值、SingleCpG 区间均值与合并 reads 的比率不同 |
-| 缓存重建 | 过期缓存按 Processor 提示重算；Raw 过期时先完成 QC Processor 的必要重建，再用 `RECOMPUTE_SINGLECPG=True` 重建 SingleCpG |
+| 缓存重建 | CpG统计统一用`RECOMPUTE_CPG_STATS`/`--recompute-cpg-stats`同时重建位点统计与信号组成；过期缓存按 Processor 提示重算；Raw 过期时先完成 QC Processor 的必要重建，再用 `RECOMPUTE_SINGLECPG=True` 重建 SingleCpG |
 | 绘图 | Final QC 按 CloneID 展示计数直方图，CpG sites 用 log 横轴；CpG density 展示 input pairs / unique CpG sites 散点及拟合，支持 PDF |
 | RNA 关联 | 使用当前完整交付的 sealed manifest 与同代 DNA QC；更新关联后先重发布 DNA 和当前代际 downstream，再整合 RNA |
 

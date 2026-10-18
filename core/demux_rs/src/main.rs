@@ -390,28 +390,22 @@ mod cli {
     pub(crate) struct Args {
         #[arg(
             long,
-            required = true,
+            required_unless_present = "evidence_pairs",
             help = "R1 FASTQ；可按 lane/chunk 顺序重复传入。"
         )]
         pub(crate) r1: Vec<PathBuf>,
 
         #[arg(
             long,
-            required_unless_present_any = ["count_only", "evidence_pairs"],
+            required_unless_present = "evidence_pairs",
             help = "R2 FASTQ；数量和顺序必须与 --r1 一一对应。"
         )]
         pub(crate) r2: Vec<PathBuf>,
 
-        #[arg(long, hide = true, conflicts_with = "count_only")]
+        #[arg(long, help = "Droplet 配对暂存目录；该模式的重放与分子证据必需。")]
         pub(crate) droplet_spool: Option<PathBuf>,
 
-        #[arg(long, requires = "counts_output")]
-        pub(crate) count_only: bool,
-        #[arg(long)]
-        pub(crate) counts_output: Option<PathBuf>,
-        #[arg(long)]
-        pub(crate) count_metrics: Option<PathBuf>,
-        #[arg(long, requires = "evidence_output", conflicts_with = "count_only")]
+        #[arg(long, requires_all = ["evidence_output", "droplet_spool"], conflicts_with_all = ["r1", "r2"])]
         pub(crate) evidence_pairs: Option<PathBuf>,
         #[arg(long, requires = "evidence_pairs")]
         pub(crate) evidence_output: Option<PathBuf>,
@@ -701,9 +695,6 @@ mod matcher {
         dna_w_spacer_len: usize,
         demux_mode: DemuxMode,
     ) -> ProcResult<'a> {
-        if demux_mode == DemuxMode::DnaOnlyDroplet {
-            return droplet::match_read(r1, &dna_indices[0]);
-        }
         let mut dna_match: Option<ProcResult<'a>> = None;
         let mut dna_rejection: Option<ProcResult<'a>> = None;
         for dna_idx in dna_indices {
@@ -2228,22 +2219,6 @@ mod droplet {
         })
     }
 
-    pub(super) fn match_read<'a>(seq: &'a [u8], index: &'a BarcodeIndex) -> ProcResult<'a> {
-        let layout = match extract(seq) {
-            Ok(layout) => layout,
-            Err(fate) => return ProcResult::rejected(fate, None),
-        };
-        match index.match_simple(layout.barcode) {
-            BarcodeMatch::Unique { id } => {
-                ProcResult::assigned(Modality::Dna, id, layout.trim_start, Some(layout.umi))
-            }
-            BarcodeMatch::Ambiguous => {
-                ProcResult::rejected(TerminalFate::Ambiguous, Some(layout.umi))
-            }
-            BarcodeMatch::None => ProcResult::rejected(TerminalFate::Unmatched, Some(layout.umi)),
-        }
-    }
-
     #[derive(Default, Serialize, serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     pub(super) struct CountMetrics {
@@ -2264,71 +2239,6 @@ mod droplet {
         pub(super) q30: [u64; 17],
     }
 
-    pub(super) fn count_barcodes(args: &Args) -> Result<()> {
-        anyhow::ensure!(
-            args.mode == DemuxMode::DnaOnlyDroplet,
-            "--count-only requires dna-only-droplet"
-        );
-        anyhow::ensure!(args.r2.is_empty(), "--count-only reads R1 only");
-        let counts_path = args
-            .counts_output
-            .as_ref()
-            .context("--counts-output is required")?;
-        let metrics_path = args
-            .count_metrics
-            .as_ref()
-            .context("--count-metrics is required")?;
-        let mut metrics = CountMetrics::default();
-        let mut counts: AHashMap<Vec<u8>, BarcodeCount> = AHashMap::new();
-        let mut batch = Vec::with_capacity(DEFAULT_CHUNK_SIZE);
-        let accumulate = |batch: &mut Vec<(Vec<u8>, Vec<u8>)>,
-                          counts: &mut AHashMap<Vec<u8>, BarcodeCount>,
-                          metrics: &mut CountMetrics| {
-            let layouts: Vec<_> = batch.par_iter().map(|(seq, _)| extract(seq)).collect();
-            for (layout, (_, quality)) in layouts.into_iter().zip(batch.iter()) {
-                metrics.input_reads += 1;
-                match layout {
-                    Ok(layout) => {
-                        metrics.structured_reads += 1;
-                        metrics.barcode_with_c += u64::from(layout.barcode.contains(&b'C'));
-                        metrics.umi_with_n += u64::from(layout.umi.contains(&b'N'));
-                        let count = counts.entry(layout.barcode.to_vec()).or_default();
-                        count.count += 1;
-                        for (i, q) in quality[layout.barcode_start..layout.barcode_start + 17]
-                            .iter()
-                            .enumerate()
-                        {
-                            count.below_q20[i] += u64::from(*q < 53);
-                            count.q30[i] += u64::from(*q >= 63);
-                        }
-                    }
-                    Err(TerminalFate::Ambiguous) => metrics.ambiguous += 1,
-                    Err(TerminalFate::Short) => metrics.short += 1,
-                    Err(_) => metrics.unmatched += 1,
-                }
-            }
-            batch.clear();
-        };
-        for path in &args.r1 {
-            let mut reader = needletail::parse_fastx_file(path)?;
-            while let Some(record) = reader.next() {
-                let record = record?;
-                let seq = record.seq();
-                let qual = record
-                    .qual()
-                    .context("R1 must contain FASTQ quality scores")?;
-                validate_fastq_quality(seq.as_ref(), qual)?;
-                normalize_read_id(record.id())?;
-                batch.push((seq.to_vec(), qual.to_vec()));
-                if batch.len() == DEFAULT_CHUNK_SIZE {
-                    accumulate(&mut batch, &mut counts, &mut metrics);
-                }
-            }
-        }
-        accumulate(&mut batch, &mut counts, &mut metrics);
-        write_counts(counts, metrics, counts_path, metrics_path)
-    }
-
     pub(super) fn write_count_row<W: std::io::Write>(
         out: &mut W, barcode: &[u8], count: &BarcodeCount,
     ) -> Result<()> {
@@ -2337,25 +2247,6 @@ mod droplet {
         };
         writeln!(out, "{}\t{}\t{}\t{}", std::str::from_utf8(barcode)?,
                  count.count, list(&count.below_q20), list(&count.q30))?;
-        Ok(())
-    }
-
-    pub(super) fn write_counts(
-        counts: AHashMap<Vec<u8>, BarcodeCount>,
-        mut metrics: CountMetrics,
-        counts_path: &Path,
-        metrics_path: &Path,
-    ) -> Result<()> {
-        metrics.unique_barcodes = counts.len();
-        let mut rows: Vec<_> = counts.into_iter().collect();
-        rows.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(&b.0)));
-        let mut out = std::io::BufWriter::new(std::fs::File::create(counts_path)?);
-        writeln!(out, "barcode\tcount\tbelow_q20\tq30")?;
-        for (barcode, count) in rows {
-            write_count_row(&mut out, &barcode, &count)?;
-        }
-        out.flush()?;
-        std::fs::write(metrics_path, serde_json::to_vec_pretty(&metrics)?)?;
         Ok(())
     }
 
@@ -2414,126 +2305,6 @@ mod droplet {
                 self.saturated = true;
             }
         }
-    }
-
-    fn scan_molecules(
-        args: &Args,
-        selected: &AHashSet<Vec<u8>>,
-        mut consume: impl FnMut(&[u8], u128),
-    ) -> Result<()> {
-        let mut batch = Vec::with_capacity(DEFAULT_CHUNK_SIZE);
-        let mut accumulate = |batch: &mut Vec<Vec<u8>>| {
-            let extracted: Vec<_> = batch
-                .par_iter()
-                .map(|seq| {
-                    let layout = extract(seq).ok()?;
-                    if !selected.contains(layout.barcode) {
-                        return None;
-                    }
-                    Some((layout.barcode, molecule_key(&layout, seq)?))
-                })
-                .collect();
-            for (barcode, key) in extracted.into_iter().flatten() {
-                consume(barcode, key);
-            }
-            batch.clear();
-        };
-        for path in &args.r1 {
-            let mut reader = needletail::parse_fastx_file(path)?;
-            while let Some(record) = reader.next() {
-                let record = record?;
-                let seq = record.seq();
-                let quality = record.qual().context("Molecule evidence requires FASTQ sequence/quality pairs")?;
-                validate_fastq_quality(seq.as_ref(), quality)?;
-                normalize_read_id(record.id())?;
-                batch.push(seq.to_vec());
-                if batch.len() == DEFAULT_CHUNK_SIZE {
-                    accumulate(&mut batch);
-                }
-            }
-        }
-        accumulate(&mut batch);
-        Ok(())
-    }
-
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct EvidencePair {
-        barcode: String,
-        parent: String,
-    }
-
-    pub(super) fn molecule_evidence(args: &Args) -> Result<()> {
-        anyhow::ensure!(
-            args.mode == DemuxMode::DnaOnlyDroplet && args.r2.is_empty() && !args.r1.is_empty(),
-            "Droplet molecule evidence reads R1 only"
-        );
-        let pairs: Vec<EvidencePair> =
-            serde_json::from_slice(&std::fs::read(args.evidence_pairs.as_ref().unwrap())?)?;
-        let mut children: AHashMap<Vec<u8>, Molecules> = AHashMap::new();
-        for pair in &pairs {
-            anyhow::ensure!(
-                [&pair.barcode, &pair.parent]
-                    .into_iter()
-                    .all(|bc| bc.len() == 17 && bc.bytes().all(|b| b"AGT".contains(&b)))
-                    && pair.barcode != pair.parent,
-                "Invalid molecule evidence pair"
-            );
-            anyhow::ensure!(
-                children
-                    .insert(pair.barcode.as_bytes().to_vec(), Molecules::default())
-                    .is_none(),
-                "Duplicate molecule evidence child"
-            );
-        }
-        anyhow::ensure!(
-            !pairs.is_empty(),
-            "Molecule evidence pairs must not be empty"
-        );
-        scan_molecules(args, &children.keys().cloned().collect(), |barcode, key| {
-            children.get_mut(barcode).unwrap().add(key);
-        })?;
-        let mut targets: AHashMap<Vec<u8>, AHashMap<u128, Vec<usize>>> = AHashMap::new();
-        let mut parent_reads: AHashMap<Vec<u8>, u64> = AHashMap::new();
-        let mut shared: Vec<AHashSet<u128>> = pairs.iter().map(|_| AHashSet::new()).collect();
-        for (index, pair) in pairs.iter().enumerate() {
-            let lookup = targets.entry(pair.parent.as_bytes().to_vec()).or_default();
-            parent_reads
-                .entry(pair.parent.as_bytes().to_vec())
-                .or_default();
-            for (_, key) in &children[pair.barcode.as_bytes()].keys {
-                lookup.entry(*key).or_default().push(index);
-            }
-        }
-        scan_molecules(args, &targets.keys().cloned().collect(), |barcode, key| {
-            *parent_reads.get_mut(barcode).unwrap() += 1;
-            if let Some(indices) = targets[barcode].get(&key) {
-                for index in indices {
-                    shared[*index].insert(key);
-                }
-            }
-        })?;
-        let evidence: BTreeMap<_, _> = pairs.iter().enumerate().map(|(index, pair)| {
-            let child = &children[pair.barcode.as_bytes()];
-            let mut keys: Vec<_> = shared[index].iter().copied().collect();
-            keys.sort_unstable();
-            (pair.barcode.clone(), serde_json::json!({
-                "parent": pair.parent,
-                "child_eligible_reads": child.reads,
-                "child_sampled_signatures": child.keys.len(),
-                "child_saturated": child.saturated,
-                "parent_eligible_reads": parent_reads[pair.parent.as_bytes()],
-                "shared_signatures": keys.into_iter().map(|key| format!("{key:022x}")).collect::<Vec<_>>()
-            }))
-        }).collect();
-        std::fs::write(
-            args.evidence_output.as_ref().unwrap(),
-            serde_json::to_vec(
-                &serde_json::json!({"signature": "exact_umi12_insert32", "child_cap": MOLECULE_CAP,
-                    "parent_scan": "complete", "pairs": evidence}),
-            )?,
-        )?;
-        Ok(())
     }
 
     #[test]
@@ -2693,11 +2464,7 @@ impl Config {
             threads: args.threads,
             dna_w_spacer_len: args.dna_w_spacer_len,
             mode: args.mode,
-            chunk_size: if args.mode == DemuxMode::DnaOnlyDroplet {
-                200_000
-            } else {
-                DEFAULT_CHUNK_SIZE
-            },
+            chunk_size: DEFAULT_CHUNK_SIZE,
         })
     }
 }
@@ -3277,6 +3044,10 @@ fn run() -> Result<()> {
         droplet_spool.is_none() || args.mode == DemuxMode::DnaOnlyDroplet,
         "staged reads require dna-only-droplet"
     );
+    anyhow::ensure!(
+        args.mode != DemuxMode::DnaOnlyDroplet || droplet_spool.is_some(),
+        "dna-only-droplet requires --droplet-spool from droplet-stage"
+    );
     if args.threads == 0 {
         anyhow::bail!("--threads must be greater than 0");
     }
@@ -3288,14 +3059,8 @@ fn run() -> Result<()> {
         )
         .build_global()
         .context("Cannot initialize Rayon global thread pool")?;
-    if args.count_only {
-        return droplet::count_barcodes(&args);
-    }
     if args.evidence_pairs.is_some() {
-        if let Some(spool) = droplet_spool {
-            return droplet_stage::evidence(&args, &spool);
-        }
-        return droplet::molecule_evidence(&args);
+        return droplet_stage::evidence(&args, droplet_spool.as_deref().unwrap());
     }
     let config = Config::from_args(args)?;
 
@@ -3580,7 +3345,7 @@ fn process_chunk(
             acc.fates.record(TerminalFate::Short);
             continue;
         }
-        let mut result = process_read(
+        let result = process_read(
             r1_seq,
             dna_indices,
             rna_idx,
@@ -3589,9 +3354,6 @@ fn process_chunk(
             dna_w_spacer_len,
             demux_mode,
         );
-        if demux_mode == DemuxMode::DnaOnlyDroplet && result.is_valid && r2_end - r2_start <= 9 {
-            result = ProcResult::rejected(TerminalFate::Short, result.umi);
-        }
         acc.fates.record(result.fate);
         if result.fate == TerminalFate::Short {
             continue;
@@ -3613,21 +3375,17 @@ fn process_chunk(
             result.trim_start,
             result.output_umi(),
             result.is_valid,
-            demux_mode != DemuxMode::DnaOnlyDroplet,
+            true,
         )?;
         write_fastq_record(
             &mut bucket.r2_raw,
             &input.r2_ids[r2_id_start..r2_id_end],
             &input.r2_seqs[r2_start..r2_end],
             &input.r2_quals[r2_start..r2_end],
-            if demux_mode == DemuxMode::DnaOnlyDroplet {
-                9
-            } else {
-                0
-            },
+            0,
             result.output_umi(),
-            demux_mode == DemuxMode::DnaOnlyDroplet,
-            demux_mode != DemuxMode::DnaOnlyDroplet,
+            false,
+            true,
         )?;
     }
     Ok(())
@@ -4422,19 +4180,32 @@ mod droplet_stage {
     }
 
     #[test]
-    fn compact_count_output_matches_u64_reference_including_ties() {
+    fn compact_count_output_preserves_u64_quality_counts_and_tie_order() {
         let root = std::env::temp_dir().join(format!("demux-compact-counts-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let mut old = AHashMap::new(); let mut new = CountTable::default();
-        for (index, count) in [1u64, 254, 255, 256, 999, 999, u32::MAX as u64 + 10].into_iter().enumerate() {
+        let mut counts = CountTable::default();
+        let values = [1u64, 254, 255, 256, 999, 999, u32::MAX as u64 + 10];
+        for (index, count) in values.into_iter().enumerate() {
             let mut key = [b'A'; 17]; key[16] = b'A' + index as u8;
-            let value = droplet::BarcodeCount { count, below_q20: [count / 3; 17], q30: [count - count / 3; 17] };
-            new.merge(key, &value).unwrap(); old.insert(key.to_vec(), value);
+            counts.merge(key, &droplet::BarcodeCount {
+                count, below_q20: [count / 3; 17], q30: [count - count / 3; 17],
+            }).unwrap();
         }
-        droplet::write_counts(old, Default::default(), &root.join("old.tsv"), &root.join("old.json")).unwrap();
-        write_compact_counts(new, Default::default(), &root.join("new.tsv"), &root.join("new.json")).unwrap();
-        assert_eq!(std::fs::read(root.join("old.tsv")).unwrap(), std::fs::read(root.join("new.tsv")).unwrap());
-        assert_eq!(std::fs::read(root.join("old.json")).unwrap(), std::fs::read(root.join("new.json")).unwrap());
+        write_compact_counts(counts, Default::default(), &root.join("counts.tsv"), &root.join("metrics.json")).unwrap();
+        let output = std::fs::read_to_string(root.join("counts.tsv")).unwrap();
+        let mut lines = output.lines();
+        assert_eq!(lines.next(), Some("barcode\tcount\tbelow_q20\tq30"));
+        for index in [6, 4, 5, 3, 2, 1, 0] {
+            let fields: Vec<_> = lines.next().unwrap().split('\t').collect();
+            assert_eq!(fields[0], format!("{}{}", "A".repeat(16), (b'A' + index as u8) as char));
+            assert_eq!(fields[1].parse::<u64>().unwrap(), values[index]);
+            for (field, value) in [(fields[2], values[index] / 3), (fields[3], values[index] - values[index] / 3)] {
+                assert_eq!(field.split(',').map(|n| n.parse::<u64>().unwrap()).collect::<Vec<_>>(), vec![value; 17]);
+            }
+        }
+        assert!(lines.next().is_none());
+        let metrics: droplet::CountMetrics = serde_json::from_slice(&std::fs::read(root.join("metrics.json")).unwrap()).unwrap();
+        assert_eq!(metrics.unique_barcodes, 7);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4442,20 +4213,30 @@ mod droplet_stage {
     fn count_table_rehash_keeps_all_counts_and_global_order() {
         let root = std::env::temp_dir().join(format!("demux-sharded-counts-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let mut expected = AHashMap::new(); let mut actual = CountTable::default();
+        let mut expected = BTreeMap::new(); let mut actual = CountTable::default();
         for i in 0..20_000u64 {
             let mut key = [b'A'; 17]; let mut number = i;
             for base in &mut key { *base = b"AGT"[(number % 3) as usize]; number /= 3; }
             let value = droplet::BarcodeCount { count: i % 1000 + 1, below_q20: [i % 300; 17], q30: [i % 700; 17] };
             actual.merge(key, &value).unwrap(); actual.merge(key, &value).unwrap();
-            expected.insert(key.to_vec(), droplet::BarcodeCount { count: value.count * 2,
-                below_q20: value.below_q20.map(|v| v * 2), q30: value.q30.map(|v| v * 2) });
+            expected.insert(String::from_utf8(key.to_vec()).unwrap(),
+                            (value.count * 2, value.below_q20[0] * 2, value.q30[0] * 2));
         }
         assert_eq!(actual.len(), 20_000); assert!(actual.parts.iter().all(|part| !part.is_empty()));
-        droplet::write_counts(expected, Default::default(), &root.join("old.tsv"), &root.join("old.json")).unwrap();
-        write_compact_counts(actual, Default::default(), &root.join("new.tsv"), &root.join("new.json")).unwrap();
-        assert_eq!(std::fs::read(root.join("old.tsv")).unwrap(), std::fs::read(root.join("new.tsv")).unwrap());
-        assert_eq!(std::fs::read(root.join("old.json")).unwrap(), std::fs::read(root.join("new.json")).unwrap());
+        write_compact_counts(actual, Default::default(), &root.join("counts.tsv"), &root.join("metrics.json")).unwrap();
+        let output = std::fs::read_to_string(root.join("counts.tsv")).unwrap();
+        let mut previous: Option<(u64, String)> = None;
+        for line in output.lines().skip(1) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let (count, low, high) = expected.remove(fields[0]).unwrap();
+            assert_eq!(fields[1].parse::<u64>().unwrap(), count);
+            for (field, value) in [(fields[2], low), (fields[3], high)] {
+                assert_eq!(field.split(',').map(|n| n.parse::<u64>().unwrap()).collect::<Vec<_>>(), vec![value; 17]);
+            }
+            if let Some((n, barcode)) = previous { assert!(n > count || (n == count && barcode.as_str() < fields[0])); }
+            previous = Some((count, fields[0].to_owned()));
+        }
+        assert!(expected.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5459,6 +5240,7 @@ mod droplet_stage {
     }
     pub(super) fn evidence(args: &Args, spool: &Path) -> Result<()> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Pair {
             barcode: String,
             parent: String,
@@ -5469,6 +5251,12 @@ mod droplet_stage {
         let (manifest, blocks) = blocks(spool)?;
         let mut children: AHashMap<Vec<u8>, droplet::Molecules> = AHashMap::new();
         for pair in &pairs {
+            anyhow::ensure!(
+                [&pair.barcode, &pair.parent].into_iter()
+                    .all(|bc| bc.len() == 17 && bc.bytes().all(|b| b"AGT".contains(&b)))
+                    && pair.barcode != pair.parent,
+                "Invalid molecule evidence pair"
+            );
             anyhow::ensure!(
                 children
                     .insert(

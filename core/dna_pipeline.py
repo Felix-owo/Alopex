@@ -15,7 +15,6 @@ from __future__ import annotations
 import stat
 import argparse
 import ast
-import bisect
 import copy
 import csv
 import datetime as dt
@@ -35,7 +34,6 @@ import tempfile
 import time
 import uuid
 import warnings
-from contextlib import ExitStack
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -330,27 +328,56 @@ def read_controller_progress(path: str | Path, offset: int = 0) -> tuple[int, st
     return offset, progress
 
 
-@lru_cache(maxsize=1)
-def _scientific_python_bindings() -> dict[str, ast.AST]:
-    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+def python_ast_bindings(source: str, *, conditional_bindings: bool = False) -> dict[str, ast.AST]:
+    """提取去 docstring 的模块绑定；可选保留条件定义的外围条件，不登记推导式局部变量。"""
+    tree = ast.parse(source)
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str):
                 node.body.pop(0)
     bindings = {}
-    for node in tree.body:
+    def bind(node: ast.AST, owner: ast.AST | None = None) -> None:
+        owner = node if owner is None else owner
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            bindings[node.name] = node
+            bindings[node.name] = owner
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
                 for child in ast.walk(target):
                     if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-                        bindings[child.id] = node
+                        bindings[child.id] = owner
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
-                bindings[alias.asname or alias.name.split(".")[0]] = node
+                bindings[alias.asname or alias.name.split(".")[0]] = owner
+        elif conditional_bindings:
+            for child in ast.iter_child_nodes(node):
+                bind(child, owner)
+
+    for node in tree.body:
+        bind(node)
     return bindings
+
+
+def python_ast_dependencies(
+    bindings: Mapping[str, ast.AST], roots: Sequence[str], *, exclude: Sequence[str] = (),
+) -> dict[str, str]:
+    """收集根绑定及传递依赖的语义 AST；外部符号和调用方排除项不进入身份。"""
+    pending, selected = list(roots), {}
+    excluded = set(exclude)
+    while pending:
+        name = pending.pop()
+        if name in selected or name not in bindings or name in excluded:
+            continue
+        node = bindings[name]
+        selected[name] = ast.dump(node, include_attributes=False)
+        pending.extend(child.id for child in ast.walk(node)
+                       if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load))
+    return selected
+
+
+@lru_cache(maxsize=1)
+def _scientific_python_bindings() -> dict[str, ast.AST]:
+    return python_ast_bindings(Path(__file__).read_text(encoding="utf-8"))
 
 
 @lru_cache(maxsize=None)
@@ -360,15 +387,7 @@ def scientific_code_identity(python: tuple[str, ...] = (), shell: tuple[str, ...
     missing = set(python) - bindings.keys()
     if missing:
         raise ValueError(f"Unknown scientific Python roots: {sorted(missing)}")
-    pending, selected = list(python), {}
-    while pending:
-        name = pending.pop()
-        if name in selected or name not in bindings or name == "effective_cpu_count":
-            continue
-        node = bindings[name]
-        selected[name] = ast.dump(node, include_attributes=False)
-        pending.extend(child.id for child in ast.walk(node)
-                       if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load))
+    selected = python_ast_dependencies(bindings, python, exclude=("effective_cpu_count",))
     shell_code = ""
     if shell:
         identity_env = {key: value for key, value in os.environ.items() if key not in {"BASH_ENV", "ENV"}}
@@ -3572,7 +3591,7 @@ def droplet_design_barcodes() -> frozenset[str]:
 
 def call_droplet_cells(
     counts_path: str | Path, output: str | Path, metrics_path: str | Path,
-    *, r1: Sequence[str | Path] = (), demux_binary: str | Path | None = None, threads: int = 1,
+    *, demux_binary: str | Path | None = None, threads: int = 1,
     spool: str | Path | None = None,
 ) -> None:
     """按固定谷底及质量/共享分子筛查调用，再限定为设计条码并记录被排除的原始身份。"""
@@ -3687,18 +3706,15 @@ def call_droplet_cells(
     try:
         design = droplet_design_barcodes()
         if candidates:
-            if not r1 or demux_binary is None or threads < 1:
-                raise ValueError("Droplet error screening requires raw R1 and demux binary for molecule evidence")
+            if spool is None or demux_binary is None or threads < 1:
+                raise ValueError("Droplet error screening requires staged reads and demux binary for molecule evidence")
             selected = [{key: r[key] for key in ("barcode", "parent")} for r in candidates]
             with tempfile.TemporaryDirectory(prefix=".droplet_evidence.", dir=Path(metrics_path).parent) as tmp:
                 pair_file, evidence_file = Path(tmp) / "pairs.json", Path(tmp) / "molecules.json"
                 pair_file.write_text(json.dumps(selected))
                 command = [str(demux_binary), "--mode", "dna-only-droplet", "--threads", str(threads),
                            "--evidence-pairs", str(pair_file), "--evidence-output", str(evidence_file)]
-                if spool is not None:
-                    command.extend(["--droplet-spool", str(spool)])
-                for path in r1:
-                    command.extend(["--r1", str(path)])
+                command.extend(["--droplet-spool", str(spool)])
                 subprocess.run(command, check=True)
                 evidence = json.loads(evidence_file.read_text())
             if (evidence["signature"] != screen["signature"] or evidence["child_cap"] != screen["child_signature_cap"]
@@ -8043,19 +8059,6 @@ def load_run_snapshot(path: str | Path) -> Mapping[str, object]:
     return payload
 
 
-def snapshot_input_path(snapshot: str | Path, key: str) -> Path:
-    """从 snapshot 返回 config/sample_manifest/barcode_map 的不可变副本路径。"""
-    if key not in {"config", "sample_manifest", "barcode_map"}:
-        raise ValueError(f"unsupported snapshot input key: {key}")
-    manifest = Path(snapshot).expanduser().resolve()
-    payload = load_run_snapshot(manifest)
-    root = manifest.parent
-    record = payload.get("input_copies", {}).get(key)
-    if not isinstance(record, Mapping):
-        raise ValueError(f"run snapshot {key} copy is missing")
-    return root / "inputs" / str(record["snapshot_path"])
-
-
 RUN_MANIFEST_SCHEMA_VERSION = 8
 
 
@@ -9511,10 +9514,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     calling = commands.add_parser("call-droplet-cells", help="按双峰谷底调用 Droplet 细胞。")
     for field in ("counts", "output", "metrics"):
         calling.add_argument("--" + field, required=True)
-    calling.add_argument("--r1", action="append", required=True)
     calling.add_argument("--demux-binary", required=True)
     calling.add_argument("--threads", type=int, default=1)
-    calling.add_argument("--spool")
+    calling.add_argument("--spool", required=True)
     stage_droplet = commands.add_parser("stage-droplet-reads", help="配对解析并提交原始条码暂存与完整计数。")
     for mate in ("r1", "r2"):
         stage_droplet.add_argument("--" + mate, action="append", required=True)
@@ -9724,7 +9726,7 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "call-droplet-cpg":
             call_droplet_cpg(args.bam, args.reference, args.coverage, args.qc, args.mbias, sample=args.sample, scratch=args.scratch, samtools=args.samtools, threads=args.threads)
         elif command == "call-droplet-cells":
-            call_droplet_cells(args.counts, args.output, args.metrics, r1=args.r1, demux_binary=args.demux_binary, threads=args.threads, spool=args.spool)
+            call_droplet_cells(args.counts, args.output, args.metrics, demux_binary=args.demux_binary, threads=args.threads, spool=args.spool)
         elif command == "stage-droplet-reads":
             stage_droplet_reads(args.r1, args.r2, args.spool, args.counts, args.structure,
                                 binary=args.binary, decoder_python=args.decoder_python, threads=args.threads)

@@ -8,7 +8,6 @@ Notebook 经 resolve_notebook_paths / run_qc_processor / load_notebook_qc_frame
 from __future__ import annotations
 
 
-import ast
 import importlib.metadata
 import csv
 import gzip
@@ -33,9 +32,9 @@ from dna_pipeline import (
     load_run_manifest,
     load_run_snapshot,
     sha256_file,
-    snapshot_input_path,
 )
 from dna_pipeline import effective_cpu_count
+from dna_pipeline import python_ast_bindings, python_ast_dependencies
 
 FINAL_MANIFEST = Path("03_results/QC_Results/sample_manifest.tsv")
 
@@ -249,7 +248,7 @@ def load_sealed_qc_context(
 
     input_copies = _mapping(snapshot.get("input_copies"), "snapshot input copies")
     config_copy = _mapping(input_copies.get("config"), "snapshot config copy")
-    snapshot_config_path = snapshot_input_path(snapshot_path, "config")
+    snapshot_config_path = snapshot_path.parent / "inputs" / str(config_copy["snapshot_path"])
     config = load_project_config(snapshot_config_path)
 
     analysis = _mapping(config.get("analysis"), "snapshot config analysis")
@@ -696,14 +695,9 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Rebuild RawAdata.h5ad from sealed CpG inputs.",
     )
     parser.add_argument(
-        "--recompute-methyl-stats",
+        "--recompute-cpg-stats",
         action="store_true",
-        help="Ignore cached methylation statistics.",
-    )
-    parser.add_argument(
-        "--recompute-composition",
-        action="store_true",
-        help="Ignore cached read-composition statistics.",
+        help="Rebuild both methylation and signal-composition statistics from sealed CpG inputs.",
     )
     parser.add_argument(
         "--recompute-gini",
@@ -1669,31 +1663,7 @@ def _raw_adata_schema_mode(out_file: Path) -> str:
 
 def _algorithm_fingerprints() -> dict[str, str]:
 
-    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str):
-                node.body.pop(0)
-    bindings = {}
-
-    def bind(node, owner=None):
-        owner = node if owner is None else owner
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            bindings[node.name] = owner
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-            for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
-                for child in ast.walk(target):
-                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-                        bindings[child.id] = owner
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                bindings[alias.asname or alias.name.split(".")[0]] = owner
-        else:
-            for child in ast.iter_child_nodes(node):
-                bind(child, owner)
-
-    for node in tree.body:
-        bind(node)
+    bindings = python_ast_bindings(Path(__file__).read_text(encoding="utf-8"), conditional_bindings=True)
     versions = {name: importlib.metadata.version(name)
                 for name in ("numpy", "pandas", "scipy", "numba", "snapatac2")}
     roots = {
@@ -1706,15 +1676,7 @@ def _algorithm_fingerprints() -> dict[str, str]:
     }
     fingerprints = {}
     for stage, names in roots.items():
-        pending, selected = list(names), {}
-        while pending:
-            name = pending.pop()
-            if name in selected or name not in bindings or name == "_algorithm_fingerprints":
-                continue
-            node = bindings[name]
-            selected[name] = ast.dump(node, include_attributes=False)
-            pending.extend(child.id for child in ast.walk(node)
-                           if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load))
+        selected = python_ast_dependencies(bindings, names, exclude=("_algorithm_fingerprints",))
         payload = json.dumps({"code": selected, "libraries": versions}, sort_keys=True)
         fingerprints[stage] = hashlib.sha256(payload.encode()).hexdigest()
     return fingerprints
@@ -1910,9 +1872,8 @@ def compute_methylation_statistics(
     chrom_sizes: Mapping[str, int],
     coordinate_base: int,
     workers: int,
-    return_composition: bool = False,
     empty_cpg_sample_ids: set[str] | None = None,
-) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     if len(cpg_files) != len(sample_ids):
         raise ValueError("CpG file count and Sample_ID count differ")
     if not cpg_files:
@@ -1935,8 +1896,6 @@ def compute_methylation_statistics(
     )
     combined = pd.DataFrame.from_records(rows)
     mapping = combined[list(MAPPING_STAT_COLUMNS)].copy()
-    if not return_composition:
-        return mapping
     composition = combined[["Sample_ID", *COMPOSITION_COV_COLS]].copy()
     return mapping, composition
 
@@ -2807,8 +2766,7 @@ def _run_pipeline_impl(
     cfg: RunConfig,
     workers: int,
     recompute_raw_adata: bool,
-    recompute_methyl_stats: bool,
-    recompute_composition: bool,
+    recompute_cpg_stats: bool,
     recompute_gini: bool,
     recompute_tss: bool,
     *,
@@ -2900,11 +2858,10 @@ def _run_pipeline_impl(
     changed = {key for key, value in identity["cache_identities"].items() if previous.get(key) != value}
     if changed:
         _log("Downstream cache identities changed: " + ", ".join(sorted(changed)))
-    recompute_methyl_stats |= "cpg" in changed
-    recompute_composition |= "cpg" in changed
+    recompute_cpg_stats |= "cpg" in changed
     recompute_gini |= "gini" in changed
     recompute_tss |= "tss" in changed
-    if any((recompute_methyl_stats, recompute_composition, recompute_gini, recompute_tss)):
+    if any((recompute_cpg_stats, recompute_gini, recompute_tss)):
         paths.input_identity.unlink(missing_ok=True)
         _fsync_directory(paths.input_identity.parent)
     dt = timer.stop("adata")
@@ -2918,14 +2875,14 @@ def _run_pipeline_impl(
     sample_ids = manifest_sample_ids
     cached_mapping = (
         None
-        if recompute_methyl_stats
+        if recompute_cpg_stats
         else _load_methyl_stats_cache(
             paths.methyl_stats_cache, sample_ids, empty_cpg_sample_ids
         )
     )
     cached_composition = (
         None
-        if recompute_composition
+        if recompute_cpg_stats
         else _validated_composition_cache(
             paths.composition_cache,
             sample_ids,
@@ -2957,7 +2914,6 @@ def _run_pipeline_impl(
             chrom_sizes=_read_chrom_sizes(cfg.ref_fai),
             coordinate_base=_source_cpg_coordinate_base(sealed.cpg_representation),
             workers=workers,
-            return_composition=True,
             empty_cpg_sample_ids=empty_cpg_sample_ids,
         )
         _atomic_write_csv(df_qc, paths.methyl_stats_cache, before_commit=prepare_cache_commit)
@@ -3064,8 +3020,7 @@ def run_pipeline(
     cfg: RunConfig,
     workers: int,
     recompute_raw_adata: bool,
-    recompute_methyl_stats: bool,
-    recompute_composition: bool,
+    recompute_cpg_stats: bool,
     recompute_gini: bool,
     recompute_tss: bool,
     *,
@@ -3079,8 +3034,7 @@ def run_pipeline(
             cfg,
             workers,
             recompute_raw_adata,
-            recompute_methyl_stats,
-            recompute_composition,
+            recompute_cpg_stats,
             recompute_gini,
             recompute_tss,
             sealed_context=sealed_context,
@@ -3140,8 +3094,7 @@ def main() -> None:
         cfg=cfg,
         workers=args.workers,
         recompute_raw_adata=bool(args.recompute_raw_adata),
-        recompute_methyl_stats=bool(args.recompute_methyl_stats),
-        recompute_composition=bool(args.recompute_composition),
+        recompute_cpg_stats=bool(args.recompute_cpg_stats),
         recompute_gini=bool(args.recompute_gini),
         recompute_tss=bool(args.recompute_tss),
         sealed_context=sealed,
@@ -5117,8 +5070,7 @@ def run_qc_processor(
     tss_sample_fraction: float = 0.1,
     tss_sample_seed: int = 0,
     recompute_raw_adata: bool = False,
-    recompute_methyl_stats: bool = False,
-    recompute_composition: bool = False,
+    recompute_cpg_stats: bool = False,
     recompute_gini: bool = False,
     recompute_tss: bool = False,
 ) -> None:
@@ -5155,8 +5107,7 @@ def run_qc_processor(
         command.append("--skip-tss")
     for flag, enabled in (
         ("--recompute-raw-adata", recompute_raw_adata),
-        ("--recompute-methyl-stats", recompute_methyl_stats),
-        ("--recompute-composition", recompute_composition),
+        ("--recompute-cpg-stats", recompute_cpg_stats),
         ("--recompute-gini", recompute_gini),
         ("--recompute-tss", recompute_tss),
     ):

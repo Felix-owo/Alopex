@@ -697,7 +697,7 @@ if PROTOCOL_POLICY.name == "droplet":
                 --spool {output.spool:q} --counts {output.counts:q} --structure {output.structure:q} >> {log:q} 2>&1
             if ! {RULE_PYTHON:q} -m dna_pipeline call-droplet-cells --counts {output.counts:q} \
                 --output {output.cells:q} --metrics {output.metrics:q} \
-                {params.r1_args} --demux-binary {input.binary:q} --threads {threads} \
+                --demux-binary {input.binary:q} --threads {threads} \
                 --spool {output.spool:q} >> {log:q} 2>&1; then
                 cat {output.metrics:q} >> {log:q}
                 exit 1
