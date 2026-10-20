@@ -1,6 +1,6 @@
-# Alopex v15.2 下游 QC 与可视化
+# Alopex v15.3 下游 QC 与可视化
 
-正式源码以 Git tag `v15.2` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
+正式源码以 Git tag `v15.3` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
 
 | 输入边界 | 要求 |
 | --- | --- |
@@ -82,8 +82,18 @@ PY_KERNEL
 | CpG 四列 | `chrom, pos, methyl, unmethyl`；位置与计数为 ASCII 十进制整数，计数非负，coverage 为正且不超过65535 |
 | 位点与 reference | 按 sealed base 和 FAI 校验真实边界；每条染色体位置严格递增，重复/乱序、未知 contig、缺表头、空行或解压失败均拒绝 |
 | 合法空细胞 | 允许仅表头的空 CpG；不把格式失败当作 zero-mapped，缓存命中不重复解压 |
+| 原生导入 | Step 2 只探测表头、首条记录与空表，直接链接原 zst 调用 `snap.pp.import_values(chunk_size=200)`；私有链接目录优先使用 SLURM_TMPDIR/节点临时目录，不可写时回退输出目录，不复制 CpG 内容。不做 Python 全表预扫。完整行/边界/顺序/解压校验随原有 Step 3 统计完成，失败不提交下游完成身份；有效 Raw/统计缓存命中不解压 |
+| 流式统计 | Step 3 在有界文本块中用编译循环完成同一套严格校验和逐行 Kahan 求和；释放 GIL 后采用最多32个工作线程，并按实际 CPU/调用方预算限幅，解码器单线程。跨块保持位点顺序和浮点累计顺序，任务全部退出后恢复 native 线程环境；失败关闭解压进程，不提交完成身份 |
 | contig 分类 | 保留 FAI 全部原名，包括点号、`NA` 与前导零；controls 仅精确匹配 `lambda` / `pUC19`，含其子串的宿主 chr 不算 controls；mt 按 chrM/MT/chrMT 分类，其他 decoy 仅进 total |
 | 身份与缺失 | `Sample_ID/CloneID/PlateID` 按字符串保留 `001`、`NA`、`nan`、`None`；数值列按数值/缺失解析，浮点缓存保持 round-trip 精度 |
+
+
+Notebook 在本地与 HPC 均通过 `run_qc_processor(PATHS)` 启动 `PATHS.pipeline_root/downstream/downstream_qc.py`，
+子进程优先使用同一 Pipeline 的 `conda/current/control/bin` 工具，避免继承 Jupyter 服务的其他 Conda 环境。
+Raw 重建与 CpG 统计统一使用上述已验证方案，无需另设分块参数；第一格的 `Pipeline:` 应指向已更新的源码目录。
+原 Notebook 已完成同资源全库对照；本地通过科学/并发回归，尚无本地2707细胞完整性能测量，不承诺所有平台固定耗时。
+有效缓存仍优先复用；算法身份变化按正常粒度更新缓存，无需重启 kernel 或强制打开重算开关。
+分块和线程实现不改变科学计数、观测零值或缺失值；更大的导入分块需要更多内存。升级说明见[本版 Release](https://github.com/Felix-owo/Alopex/releases/tag/v15.3)。
 
 ### 保存供下游复用的 single-CpG 矩阵
 
@@ -168,7 +178,7 @@ Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对�
 | TAPS controls | lambda 假阳性 / pUC19 转换率为 `sum(mod)/sum(mod+unmod)`，须同时报告观测数；与 QC 位点均值不同，不混用为化学效率 |
 | TAPS Non-CpG | 可判链宿主分子的 CHG/CHH 原始转换率；零观测缺失，未经 SNP/测序错误校正，不能直接解释为真实 mCH 或 cDNA 污染率；High-CpH 为 NaN |
 
-上表保留各指标的分母与零值含义。Doctor 与合成边界回归仅覆盖其测试输入，不代表真实全库科学等价或性能验证。
+上表明确各指标的生物学分母及零值含义。Doctor与合成回归仅覆盖相应输入，不代表真实全库科学等价或性能验证。
 
 | 默认 HQ 条件（同时满足） | 阈值 |
 | --- | --- |
@@ -205,3 +215,5 @@ Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对�
 | 文库映射 | DNA `rna_sample` 留空；RNA 项目 `00_config/dna_rna_library_map.tsv` 指定 DNA/RNA 文库，按完整 CB17 关联 |
 | 细胞集合 | 两边独立 calling/QC；`DNA_RNA_cell_links.csv` 保留双方全集，整合 QC 只含共同且双方 QC 可用的细胞 |
 | 身份冲突 | 文库冲突或错误交付代际失败；不套用孔板的细胞集合相等约束，未配对不补科学零值 |
+
+Droplet两侧独立calling，不要求细胞集合相等；孔板关联仍要求完整细胞集合对应。

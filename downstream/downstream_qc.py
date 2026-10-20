@@ -662,7 +662,6 @@ def source_identity(
 import argparse
 
 
-import multiprocessing
 import os
 import re
 import shutil
@@ -671,7 +670,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from functools import lru_cache
 
@@ -1069,7 +1068,7 @@ RAW_ADATA_SCHEMA_MODE = "strand_resolved_headered_empty_safe"
 RAW_ADATA_ALGORITHM_VERSION = "snapatac2_import_values_native_reference_v2"
 EMPTY_CPG_SENTINEL_CONTIG = "__DNA_PIPELINE_EMPTY__"
 
-MAX_CPG_PROCESS_WORKERS = 32
+MAX_CPG_WORKERS = 32
 _THREAD_LIMIT_ENV_VARS = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -1090,20 +1089,15 @@ def _classify_seq_name(seq: str) -> tuple[bool, bool, bool, bool]:
     return is_lambda, is_puc, is_mt, is_host
 
 
-def _initialize_cpg_worker() -> None:
-
-    for variable in _THREAD_LIMIT_ENV_VARS:
-        os.environ[variable] = "1"
-
-
-def _bounded_process_workers(requested: int, task_count: int) -> int:
+def _bounded_cpg_workers(requested: int, task_count: int) -> int:
 
     if task_count <= 0:
         return 0
-    return min(effective_cpu_count(requested), MAX_CPG_PROCESS_WORKERS, task_count)
+    return min(effective_cpu_count(requested), MAX_CPG_WORKERS, task_count)
 
 
-def _process_map_ordered(function, tasks: list[tuple], worker_count: int) -> list:
+def _thread_map_ordered(function, tasks: list[tuple], worker_count: int) -> list:
+    """编译循环释放 GIL 后共享线程；解码器单线程，完成或失败后恢复父环境。"""
 
     if not tasks:
         return []
@@ -1122,10 +1116,8 @@ def _process_map_ordered(function, tasks: list[tuple], worker_count: int) -> lis
     executor = None
     futures = {}
     try:
-        executor = ProcessPoolExecutor(
+        executor = ThreadPoolExecutor(
             max_workers=worker_count,
-            mp_context=multiprocessing.get_context("spawn"),
-            initializer=_initialize_cpg_worker,
         )
         futures = {
             executor.submit(function, *arguments): index
@@ -1442,6 +1434,20 @@ def make_cpg_peak_matrix(adata, *, peak_file: Path, **kwargs):
     return snap.pp.make_peak_matrix(adata, use_rep=regions, **kwargs)
 
 
+def _make_cpg_import_dir(output_parent: Path) -> Path:
+    """临时链接优先用节点磁盘；不可写时回到输出目录，不复制或改变 CpG 内容。"""
+    local_tmp = "/tmp" if sys.platform.startswith("linux") else tempfile.gettempdir()
+    roots = [Path(root) for root in (os.environ.get("SLURM_TMPDIR"), local_tmp, output_parent)
+             if root]
+    for root in dict.fromkeys(roots):
+        try:
+            return Path(tempfile.mkdtemp(prefix=".snapatac-cpg-input.", dir=str(root)))
+        except OSError:
+            if root == output_parent:
+                raise
+    raise RuntimeError("Cannot create the private CpG import directory")
+
+
 def load_or_create_raw_adata(
     selected_files: list[Path],
     out_file: Path,
@@ -1558,8 +1564,9 @@ def load_or_create_raw_adata(
                 existing.close()
 
     chrom_sizes = _read_chrom_sizes(fai_path) if fai_path is not None and fai_path.exists() else None
+    # sealed CpG 原文件直接交给原生导入，不再用 Python 预扫全库。
     empty_cpg = {sample_id for sample_id, path in sources.items()
-                 if _validate_cpg_input(path, chrom_sizes, source_base)}
+                 if _cpg_table_is_empty(path, chrom_sizes, source_base)}
     sealed_context.assert_current()
     if zero_mapped - empty_cpg:
         raise ValueError("Zero-mapped cells must have an empty current CpG result")
@@ -1568,9 +1575,8 @@ def load_or_create_raw_adata(
         return None, empty_cpg
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    import_dir = Path(
-        tempfile.mkdtemp(prefix=".snapatac-cpg-input.", dir=str(out_file.parent))
-    )
+    import_dir = _make_cpg_import_dir(out_file.parent)
+    _log(f"Raw CpG temporary links: {import_dir}", level="DEBUG")
     temporary = out_file.with_name(
         f".{out_file.stem}.tmp.{os.getpid()}.{time.time_ns()}{out_file.suffix}"
     )
@@ -1598,7 +1604,7 @@ def load_or_create_raw_adata(
             chrom_sizes={chrom: length + source_base for chrom, length in chrom_sizes.items()},
             file=str(temporary),
             backend="hdf5",
-            chunk_size=8,
+            chunk_size=200,
         )
         new_names = [
             linkname2clean.get(
@@ -1758,21 +1764,30 @@ def _iter_cpg_rows(handle, path: Path, chrom_sizes: Mapping[str, int] | None, co
         yield chrom, pos, methyl, unmethyl
 
 
-def _validate_cpg_input(path: Path, chrom_sizes: Mapping[str, int] | None, coordinate_base: int) -> bool:
+def _cpg_table_is_empty(path: Path, chrom_sizes: Mapping[str, int] | None, coordinate_base: int) -> bool:
+    """只探测表头与首条记录；全表格式/解压校验由 CpG 流式统计完成。"""
     process, handle = _open_cpg_text(path)
     stream_error = None
     found_data = False
     try:
-        for _ in _iter_cpg_rows(handle, path, chrom_sizes, coordinate_base):
-            found_data = True
+        rows = _iter_cpg_rows(handle, path, chrom_sizes, coordinate_base)
+        found_data = next(rows, None) is not None
     except BaseException as exc:
         stream_error = exc
-        if process is not None and process.poll() is None:
-            process.terminate()
         raise
     finally:
         handle.close()
-        _finish_cpg_process(process, path, stream_error)
+        # 非空流主动早停，不能把本次关闭管道产生的 SIGPIPE 当成损坏输入。
+        # 空表已读至 EOF，仍必须检查解码器退出，禁止把解压失败当成空细胞。
+        if process is not None and (found_data or stream_error is not None):
+            if process.poll() is None:
+                process.terminate()
+            if process.stderr is not None:
+                process.stderr.read()
+                process.stderr.close()
+            process.wait()
+        else:
+            _finish_cpg_process(process, path, stream_error)
     return not found_data
 
 
@@ -1780,6 +1795,140 @@ def _kahan_add(total: float, correction: float, value: float) -> tuple[float, fl
     adjusted = value - correction
     updated = total + adjusted
     return updated, (updated - total) - adjusted
+
+
+@njit(cache=True, nogil=True)
+def _scan_cpg_summary_block(data, names, offsets, lengths, categories, positions,
+                            coordinate_base, sums, corrections, previous_chrom):
+    # 每块计数在 Python 中累加，避免完整文库的整数累计受 int64 限制。
+    counts = np.zeros(3, dtype=np.int64)
+    coverage = np.zeros(5, dtype=np.int64)
+    cursor = 0
+    line_index = 0
+    while cursor < len(data):
+        start = cursor
+        while cursor < len(data) and data[cursor] != 9 and data[cursor] != 10:
+            cursor += 1
+        if cursor == start or cursor == len(data) or data[cursor] != 9:
+            return counts, coverage, previous_chrom, line_index, 1
+        chrom_end = cursor
+        chrom = previous_chrom
+        if chrom >= 0:
+            if offsets[chrom + 1] - offsets[chrom] != chrom_end - start:
+                chrom = -1
+            else:
+                for j in range(chrom_end - start):
+                    if data[start + j] != names[offsets[chrom] + j]:
+                        chrom = -1
+                        break
+        if chrom < 0:
+            for ref in range(len(lengths)):
+                if offsets[ref + 1] - offsets[ref] != chrom_end - start:
+                    continue
+                same = True
+                for j in range(chrom_end - start):
+                    if data[start + j] != names[offsets[ref] + j]:
+                        same = False
+                        break
+                if same:
+                    chrom = ref
+                    break
+        if chrom < 0:
+            return counts, coverage, previous_chrom, line_index, 2
+        numbers = np.zeros(3, dtype=np.int64)
+        for column in range(3):
+            cursor += 1
+            digit_start = cursor
+            limit = lengths[chrom] - 1 + coordinate_base if column == 0 else 65535
+            value = 0
+            while cursor < len(data) and data[cursor] != 9 and data[cursor] != 10:
+                digit = int(data[cursor]) - 48
+                if digit < 0 or digit > 9:
+                    return counts, coverage, previous_chrom, line_index, 1
+                # 先检查再乘加，长整数/前导零不能绕过范围检查或溢出。
+                if value > (limit - digit) // 10:
+                    return counts, coverage, previous_chrom, line_index, 2
+                value = value * 10 + digit
+                cursor += 1
+            if cursor == digit_start:
+                return counts, coverage, previous_chrom, line_index, 1
+            expected = 9 if column < 2 else 10
+            if cursor >= len(data) or data[cursor] != expected:
+                return counts, coverage, previous_chrom, line_index, 1
+            numbers[column] = value
+        position, methylated, unmethylated = numbers
+        total = methylated + unmethylated
+        if position < coordinate_base or total <= 0 or total > 65535:
+            return counts, coverage, previous_chrom, line_index, 2
+        if position <= positions[chrom]:
+            return counts, coverage, previous_chrom, line_index, 3
+        positions[chrom] = position
+        previous_chrom = chrom
+        category = categories[chrom]
+        coverage[4] += total
+        if category >= 0:
+            coverage[category] += total
+        if category == 0 or category == 1 or category == 3:
+            index = 0 if category == 3 else category + 1
+            counts[index] += 1
+            fraction = 0.0 if methylated == 0 else float(methylated) / float(total)
+            # 不启用 fastmath，不做分块重排/归约；与原逐行 Kahan 运算顺序一致。
+            adjusted = fraction - corrections[index]
+            updated = sums[index] + adjusted
+            corrections[index] = (updated - sums[index]) - adjusted
+            sums[index] = updated
+        cursor += 1
+        line_index += 1
+    return counts, coverage, previous_chrom, line_index, 0
+
+
+def _compiled_cpg_summary(handle, path, chrom_sizes, coordinate_base):
+    """有界文本块中校验并汇总原始 CpG；跨块保持逐染色体顺序及补偿求和状态。"""
+    if handle.readline().rstrip("\n") != "chrom\tpos\tmethyl\tunmethyl":
+        raise ValueError(f"CpG input has an invalid header: {path}")
+    encoded = [chrom.encode("utf-8") for chrom in chrom_sizes]
+    names = np.frombuffer(b"".join(encoded), dtype=np.uint8)
+    offsets = np.array([0, *np.cumsum([len(value) for value in encoded])], dtype=np.int64)
+    lengths = np.array(list(chrom_sizes.values()), dtype=np.int64)
+    categories = []
+    for chrom in chrom_sizes:
+        is_lambda, is_puc, is_mt, is_host = _classify_seq_name(chrom)
+        categories.append(0 if is_lambda else 1 if is_puc else 2 if is_mt else 3 if is_host else -1)
+    categories = np.array(categories, dtype=np.int64)
+    positions = np.full(len(lengths), -1, dtype=np.int64)
+    sums = np.zeros(3, dtype=np.float64)
+    corrections = np.zeros(3, dtype=np.float64)
+    counts = [0, 0, 0]
+    coverage = [0, 0, 0, 0, 0]
+    pending = ""
+    previous_chrom = -1
+    line_no = 2
+    while True:
+        text = handle.read(4 * 1024 * 1024)
+        if text:
+            pending += text
+            end = pending.rfind("\n")
+            if end < 0:
+                continue
+            block, pending = pending[:end + 1], pending[end + 1:]
+        elif pending:
+            block, pending = pending + "\n", ""
+        else:
+            break
+        data = np.frombuffer(block.encode("utf-8"), dtype=np.uint8)
+        batch_counts, batch_coverage, previous_chrom, lines, error = _scan_cpg_summary_block(
+            data, names, offsets, lengths, categories, positions, coordinate_base,
+            sums, corrections, previous_chrom,
+        )
+        if error:
+            detail = "duplicate or out-of-order CpG position" if error == 3 else "invalid CpG fields or coordinate/counts"
+            raise ValueError(f"{path}:{line_no + lines}: {detail}")
+        counts = [a + int(b) for a, b in zip(counts, batch_counts)]
+        coverage = [a + int(b) for a, b in zip(coverage, batch_coverage)]
+        line_no += lines
+    return dict(zip(("host", "lambda", "pUC19"), counts)), dict(zip(("host", "lambda", "pUC19"), sums)), dict(zip(
+        ("lambda_cov", "puc19_cov", "mt_cov", "host_cov", "total_cov"), coverage,
+    ))
 
 
 def _stream_one_cpg_summary(
@@ -1805,37 +1954,40 @@ def _stream_one_cpg_summary(
     process, handle = _open_cpg_text(path)
     stream_error: BaseException | None = None
     try:
-        for chrom, position, methylated, unmethylated in _iter_cpg_rows(
-            handle, path, chrom_sizes, coordinate_base
-        ):
-            total = methylated + unmethylated
-            is_lambda_comp, is_puc_comp, is_mt_comp, is_host_comp = (
-                _classify_seq_name(chrom)
-            )
-            coverage["total_cov"] += total
-            if is_lambda_comp:
-                coverage["lambda_cov"] += total
-            elif is_puc_comp:
-                coverage["puc19_cov"] += total
-            elif is_mt_comp:
-                coverage["mt_cov"] += total
-            elif is_host_comp:
-                coverage["host_cov"] += total
+        if chrom_sizes is not None:
+            counts, fraction_sums, coverage = _compiled_cpg_summary(handle, path, chrom_sizes, coordinate_base)
+        else:
+            for chrom, position, methylated, unmethylated in _iter_cpg_rows(
+                handle, path, chrom_sizes, coordinate_base
+            ):
+                total = methylated + unmethylated
+                is_lambda_comp, is_puc_comp, is_mt_comp, is_host_comp = (
+                    _classify_seq_name(chrom)
+                )
+                coverage["total_cov"] += total
+                if is_lambda_comp:
+                    coverage["lambda_cov"] += total
+                elif is_puc_comp:
+                    coverage["puc19_cov"] += total
+                elif is_mt_comp:
+                    coverage["mt_cov"] += total
+                elif is_host_comp:
+                    coverage["host_cov"] += total
 
-            category = (
-                "lambda" if is_lambda_comp else "pUC19" if is_puc_comp else "host" if is_host_comp else None
-            )
-            if category is None:
-                continue
-            counts[category] += 1
-            fraction = (
-                0.0 if methylated == 0 else float(methylated) / float(total)
-            )
-            fraction_sums[category], fraction_corrections[category] = _kahan_add(
-                fraction_sums[category],
-                fraction_corrections[category],
-                fraction,
-            )
+                category = (
+                    "lambda" if is_lambda_comp else "pUC19" if is_puc_comp else "host" if is_host_comp else None
+                )
+                if category is None:
+                    continue
+                counts[category] += 1
+                fraction = (
+                    0.0 if methylated == 0 else float(methylated) / float(total)
+                )
+                fraction_sums[category], fraction_corrections[category] = _kahan_add(
+                    fraction_sums[category],
+                    fraction_corrections[category],
+                    fraction,
+                )
     except BaseException as exc:
         stream_error = exc
         if process is not None and process.poll() is None:
@@ -1881,12 +2033,12 @@ def compute_methylation_statistics(
     empty_cpg = {str(value) for value in (empty_cpg_sample_ids or set())}
     if empty_cpg - set(map(str, sample_ids)):
         raise ValueError("Empty-CpG Sample_ID set differs from CpG inputs")
-    worker_count = _bounded_process_workers(workers, len(cpg_files))
+    worker_count = _bounded_cpg_workers(workers, len(cpg_files))
     _log(
         f"正在从 CpG 表流式提取统计信息 (workers: {worker_count})...",
         level="DEBUG",
     )
-    rows = _process_map_ordered(
+    rows = _thread_map_ordered(
         _stream_one_cpg_summary,
         [
             (path, sample_id, chrom_sizes, coordinate_base, str(sample_id) in empty_cpg)
@@ -5114,6 +5266,8 @@ def run_qc_processor(
         if enabled:
             command.append(flag)
     environment = os.environ.copy()
+    # 使用本 Pipeline 已构建的解码工具，避免继承 Jupyter 服务的其他 Conda 环境。
+    environment["PATH"] = str(paths.pipeline_root / "conda/current/control/bin") + os.pathsep + environment.get("PATH", "")
     for variable in _THREAD_LIMIT_ENV_VARS:
         environment[variable] = worker_count
     _log(f"启动 QC Processor 子进程: {processor}")
