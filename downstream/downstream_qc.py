@@ -2345,16 +2345,36 @@ def _read_tss_offset_map(
     return pd.Series(values.astype(np.int32), index=region_keys, name="position_coarse")
 
 
+@njit
+def _mark_tss_covered_bits(bits, indices, reference_size):
+    """只按稀疏索引标记真实观测，不读取甲基化值或改变零值含义。"""
+    for index in indices:
+        if index < 0 or index >= reference_size:
+            raise ValueError('Raw CpG index is outside the reference')
+        bits[index >> 3] |= np.uint8(1 << (index & 7))
+
+
 def _tss_covered_positions(raw_adata) -> tuple[np.ndarray, dict[str, tuple[int, int]]]:
-    covered = np.empty(0, dtype=np.int64)
-    for matrix, _, _ in raw_adata.obsm.el("__values__").chunked(4):
-        covered = np.union1d(covered, matrix.indices)
+    """按原生全局索引构建覆盖并集，避免逐批重排已累计的位点。"""
     ranges = {}
     offset = 0
-    reference = raw_adata.uns["reference_sequences"]
-    for chrom, length in zip(reference["reference_seq_name"], reference["reference_seq_length"], strict=True):
-        ranges[str(chrom)] = (offset, int(length))
-        offset += int(length)
+    reference = raw_adata.uns['reference_sequences']
+    for chrom, length in zip(reference['reference_seq_name'], reference['reference_seq_length'], strict=True):
+        length = int(length)
+        if length < 0:
+            raise ValueError('Raw reference length must be nonnegative')
+        ranges[str(chrom)] = (offset, length)
+        offset += length
+    bits = np.zeros((offset + 7) // 8, dtype=np.uint8)
+    for matrix, _, _ in raw_adata.obsm.el('__values__').chunked(4):
+        _mark_tss_covered_bits(bits, matrix.indices, offset)
+    parts = []
+    # 分块展开，避免为整个人类基因组创建字节级稠密布尔数组。
+    for start in range(0, len(bits), 1 << 20):
+        part = np.flatnonzero(np.unpackbits(bits[start:start + (1 << 20)], bitorder='little'))
+        if part.size:
+            parts.append(part.astype(np.int64, copy=False) + start * 8)
+    covered = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
     return covered, ranges
 
 
@@ -2454,6 +2474,42 @@ def _validated_tss_cache(
         return None
 
 
+@njit
+def _coverage_bins_from_csr(indptr, indices, data, chrom_offsets, bin_offsets, bin_size, base):
+    """按原生 reference 顺序分箱，保持原生逐观测 float32 coverage 累加。"""
+    # 只存观测分箱；小 bin 也不能按整个基因组长度分配稠密数组。
+    capacity = min(len(data), (len(indptr) - 1) * bin_offsets[-1])
+    values = np.empty(capacity, dtype=np.float32)
+    bins = np.empty(capacity, dtype=np.int64)
+    rows = np.zeros(len(indptr), dtype=np.int64)
+    used = 0
+    for row in range(len(indptr) - 1):
+        chrom = 0
+        previous = -1
+        for k in range(indptr[row], indptr[row + 1]):
+            index = indices[k]
+            while chrom + 1 < len(chrom_offsets) and index >= chrom_offsets[chrom + 1]:
+                chrom += 1
+            if chrom + 1 >= len(chrom_offsets):
+                raise ValueError("Raw CpG index is outside the reference")
+            pos = index - chrom_offsets[chrom] - base
+            if pos < 0:
+                raise ValueError("Raw CpG index is outside the configured coordinate base")
+            target = bin_offsets[chrom] + pos // bin_size
+            coverage = np.float32(data[k] & 0xffff)
+            if target != previous:
+                if target < previous:
+                    raise ValueError("Raw CpG bins are not ordered")
+                bins[used] = target
+                values[used] = coverage
+                used += 1
+                previous = target
+            else:
+                values[used - 1] = np.float32(values[used - 1] + coverage)
+        rows[row + 1] = used
+    return rows, bins[:used], values[:used]
+
+
 def compute_gini_index(
     raw_adata: ad.AnnData,
     bin_size: int,
@@ -2479,75 +2535,58 @@ def compute_gini_index(
         _log("Gini Index 缓存不符合当前样本/数值契约，重新计算", level="WARNING")
 
     _log(f"开始计算 Gini Index (Bin Size: {bin_size})", level="INFO")
-    temporary = cache_path.with_name(
-        f".gini-tiles.{os.getpid()}.{time.time_ns()}.h5ad"
+    base = _raw_cpg_coordinate_base(raw_adata)
+    reference = raw_adata.uns["reference_sequences"]
+    lengths = np.asarray(reference["reference_bp_length"].to_list(), dtype=np.int64)
+    chrom_offsets = np.concatenate((np.array([0], dtype=np.int64),
+                                    np.cumsum(lengths + base)))
+    bin_offsets = np.concatenate((np.array([0], dtype=np.int64),
+                                  np.cumsum((lengths + bin_size - 1) // bin_size)))
+    out = np.full(raw_adata.n_obs, np.nan, dtype=np.float64)
+    # 直接消费 backed CSR，避免逐位点创建区间对象及临时 tile HDF5 的往返 I/O。
+    # 只保留观测分箱；不把无 coverage 的缺失分箱补成零，也不丢弃零甲基化位点。
+    for matrix, start, end in tqdm(
+        raw_adata.obsm.el("__values__").chunked(4),
+        total=(raw_adata.n_obs + 3) // 4, desc="Gini Index",
+    ):
+        rows, _, counts = _coverage_bins_from_csr(
+            matrix.indptr, matrix.indices, matrix.data,
+            chrom_offsets, bin_offsets, bin_size, base,
+        )
+        for local_index in range(end - start):
+            values = counts[rows[local_index]:rows[local_index + 1]]
+            if values.size:
+                out[start + local_index] = _gini_from_sorted_positive(
+                    np.sort(values.astype(np.float64, copy=False))
+                )
+    s = pd.Series(out, index=np.asarray(raw_adata.obs_names, dtype=str), name="Gini_Index")
+    result = _require_exact_sample_ids(
+        pd.DataFrame({"Sample_ID": s.index, "Gini_Index": s.values}),
+        expected_sample_ids,
+        "Computed Gini statistics",
     )
-    adata_bin = None
-    try:
-        base = _raw_cpg_coordinate_base(raw_adata)
-        if base == 0:
-            adata_bin = snap.pp.add_tile_matrix(
-                raw_adata, bin_size=bin_size, value_type="total", summary_type="sum",
-                exclude_chroms=[], inplace=False, file=str(temporary), backend="hdf5", chunk_size=4,
-            )
-        else:
-            reference = raw_adata.uns["reference_sequences"]
-            regions = [f"{chrom}:{start + base}-{min(start + bin_size, int(length)) + base}"
-                       for chrom, length in zip(reference["reference_seq_name"], reference["reference_bp_length"], strict=True)
-                       for start in range(0, int(length), bin_size)]
-            adata_bin = snap.pp.make_peak_matrix(
-                raw_adata, use_rep=regions, value_type="total", summary_type="sum",
-                inplace=False, file=str(temporary), backend="hdf5", chunk_size=4,
-            )
-        out = np.full(adata_bin.n_obs, np.nan, dtype=np.float64)
-        for matrix, start, end in tqdm(
-            adata_bin.chunked_X(4),
-            total=(adata_bin.n_obs + 3) // 4,
-            desc="Gini Index",
-        ):
-            matrix = matrix.tocsr(copy=False)
-            for local_index in range(end - start):
-                lo = matrix.indptr[local_index]
-                hi = matrix.indptr[local_index + 1]
-                values = matrix.data[lo:hi]
-                if values.size:
-                    out[start + local_index] = _gini_from_sorted_positive(
-                        np.sort(values.astype(np.float64, copy=False))
-                    )
-        s = pd.Series(
-            out, index=np.asarray(adata_bin.obs_names, dtype=str), name="Gini_Index"
+    values = pd.to_numeric(result["Gini_Index"], errors="raise").to_numpy(
+        dtype=float
+    )
+    if (
+        np.isinf(values).any()
+        or (values[np.isfinite(values)] < 0).any()
+        or (values[np.isfinite(values)] > 1).any()
+    ):
+        raise ValueError(
+            "Computed Gini values must be within [0, 1] when defined"
         )
-        result = _require_exact_sample_ids(
-            pd.DataFrame({"Sample_ID": s.index, "Gini_Index": s.values}),
-            expected_sample_ids,
-            "Computed Gini statistics",
-        )
-        values = pd.to_numeric(result["Gini_Index"], errors="raise").to_numpy(
-            dtype=float
-        )
-        if (
-            np.isinf(values).any()
-            or (values[np.isfinite(values)] < 0).any()
-            or (values[np.isfinite(values)] > 1).any()
-        ):
-            raise ValueError(
-                "Computed Gini values must be within [0, 1] when defined"
-            )
-        empty_mask = result["Sample_ID"].astype(str).isin(empty_cpg_sample_ids)
-        if not np.isnan(values[empty_mask]).all() or not np.isfinite(
-            values[~empty_mask]
-        ).all():
-            raise ValueError("Computed Gini missingness differs from empty-CpG cells")
-        _atomic_write_csv(result, cache_path, before_commit=before_commit)
-        return pd.Series(
-            values,
-            index=result["Sample_ID"].astype(str),
-            name="Gini_Index",
-        )
-    finally:
-        if adata_bin is not None:
-            adata_bin.close()
-        temporary.unlink(missing_ok=True)
+    empty_mask = result["Sample_ID"].astype(str).isin(empty_cpg_sample_ids)
+    if not np.isnan(values[empty_mask]).all() or not np.isfinite(
+        values[~empty_mask]
+    ).all():
+        raise ValueError("Computed Gini missingness differs from empty-CpG cells")
+    _atomic_write_csv(result, cache_path, before_commit=before_commit)
+    return pd.Series(
+        values,
+        index=result["Sample_ID"].astype(str),
+        name="Gini_Index",
+    )
 
 
 def _validate_tss_sampling(fraction: float, seed: int) -> None:
@@ -2588,6 +2627,26 @@ def _select_tss_cells(df_qc: pd.DataFrame, fraction: float, seed: int) -> tuple[
         "sample_ids": selected_ids,
         "clones": clone_counts,
     }
+
+
+def _copy_tss_cells(raw_adata, indices: list[int], out: Path):
+    """只读取抽中行的原始稀疏整数记录，建立供 TSS 消费的 backed 副本。"""
+    from scipy.sparse import vstack
+
+    # 原生离散行 subset 会先解压整个 CSR；连续 slice 则只读取该行。
+    # 不解码、聚合或重编码 packed counts，保留索引、观测零值与行顺序。
+    values = raw_adata.obsm.el("__values__")
+    selected = vstack([values[index:index + 1, :] for index in indices], format="csr")
+    obs = raw_adata.obs[:].to_pandas().iloc[indices].copy()
+    names = list(raw_adata.obs_names)
+    obs.index = [names[index] for index in indices]
+    result = snap.AnnData(
+        filename=str(out), backend="hdf5", obs=obs,
+        obsm={"__values__": selected},
+        uns={name: raw_adata.uns[name] for name in raw_adata.uns.keys()},
+    )
+    result.obs_names = obs.index.to_list()
+    return result
 
 
 def compute_tss_profile(
@@ -2648,8 +2707,10 @@ def compute_tss_profile(
                 backend="hdf5",
                 chunk_size=4,
             )
+            # 汇总批次包含完整细胞，减少小批分组与HDF5往返，不跨细胞合并科学统计。
             return _aggregate_tss_matrix(
-                matrix, pos_series, value_name, aggregate, chunk_size=4
+                matrix, pos_series, value_name, aggregate,
+                chunk_size=4 if selected_raw is not None else 64,
             )
         finally:
             try:
@@ -2665,14 +2726,28 @@ def compute_tss_profile(
         if len(raw_ids) != len(set(raw_ids)) or expected_sample_ids - set(raw_ids):
             raise ValueError("TSS Sample_ID set differs from RawAdata")
         if expected_sample_ids != set(raw_ids):
-            selected_raw = raw_adata.subset(
-                obs_indices=[index for index, sid in enumerate(raw_ids) if sid in expected_sample_ids],
-                out=str(subset_file), inplace=False, backend="hdf5",
+            selected_raw = _copy_tss_cells(
+                raw_adata,
+                [index for index, sid in enumerate(raw_ids) if sid in expected_sample_ids],
+                subset_file,
             )
             raw_adata = selected_raw
-        covered, ranges = _tss_covered_positions(raw_adata)
-        pos_series = _read_tss_offset_map(tss_bed_path, _raw_cpg_coordinate_base(raw_adata),
-                                        covered_positions=covered, reference_ranges=ranges)
+        # 抽检时筛去未观测区间能降低两次原生矩阵开销；全库不再为此额外扫描所有记录。
+        if selected_raw is not None:
+            covered, ranges = _tss_covered_positions(raw_adata)
+            pos_series = _read_tss_offset_map(
+                tss_bed_path, _raw_cpg_coordinate_base(raw_adata),
+                covered_positions=covered, reference_ranges=ranges,
+            )
+        else:
+            pos_series = _read_tss_offset_map(tss_bed_path, _raw_cpg_coordinate_base(raw_adata))
+            reference = raw_adata.uns['reference_sequences']
+            indexed_lengths = dict(zip(reference['reference_seq_name'], reference['reference_seq_length'], strict=True))
+            # 原生矩阵仍只接收实际reference内的区间；不额外读取Raw来筛空区间。
+            pos_series = pos_series.loc[
+                [chrom in indexed_lengths and int(span.split('-')[0]) < int(indexed_lengths[chrom])
+                 for chrom, span in (region.rsplit(':', 1) for region in pos_series.index)]
+            ]
         tss_regions = pos_series.index.to_list()
         if not tss_regions:
             prof = pd.DataFrame(columns=TSS_REQUIRED_COLUMNS)

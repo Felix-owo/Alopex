@@ -1,6 +1,6 @@
-# Alopex v15.3 下游 QC 与可视化
+# Alopex v15.4 下游 QC 与可视化
 
-正式源码以 Git tag `v15.3` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
+正式源码以 Git tag `v15.4` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
 
 | 输入边界 | 要求 |
 | --- | --- |
@@ -93,7 +93,7 @@ Notebook 在本地与 HPC 均通过 `run_qc_processor(PATHS)` 启动 `PATHS.pipe
 Raw 重建与 CpG 统计统一使用上述已验证方案，无需另设分块参数；第一格的 `Pipeline:` 应指向已更新的源码目录。
 原 Notebook 已完成同资源全库对照；本地通过科学/并发回归，尚无本地2707细胞完整性能测量，不承诺所有平台固定耗时。
 有效缓存仍优先复用；算法身份变化按正常粒度更新缓存，无需重启 kernel 或强制打开重算开关。
-分块和线程实现不改变科学计数、观测零值或缺失值；更大的导入分块需要更多内存。升级说明见[本版 Release](https://github.com/Felix-owo/Alopex/releases/tag/v15.3)。
+分块和线程实现不改变科学计数、观测零值或缺失值；更大的导入分块需要更多内存。升级说明见[本版 Release](https://github.com/Felix-owo/Alopex/releases/tag/v15.4)。
 
 ### 保存供下游复用的 single-CpG 矩阵
 
@@ -118,7 +118,7 @@ Raw 重建与 CpG 统计统一使用上述已验证方案，无需另设分块�
 | single-CpG BED | `resources/<genome>_reference/cpg/<genome>.single_cpg.bed.gz`，BED3 / 0-based half-open `[C, G+1)`，不含 lambda/pUC19 |
 | 资源分发 | 生成的 `resources/*_reference/` 留在目标平台，不进入源码包或强制提交 Git |
 | 外部资源 | CLI `--tss-bed /path/to/genome_TSS_2000_2000_20.bed` 或 Notebook `TSS_BED`；须匹配 sealed reference build |
-| BED 校验 | genomic interval 非负整数、非空且唯一，第9列 offset 为有限32-bit整数；先检查全部行，再筛实际覆盖 |
+| BED 校验 | genomic interval 非负整数、非空且唯一，第9列 offset 为有限32-bit整数；先检查全部行，再限制原生reference范围；实际抽检子集另筛无覆盖区间，全检不额外预扫描Raw |
 | 显式跳过 | `--skip-tss` 或 `SKIP_TSS=True`；清理该交付旧 TSS CSV/PDF，避免把旧曲线当作新结果 |
 
 Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对应 CLI `--tss-sample-fraction` / `--tss-sample-seed`。比例须有限且在 `(0,1]`，种子为非负整数。
@@ -137,6 +137,8 @@ Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对�
 | 抽检记录 | `.cache/DNAme_QC_Input_Identity.json` 的 `tss_sampling` 保存方法、比例、种子、逐克隆数量与选中 ID |
 | profile 行数 | CSV 仅记录选中且有覆盖的 bins，细胞数可小于抽检数；全体无覆盖时仅表头 CSV 合法并可复用，旧 PDF 清理 |
 | 零值与坐标 | 有 coverage 而甲基化为0仍保留；无覆盖不补0。区间自动适配 sealed base，标准 BED 不变，相对 TSS 距离不加减1 |
+
+抽检副本只读取选中细胞的 CSR 行切片，保留原始整数记录、全局位点索引和原生 reference 顺序，再交给原生 TSS 矩阵计算；避免离散行 `subset` 先把全库解压到内存。复制内存随抽中细胞的实际观测数增长，完整库仍用已有 backed Raw；不需要新增资源参数或修改 Notebook。抽检采用有界覆盖筛选，全检免去额外覆盖预扫描；计算方式不改变抽样名单或科学结果。
 
 ## 输出
 
@@ -172,7 +174,7 @@ Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对�
 | QC 甲基化率 | 宿主、lambda、pUC19 分别对已覆盖位点的 `m/(m+u)` 取均值再×100；无观测为 NaN，不是合并 reads 的比例 |
 | SingleCpG | 参考区间内已覆盖位点的 fraction 均值；如 `1/4` 与 `9/12` 的均值为0.5，不是 `10/16`；有覆盖全 unmethyl 保显式0，缺覆盖不补0 |
 | TSS | 每个 offset 对有覆盖 bins 的 fraction 取均值；count 为甲基化信号之和，不是 read pairs 或总 coverage |
-| Gini | 用有覆盖 bins 的 `m+u`，不纳入未覆盖 bins；有 coverage 的零甲基化不等同缺失 |
+| Gini | 流式读取 backed CSR，以原生 float32 顺序累加有覆盖 bins 的 `m+u`，省去临时分箱矩阵；不纳入未覆盖 bins，有 coverage 的零甲基化不等同缺失。计算公式、原生reference顺序与观测零值含义保持不变 |
 | 信号组成 | host/lambda/pUC19/mtDNA coverage 各除以全部 contig 的总 coverage 再×100，其他 decoy 只进分母；不是位点比例 |
 | 原生 mapping | 各 backend 单位/分母不同，不视为同义指标或默认跨 backend HQ 阈值 |
 | TAPS controls | lambda 假阳性 / pUC19 转换率为 `sum(mod)/sum(mod+unmod)`，须同时报告观测数；与 QC 位点均值不同，不混用为化学效率 |
