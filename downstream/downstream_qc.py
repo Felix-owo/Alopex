@@ -14,6 +14,7 @@ import gzip
 import hashlib
 import json
 import sys
+from collections.abc import Callable
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -1303,6 +1304,64 @@ def _raw_adata_schema_matches(
     )
 
 
+def _invalidate_completion(path: Path) -> None:
+    """替换任一缓存之前撤销旧完成身份；失败由下一次 Processor 恢复。"""
+    if path.exists():
+        path.unlink()
+        _fsync_directory(path.parent)
+
+
+@dataclass(frozen=True)
+class CompletedQCContext:
+    """一次加载的完整 QC 身份；消费者复用元数据，只在边界复验文件状态。"""
+
+    raw_schema: Mapping[str, Any]
+    algorithms: Mapping[str, str]
+    sample_ids: tuple[str, ...]
+    assert_current: Callable[[], None]
+
+
+def _require_completed_qc(paths: RunPaths, sealed: SealedQCContext) -> CompletedQCContext:
+    """统一核对 QC 与 Raw 的交付、算法及细胞集合，保留提交前复验边界。"""
+    try:
+        marker_state = _delivery_marker_state(paths.input_identity)
+        identity = json.loads(paths.input_identity.read_text())
+        schema_path = paths.raw_adata.with_name("RawAdata.input_schema.json")
+        schema_state = _delivery_marker_state(schema_path)
+        raw_schema = json.loads(schema_path.read_text())
+        sample_ids = tuple(cell["sample_id"] for cell in read_active_cells(
+            paths.project_dir, sealed_context=sealed))
+        algorithms = _algorithm_fingerprints()
+        if (not paths.qc_info.is_file()
+                or any(identity.get(key) != getattr(sealed, key) for key in
+                ("delivery_id", "snapshot_id", "run_manifest_sha256", "snapshot_config_sha256"))
+                or identity.get("raw_generation") != raw_schema.get("generation_id")
+                or identity.get("algorithms") != {k: v for k, v in algorithms.items() if k != "single"}
+                or not _raw_adata_schema_matches(paths.raw_adata, raw_schema)
+                or raw_schema.get("algorithm_sha256") != algorithms["raw"]
+                or raw_schema.get("delivery_id") != sealed.delivery_id
+                or raw_schema.get("snapshot_id") != sealed.snapshot_id
+                or raw_schema.get("source_cpg_representation") != sealed.cpg_representation
+                or len(raw_schema["sample_ids"]) != len(sample_ids)
+                or set(raw_schema["sample_ids"]) != set(sample_ids)):
+            raise ValueError("stale completion identity")
+        raw_state = dict(raw_schema["h5ad"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise ValueError("QC is incomplete or stale; rerun the QC Processor") from exc
+
+    def assert_current():
+        sealed.assert_current()
+        try:
+            if (_delivery_marker_state(paths.input_identity) != marker_state
+                    or _delivery_marker_state(schema_path) != schema_state
+                    or _raw_adata_stat_binding(paths.raw_adata) != raw_state):
+                raise ValueError("QC completion changed; rerun the QC Processor")
+        except OSError as exc:
+            raise ValueError("QC completion changed; rerun the QC Processor") from exc
+    assert_current()
+    return CompletedQCContext(raw_schema, algorithms, sample_ids, assert_current)
+
+
 def _publish_raw_adata_generation(
     temporary: Path,
     out_file: Path,
@@ -1310,6 +1369,7 @@ def _publish_raw_adata_generation(
     input_signature: dict,
     *,
     generation_id: str | None = None,
+    before_commit=None,
 ) -> dict:
 
 
@@ -1323,8 +1383,9 @@ def _publish_raw_adata_generation(
         raise ValueError("RawAdata generation_id must be 32 lowercase hex characters")
 
     _fsync_file(temporary)
-    schema_file.unlink(missing_ok=True)
-    _fsync_directory(out_file.parent)
+    if before_commit is not None:
+        before_commit()
+    _invalidate_completion(schema_file)
     os.replace(temporary, out_file)
     _fsync_directory(out_file.parent)
 
@@ -1333,7 +1394,7 @@ def _publish_raw_adata_generation(
         "generation_id": generation_id,
         "h5ad": _raw_adata_stat_binding(out_file),
     }
-    _atomic_write_json(schema_payload, schema_file)
+    _atomic_write_json(schema_payload, schema_file, before_commit=before_commit)
     return schema_payload
 
 
@@ -1458,6 +1519,7 @@ def load_or_create_raw_adata(
     zero_mapped_sample_ids: set[str],
     sealed_context: SealedQCContext,
     cpg_output_identities: Mapping[str, Mapping[str, object]],
+    before_rebuild=None,
 ):
     """按 sealed 坐标导入 CpG，保留原生染色体索引顺序并按名称补充真实长度。
 
@@ -1563,6 +1625,8 @@ def load_or_create_raw_adata(
             if existing is not None:
                 existing.close()
 
+    if before_rebuild is not None:
+        before_rebuild()
     chrom_sizes = _read_chrom_sizes(fai_path) if fai_path is not None and fai_path.exists() else None
     # sealed CpG 原文件直接交给原生导入，不再用 Python 预扫全库。
     empty_cpg = {sample_id for sample_id, path in sources.items()
@@ -1637,7 +1701,8 @@ def load_or_create_raw_adata(
         snap_data = None
         sealed_context.assert_current()
         _publish_raw_adata_generation(
-            temporary, out_file, schema_file, input_signature
+            temporary, out_file, schema_file, input_signature,
+            before_commit=sealed_context.assert_current,
         )
     finally:
         if snap_data is not None:
@@ -3013,9 +3078,7 @@ def _run_pipeline_impl(
     def prepare_cache_commit():
         # 自动修复缓存也须撤旧身份；交付换代后不得提交本次计算结果。
         sealed.assert_current()
-        if paths.input_identity.exists():
-            paths.input_identity.unlink()
-            _fsync_directory(paths.input_identity.parent)
+        _invalidate_completion(paths.input_identity)
 
     records = build_qc_records(paths.project_dir, sealed_context=sealed)
     extra_identity_files = {"reference_fai": cfg.ref_fai}
@@ -3034,6 +3097,15 @@ def _run_pipeline_impl(
     if dt is not None:
         _log(f"  done: {dt:.2f}s")
 
+    previous = {}
+    if paths.input_identity.is_file():
+        try:
+            previous = json.loads(paths.input_identity.read_text(encoding="utf-8"))["cache_identities"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    if not isinstance(previous, dict):
+        previous = {}
+
     timer.start("adata")
     _log("Step 2/6: CpG -> AnnData")
     raw_adata = None
@@ -3050,6 +3122,7 @@ def _run_pipeline_impl(
         zero_mapped_sample_ids=zero_mapped_sample_ids,
         sealed_context=sealed,
         cpg_output_identities=cpg_output_identities,
+        before_rebuild=prepare_cache_commit,
     )
     if raw_adata is not None:
         _raw_adata_owner.append(raw_adata)
@@ -3073,15 +3146,9 @@ def _run_pipeline_impl(
     identity["raw_generation"] = json.loads(
         paths.raw_adata.with_name("RawAdata.input_schema.json").read_text(encoding="utf-8")
     )["generation_id"]
-    identity["cache_identities"] = _cache_identities(identity, cfg, _algorithm_fingerprints())
-    previous = {}
-    if paths.input_identity.is_file():
-        try:
-            previous = json.loads(paths.input_identity.read_text(encoding="utf-8"))["cache_identities"]
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
-    if not isinstance(previous, dict):
-        previous = {}
+    algorithms = _algorithm_fingerprints()
+    identity["algorithms"] = {k: v for k, v in algorithms.items() if k != "single"}
+    identity["cache_identities"] = _cache_identities(identity, cfg, algorithms)
     changed = {key for key, value in identity["cache_identities"].items() if previous.get(key) != value}
     if changed:
         _log("Downstream cache identities changed: " + ", ".join(sorted(changed)))
@@ -3089,8 +3156,7 @@ def _run_pipeline_impl(
     recompute_gini |= "gini" in changed
     recompute_tss |= "tss" in changed
     if any((recompute_cpg_stats, recompute_gini, recompute_tss)):
-        paths.input_identity.unlink(missing_ok=True)
-        _fsync_directory(paths.input_identity.parent)
+        prepare_cache_commit()
     dt = timer.stop("adata")
     if dt is not None:
         _log(f"  done: {dt:.2f}s")
@@ -5351,6 +5417,16 @@ def run_qc_processor(
         raise RuntimeError(f"QC Processor failed with exit code {completed.returncode}")
 
 
+def _single_obs_equal(left, right) -> bool:
+    """仅比较时统一浮点缺失表示；不把零值当缺失，也不改写原始注释。"""
+    def normalize(frame):
+        return frame.with_columns([
+            pl.col(name).fill_nan(None)
+            for name, dtype in frame.schema.items() if dtype in (pl.Float32, pl.Float64)
+        ])
+    return normalize(left).equals(normalize(right))
+
+
 def prepare_single_cpg_adata(
     paths: NotebookPaths,
     df_qc: pd.DataFrame,
@@ -5380,9 +5456,9 @@ def prepare_single_cpg_adata(
     run_paths = build_paths(paths.project_dir, sealed.delivery_id)
     if run_paths.qc_results_dir != paths.qc_results_dir:
         raise ValueError("Notebook QC directory differs from the current delivery")
-    sample_ids = [cell["sample_id"] for cell in read_active_cells(
-        paths.project_dir, sealed_context=sealed
-    )]
+    completed_qc = _require_completed_qc(run_paths, sealed)
+    assert_qc_current = completed_qc.assert_current
+    sample_ids = list(completed_qc.sample_ids)
     if not sample_ids:
         raise ValueError("Single-CpG generation requires at least one cell")
     if not df_qc.columns.is_unique or not set(QC_INFO_COLUMNS).issubset(df_qc.columns):
@@ -5398,14 +5474,8 @@ def prepare_single_cpg_adata(
         check_dtype=False, check_exact=True,
     )
     raw_path = run_paths.raw_adata
-    raw_schema = json.loads(raw_path.with_name("RawAdata.input_schema.json").read_text())
-    algorithms = _algorithm_fingerprints()
-    if (not _raw_adata_schema_matches(raw_path, raw_schema)
-            or raw_schema.get("algorithm_sha256") != algorithms["raw"]
-            or raw_schema["delivery_id"] != sealed.delivery_id
-            or raw_schema.get("source_cpg_representation") != sealed.cpg_representation
-            or set(raw_schema["sample_ids"]) != set(sample_ids)):
-        raise ValueError("RawAdata is stale or unverified; rerun the QC Processor")
+    raw_schema = completed_qc.raw_schema
+    algorithms = completed_qc.algorithms
     genome = str(sealed.config["species"])
     bed = paths.pipeline_root / "resources" / f"{genome}_reference" / "cpg" / f"{genome}.single_cpg.bed.gz"
     signature = {
@@ -5465,25 +5535,29 @@ def prepare_single_cpg_adata(
         for column in aligned.columns:
             merged[column] = aligned[column].array
         updated = pl.from_pandas(merged)
-        sealed.assert_current()
-        if not updated.equals(current):
+        assert_qc_current()
+        obs_changed = not _single_obs_equal(updated, current)
+        if obs_changed:
             if reuse and not recompute:
                 matrix.close()
                 matrix = None
                 matrix = snap.read(str(output), backed="r+")
-                schema_path.unlink(missing_ok=True)
+                _invalidate_completion(schema_path)
             matrix.obs = updated
             matrix.obs_names = names
         matrix.close()
         matrix = None
-        sealed.assert_current()
+        assert_qc_current()
         if not reuse or recompute:
             _fsync_file(temporary)
-            schema_path.unlink(missing_ok=True)
+            assert_qc_current()
+            _invalidate_completion(schema_path)
             os.replace(temporary, output)
-        _atomic_write_json(
-            {"input": signature, "h5ad": _raw_adata_stat_binding(output)}, schema_path
-        )
+        if not reuse or recompute or obs_changed:
+            _atomic_write_json(
+                {"input": signature, "h5ad": _raw_adata_stat_binding(output)}, schema_path,
+                before_commit=assert_qc_current,
+            )
         _log(f"SingleCpG 已就绪，{len(names)} 个细胞，{coordinate_base}-based，文件已关闭: {output}")
         return output
     finally:
@@ -5502,22 +5576,25 @@ def load_notebook_qc_frame(
     paths: NotebookPaths,
 ) -> tuple[pd.DataFrame, dict[str, str] | None]:
     """加载 QC Processor 产出的 DNAme QC 表并初始化绘图主题与 CloneID 配色。"""
+    sealed = load_sealed_qc_context(paths.project_dir, expected_pipeline_root=paths.pipeline_root)
+    if sealed.delivery_id != paths.delivery_id:
+        raise ValueError("Delivery changed; rerun the Notebook from its first cell")
+    run_paths = build_paths(paths.project_dir, sealed.delivery_id)
+    if run_paths.qc_results_dir != paths.qc_results_dir:
+        raise ValueError("Notebook QC directory differs from the current delivery")
+    assert_qc_current = _require_completed_qc(run_paths, sealed).assert_current
     paths.qc_results_dir.mkdir(parents=True, exist_ok=True)
     paths.plots_dir.mkdir(parents=True, exist_ok=True)
     setup_nature_style()
-    if paths.qc_info.exists():
-        df_qc = pd.read_csv(
-            paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
-            float_precision="round_trip",
-        )
-        print(f"✅ 已加载 QC 数据: {len(df_qc)} 个样本")
-    else:
-        df_qc = pd.DataFrame()
-        print(f"❌ 找不到 QC 数据文件: {paths.qc_info}")
-        print("请先成功运行上一格 QC Processor；该步骤需要 snapatac2、anndata、polars、pandas、numpy。")
+    df_qc = pd.read_csv(
+        paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
+        float_precision="round_trip",
+    )
+    print(f"✅ 已加载 QC 数据: {len(df_qc)} 个样本")
     clone_color_map: dict[str, str] | None = None
     if not df_qc.empty and "CloneID" in df_qc.columns:
         df_qc["CloneID"] = df_qc["CloneID"].map(normalize_clone_id_value)
         unique_clones = sorted(df_qc["CloneID"].dropna().unique().tolist())
         clone_color_map = generate_clone_color_map(unique_clones)
+    assert_qc_current()
     return df_qc, clone_color_map

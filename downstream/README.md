@@ -1,6 +1,6 @@
-# Alopex v15.4 下游 QC 与可视化
+# Alopex v15.5 下游 QC 与可视化
 
-正式源码以 Git tag `v15.4` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
+正式源码以 Git tag `v15.5` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
 
 | 输入边界 | 要求 |
 | --- | --- |
@@ -71,9 +71,10 @@ PY_KERNEL
 | --- | --- |
 | 正常重复运行 | 自动复用；输入身份复用 sealed inventory，不为 hash 再次遍历全部 CpG |
 | 调整 TSS BED、比例或种子 | 仅 TSS 自动失效，无需强制重建 Raw/QC/Gini/Single |
+| QC 完成身份缺失或计算期间变化 | 先重新运行 Processor 成功完成，再加载 QC 或生成 SingleCpG；Notebook 与 Single 使用同一已验证上下文 |
 | Raw 输入或算法身份过期 | 先运行 Processor 完成 Raw 必要重建，再处理 SingleCpG；不能仅改 metadata 或用 Single 强制开关绕过 |
 | SingleCpG 来源未知或身份变化 | 按提示设置 `RECOMPUTE_SINGLECPG=True`；身份绑定交付、Raw generation、BED、参数、算法与科学库版本 |
-| 仅细胞注释变化 | 矩阵可复用，只更新 SingleCpG `obs`；原有 QC 列仍须与当前磁盘 QC 一致 |
+| 仅细胞注释变化 | 矩阵可复用，只更新 SingleCpG `obs`；原有 QC 列仍须与当前磁盘 QC 一致。NaN/null 仅在比较时视为同一缺失，真实零值独立；未变化不改写矩阵或完成记录 |
 | 科学统计重算中断 | 旧完成身份撤销，下一次重新计算；有效 Raw 仍可复用。全部缓存命中时的导出失败不破坏有效缓存 |
 | 缓存计数自相矛盾 | 零位点/零 coverage 必须一致，宿主 coverage 须在 `sites` 至 `65535×sites`；异常从 canonical CpG 重算，不静默接受 |
 
@@ -93,7 +94,7 @@ Notebook 在本地与 HPC 均通过 `run_qc_processor(PATHS)` 启动 `PATHS.pipe
 Raw 重建与 CpG 统计统一使用上述已验证方案，无需另设分块参数；第一格的 `Pipeline:` 应指向已更新的源码目录。
 原 Notebook 已完成同资源全库对照；本地通过科学/并发回归，尚无本地2707细胞完整性能测量，不承诺所有平台固定耗时。
 有效缓存仍优先复用；算法身份变化按正常粒度更新缓存，无需重启 kernel 或强制打开重算开关。
-分块和线程实现不改变科学计数、观测零值或缺失值；更大的导入分块需要更多内存。升级说明见[本版 Release](https://github.com/Felix-owo/Alopex/releases/tag/v15.4)。
+分块和线程实现不改变科学计数、观测零值或缺失值；更大的导入分块需要更多内存。升级说明见[本版 Release](https://github.com/Felix-owo/Alopex/releases/tag/v15.5)。
 
 ### 保存供下游复用的 single-CpG 矩阵
 

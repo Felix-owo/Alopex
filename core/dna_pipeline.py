@@ -1365,7 +1365,25 @@ def load_project_config(path: Path | str) -> dict[str, object]:
     """读取项目 config YAML 并走唯一 finalize 加载链。"""
     import yaml
 
-    config = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    class UniqueKeyLoader(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            # 合并键仍按 YAML 语义处理；同一映射显式重复的键必须在覆盖前拒绝。
+            seen = set()
+            for key_node, _ in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    key = "<<"
+                else:
+                    key = self.construct_object(key_node, deep=deep)
+                try:
+                    duplicate = key in seen
+                    seen.add(key)
+                except TypeError as exc:
+                    raise ValueError(f"Invalid config mapping key: {path}:{key_node.start_mark.line + 1}") from exc
+                if duplicate:
+                    raise ValueError(f"Duplicate config key {key!r}: {path}:{key_node.start_mark.line + 1}")
+            return super().construct_mapping(node, deep=deep)
+
+    config = yaml.load(Path(path).read_text(encoding="utf-8"), Loader=UniqueKeyLoader) or {}
     if not isinstance(config, dict):
         raise ValueError(f"project config root must be a mapping: {path}")
     return finalize_project_config(config)
