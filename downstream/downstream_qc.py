@@ -14,6 +14,10 @@ import gzip
 import hashlib
 import json
 import sys
+import fcntl
+import stat as _qc_lock_stat
+import threading
+from contextlib import contextmanager
 from collections.abc import Callable
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -862,41 +866,108 @@ def _has_file(path: Path) -> bool:
     return path.exists() and path.stat().st_size > 0
 
 
-def resolve_qc_results_dir(project_dir: Path, delivery_id: str) -> Path:
-    """按内部交付记录复用 QC 目录；首次创建使用本地生成时间，同秒重名追加微秒。"""
-    project_dir = project_dir.resolve()
-    root = _project_directory(project_dir, Path("06_downstream"), create=True)
-    matches = []
-    for candidate in sorted(root.glob("QC_Results_*")):
-        candidate = _project_directory(
-            project_dir, candidate.relative_to(project_dir), create=False
-        )
-        marker = candidate / ".delivery.json"
-        if marker.is_symlink():
-            raise ValueError(f"QC delivery record must not be a symlink: {marker}")
-        if not marker.is_file():
-            continue
-        identity = json.loads(marker.read_text(encoding="utf-8"))
-        if not isinstance(identity, dict):
-            raise ValueError(f"Invalid QC delivery record: {marker}")
-        if identity.get("delivery_id") == delivery_id:
-            matches.append(candidate)
-    if len(matches) > 1:
-        raise ValueError(f"Multiple QC directories for the current delivery: {matches}")
-    if matches:
-        return matches[0]
-    now = datetime.now().astimezone()
-    directory = root / now.strftime("QC_Results_%Y%m%d_%H%M%S")
+_QC_WRITE_GUARD = threading.Lock()
+_QC_WRITE_LOCKS: dict[Path, tuple[int, int]] = {}
+
+
+def _qc_locks_after_fork() -> None:
+    # fork 子进程不能延长父事务的锁寿命，也不能对共享 open description 执行 unlock。
+    for _, descriptor in _QC_WRITE_LOCKS.values():
+        os.close(descriptor)
+    _QC_WRITE_LOCKS.clear()
+    _QC_WRITE_GUARD.release()
+
+
+os.register_at_fork(before=_QC_WRITE_GUARD.acquire,
+                    after_in_parent=_QC_WRITE_GUARD.release,
+                    after_in_child=_qc_locks_after_fork)
+
+
+@contextmanager
+def _qc_write_lock(directory: Path):
+    """保护下游目录事务；跨进程/线程冲突立即拒绝，同线程嵌套复用锁。
+
+    锁文件保留原 inode，绝不 unlink；异常或进程退出由关闭描述符释放锁。
+    上游仍只使用 Snakemake 锁，sealed marker 的前后复验保持独立。
+    """
+    directory = Path(directory)
+    if directory.is_symlink():
+        raise ValueError(f"QC transaction directory must not be a symlink: {directory}")
+    directory = directory.resolve()
+    owner = threading.get_ident()
+    process_id = os.getpid()
+    busy = f"Downstream QC is busy: {directory}; retry after the current writer finishes"
+    with _QC_WRITE_GUARD:
+        held = _QC_WRITE_LOCKS.get(directory)
+        nested = held is not None and held[0] == owner
+        if held is not None and not nested:
+            raise RuntimeError(busy)
+        if not nested:
+            descriptor = os.open(directory / ".qc-write.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                if not _qc_lock_stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise ValueError(f"QC lock must be a regular file: {directory}")
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise RuntimeError(busy) from exc
+                _QC_WRITE_LOCKS[directory] = (owner, descriptor)
+            except BaseException:
+                os.close(descriptor)
+                raise
     try:
-        directory.mkdir()
-    except FileExistsError:
-        directory = root / now.strftime("QC_Results_%Y%m%d_%H%M%S_%f")
-        directory.mkdir()
-    _atomic_write_json(
-        {"delivery_id": delivery_id, "created_at": now.isoformat()},
-        directory / ".delivery.json",
-    )
-    return directory
+        yield
+    finally:
+        if not nested and os.getpid() == process_id:
+            with _QC_WRITE_GUARD:
+                del _QC_WRITE_LOCKS[directory]
+                # close 足以释放 flock；避免任何清理路径删除另一个进程使用的锁文件。
+                os.close(descriptor)
+
+
+def resolve_qc_results_dir(project_dir: Path, delivery_id: str) -> Path:
+    """在目录事务内复用/创建唯一交付目录，首次创建失败仅清理本次候选。"""
+    project_dir = project_dir.resolve()
+    root = _project_directory(project_dir, Path("06_downstream"), create=False)
+    root.mkdir(exist_ok=True)
+    with _qc_write_lock(root):
+        matches = []
+        for candidate in sorted(root.glob("QC_Results_*")):
+            candidate = _project_directory(
+                project_dir, candidate.relative_to(project_dir), create=False
+            )
+            marker = candidate / ".delivery.json"
+            if marker.is_symlink():
+                raise ValueError(f"QC delivery record must not be a symlink: {marker}")
+            if not marker.is_file():
+                continue
+            identity = json.loads(marker.read_text(encoding="utf-8"))
+            if not isinstance(identity, dict):
+                raise ValueError(f"Invalid QC delivery record: {marker}")
+            if identity.get("delivery_id") == delivery_id:
+                matches.append(candidate)
+        if len(matches) > 1:
+            raise ValueError(f"Multiple QC directories for the current delivery: {matches}")
+        if matches:
+            return matches[0]
+        now = datetime.now().astimezone()
+        directory = root / now.strftime("QC_Results_%Y%m%d_%H%M%S")
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            directory = root / now.strftime("QC_Results_%Y%m%d_%H%M%S_%f")
+            directory.mkdir()
+        try:
+            _atomic_write_json(
+                {"delivery_id": delivery_id, "created_at": now.isoformat()},
+                directory / ".delivery.json",
+            )
+        except BaseException:
+            # 写出可能已完成 rename；这里只回收本次独占创建且尚未交给 consumer 的目录。
+            (directory / ".delivery.json").unlink(missing_ok=True)
+            directory.rmdir()
+            raise
+        return directory
 
 
 def build_paths(
@@ -910,8 +981,9 @@ def build_paths(
     qc_results_dir = resolve_qc_results_dir(project_dir, delivery_id)
 
     cache_dir = _project_directory(
-        project_dir, qc_results_dir.relative_to(project_dir) / ".cache", create=True
+        project_dir, qc_results_dir.relative_to(project_dir) / ".cache", create=False
     )
+    cache_dir.mkdir(exist_ok=True)
 
     return RunPaths(
         project_dir=project_dir,
@@ -2987,70 +3059,75 @@ def _export_qc(
     identity: Mapping[str, object],
     sealed: SealedQCContext,
 ) -> None:
-    if not df_qc.empty:
-        computed_columns = [
-            "Sample_ID",
-            "CloneID",
-            "Native_Mapping%",
-            "Duplicate_Pair_Rate%",
-            "Final_Pair_Yield%",
-            "Gini_Index",
-        ]
-        missing_computed_columns = [
-            column for column in computed_columns if column not in df_qc.columns
-        ]
-        if missing_computed_columns:
-            raise ValueError(
-                "Final QC computation is missing required field(s): "
-                + ", ".join(missing_computed_columns)
-            )
-        sample_id_values = df_qc["Sample_ID"].astype(str)
-        empty_cpg_mask = sample_id_values.isin(empty_cpg_sample_ids)
-        umi_consensus_sample_ids = set(
-            pipeline_qc.loc[
-                pipeline_qc["dedup_policy"] == "per_cytosine_umi_consensus_hamming1",
-                "sample_id",
-            ].astype(str)
-        )
-        for column in computed_columns[2:]:
-            values = pd.to_numeric(df_qc[column], errors="raise").to_numpy(dtype=float)
-            nan_mask = None
-            if column == "Gini_Index":
-                nan_mask = empty_cpg_mask
-            elif column == "Duplicate_Pair_Rate%":
-                nan_mask = sample_id_values.isin(umi_consensus_sample_ids)
-            if (
-                np.isinf(values).any()
-                or (values[np.isfinite(values)] < 0).any()
-                or (nan_mask is None and not np.isfinite(values).all())
-                or (
-                    nan_mask is not None
-                    and (
-                        not np.isnan(values[nan_mask]).all()
-                        or not np.isfinite(values[~nan_mask]).all()
-                    )
+    with _qc_write_lock(paths.qc_results_dir):
+        if not df_qc.empty:
+            computed_columns = [
+                "Sample_ID",
+                "CloneID",
+                "Native_Mapping%",
+                "Duplicate_Pair_Rate%",
+                "Final_Pair_Yield%",
+                "Gini_Index",
+            ]
+            missing_computed_columns = [
+                column for column in computed_columns if column not in df_qc.columns
+            ]
+            if missing_computed_columns:
+                raise ValueError(
+                    "Final QC computation is missing required field(s): "
+                    + ", ".join(missing_computed_columns)
                 )
-            ):
-                raise ValueError(f"Final QC output contains invalid {column}")
-        clone_ids = df_qc["CloneID"].astype("string").str.strip()
-        if clone_ids.isna().any() or clone_ids.eq("").any():
-            raise ValueError("Final QC output contains an empty CloneID")
-
-        missing_qc_info_columns = [
-            column for column in QC_INFO_COLUMNS if column not in df_qc.columns
-        ]
-        if missing_qc_info_columns:
-            raise ValueError(
-                "DNAme QC information is missing column(s): "
-                + ", ".join(missing_qc_info_columns)
+            sample_id_values = df_qc["Sample_ID"].astype(str)
+            empty_cpg_mask = sample_id_values.isin(empty_cpg_sample_ids)
+            umi_consensus_sample_ids = set(
+                pipeline_qc.loc[
+                    pipeline_qc["dedup_policy"] == "per_cytosine_umi_consensus_hamming1",
+                    "sample_id",
+                ].astype(str)
             )
-        df_qc = df_qc[list(QC_INFO_COLUMNS)]
+            for column in computed_columns[2:]:
+                values = pd.to_numeric(df_qc[column], errors="raise").to_numpy(dtype=float)
+                nan_mask = None
+                if column == "Gini_Index":
+                    nan_mask = empty_cpg_mask
+                elif column == "Duplicate_Pair_Rate%":
+                    nan_mask = sample_id_values.isin(umi_consensus_sample_ids)
+                if (
+                    np.isinf(values).any()
+                    or (values[np.isfinite(values)] < 0).any()
+                    or (nan_mask is None and not np.isfinite(values).all())
+                    or (
+                        nan_mask is not None
+                        and (
+                            not np.isnan(values[nan_mask]).all()
+                            or not np.isfinite(values[~nan_mask]).all()
+                        )
+                    )
+                ):
+                    raise ValueError(f"Final QC output contains invalid {column}")
+            clone_ids = df_qc["CloneID"].astype("string").str.strip()
+            if clone_ids.isna().any() or clone_ids.eq("").any():
+                raise ValueError("Final QC output contains an empty CloneID")
 
-        df_qc = _require_exact_sample_ids(
-            df_qc, manifest_sample_ids, "Final QC output"
-        )
-        _atomic_write_csv(df_qc, paths.qc_info, before_commit=sealed.assert_current)
-        _atomic_write_json(identity, paths.input_identity, before_commit=sealed.assert_current)
+            missing_qc_info_columns = [
+                column for column in QC_INFO_COLUMNS if column not in df_qc.columns
+            ]
+            if missing_qc_info_columns:
+                raise ValueError(
+                    "DNAme QC information is missing column(s): "
+                    + ", ".join(missing_qc_info_columns)
+                )
+            df_qc = df_qc[list(QC_INFO_COLUMNS)]
+
+            df_qc = _require_exact_sample_ids(
+                df_qc, manifest_sample_ids, "Final QC output"
+            )
+            def before_csv_commit():
+                sealed.assert_current()
+                _invalidate_completion(paths.input_identity)
+
+            _atomic_write_csv(df_qc, paths.qc_info, before_commit=before_csv_commit)
+            _atomic_write_json(identity, paths.input_identity, before_commit=sealed.assert_current)
 
 
 def _run_pipeline_impl(
@@ -3320,29 +3397,30 @@ def run_pipeline(
     sealed_context: SealedQCContext | None = None,
 ) -> None:
     """运行 QC 流程，并保证所有退出路径都关闭自有的 RawAdata 句柄。"""
-    raw_adata_owner: list = []
-    try:
-        _run_pipeline_impl(
-            paths,
-            cfg,
-            workers,
-            recompute_raw_adata,
-            recompute_cpg_stats,
-            recompute_gini,
-            recompute_tss,
-            sealed_context=sealed_context,
-            _raw_adata_owner=raw_adata_owner,
-        )
-    finally:
-        close_error: BaseException | None = None
-        for raw_adata in reversed(raw_adata_owner):
-            try:
-                raw_adata.close()
-            except BaseException as exc:
-                if close_error is None:
-                    close_error = exc
-        if close_error is not None and sys.exc_info()[0] is None:
-            raise close_error
+    with _qc_write_lock(paths.qc_results_dir):
+        raw_adata_owner: list = []
+        try:
+            _run_pipeline_impl(
+                paths,
+                cfg,
+                workers,
+                recompute_raw_adata,
+                recompute_cpg_stats,
+                recompute_gini,
+                recompute_tss,
+                sealed_context=sealed_context,
+                _raw_adata_owner=raw_adata_owner,
+            )
+        finally:
+            close_error: BaseException | None = None
+            for raw_adata in reversed(raw_adata_owner):
+                try:
+                    raw_adata.close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+            if close_error is not None and sys.exc_info()[0] is None:
+                raise close_error
 
 
 def parse_args() -> argparse.Namespace:
@@ -5440,136 +5518,137 @@ def prepare_single_cpg_adata(
     已验证的矩阵可复用，仅 QC/HQ 改变时只更新 obs。未知或过期文件须显式
     recompute；新矩阵完成并关闭后才替换正式文件，不关闭其他 Notebook 的句柄。
     """
-    if snap is None:
-        raise ImportError("Single-CpG generation requires the Alopex notebook environment")
-    sealed = load_sealed_qc_context(
-        paths.project_dir, expected_pipeline_root=paths.pipeline_root
-    )
-    if sealed.delivery_id != paths.delivery_id:
-        raise ValueError("Delivery changed; rerun the Notebook from its first cell")
-    coordinate_base = _source_cpg_coordinate_base(sealed.cpg_representation)
-    coordinate_metadata = {
-        "cpg_coordinate_base": coordinate_base,
-        "cpg_interval_convention": "half-open" if coordinate_base == 0 else "closed",
-        "source_cpg_representation": sealed.cpg_representation,
-    }
-    run_paths = build_paths(paths.project_dir, sealed.delivery_id)
-    if run_paths.qc_results_dir != paths.qc_results_dir:
-        raise ValueError("Notebook QC directory differs from the current delivery")
-    completed_qc = _require_completed_qc(run_paths, sealed)
-    assert_qc_current = completed_qc.assert_current
-    sample_ids = list(completed_qc.sample_ids)
-    if not sample_ids:
-        raise ValueError("Single-CpG generation requires at least one cell")
-    if not df_qc.columns.is_unique or not set(QC_INFO_COLUMNS).issubset(df_qc.columns):
-        raise ValueError("df_qc must contain the complete QC table with unique column names")
-    qc = _require_exact_sample_ids(df_qc, sample_ids, "Notebook QC")
-    saved_qc = pd.read_csv(
-        paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
-        float_precision="round_trip",
-    )
-    saved_qc = _require_exact_sample_ids(saved_qc, sample_ids, "Saved QC")
-    pd.testing.assert_frame_equal(
-        qc[list(QC_INFO_COLUMNS)], saved_qc[list(QC_INFO_COLUMNS)],
-        check_dtype=False, check_exact=True,
-    )
-    raw_path = run_paths.raw_adata
-    raw_schema = completed_qc.raw_schema
-    algorithms = completed_qc.algorithms
-    genome = str(sealed.config["species"])
-    bed = paths.pipeline_root / "resources" / f"{genome}_reference" / "cpg" / f"{genome}.single_cpg.bed.gz"
-    signature = {
-        "algorithm_sha256": algorithms["single"],
-        **coordinate_metadata,
-        "snapatac2": importlib.metadata.version("snapatac2"),
-        "delivery_id": sealed.delivery_id,
-        "raw_generation": raw_schema["generation_id"],
-        "raw_h5ad": raw_schema["h5ad"],
-        "bed": _content_binding(bed),
-        "value_type": "fraction", "summary_type": "mean", "chunk_size": 500,
-    }
-    output = paths.qc_results_dir / "SingleCpG_Adata.h5ad"
-    schema_path = output.with_name("SingleCpG_Adata.input_schema.json")
-    cached = None
-    if schema_path.is_file():
-        try:
-            cached = json.loads(schema_path.read_text())
-        except (OSError, ValueError):
-            pass
-    reuse = (output.is_file() and isinstance(cached, dict)
-             and cached.get("input") == signature
-             and cached.get("h5ad") == _raw_adata_stat_binding(output))
-    if output.exists() and not reuse and not recompute:
-        raise ValueError(
-            f"Existing SingleCpG file is unverified or stale: {output}. "
-            "Set RECOMPUTE_SINGLECPG=True to rebuild it explicitly."
+    with _qc_write_lock(paths.qc_results_dir):
+        if snap is None:
+            raise ImportError("Single-CpG generation requires the Alopex notebook environment")
+        sealed = load_sealed_qc_context(
+            paths.project_dir, expected_pipeline_root=paths.pipeline_root
         )
-    temporary = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp.h5ad")
-    raw = matrix = None
-    try:
-        if reuse and not recompute:
-            matrix = snap.read(str(output), backed="r")
-        else:
-            _log("生成 single-CpG 矩阵：fraction/mean，chunk_size=500")
-            raw = snap.read(str(raw_path), backed="r")
-            _require_exact_sample_ids(qc, list(raw.obs_names), "RawAdata QC")
-            if _raw_cpg_coordinate_base(raw) != coordinate_base:
-                raise ValueError("RawAdata coordinates differ from the sealed CpG representation")
-            matrix = make_cpg_peak_matrix(
-                raw, value_type="fraction", summary_type="mean",
-                peak_file=bed, inplace=False, file=str(temporary), chunk_size=500,
+        if sealed.delivery_id != paths.delivery_id:
+            raise ValueError("Delivery changed; rerun the Notebook from its first cell")
+        coordinate_base = _source_cpg_coordinate_base(sealed.cpg_representation)
+        coordinate_metadata = {
+            "cpg_coordinate_base": coordinate_base,
+            "cpg_interval_convention": "half-open" if coordinate_base == 0 else "closed",
+            "source_cpg_representation": sealed.cpg_representation,
+        }
+        run_paths = build_paths(paths.project_dir, sealed.delivery_id)
+        if run_paths.qc_results_dir != paths.qc_results_dir:
+            raise ValueError("Notebook QC directory differs from the current delivery")
+        completed_qc = _require_completed_qc(run_paths, sealed)
+        assert_qc_current = completed_qc.assert_current
+        sample_ids = list(completed_qc.sample_ids)
+        if not sample_ids:
+            raise ValueError("Single-CpG generation requires at least one cell")
+        if not df_qc.columns.is_unique or not set(QC_INFO_COLUMNS).issubset(df_qc.columns):
+            raise ValueError("df_qc must contain the complete QC table with unique column names")
+        qc = _require_exact_sample_ids(df_qc, sample_ids, "Notebook QC")
+        saved_qc = pd.read_csv(
+            paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
+            float_precision="round_trip",
+        )
+        saved_qc = _require_exact_sample_ids(saved_qc, sample_ids, "Saved QC")
+        pd.testing.assert_frame_equal(
+            qc[list(QC_INFO_COLUMNS)], saved_qc[list(QC_INFO_COLUMNS)],
+            check_dtype=False, check_exact=True,
+        )
+        raw_path = run_paths.raw_adata
+        raw_schema = completed_qc.raw_schema
+        algorithms = completed_qc.algorithms
+        genome = str(sealed.config["species"])
+        bed = paths.pipeline_root / "resources" / f"{genome}_reference" / "cpg" / f"{genome}.single_cpg.bed.gz"
+        signature = {
+            "algorithm_sha256": algorithms["single"],
+            **coordinate_metadata,
+            "snapatac2": importlib.metadata.version("snapatac2"),
+            "delivery_id": sealed.delivery_id,
+            "raw_generation": raw_schema["generation_id"],
+            "raw_h5ad": raw_schema["h5ad"],
+            "bed": _content_binding(bed),
+            "value_type": "fraction", "summary_type": "mean", "chunk_size": 500,
+        }
+        output = paths.qc_results_dir / "SingleCpG_Adata.h5ad"
+        schema_path = output.with_name("SingleCpG_Adata.input_schema.json")
+        cached = None
+        if schema_path.is_file():
+            try:
+                cached = json.loads(schema_path.read_text())
+            except (OSError, ValueError):
+                pass
+        reuse = (output.is_file() and isinstance(cached, dict)
+                 and cached.get("input") == signature
+                 and cached.get("h5ad") == _raw_adata_stat_binding(output))
+        if output.exists() and not reuse and not recompute:
+            raise ValueError(
+                f"Existing SingleCpG file is unverified or stale: {output}. "
+                "Set RECOMPUTE_SINGLECPG=True to rebuild it explicitly."
             )
-            if coordinate_base == 1:
-                feature_names = []
-                for name in matrix.var_names:
-                    chrom, interval = name.rsplit(":", 1)
-                    start, end = interval.split("-")
-                    feature_names.append(f"{chrom}:{start}-{int(end) - 1}")
-                matrix.var_names = feature_names
-            for key, value in coordinate_metadata.items():
-                matrix.uns[key] = value
-        names = list(matrix.obs_names)
-        aligned = _require_exact_sample_ids(qc, names, "SingleCpG QC")
-        current = matrix.obs[:]
-        merged = current.to_pandas()
-        for column in aligned.columns:
-            merged[column] = aligned[column].array
-        updated = pl.from_pandas(merged)
-        assert_qc_current()
-        obs_changed = not _single_obs_equal(updated, current)
-        if obs_changed:
-            if reuse and not recompute:
-                matrix.close()
-                matrix = None
-                matrix = snap.read(str(output), backed="r+")
-                _invalidate_completion(schema_path)
-            matrix.obs = updated
-            matrix.obs_names = names
-        matrix.close()
-        matrix = None
-        assert_qc_current()
-        if not reuse or recompute:
-            _fsync_file(temporary)
-            assert_qc_current()
-            _invalidate_completion(schema_path)
-            os.replace(temporary, output)
-        if not reuse or recompute or obs_changed:
-            _atomic_write_json(
-                {"input": signature, "h5ad": _raw_adata_stat_binding(output)}, schema_path,
-                before_commit=assert_qc_current,
-            )
-        _log(f"SingleCpG 已就绪，{len(names)} 个细胞，{coordinate_base}-based，文件已关闭: {output}")
-        return output
-    finally:
+        temporary = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp.h5ad")
+        raw = matrix = None
         try:
-            if matrix is not None:
-                matrix.close()
+            if reuse and not recompute:
+                matrix = snap.read(str(output), backed="r")
+            else:
+                _log("生成 single-CpG 矩阵：fraction/mean，chunk_size=500")
+                raw = snap.read(str(raw_path), backed="r")
+                _require_exact_sample_ids(qc, list(raw.obs_names), "RawAdata QC")
+                if _raw_cpg_coordinate_base(raw) != coordinate_base:
+                    raise ValueError("RawAdata coordinates differ from the sealed CpG representation")
+                matrix = make_cpg_peak_matrix(
+                    raw, value_type="fraction", summary_type="mean",
+                    peak_file=bed, inplace=False, file=str(temporary), chunk_size=500,
+                )
+                if coordinate_base == 1:
+                    feature_names = []
+                    for name in matrix.var_names:
+                        chrom, interval = name.rsplit(":", 1)
+                        start, end = interval.split("-")
+                        feature_names.append(f"{chrom}:{start}-{int(end) - 1}")
+                    matrix.var_names = feature_names
+                for key, value in coordinate_metadata.items():
+                    matrix.uns[key] = value
+            names = list(matrix.obs_names)
+            aligned = _require_exact_sample_ids(qc, names, "SingleCpG QC")
+            current = matrix.obs[:]
+            merged = current.to_pandas()
+            for column in aligned.columns:
+                merged[column] = aligned[column].array
+            updated = pl.from_pandas(merged)
+            assert_qc_current()
+            obs_changed = not _single_obs_equal(updated, current)
+            if obs_changed:
+                if reuse and not recompute:
+                    matrix.close()
+                    matrix = None
+                    matrix = snap.read(str(output), backed="r+")
+                    _invalidate_completion(schema_path)
+                matrix.obs = updated
+                matrix.obs_names = names
+            matrix.close()
+            matrix = None
+            assert_qc_current()
+            if not reuse or recompute:
+                _fsync_file(temporary)
+                assert_qc_current()
+                _invalidate_completion(schema_path)
+                os.replace(temporary, output)
+            if not reuse or recompute or obs_changed:
+                _atomic_write_json(
+                    {"input": signature, "h5ad": _raw_adata_stat_binding(output)}, schema_path,
+                    before_commit=assert_qc_current,
+                )
+            _log(f"SingleCpG 已就绪，{len(names)} 个细胞，{coordinate_base}-based，文件已关闭: {output}")
+            return output
         finally:
             try:
-                if raw is not None:
-                    raw.close()
+                if matrix is not None:
+                    matrix.close()
             finally:
-                temporary.unlink(missing_ok=True)
+                try:
+                    if raw is not None:
+                        raw.close()
+                finally:
+                    temporary.unlink(missing_ok=True)
 
 
 def load_notebook_qc_frame(

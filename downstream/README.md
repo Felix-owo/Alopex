@@ -1,6 +1,6 @@
-# Alopex v15.5 下游 QC 与可视化
+# Alopex v15.6 下游 QC 与可视化
 
-正式源码以 Git tag `v15.5` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
+正式源码以 Git tag `v15.6` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
 
 | 输入边界 | 要求 |
 | --- | --- |
@@ -93,8 +93,8 @@ Notebook 在本地与 HPC 均通过 `run_qc_processor(PATHS)` 启动 `PATHS.pipe
 子进程优先使用同一 Pipeline 的 `conda/current/control/bin` 工具，避免继承 Jupyter 服务的其他 Conda 环境。
 Raw 重建与 CpG 统计统一使用上述已验证方案，无需另设分块参数；第一格的 `Pipeline:` 应指向已更新的源码目录。
 原 Notebook 已完成同资源全库对照；本地通过科学/并发回归，尚无本地2707细胞完整性能测量，不承诺所有平台固定耗时。
-有效缓存仍优先复用；算法身份变化按正常粒度更新缓存，无需重启 kernel 或强制打开重算开关。
-分块和线程实现不改变科学计数、观测零值或缺失值；更大的导入分块需要更多内存。升级说明见[本版 Release](https://github.com/Felix-owo/Alopex/releases/tag/v15.5)。
+有效缓存仍优先复用；过期缓存按 Processor 提示处理。更新本版后请结束旧写任务并重启 Notebook kernel；SingleCpG 提示来源过期时需显式重建。
+分块和线程实现不改变科学计数、观测零值或缺失值；更大的导入分块需要更多内存。升级操作见下方[输出与写入边界](#输出)。
 
 ### 保存供下游复用的 single-CpG 矩阵
 
@@ -144,6 +144,8 @@ Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对�
 ## 输出
 
 输出目录为 `<project>/06_downstream/QC_Results_YYYYMMDD_HHMMSS/`，时间取首次创建的本地时间，同秒冲突加微秒。`.delivery.json` 绑定交付：同交付复用目录/cache，新交付新建；多个匹配会拒绝，不按 mtime 或目录名猜测。
+
+同一交付的 QC Processor 与 SingleCpG 更新只能有一个写入者；重复启动遇到 `Downstream QC is busy` 时，等当前任务结束后重试。目录初始化也受互斥保护，避免两个 Notebook 同时创建重复目录。`.qc-write.lock` 是持久锁文件，**不要删除或替换**；进程退出后系统会释放锁，文件仍存在不代表任务在运行。最终 QC CSV 替换前撤销旧完成身份，提交中断后重跑 Processor 恢复，不应继续消费未完成结果。更新此模块后应结束旧写任务并重启 Notebook kernel，确保所有写入者加载同一实现。
 
 | 文件 / 目录 | 用途 |
 | --- | --- |
