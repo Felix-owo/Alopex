@@ -93,20 +93,31 @@ txn_try_remove_stale_lock() (
     return 0
 )
 
-# mkdir 原子占位；成功后写 owner.tsv 并置 TXN_LOCK_HELD=1；忙锁返回 75。
+# mkdir 原子占位；owner 完整写入后才宣布持锁，失败只清本次目录；忙锁返回 75。
 txn_acquire_lock() {
     local lock_dir="$1" label="${2:-transaction}" attempt owner_host owner_pid owner_job job_state_line
-    mkdir -p "$(dirname "$lock_dir")"
+    local owner_record started_utc started_epoch rc
+    owner_host="$(txn_lock_hostname)" || return $?
+    started_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)" || return $?
+    started_epoch="$(date +%s)" || return $?
+    owner_record="$(printf 'pid\t%s\nhost\t%s\nstarted_utc\t%s\nstarted_epoch\t%s\ncommand\t%s\n' \
+        "$$" "$owner_host" "$started_utc" "$started_epoch" "$0")" || return $?
+    if [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]]; then
+        owner_record+=$'\nslurm_job\t'"$SLURM_JOB_ID"
+    fi
+    mkdir -p "$(dirname "$lock_dir")" || return $?
     for attempt in 1 2; do
         if mkdir "$lock_dir" 2>/dev/null; then
-            {
-                printf 'pid\t%s\n' "$$"
-                printf 'host\t%s\n' "$(txn_lock_hostname)"
-                printf 'started_utc\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-                printf 'started_epoch\t%s\n' "$(date +%s)"
-                [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]] && printf 'slurm_job\t%s\n' "$SLURM_JOB_ID"
-                printf 'command\t%s\n' "$0"
-            } > "$lock_dir/owner.tsv"
+            # 条件调用中 set -e 不生效；固定目录 inode 后写入及清理，不能吞掉 I/O 错误。
+            if (
+                cd "$lock_dir" || exit $?
+                lock_dir="$PWD"
+                if printf '%s\n' "$owner_record" > owner.tsv; then exit 0; else rc=$?; fi
+                if ! { rm -f -- owner.tsv && [[ "$lock_dir" -ef . ]] && rmdir -- "$lock_dir"; }; then
+                    echo "WARNING: owner 写入失败，无法清理本次事务锁：$lock_dir" >&2
+                fi
+                exit "$rc"
+            ); then :; else return $?; fi
             TXN_LOCK_HELD=1
             return 0
         fi
@@ -131,15 +142,31 @@ txn_acquire_lock() {
 
 # 只有「同主机 + PID == $$」的 owner 才允许删除锁目录。
 txn_release_lock() {
-    local lock_dir="$1" owner_host owner_pid
+    local lock_dir="$1" owner_host owner_pid owner_record rc
     (( TXN_LOCK_HELD == 1 )) || return 0
     [[ -d "$lock_dir" ]] || { TXN_LOCK_HELD=0; return 0; }
-    owner_host="$(txn_read_owner_field "$lock_dir" host 2>/dev/null || true)"
-    owner_pid="$(txn_read_owner_field "$lock_dir" pid 2>/dev/null || true)"
-    if [[ "$owner_host" == "$(txn_lock_hostname)" && "$owner_pid" == "$$" ]]; then
-        rm -rf -- "$lock_dir"
-    else
-        echo "WARNING: 当前进程不是锁 owner，拒绝删除： $lock_dir" >&2
+    if (
+        cd "$lock_dir" || exit $?
+        lock_dir="$PWD"
+        owner_host="$(txn_read_owner_field . host 2>/dev/null || true)"
+        owner_pid="$(txn_read_owner_field . pid 2>/dev/null || true)"
+        if [[ "$owner_host" != "$(txn_lock_hostname)" || "$owner_pid" != "$$" ]]; then
+            echo "WARNING: 当前进程不是锁 owner，拒绝删除： $lock_dir" >&2
+            exit 1
+        fi
+        owner_record="$(cat owner.tsv)" || exit $?
+        [[ "$lock_dir" -ef . ]] || exit 1
+        # 不递归删除：rmdir 失败时恢复原 owner，使权限恢复后仍可释放或按死亡证据回收。
+        rm -f -- owner.tsv || exit $?
+        if rmdir -- "$lock_dir"; then exit 0; else rc=$?; fi
+        if ! printf '%s\n' "$owner_record" > owner.tsv; then
+            echo "WARNING: 无法恢复本次事务锁的 owner：$lock_dir" >&2
+        fi
+        exit "$rc"
+    ); then :; else
+        rc=$?
+        echo "WARNING: 无法释放本次事务锁：$lock_dir" >&2
+        return "$rc"
     fi
     TXN_LOCK_HELD=0
 }
@@ -1041,7 +1068,7 @@ run_conda_section() {
     publish_release
     echo "已原子发布 Conda release：$NEW_RELEASE_PATH"
     prune_superseded_releases
-    txn_release_lock "$ENVIRONMENT_LOCK"
+    txn_release_lock "$ENVIRONMENT_LOCK" || return $?
     trap - EXIT
     echo
     echo "Alopex Conda release 构建并激活成功："
@@ -1142,6 +1169,15 @@ cleanup_stale_reference_builds() {
     find "$REFERENCE_BUILD_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'reference.*' -exec rm -rf {} + 2>/dev/null || true
 }
 
+# 只在安装/恢复全部完成后调用。先解除回滚状态，避免递归清理部分成功后丢失完成标记却再次回滚。
+retire_reference_journal() {
+    local journal="$1" rollback_marker="$2"
+    if [[ -f "$journal/$rollback_marker" ]]; then
+        rm -f -- "$journal/$rollback_marker" || return $?
+    fi
+    rm -rf -- "$journal"
+}
+
 reference_transaction_exit() {
     stop_reference_children
     recover_assembled_commit || true
@@ -1161,7 +1197,7 @@ reference_transaction_signal() {
 }
 
 with_transaction_lock_reference() {
-    local rc
+    local rc release_rc
     txn_acquire_lock "$REFERENCE_LOCK" "reference build transaction" || return $?
     cleanup_stale_reference_builds
     recover_assembled_commit && recover_downstream_transactions && recover_biscuit_commit && recover_bismark_commit && recover_bwa_commit || {
@@ -1178,7 +1214,10 @@ with_transaction_lock_reference() {
     cleanup_reference_temps
     cleanup_stale_reference_builds
     trap - EXIT INT TERM HUP
-    txn_release_lock "$REFERENCE_LOCK"
+    if txn_release_lock "$REFERENCE_LOCK"; then :; else
+        release_rc=$?
+        (( rc != 0 )) || rc="$release_rc"
+    fi
     return "$rc"
 }
 
@@ -1200,8 +1239,10 @@ MM10_BUNDLE_READY=0
 
 # BISCUIT index 后缀通过 dna_pipeline index-suffixes CLI 惰性读取，避免 Shell 双写清单。
 _biscuit_index_suffixes() {
-    printf '.fai\n'
-    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline index-suffixes
+    local suffixes
+    suffixes="$(env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline index-suffixes)" || return $?
+    [[ -n "$suffixes" ]] || return 1
+    printf '.fai\n%s\n' "$suffixes"
 }
 # index 中断时 BISCUIT 可能留下的工作文件；不属于 READY identity，只用于清理。
 _biscuit_transient_suffixes() {
@@ -1292,9 +1333,9 @@ ensure_source_fai() {
     local label="$1" fasta="$2" fai="${2}.fai" rebuilt=0
 
     if [[ ! -s "$fai" || "$fasta" -nt "$fai" ]]; then
-        rm -f -- "$fai"
+        rm -f -- "$fai" || return $?
         echo "为 source FASTA 建索引以检查完整性： $fasta"
-        "$SAMTOOLS_BIN" faidx "$fasta"
+        "$SAMTOOLS_BIN" faidx "$fasta" || return $?
         rebuilt=1
     fi
 
@@ -1304,8 +1345,8 @@ ensure_source_fai() {
 
     if (( rebuilt == 0 )); then
         echo "缓存的 source FAI 校验失败，重建一次： $fai"
-        rm -f -- "$fai"
-        "$SAMTOOLS_BIN" faidx "$fasta"
+        rm -f -- "$fai" || return $?
+        "$SAMTOOLS_BIN" faidx "$fasta" || return $?
         fai_contract_check source "$label" "$fai" "$fasta" && return 0
     fi
 
@@ -1390,7 +1431,7 @@ recover_assembled_commit() {
         journal="$(assembled_commit_journal "$species")" || return $?
         [[ -d "$journal" ]] || continue
         if [[ ! -f "$journal/PREPARED" ]]; then
-            rm -rf -- "$journal" || return $?
+            retire_reference_journal "$journal" PREPARED || return $?
             continue
         fi
         [[ "$(cat "$journal/TARGET")" == "$fasta" ]] || {
@@ -1423,7 +1464,7 @@ recover_assembled_commit() {
                 fi
             done
         fi
-        rm -rf -- "$journal" || return $?
+        retire_reference_journal "$journal" PREPARED || return $?
     done
 }
 
@@ -1491,13 +1532,15 @@ assemble_reference() {
 
 
 biscuit_index_ready() {
-    local fasta="$1" suffix journal
+    local fasta="$1" suffix suffixes journal
     [[ -s "$fasta" ]] || return 1
     journal="$(biscuit_commit_journal "$fasta")" || return $?
     [[ ! -d "$journal" ]] || return 1
+    suffixes="$(_biscuit_index_suffixes)" || return $?
+    [[ -n "$suffixes" ]] || return 1
     while IFS= read -r suffix; do
-        [[ -s "${fasta}${suffix}" ]] || return 1
-    done < <(_biscuit_index_suffixes)
+        [[ -n "$suffix" && -s "${fasta}${suffix}" ]] || return 1
+    done <<< "$suffixes"
     return 0
 }
 
@@ -1512,17 +1555,19 @@ biscuit_commit_journal() {
     printf '%s/%s.biscuit-sidecar.COMMITTING\n' "$REFERENCE_BUILD_ROOT" "$species"
 }
 
-# 恢复中断的 sidecar 提交：BACKUPS_READY 之前 public 文件从未被触碰，journal 只是 scratch。
+# BACKUPS_READY 前未触碰 public；FINISHED 后仅继续清 journal，不回滚已完整安装的文件族。
 recover_biscuit_commit() {
-    local journal fasta target backup suffix
+    local journal fasta target backup suffix suffixes
     (( $# > 0 )) || set -- "$HG38_REFERENCE" "$MM10_REFERENCE"
     for fasta in "$@"; do
         journal="$(biscuit_commit_journal "$fasta")" || return $?
         [[ -d "$journal" ]] || continue
-        if [[ ! -f "$journal/BACKUPS_READY" ]]; then
-            rm -rf -- "$journal" || return $?
+        if [[ ! -f "$journal/BACKUPS_READY" || -f "$journal/FINISHED" ]]; then
+            retire_reference_journal "$journal" BACKUPS_READY || return $?
             continue
         fi
+        suffixes="$(_biscuit_index_suffixes)" || return $?
+        [[ -n "$suffixes" ]] || return 1
         target="$(cat "$journal/TARGET" 2>/dev/null || true)"
         if [[ "$target" != "$fasta" ]]; then
             echo "ERROR: BISCUIT sidecar journal TARGET 与物种不符，拒绝恢复：$journal" >&2
@@ -1531,22 +1576,31 @@ recover_biscuit_commit() {
         echo "恢复中断的 BISCUIT sidecar 提交： $fasta"
         backup="$journal/backup"
         while IFS= read -r suffix; do
+            [[ -n "$suffix" ]] || return 1
             rm -f -- "${fasta}${suffix}" || return $?
             [[ ! -e "$backup/sidecar${suffix}" ]] || cp -p -- "$backup/sidecar${suffix}" "${fasta}${suffix}" || return $?
-        done < <(_biscuit_index_suffixes)
-        rm -rf -- "$journal" || return $?
+        done <<< "$suffixes"
+        retire_reference_journal "$journal" BACKUPS_READY || return $?
     done
 }
 
 commit_biscuit_sidecars() {
-    local fasta="$1" tmp_fasta="$2" suffix
-    while IFS= read -r suffix; do rm -f -- "${fasta}${suffix}"; done < <(_biscuit_transient_suffixes)
+    local fasta="$1" tmp_fasta="$2" suffix suffixes transient_suffixes
+    # 进程替换不会传播枚举器的退出码；先完整取得清单，再触碰旧索引。
+    suffixes="$(_biscuit_index_suffixes)" || return $?
+    transient_suffixes="$(_biscuit_transient_suffixes)" || return $?
+    [[ -n "$suffixes" ]] || return 1
     while IFS= read -r suffix; do
+        [[ -n "$suffix" ]] || continue
+        rm -f -- "${fasta}${suffix}" || return $?
+    done <<< "$transient_suffixes"
+    while IFS= read -r suffix; do
+        [[ -n "$suffix" ]] || return 1
         mv -f -- "${tmp_fasta}${suffix}" "${fasta}${suffix}" || return 1
-    done < <(_biscuit_index_suffixes)
+    done <<< "$suffixes"
     while IFS= read -r suffix; do
         [[ -s "${fasta}${suffix}" ]] || return 1
-    done < <(_biscuit_index_suffixes)
+    done <<< "$suffixes"
 }
 
 # 检查普通 BWA 索引的完整五文件家族。
@@ -1576,7 +1630,7 @@ recover_bwa_commit() {
             [[ -d "$target" ]] || return 1
         fi
     fi
-    rm -rf -- "$journal"
+    retire_reference_journal "$journal" PREPARED
 }
 
 # 在独立目录构建普通 BWA 索引，并通过可恢复事务替换完整家族。
@@ -1591,20 +1645,23 @@ build_bwa_index() {
     [[ ! -e "$journal" ]] || return 1
     mkdir "$journal" || return $?
     printf '%s\n' "$fasta.bwa" > "$journal/TARGET" || return $?
-    if [[ ! -e "$fasta.bwa" && ! -L "$fasta.bwa" ]]; then : > "$journal/ABSENT"; fi
+    if [[ ! -e "$fasta.bwa" && ! -L "$fasta.bwa" ]]; then : > "$journal/ABSENT" || return $?; fi
     : > "$journal/PREPARED" || return $?
     if [[ ! -f "$journal/ABSENT" ]]; then mv -- "$fasta.bwa" "$journal/backup" || return $?; fi
     mv -- "$build_dir/new" "$fasta.bwa" || return $?
     : > "$journal/FINISHED" || return $?
-    rm -rf -- "$journal" "$build_dir"
+    retire_reference_journal "$journal" PREPARED || return $?
+    rm -rf -- "$build_dir"
 }
 
 build_biscuit_index() {
-    local fasta="$1" species build_dir tmp_fasta journal backup suffix
+    local fasta="$1" species build_dir tmp_fasta journal backup suffix suffixes
     journal="$(biscuit_commit_journal "$fasta")" || return $?
     case "$fasta" in "$HG38_REFERENCE") species=hg38 ;; "$MM10_REFERENCE") species=mm10 ;; esac
-    mkdir -p "$REFERENCE_BUILD_ROOT"
+    mkdir -p "$REFERENCE_BUILD_ROOT" || return $?
     recover_biscuit_commit "$fasta" || return $?
+    suffixes="$(_biscuit_index_suffixes)" || return $?
+    [[ -n "$suffixes" ]] || return 1
     build_dir="$(mktemp -d "$REFERENCE_BUILD_ROOT/reference.${species}.biscuit.XXXXXX")" || return $?
     register_reference_temp "$build_dir" || return $?
     tmp_fasta="$build_dir/${fasta##*/}"
@@ -1613,11 +1670,11 @@ build_biscuit_index() {
     "$SAMTOOLS_BIN" faidx "$tmp_fasta" || return $?
     "$BISCUIT_BIN" index "$tmp_fasta" || return $?
     while IFS= read -r suffix; do
-        [[ -s "${tmp_fasta}${suffix}" ]] || {
+        [[ -n "$suffix" && -s "${tmp_fasta}${suffix}" ]] || {
             echo "ERROR: 临时 BISCUIT index 不完整，保留已有公开 index。" >&2
             return 1
         }
-    done < <(_biscuit_index_suffixes)
+    done <<< "$suffixes"
 
     echo "临时 BISCUIT index 已通过校验，开始提交 sidecars。"
     [[ ! -e "$journal" ]] || {
@@ -1628,18 +1685,19 @@ build_biscuit_index() {
     tmp_fasta="$journal/${fasta##*/}"
     backup="$journal/backup"
     mkdir -p "$backup" || return $?
-    printf '%s\n' "$fasta" > "$journal/TARGET"
+    printf '%s\n' "$fasta" > "$journal/TARGET" || return $?
     while IFS= read -r suffix; do
         [[ ! -e "${fasta}${suffix}" ]] || cp -p -- "${fasta}${suffix}" "$backup/sidecar${suffix}" || return $?
-    done < <(_biscuit_index_suffixes)
-    : > "$journal/BACKUPS_READY"
+    done <<< "$suffixes"
+    : > "$journal/BACKUPS_READY" || return $?
 
     if ! commit_biscuit_sidecars "$fasta" "$tmp_fasta"; then
         echo "ERROR: BISCUIT sidecar 提交失败，正在恢复上一完整文件族。" >&2
         recover_biscuit_commit "$fasta" || return $?
         return 1
     fi
-    rm -rf -- "$journal"
+    : > "$journal/FINISHED" || return $?
+    retire_reference_journal "$journal" BACKUPS_READY
 }
 
 
@@ -1682,7 +1740,7 @@ recover_bismark_commit() {
     journal="$(bismark_commit_journal)"
     [[ -d "$journal" ]] || return 0
     if [[ ! -f "$journal/PREPARED" || -f "$journal/FINISHED" ]]; then
-        rm -rf -- "$journal"
+        retire_reference_journal "$journal" PREPARED
         return $?
     fi
     root="$(cat "$journal/TARGET")" || return $?
@@ -1709,7 +1767,7 @@ recover_bismark_commit() {
         fi
     done < "$journal/ENTRIES"
     : > "$journal/FINISHED" || return $?
-    rm -rf -- "$journal"
+    retire_reference_journal "$journal" PREPARED
 }
 
 commit_bismark_component() {
@@ -1740,7 +1798,7 @@ commit_bismark_component() {
         return 1
     done
     : > "$journal/FINISHED" || return $?
-    rm -rf -- "$journal"
+    retire_reference_journal "$journal" PREPARED
 }
 
 build_bismark_standard_index() {
@@ -1846,8 +1904,8 @@ recover_downstream_commit() {
     [[ -d "$journal" ]] || return 0
     downstream_reference_paths "$species" || return $?
 
-    if [[ ! -f "$journal/BACKUPS_READY" ]]; then
-        rm -rf -- "$journal"
+    if [[ ! -f "$journal/BACKUPS_READY" || -f "$journal/FINISHED" ]]; then
+        retire_reference_journal "$journal" BACKUPS_READY || return $?
         return 0
     fi
 
@@ -1857,7 +1915,7 @@ recover_downstream_commit() {
     backup="$journal/backup"
     [[ ! -e "$backup/tss.bed" ]] || cp -p -- "$backup/tss.bed" "$DOWNSTREAM_TSS" || return $?
     [[ ! -e "$backup/single_cpg.bed.gz" ]] || cp -p -- "$backup/single_cpg.bed.gz" "$DOWNSTREAM_SINGLE_CPG" || return $?
-    rm -rf -- "$journal"
+    retire_reference_journal "$journal" BACKUPS_READY
 }
 
 recover_downstream_transactions() {
@@ -1867,8 +1925,8 @@ recover_downstream_transactions() {
 
 build_downstream_references() {
     local species="$1" fasta="$2" build_dir journal new backup
-    downstream_reference_paths "$species"
-    mkdir -p "$REFERENCE_BUILD_ROOT"
+    downstream_reference_paths "$species" || return $?
+    mkdir -p "$REFERENCE_BUILD_ROOT" || return $?
     recover_downstream_commit "$species" || return $?
     build_dir="$(mktemp -d "$REFERENCE_BUILD_ROOT/reference.${species}.downstream.XXXXXX")" || return $?
     register_reference_temp "$build_dir" || return $?
@@ -1899,7 +1957,7 @@ build_downstream_references() {
 
     [[ ! -e "$DOWNSTREAM_TSS" ]] || cp -p -- "$DOWNSTREAM_TSS" "$backup/tss.bed" || return $?
     [[ ! -e "$DOWNSTREAM_SINGLE_CPG" ]] || cp -p -- "$DOWNSTREAM_SINGLE_CPG" "$backup/single_cpg.bed.gz" || return $?
-    : > "$journal/BACKUPS_READY"
+    : > "$journal/BACKUPS_READY" || return $?
 
     mkdir -p "$(dirname "$DOWNSTREAM_TSS")" "$(dirname "$DOWNSTREAM_SINGLE_CPG")" || return $?
     if ! mv -f -- "$new/tss.bed" "$DOWNSTREAM_TSS" ||
@@ -1910,7 +1968,8 @@ build_downstream_references() {
         return 1
     fi
 
-    rm -rf -- "$journal"
+    : > "$journal/FINISHED" || return $?
+    retire_reference_journal "$journal" BACKUPS_READY || return $?
     echo "$species downstream TSS + single-CpG 已校验并提交。"
 }
 
@@ -2520,7 +2579,7 @@ demux_transaction_signal() {
 }
 
 with_transaction_lock_demux() {
-    local rc
+    local rc release_rc
     txn_acquire_lock "$DEMUX_LOCK" "demux build transaction" || return $?
 
     trap 'cleanup_demux_transaction' EXIT
@@ -2536,7 +2595,10 @@ with_transaction_lock_demux() {
 
     cleanup_demux_build_candidate
     trap - EXIT INT TERM HUP
-    txn_release_lock "$DEMUX_LOCK"
+    if txn_release_lock "$DEMUX_LOCK"; then :; else
+        release_rc=$?
+        (( rc != 0 )) || rc="$release_rc"
+    fi
     return "$rc"
 }
 
@@ -2891,7 +2953,7 @@ run_download_section() {
                 --prefix "$warm_root/$role" \
                 --file "$specification"
     done
-    txn_release_lock "$ENVIRONMENT_LOCK"
+    txn_release_lock "$ENVIRONMENT_LOCK" || return $?
     trap - EXIT
     echo "预热 Rust 依赖缓存： cargo fetch"
     with_transaction_lock_demux demux_fetch_only
