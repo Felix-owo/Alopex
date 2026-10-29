@@ -1,6 +1,6 @@
-# Alopex v15.7
+# Alopex v15.8
 
-正式源码以 Git tag `v15.7` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v15.8` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 | 协议 / `analysis.protocol` | 后端 | 主要处理 |
 | --- | --- | --- |
@@ -13,7 +13,7 @@
 | --- | --- |
 | 配置默认值与可调参数 | 初始化生成的 `00_config/config.yaml` 与内置 schema |
 | Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
-| 本版源码与升级操作 | [v15.7 源码](https://github.com/Felix-owo/Alopex/tree/v15.7)、[下游写入与升级说明](downstream/README.md#输出) |
+| 本版源码与升级操作 | [v15.8 源码](https://github.com/Felix-owo/Alopex/tree/v15.8)、[下游写入与升级说明](downstream/README.md#输出) |
 
 ## 1. 安装
 
@@ -139,7 +139,7 @@ mate 支持 `R1/R2` 或 `1/2`，分隔符支持 `_ . -`；lane 为 1–999，chu
 | 操作 / 清单 | 行为 |
 | --- | --- |
 | 刷新 | 全量发现输入，生成或更新 `00_config/sample_manifest.tsv`；多个目录中的同样本 plain 配对按目录顺序改为 chunk 命名 |
-| 冲突与备份 | 相同副本、缺 mate、混合命名等冲突拒绝，已应用改名会回滚；清单内容未变不改写，有效旧清单变更时保留滚动 `.bak` |
+| 冲突与备份 | 相同副本、缺 mate、混合命名等冲突拒绝；刷新失败或可捕获中断时回滚已应用改名，并恢复原清单（原不存在则移除新清单）。清单内容未变不改写，有效旧清单变更时原子更新滚动 `.bak`；备份写入失败保留上一完整备份。刷新、备份及回滚保留原清单权限 |
 | 清单六列 | `sample_id / dna_raw_sample / rna_sample / species / protocol / notes` |
 | 选样 | 删除不需要的行后直接 dry-run / 运行；未登记 FASTQ 可留在原地，会提示并跳过 |
 | 再次刷新 | **会补登记有效输入，可能重新加入手动删行的样本** |

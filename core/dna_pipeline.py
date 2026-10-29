@@ -35,7 +35,8 @@ import time
 import uuid
 import warnings
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
@@ -103,13 +104,16 @@ def atomic_write_bytes(path: str | Path, data: bytes, *, mode: int | None = None
     temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     created = False
     try:
-        with temporary.open("xb") as handle:
+        with open(temporary, "xb", opener=lambda name, flags: os.open(
+            name, flags, 0o600 if mode is not None else 0o666,
+        )) as handle:
             created = True
+            if mode is not None:
+                # 在任何内容写入前收紧权限，避免私有清单在临时文件中短暂可读。
+                os.fchmod(handle.fileno(), mode)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        if mode is not None:
-            os.chmod(temporary, mode)
         os.replace(temporary, destination)
     finally:
         if created:
@@ -283,9 +287,11 @@ def write_tsv_atomic(
     path: str | Path,
     rows: Sequence[Mapping[str, object]],
     fieldnames: Sequence[str],
+    *,
+    mode: int | None = None,
 ) -> None:
     """用本次独占的临时文件原子发布 manifest；失败保留旧文件并清理自己的临时文件。"""
-    atomic_write_bytes(path, render_tsv(rows, fieldnames).encode("utf-8"))
+    atomic_write_bytes(path, render_tsv(rows, fieldnames).encode("utf-8"), mode=mode)
 
 
 def effective_cpu_count(requested: int = 0) -> int:
@@ -1366,14 +1372,22 @@ def load_project_config(path: Path | str) -> dict[str, object]:
     import yaml
 
     class UniqueKeyLoader(yaml.SafeLoader):
-        def construct_mapping(self, node, deep=False):
-            # 合并键仍按 YAML 语义处理；同一映射显式重复的键必须在覆盖前拒绝。
+        def __init__(self, stream):
+            super().__init__(stream)
+            self.checked_mappings = set()
+
+        def flatten_mapping(self, node):
+            # merge 来源可能只被 flatten 而不经过 construct_mapping，必须在展开前验证。
+            # 锚点会复用节点；展开后出现的继承/显式覆盖不属于原映射的重复键。
+            if node in self.checked_mappings:
+                return super().flatten_mapping(node)
+            self.checked_mappings.add(node)
             seen = set()
             for key_node, _ in node.value:
                 if key_node.tag == "tag:yaml.org,2002:merge":
                     key = "<<"
                 else:
-                    key = self.construct_object(key_node, deep=deep)
+                    key = self.construct_object(key_node)
                 try:
                     duplicate = key in seen
                     seen.add(key)
@@ -1381,7 +1395,7 @@ def load_project_config(path: Path | str) -> dict[str, object]:
                     raise ValueError(f"Invalid config mapping key: {path}:{key_node.start_mark.line + 1}") from exc
                 if duplicate:
                     raise ValueError(f"Duplicate config key {key!r}: {path}:{key_node.start_mark.line + 1}")
-            return super().construct_mapping(node, deep=deep)
+            return super().flatten_mapping(node)
 
     config = yaml.load(Path(path).read_text(encoding="utf-8"), Loader=UniqueKeyLoader) or {}
     if not isinstance(config, dict):
@@ -2626,37 +2640,44 @@ def resolve_single_pair_fastq_collisions(
     if not plans or not apply:
         return plans
 
-    _apply_fastq_renames(dir_raw, plans)
+    with _fastq_rename_transaction(dir_raw, plans):
+        pass
     return plans
 
 
-def _apply_fastq_renames(dir_raw: Path, plans: Sequence[tuple[Path, Path]]) -> None:
-    applied: list[tuple[Path, Path]] = []
-
-    def _rollback() -> None:
-        for source, target in reversed(applied):
-            target.rename(source)
-
+@contextmanager
+def _fastq_rename_transaction(
+    dir_raw: Path, plans: Sequence[tuple[Path, Path]],
+) -> Iterator[None]:
+    """改名、重新发现及调用方提交共用回滚边界；保留中断前真实完成的文件操作。"""
+    attempted: list[tuple[Path, Path]] = []
     try:
         for source, target in plans:
             if target.exists() or target.is_symlink():
                 raise FileExistsError(f"FASTQ rename target already exists: {target}")
+            # rename 已成功但尚未返回 Python 时也可能收到 Ctrl-C，须先登记操作。
+            attempted.append((source, target))
             source.rename(target)
-            applied.append((source, target))
-    except OSError:
-        _rollback()
+        if plans:
+            try:
+                discover_samples(dir_raw)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Collision renames were rolled back because the merged inventory under "
+                    f"{dir_raw} still does not validate: {exc}"
+                ) from exc
+        yield
+    except BaseException:
+        for source, target in reversed(attempted):
+            if target.exists() or target.is_symlink():
+                if source.exists() or source.is_symlink():
+                    raise FileExistsError(f"FASTQ rollback source already exists: {source}")
+                target.rename(source)
         raise
-    try:
-        discover_samples(dir_raw)
-    except Exception as exc:
-        _rollback()
-        raise RuntimeError(
-            f"Collision renames were rolled back because the merged inventory under "
-            f"{dir_raw} still does not validate: {exc}"
-        ) from exc
-    logger.info(
-        "Normalized %d colliding FASTQ file(s) into chunk-style segments", len(applied)
-    )
+    if plans:
+        logger.info(
+            "Normalized %d colliding FASTQ file(s) into chunk-style segments", len(plans)
+        )
 
 
 _BARCODE_RE = re.compile(r"^[ACGT]+$")
@@ -3144,18 +3165,27 @@ def refresh_manifest(
     backup_path: Path | None = None
 
     if not dry_run:
-        if fastq_renames:
-            _apply_fastq_renames(raw_dir, fastq_renames)
-        try:
-            if changed:
-                if manifest_path.is_file() and existing_rows:
-                    backup_path = manifest_path.with_name(f"{manifest_path.name}.bak")
-                    shutil.copy2(manifest_path, backup_path)
-                write_tsv_atomic(manifest_path, rows, PROJECT_SAMPLE_MANIFEST_FIELDS)
-        except Exception:
-            for source, target in reversed(fastq_renames):
-                target.rename(source)
-            raise
+        original_manifest = manifest_path.read_bytes() if changed and manifest_path.exists() else None
+        original_mode = stat.S_IMODE(manifest_path.stat().st_mode) if original_manifest is not None else None
+        with _fastq_rename_transaction(raw_dir, fastq_renames):
+            try:
+                if changed:
+                    if original_manifest is not None and existing_rows:
+                        backup_path = manifest_path.with_name(f"{manifest_path.name}.bak")
+                        # 不原地截断旧备份，也不沿既有链接写入其他文件。
+                        atomic_write_bytes(
+                            backup_path, original_manifest,
+                            mode=original_mode,
+                        )
+                    write_tsv_atomic(manifest_path, rows, PROJECT_SAMPLE_MANIFEST_FIELDS, mode=original_mode)
+            except BaseException:
+                # 替换已经完成后仍可能收到中断；先恢复清单，再由外层逆序恢复文件名。
+                if changed:
+                    if original_manifest is None:
+                        manifest_path.unlink(missing_ok=True)
+                    elif not manifest_path.exists() or manifest_path.read_bytes() != original_manifest:
+                        atomic_write_bytes(manifest_path, original_manifest, mode=original_mode)
+                raise
 
     return {
         "project_dir": project_dir,
