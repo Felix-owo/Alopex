@@ -1,6 +1,6 @@
-# Alopex v15.9
+# Alopex v15.9.1
 
-正式源码以 Git tag `v15.9` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v15.9.1` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 | 协议 / `analysis.protocol` | 后端 | 主要处理 |
 | --- | --- | --- |
@@ -13,7 +13,7 @@
 | --- | --- |
 | 配置默认值与可调参数 | 初始化生成的 `00_config/config.yaml` 与内置 schema |
 | Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
-| 本版源码与升级操作 | [v15.9 源码](https://github.com/Felix-owo/Alopex/tree/v15.9)、[下游写入与升级说明](downstream/README.md#输出) |
+| 本版源码与升级操作 | [v15.9.1 源码](https://github.com/Felix-owo/Alopex/tree/v15.9.1)、[下游写入与升级说明](downstream/README.md#输出) |
 
 ## 1. 安装
 

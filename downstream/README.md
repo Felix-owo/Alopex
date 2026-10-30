@@ -1,6 +1,6 @@
-# Alopex v15.7 下游 QC 与可视化
+# Alopex v15.9.1 下游 QC 与可视化
 
-正式源码以 Git tag `v15.7` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
+正式源码以 Git tag `v15.9.1` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
 
 | 输入边界 | 要求 |
 | --- | --- |
