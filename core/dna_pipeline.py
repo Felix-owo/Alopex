@@ -1369,6 +1369,11 @@ def finalize_project_config(config: Mapping[str, object]) -> dict[str, object]:
 
 def load_project_config(path: Path | str) -> dict[str, object]:
     """读取项目 config YAML 并走唯一 finalize 加载链。"""
+    return _parse_project_config(Path(path).read_text(encoding="utf-8"), path=path)
+
+
+def _parse_project_config(text: str, *, path: Path | str) -> dict[str, object]:
+    """从一次已观测的配置内容解析，供普通加载与 snapshot 共用。"""
     import yaml
 
     class UniqueKeyLoader(yaml.SafeLoader):
@@ -1397,7 +1402,7 @@ def load_project_config(path: Path | str) -> dict[str, object]:
                     raise ValueError(f"Duplicate config key {key!r}: {path}:{key_node.start_mark.line + 1}")
             return super().flatten_mapping(node)
 
-    config = yaml.load(Path(path).read_text(encoding="utf-8"), Loader=UniqueKeyLoader) or {}
+    config = yaml.load(text, Loader=UniqueKeyLoader) or {}
     if not isinstance(config, dict):
         raise ValueError(f"project config root must be a mapping: {path}")
     return finalize_project_config(config)
@@ -7850,6 +7855,21 @@ def _backend_reference_observation(
     }
 
 
+def _observe_snapshot_input(path: Path) -> tuple[bytes, dict[str, object]]:
+    """一次读取小型运行输入；科学解析和内容身份必须使用同一份字节。"""
+    before = path.stat()
+    content = path.read_bytes()
+    after = path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+    ):
+        raise RuntimeError(f"file changed while reading run input: {path}")
+    return content, {
+        "path": str(path.resolve()), "size_bytes": len(content),
+        "mtime_ns": before.st_mtime_ns, "sha256": sha256_bytes(content),
+    }
+
+
 def _snapshot_basis(
     *,
     pipeline_root: Path,
@@ -7861,7 +7881,8 @@ def _snapshot_basis(
     rastair_env: Path,
     allow_external_config: bool = False,
 ) -> Mapping[str, object]:
-    config = load_project_config(config_path)
+    config_bytes, config_identity = _observe_snapshot_input(config_path)
+    config = _parse_project_config(config_bytes.decode("utf-8"), path=config_path)
     expected_project = config_path.parent.parent.resolve()
     if not allow_external_config and project_dir.resolve() != expected_project:
         raise ValueError(f"project/config mismatch: {project_dir} != {expected_project}")
@@ -7885,6 +7906,11 @@ def _snapshot_basis(
                        "rastair": rastair_env}[backend]
     )
     protocol = str(config.get("analysis", {}).get("protocol", "")).strip().lower()
+    manifest_bytes, manifest_identity = _observe_snapshot_input(sample_manifest)
+    manifest_rows = _parse_project_sample_manifest(
+        io.StringIO(manifest_bytes.decode("utf-8-sig"), newline=""), path=sample_manifest,
+        species=species, protocol=protocol,
+    )
     return {
         "pipeline": {
             "root": str(pipeline_root.resolve()),
@@ -7898,13 +7924,13 @@ def _snapshot_basis(
         },
         "project": {
             "path": str(project_dir.resolve()),
-            "config": stable_file_identity(config_path, hash_content=True),
-            "sample_manifest": stable_file_identity(sample_manifest, hash_content=True),
+            "config": config_identity,
+            "sample_manifest": manifest_identity,
             **({} if protocol == "droplet" else {"barcode_map": stable_file_identity(barcode_map, hash_content=True)}),
         },
         "raw_fastqs": _fastq_inventory(
             project_dir / "01_raw",
-            read_project_sample_manifest(sample_manifest, species=species, protocol=protocol),
+            manifest_rows,
             protocol=protocol,
         ),
         "reference": reference_record,
