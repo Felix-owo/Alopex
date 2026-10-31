@@ -88,9 +88,9 @@ def stable_file_identity(
     if hash_content:
         identity["sha256"] = sha256_file(source)
         after = source.stat()
-        if (before.st_size, before.st_mtime_ns) != (
-            after.st_size,
-            after.st_mtime_ns,
+        # 等长替换可保留 mtime；inode/ctime 防止把旧哈希绑定到新文件。
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
         ):
             raise RuntimeError(f"file changed while recording identity: {source}")
     return identity
@@ -146,6 +146,18 @@ def _read_json(path: Path, label: str) -> dict[str, object]:
 
 def _utc_now() -> str:
     return dt.datetime.now(dt.UTC).isoformat()
+
+
+def _close_native_stream(process: subprocess.Popen) -> None:
+    """关闭本次原生 reader；解析失败时限时终止并回收孩子，不覆盖原始解析异常。"""
+    process.stdout.close()
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
 
 def _safe_relative(text: object, *, label: str) -> Path:
@@ -3846,6 +3858,19 @@ def call_droplet_cells(
         os.replace(temporary, destination)
 
 
+def _cell_order_key(value: str) -> tuple[int, int | str]:
+    """与 Rust i64 排序一致；非 ASCII 数字或越界值按原字符串排序，不改写身份。"""
+    match = re.fullmatch(r"([+-]?)([0-9]+)", value)
+    if match:
+        # 去前导零只服务数值比较，避免 Python 超长十进制转换限制改变 Rust 的有效整数集合。
+        digits = match[2].lstrip("0") or "0"
+        if len(digits) <= 19:
+            number = int(match[1] + digits)
+            if -(1 << 63) <= number < (1 << 63):
+                return (0, number)
+    return (1, value)
+
+
 def cell_identity(project: str, protocol: str, plate: str, barcode: str) -> str:
     """按孔板或液滴协议构造唯一 cell ID。"""
     if protocol == "droplet":
@@ -3914,11 +3939,7 @@ def write_initial_cell_manifest(
 
     def sort_key(row: Mapping[str, str]) -> tuple[object, ...]:
         raw_order = str(row.get("cell_order", "") or "").strip()
-        try:
-            order: tuple[int, object] = (0, int(raw_order))
-        except ValueError:
-            order = (1, raw_order)
-        return (row.get("project_sample_id", ""), order, row.get("plate_id", ""))
+        return (row.get("project_sample_id", ""), _cell_order_key(raw_order), row.get("plate_id", ""))
 
     write_tsv_atomic(
         out_tsv,
@@ -5222,24 +5243,31 @@ def excluded_reads_from_bam(bam_path: Path, samtools: str, excluded: set[str]) -
     if not contigs:
         return set()
 
-    proc = subprocess.Popen(
-        [samtools, "view", str(bam_path), *contigs],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1,
-    )
-    assert proc.stdout is not None
-    names = set()
-    for line in proc.stdout:
-        if not line:
-            continue
-        names.add(normalize_read_name(line.split("\t", 1)[0]))
-    proc.stdout.close()
-    stderr = proc.stderr.read() if proc.stderr is not None else ""
-    returncode = proc.wait()
-    if returncode != 0:
-        raise RuntimeError(stderr.strip() or f"samtools view failed for {bam_path}")
+    # stdout 必须流式读取；stderr 使用临时文件，避免双 PIPE 互相等待。
+    with tempfile.TemporaryFile(mode="w+t", errors="replace") as diagnostics:
+        proc = subprocess.Popen(
+            [samtools, "view", str(bam_path), *contigs],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=diagnostics,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        names = set()
+        try:
+            for line in proc.stdout:
+                if not line:
+                    continue
+                names.add(normalize_read_name(line.split("\t", 1)[0]))
+            returncode = proc.wait()
+            if returncode != 0:
+                diagnostics.seek(0)
+                raise RuntimeError(
+                    f"samtools view failed for {bam_path} (exit {returncode}): "
+                    f"{diagnostics.read().strip()}"
+                )
+        finally:
+            _close_native_stream(proc)
     return names
 
 
@@ -6102,14 +6130,7 @@ def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Pat
             os.replace(root / name, target)
     finally:
         if proc is not None:
-            proc.stdout.close()
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+            _close_native_stream(proc)
         shutil.rmtree(root)
 
 
@@ -6465,9 +6486,7 @@ def write_taps_alignment_qc(bam: str, samtools: str, scratch: str, sample: str, 
         if process.wait() != 0:
             raise RuntimeError("samtools collate failed during TAPS pair accounting")
     finally:
-        if process.poll() is None:
-            process.terminate()
-        process.wait()
+        _close_native_stream(process)
     atomic_write_json(output, {"sample": sample, "backend": "rastair", "schema_version": 1,
                                "read_groups": header.get("RG", []), "programs": header.get("PG", []),
                                "reference_sequences": header["SQ"], **counts})
@@ -6660,9 +6679,7 @@ def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str, 
         if primary_pairs != expected_pairs:
             raise ValueError("TAPS non-CpG primary pair count disagrees with alignment QC")
     finally:
-        if process.poll() is None:
-            process.terminate()
-        process.wait()
+        _close_native_stream(process)
     modified = counts["non_cpg_chg_mod"] + counts["non_cpg_chh_mod"]
     total = modified + counts["non_cpg_chg_unmod"] + counts["non_cpg_chh_unmod"]
     return {**counts, "non_cpg_observations": total,
@@ -6759,6 +6776,9 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
             label = f"Rastair BED {bed} line {reader.line_num}"
             if len(row) != len(fieldnames) or any(row[column[key]] == "" for key in required):
                 raise ValueError(f"{label} has missing or extra fields")
+            origin = row[column["cpg"]]
+            if origin not in {"REF", "NEW"}:
+                raise ValueError(f"{label} has invalid CpG origin: {origin!r} (requires REF or NEW)")
             chrom = row[column["#chr"]]
             if chrom not in contigs:
                 raise ValueError(f"{label} contig {chrom!r} is absent from the reference FASTA")
@@ -6772,7 +6792,7 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
             if previous is not None and key <= previous:
                 raise ValueError("Rastair BED is not ordered or contains duplicate positions")
             previous = key
-            if row[column["cpg"]] != "REF":
+            if origin == "NEW":
                 counts["excluded_variant_or_denovo_rows"] += 1
                 continue
             if chrom != reference_chrom or not reference_start < pos < reference_end - 1:
@@ -7488,13 +7508,9 @@ def _emit_final_tsv(
 
     def cell_sort_key(item: Mapping[str, object]) -> tuple[object, ...]:
         raw_order = str(item.get("cell_order", "") or "").strip()
-        try:
-            order_key: tuple[int, object] = (0, int(raw_order))
-        except ValueError:
-            order_key = (1, raw_order)
         return (
             str(item.get("project_sample_id", "")),
-            order_key,
+            _cell_order_key(raw_order),
             str(item.get("plate_id", "")),
             str(item.get("sample_id", "")),
         )
@@ -8162,11 +8178,14 @@ def _check_result_directories(root: Path, relative: Path, *, label: str) -> None
             directory /= part
 
 
-def _staged_file_state(path: Path) -> dict[str, int]:
-    """绑定已哈希文件的 inode 与内容修改状态；硬链接改变 ctime，不用于恢复判定。"""
+def _staged_file_state(path: Path, *, include_ctime: bool = False) -> dict[str, int]:
+    """ctime 仅用于本次读取/哈希期间的检查；硬链接改变它，不写入恢复身份。"""
     stat = path.stat()
-    return {"device": stat.st_dev, "inode": stat.st_ino,
-            "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    state = {"device": stat.st_dev, "inode": stat.st_ino,
+             "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    if include_ctime:
+        state["ctime_ns"] = stat.st_ctime_ns
+    return state
 
 
 def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
@@ -8175,7 +8194,7 @@ def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
     _check_result_directories(results, manifest, label="staged delivery")
     if (results / manifest).is_symlink():
         raise ValueError(f"staged result may not be a symlink: {results / manifest}")
-    manifest_state = _staged_file_state(results / manifest)
+    manifest_state = _staged_file_state(results / manifest, include_ctime=True)
     with (results / manifest).open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {"sample_id", "cpg_path", "snp_path"}
@@ -8204,12 +8223,13 @@ def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
             raise ValueError(f"staged result may not be a symlink: {path}")
         if not path.is_file():
             raise FileNotFoundError(f"declared staged result is missing: {path}")
-        state = _staged_file_state(path)
+        state = _staged_file_state(path, include_ctime=True)
         if relative == manifest and state != manifest_state:
             raise ValueError(f"staged manifest changed during inventory: {path}")
         digest = sha256_file(path)
-        if _staged_file_state(path) != state:
+        if _staged_file_state(path, include_ctime=True) != state:
             raise ValueError(f"staged output changed while hashing: {path}")
+        del state["ctime_ns"]
         records.append(
             {
                 "path": relative.as_posix(),

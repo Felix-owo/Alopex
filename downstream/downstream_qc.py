@@ -1313,12 +1313,35 @@ def _raw_adata_stat_binding(path: Path) -> dict:
     }
 
 
+def _reference_guard(*paths: Path | None, before_commit=None) -> Callable[[], None]:
+    """绑定本次读取的参考文件状态；仅瞬时复验，不把mtime/ctime写入内容身份。"""
+    def state(path):
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+    observed = [(Path(path), state(Path(path))) for path in paths if path is not None]
+
+    def assert_current():
+        if before_commit is not None:
+            before_commit()
+        for path, expected in observed:
+            try:
+                current = state(path)
+            except OSError as exc:
+                raise ValueError(f"Reference input changed during downstream computation: {path}") from exc
+            if current != expected:
+                raise ValueError(f"Reference input changed during downstream computation: {path}")
+    return assert_current
+
+
 def _content_binding(path: Path) -> dict:
     path = Path(path).resolve()
+    assert_current = _reference_guard(path)
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    assert_current()
     return {
         "path": str(path),
         "size_bytes": path.stat().st_size,
@@ -1598,7 +1621,8 @@ def load_or_create_raw_adata(
     reference_sequences 的行序决定全局稀疏列偏移，不得用 FAI 行序重建；
     1-based 每条染色体为坐标 0 留空槽，不改变真实参考长度。
     """
-    sealed_context.assert_current()
+    assert_current = _reference_guard(fai_path, before_commit=sealed_context.assert_current)
+    assert_current()
     source_base = _source_cpg_coordinate_base(sealed_context.cpg_representation)
     expected = [str(value) for value in expected_sample_ids]
     zero_mapped = {str(value) for value in zero_mapped_sample_ids}
@@ -1683,7 +1707,7 @@ def load_or_create_raw_adata(
                     "RawAdata Sample_ID set differs from current final manifest"
                 )
             if schema_matches:
-                sealed_context.assert_current()
+                assert_current()
                 validated = existing
                 existing = None
                 return validated, set(cached_empty)
@@ -1691,7 +1715,7 @@ def load_or_create_raw_adata(
                 "RawAdata does not match the current configured-base four-column input schema"
             )
         except Exception as e:
-            sealed_context.assert_current()
+            assert_current()
             _log(f"读取现有 h5ad 失败，尝试重建: {e}", level="WARNING")
         finally:
             if existing is not None:
@@ -1703,7 +1727,7 @@ def load_or_create_raw_adata(
     # sealed CpG 原文件直接交给原生导入，不再用 Python 预扫全库。
     empty_cpg = {sample_id for sample_id, path in sources.items()
                  if _cpg_table_is_empty(path, chrom_sizes, source_base)}
-    sealed_context.assert_current()
+    assert_current()
     if zero_mapped - empty_cpg:
         raise ValueError("Zero-mapped cells must have an empty current CpG result")
     input_signature["empty_cpg_sample_ids"] = sorted(empty_cpg)
@@ -1771,10 +1795,10 @@ def load_or_create_raw_adata(
         ))
         snap_data.close()
         snap_data = None
-        sealed_context.assert_current()
+        assert_current()
         _publish_raw_adata_generation(
             temporary, out_file, schema_file, input_signature,
-            before_commit=sealed_context.assert_current,
+            before_commit=assert_current,
         )
     finally:
         if snap_data is not None:
@@ -1843,40 +1867,55 @@ def _cache_identities(identity: Mapping[str, object], cfg, algorithms: Mapping[s
 
 
 def _open_cpg_text(path: Path):
-
+    """打开流式 CpG 解码器；调用方负责关闭文本流并完成子进程回收。"""
     if path.name.endswith(".zst"):
         executable = shutil.which("zstdcat")
         if executable is None:
             raise FileNotFoundError("zstdcat is required to read CpG .zst files")
-        process = subprocess.Popen(
-            [executable, str(path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if process.stdout is None:
-            process.kill()
-            raise RuntimeError(f"Cannot open zstd stream: {path}")
-        return process, process.stdout
+        # 科学文本保持流式读取；诊断不能占满无人读取的第二条管道。
+        diagnostics = tempfile.TemporaryFile(mode="w+t", errors="replace")
+        try:
+            process = subprocess.Popen(
+                [executable, str(path)],
+                stdout=subprocess.PIPE,
+                stderr=diagnostics,
+                text=True,
+            )
+        except BaseException:
+            diagnostics.close()
+            raise
+        assert process.stdout is not None
+        return process, process.stdout, diagnostics
     raise ValueError(
         f"CpG input must use the current .cpg.tsv.zst contract: {path}"
     )
 
 
 def _finish_cpg_process(
-    process: subprocess.Popen | None, path: Path, stream_error: BaseException | None
+    process: subprocess.Popen | None, path: Path, stream_error: BaseException | None,
+    diagnostics, *, early_stop: bool = False,
 ) -> None:
-    if process is None:
-        return
-    stderr = ""
-    if process.stderr is not None:
-        stderr = process.stderr.read()
-        process.stderr.close()
-    return_code = process.wait()
-    if return_code and stream_error is None:
-        raise RuntimeError(
-            f"zstdcat failed for {path} (exit {return_code}): {stderr.strip()}"
-        )
+    try:
+        if process is None or early_stop or stream_error is not None:
+            return
+        return_code = process.wait()
+        if return_code:
+            diagnostics.seek(0)
+            raise RuntimeError(
+                f"zstdcat failed for {path} (exit {return_code}): {diagnostics.read().strip()}"
+            )
+    finally:
+        try:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        finally:
+            if diagnostics is not None:
+                diagnostics.close()
 
 
 def _iter_cpg_rows(handle, path: Path, chrom_sizes: Mapping[str, int] | None, coordinate_base: int):
@@ -1903,7 +1942,7 @@ def _iter_cpg_rows(handle, path: Path, chrom_sizes: Mapping[str, int] | None, co
 
 def _cpg_table_is_empty(path: Path, chrom_sizes: Mapping[str, int] | None, coordinate_base: int) -> bool:
     """只探测表头与首条记录；全表格式/解压校验由 CpG 流式统计完成。"""
-    process, handle = _open_cpg_text(path)
+    process, handle, diagnostics = _open_cpg_text(path)
     stream_error = None
     found_data = False
     try:
@@ -1916,15 +1955,7 @@ def _cpg_table_is_empty(path: Path, chrom_sizes: Mapping[str, int] | None, coord
         handle.close()
         # 非空流主动早停，不能把本次关闭管道产生的 SIGPIPE 当成损坏输入。
         # 空表已读至 EOF，仍必须检查解码器退出，禁止把解压失败当成空细胞。
-        if process is not None and (found_data or stream_error is not None):
-            if process.poll() is None:
-                process.terminate()
-            if process.stderr is not None:
-                process.stderr.read()
-                process.stderr.close()
-            process.wait()
-        else:
-            _finish_cpg_process(process, path, stream_error)
+        _finish_cpg_process(process, path, stream_error, diagnostics, early_stop=found_data)
     return not found_data
 
 
@@ -2088,7 +2119,7 @@ def _stream_one_cpg_summary(
         "host_cov": 0,
         "total_cov": 0,
     }
-    process, handle = _open_cpg_text(path)
+    process, handle, diagnostics = _open_cpg_text(path)
     stream_error: BaseException | None = None
     try:
         if chrom_sizes is not None:
@@ -2127,12 +2158,10 @@ def _stream_one_cpg_summary(
                 )
     except BaseException as exc:
         stream_error = exc
-        if process is not None and process.poll() is None:
-            process.terminate()
         raise
     finally:
         handle.close()
-        _finish_cpg_process(process, path, stream_error)
+        _finish_cpg_process(process, path, stream_error, diagnostics)
 
     def mean_percent(category: str) -> float:
         count = counts[category]
@@ -2799,6 +2828,13 @@ def compute_tss_profile(
     before_commit=None,
 ) -> pd.DataFrame:
     """仅计算传入 QC 子集的 TSS，先复制对应 RawAdata 行并在退出时清理临时矩阵。"""
+    assert_reference_current = _reference_guard(tss_bed_path)
+
+    def prepare_tss_commit():
+        if before_commit is not None:
+            before_commit()
+        assert_reference_current()
+
     if set(empty_cpg_sample_ids) - set(df_qc["Sample_ID"].astype(str)):
         raise ValueError("Empty-CpG Sample_ID set differs from QC table")
     df_qc, _ = _select_tss_cells(df_qc, sample_fraction, sample_seed)
@@ -2812,6 +2848,7 @@ def compute_tss_profile(
                 prof = None
         if prof is not None:
             _log("命中 TSS Profile 缓存", level="DEBUG")
+            assert_reference_current()
             return prof
         _log("TSS Profile 缓存不符合当前键/数值契约，重新计算", level="WARNING")
 
@@ -2819,7 +2856,7 @@ def compute_tss_profile(
     if expected_sample_ids == empty_cpg:
         _read_tss_offset_map(tss_bed_path)
         prof = pd.DataFrame(columns=TSS_REQUIRED_COLUMNS)
-        _atomic_write_csv(prof, out_csv, before_commit=before_commit)
+        _atomic_write_csv(prof, out_csv, before_commit=prepare_tss_commit)
         validated = _validated_tss_cache(out_csv, expected_sample_ids, empty_cpg)
         if validated is None:
             out_csv.unlink(missing_ok=True)
@@ -2888,7 +2925,7 @@ def compute_tss_profile(
         tss_regions = pos_series.index.to_list()
         if not tss_regions:
             prof = pd.DataFrame(columns=TSS_REQUIRED_COLUMNS)
-            _atomic_write_csv(prof, out_csv, before_commit=before_commit)
+            _atomic_write_csv(prof, out_csv, before_commit=prepare_tss_commit)
             return prof
         frac_pl = make_and_aggregate("fraction", "mean", "meth_frac", "mean")
         count_pl = make_and_aggregate("target", "sum", "count", "sum")
@@ -2908,7 +2945,7 @@ def compute_tss_profile(
         how="left",
         validate="many_to_one",
     )
-    _atomic_write_csv(prof, out_csv, before_commit=before_commit)
+    _atomic_write_csv(prof, out_csv, before_commit=prepare_tss_commit)
     prof = _validated_tss_cache(out_csv, expected_sample_ids, empty_cpg)
     if prof is None:
         out_csv.unlink(missing_ok=True)
@@ -3058,7 +3095,9 @@ def _export_qc(
     empty_cpg_sample_ids: set[str],
     identity: Mapping[str, object],
     sealed: SealedQCContext,
+    *, before_commit=None,
 ) -> None:
+    assert_current = before_commit or sealed.assert_current
     with _qc_write_lock(paths.qc_results_dir):
         if not df_qc.empty:
             computed_columns = [
@@ -3123,11 +3162,11 @@ def _export_qc(
                 df_qc, manifest_sample_ids, "Final QC output"
             )
             def before_csv_commit():
-                sealed.assert_current()
+                assert_current()
                 _invalidate_completion(paths.input_identity)
 
             _atomic_write_csv(df_qc, paths.qc_info, before_commit=before_csv_commit)
-            _atomic_write_json(identity, paths.input_identity, before_commit=sealed.assert_current)
+            _atomic_write_json(identity, paths.input_identity, before_commit=assert_current)
 
 
 def _run_pipeline_impl(
@@ -3152,9 +3191,11 @@ def _run_pipeline_impl(
         paths.project_dir, expected_pipeline_root=_pipeline_dir()
     )
 
+    assert_current = _reference_guard(cfg.ref_fai, cfg.tss_bed, before_commit=sealed.assert_current)
+
     def prepare_cache_commit():
         # 自动修复缓存也须撤旧身份；交付换代后不得提交本次计算结果。
-        sealed.assert_current()
+        assert_current()
         _invalidate_completion(paths.input_identity)
 
     records = build_qc_records(paths.project_dir, sealed_context=sealed)
@@ -3376,7 +3417,7 @@ def _run_pipeline_impl(
     _log("Export: write CSVs")
     _export_qc(
         paths, df_qc, pipeline_qc, manifest_sample_ids,
-        empty_cpg_sample_ids, identity, sealed,
+        empty_cpg_sample_ids, identity, sealed, before_commit=assert_current,
     )
     dt = timer.stop("export")
     if dt is not None:
@@ -5557,6 +5598,7 @@ def prepare_single_cpg_adata(
         algorithms = completed_qc.algorithms
         genome = str(sealed.config["species"])
         bed = paths.pipeline_root / "resources" / f"{genome}_reference" / "cpg" / f"{genome}.single_cpg.bed.gz"
+        assert_qc_current = _reference_guard(bed, before_commit=assert_qc_current)
         signature = {
             "algorithm_sha256": algorithms["single"],
             **coordinate_metadata,

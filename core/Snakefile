@@ -461,32 +461,16 @@ def static_resource_runtime_min(rule_key, demux_sample=None, attempt=1):
 
 @functools.lru_cache(maxsize=None)
 def demux_run_total_bytes(run_id, mates=("r1", "r2")):
-    """统计 run 指定 mate 的压缩 FASTQ 字节；identity 缺 size_bytes 时回退 stat 实际路径。"""
+    """只读本次快照记录的压缩 FASTQ 字节；无快照的 dry-run 使用保守资源档位。"""
     if not RUN_SNAPSHOT:
         return None
-    basis = RUN_SNAPSHOT.get("basis")
-    records = basis.get("raw_fastqs") if isinstance(basis, Mapping) else None
-    if not isinstance(records, list):
-        return None
-    run_key = str(run_id).strip()
-    target = str(RAW_SAMPLES_MAP.get(run_key, {}).get("raw_sample", run_key))
-    total = 0
-    for record in records:
-        if str(record.get("raw_sample", "")) != target:
-            continue
-        for mate in mates:
-            identity = record.get(mate)
-            if not isinstance(identity, Mapping):
-                continue
-            size_bytes = int(identity.get("size_bytes", 0) or 0)
-            if size_bytes <= 0:
-                path = str(identity.get("path", "") or "")
-                try:
-                    size_bytes = os.path.getsize(path) if path else 0
-                except OSError:
-                    size_bytes = 0
-            total += size_bytes
-    return total
+    target = RAW_SAMPLES_MAP[run_id]["raw_sample"]
+    return sum(
+        record[mate]["size_bytes"]
+        for record in RUN_SNAPSHOT["basis"]["raw_fastqs"]
+        if record["raw_sample"] == target
+        for mate in mates
+    )
 
 def demux_resource_mem_mb(run_id, attempt=1):
     return int(demux_resource_request(demux_run_total_bytes(run_id), int(attempt)).mem_mb)

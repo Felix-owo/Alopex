@@ -1,6 +1,6 @@
-# Alopex v15.9.1
+# Alopex v16
 
-正式源码以 Git tag `v15.9.1` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v16` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 | 协议 / `analysis.protocol` | 后端 | 主要处理 |
 | --- | --- | --- |
@@ -11,19 +11,25 @@
 
 | 查阅内容 | 文档 |
 | --- | --- |
-| 配置默认值与可调参数 | 初始化生成的 `00_config/config.yaml` 与内置 schema |
+| 配置默认值、科学阈值、资源与 QC 分母 | [分析参数表](docs/ANALYSIS_PARAMETERS.md) |
 | Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
-| 本版源码与升级操作 | [v15.9.1 源码](https://github.com/Felix-owo/Alopex/tree/v15.9.1)、[下游写入与升级说明](downstream/README.md#输出) |
 
 ## 1. 安装
 
-准备可调用的 Conda、git、curl 和 gzip；Pipeline 与数据项目分开存放。
+准备可调用的 Conda、git、curl、gzip 和本地 C 编译器（macOS Command Line Tools / Linux `cc`，供 Rust 依赖构建）；Pipeline 与数据项目分开存放。
+
+环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。本版沿用已验证的环境，不需要额外 channel、自建 Conda 包或第三方源码补丁。
+
+从 [v16 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16) 下载 `Alopex-v16.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；开发测试、实验档案和 GitHub workflow 不进入发行包。
 
 ```bash
-git clone https://github.com/Felix-owo/Alopex.git
-cd Alopex
+shasum -a 256 -c SHA256SUMS
+tar -xzf Alopex-v16.tar.gz
+cd Alopex-v16
 conda --version
 ```
+
+跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。运行快照会记录实际源码、环境和输入身份。
 
 | 平台 / 部署方式 | 要求 |
 | --- | --- |
@@ -109,7 +115,7 @@ cabernet:
 | Cabernet / SRD | 可选 `methylation_backend: bismark` 或 `biscuit`；Bismark 默认 combined-index end-to-end，`bismark.local_alignment: true` 改为 CT/GA local；Bismark 各协议均固定 `--maxins 1000` |
 | Droplet | backend、spacer=0、non-directional 固定，不声明 `methylation_backend`、`demux.dna_w_spacer_len` 或 `bismark.library_type`；无需 Barcode Map，`rna_sample` 留空 |
 | TAPS | backend 固定 Rastair，不声明 `methylation_backend`；输出 SNP VCF/索引与 Non-CpG QC |
-| 无差异模块 | `taps` / `droplet` 可省略或为 `{}`；完整可调项见初始化生成的 config 模板和内置 schema |
+| 无差异模块 | `taps` / `droplet` 可省略或为 `{}`；完整可调项和资源档位见[参数表](docs/ANALYSIS_PARAMETERS.md) |
 
 | 孔板 Barcode Map | 要求 |
 | --- | --- |
@@ -212,4 +218,4 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 
 ## 许可证
 
-Alopex 以 [GPL-3.0](LICENSE) 发布。本仓库按发布版本同步核心 workflow、下游代码、Doctor fixture 和默认 Barcode Map。
+Alopex 以 [GPL-3.0](LICENSE) 发布。

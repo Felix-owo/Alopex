@@ -1,6 +1,6 @@
-# Alopex v15.9.1 下游 QC 与可视化
+# Alopex v16 下游 QC 与可视化
 
-正式源码以 Git tag `v15.9.1` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
+正式源码以 Git tag `v16` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
 
 | 输入边界 | 要求 |
 | --- | --- |
@@ -76,6 +76,7 @@ PY_KERNEL
 | SingleCpG 来源未知或身份变化 | 按提示设置 `RECOMPUTE_SINGLECPG=True`；身份绑定交付、Raw generation、BED、参数、算法与科学库版本 |
 | 仅细胞注释变化 | 矩阵可复用，只更新 SingleCpG `obs`；原有 QC 列仍须与当前磁盘 QC 一致。NaN/null 仅在比较时视为同一缺失，真实零值独立；未变化不改写矩阵或完成记录 |
 | 科学统计重算中断 | 旧完成身份撤销，下一次重新计算；有效 Raw 仍可复用。全部缓存命中时的导出失败不破坏有效缓存 |
+| 计算中参考变化 | FAI、TSS BED或Single BED在身份读取到提交期间被替换/改写时拒绝提交完成身份；确认参考稳定后重新运行。仅复验本次文件状态，不增加哈希遍数；已替换但未完成的矩阵不能作为有效缓存复用 |
 | 缓存计数自相矛盾 | 零位点/零 coverage 必须一致，宿主 coverage 须在 `sites` 至 `65535×sites`；异常从 canonical CpG 重算，不静默接受 |
 
 | 科学输入校验 | 保留的含义 |
@@ -83,6 +84,7 @@ PY_KERNEL
 | CpG 四列 | `chrom, pos, methyl, unmethyl`；位置与计数为 ASCII 十进制整数，计数非负，coverage 为正且不超过65535 |
 | 位点与 reference | 按 sealed base 和 FAI 校验真实边界；每条染色体位置严格递增，重复/乱序、未知 contig、缺表头、空行或解压失败均拒绝 |
 | 合法空细胞 | 允许仅表头的空 CpG；不把格式失败当作 zero-mapped，缓存命中不重复解压 |
+| 解压进程 | 数据保持流式读取，诊断暂存自动清理的临时文件，避免大量stderr堵塞读取。完整读取及空表必须检查解压退出码并报告原生错误；非空首行探测可提前结束，解析失败或早停均终止并回收本次解码器 |
 | 原生导入 | Step 2 只探测表头、首条记录与空表，直接链接原 zst 调用 `snap.pp.import_values(chunk_size=200)`；私有链接目录优先使用 SLURM_TMPDIR/节点临时目录，不可写时回退输出目录，不复制 CpG 内容。不做 Python 全表预扫。完整行/边界/顺序/解压校验随原有 Step 3 统计完成，失败不提交下游完成身份；有效 Raw/统计缓存命中不解压 |
 | 流式统计 | Step 3 在有界文本块中用编译循环完成同一套严格校验和逐行 Kahan 求和；释放 GIL 后采用最多32个工作线程，并按实际 CPU/调用方预算限幅，解码器单线程。跨块保持位点顺序和浮点累计顺序，任务全部退出后恢复 native 线程环境；失败关闭解压进程，不提交完成身份 |
 | contig 分类 | 保留 FAI 全部原名，包括点号、`NA` 与前导零；controls 仅精确匹配 `lambda` / `pUC19`，含其子串的宿主 chr 不算 controls；mt 按 chrM/MT/chrMT 分类，其他 decoy 仅进 total |
@@ -94,7 +96,7 @@ Notebook 在本地与 HPC 均通过 `run_qc_processor(PATHS)` 启动 `PATHS.pipe
 Raw 重建与 CpG 统计统一使用上述已验证方案，无需另设分块参数；第一格的 `Pipeline:` 应指向已更新的源码目录。
 原 Notebook 已完成同资源全库对照；本地通过科学/并发回归，尚无本地2707细胞完整性能测量，不承诺所有平台固定耗时。
 有效缓存仍优先复用；过期缓存按 Processor 提示处理。更新本版后请结束旧写任务并重启 Notebook kernel；SingleCpG 提示来源过期时需显式重建。
-分块和线程实现不改变科学计数、观测零值或缺失值；更大的导入分块需要更多内存。升级操作见下方[输出与写入边界](#输出)。
+
 
 ### 保存供下游复用的 single-CpG 矩阵
 
@@ -139,7 +141,7 @@ Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对�
 | profile 行数 | CSV 仅记录选中且有覆盖的 bins，细胞数可小于抽检数；全体无覆盖时仅表头 CSV 合法并可复用，旧 PDF 清理 |
 | 零值与坐标 | 有 coverage 而甲基化为0仍保留；无覆盖不补0。区间自动适配 sealed base，标准 BED 不变，相对 TSS 距离不加减1 |
 
-抽检副本只读取选中细胞的 CSR 行切片，保留原始整数记录、全局位点索引和原生 reference 顺序，再交给原生 TSS 矩阵计算；避免离散行 `subset` 先把全库解压到内存。复制内存随抽中细胞的实际观测数增长，完整库仍用已有 backed Raw；不需要新增资源参数或修改 Notebook。抽检采用有界覆盖筛选，全检免去额外覆盖预扫描；计算方式不改变抽样名单或科学结果。
+抽检副本只读取选中细胞的 CSR 行切片，保留原始整数记录、全局位点索引和原生 reference 顺序，再交给原生 TSS 矩阵计算；避免离散行 `subset` 先把全库解压到内存。复制内存随抽中细胞的实际观测数增长，完整库仍用已有 backed Raw；不需要新增资源参数或修改 Notebook。
 
 ## 输出
 
@@ -177,13 +179,13 @@ Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对�
 | QC 甲基化率 | 宿主、lambda、pUC19 分别对已覆盖位点的 `m/(m+u)` 取均值再×100；无观测为 NaN，不是合并 reads 的比例 |
 | SingleCpG | 参考区间内已覆盖位点的 fraction 均值；如 `1/4` 与 `9/12` 的均值为0.5，不是 `10/16`；有覆盖全 unmethyl 保显式0，缺覆盖不补0 |
 | TSS | 每个 offset 对有覆盖 bins 的 fraction 取均值；count 为甲基化信号之和，不是 read pairs 或总 coverage |
-| Gini | 流式读取 backed CSR，以原生 float32 顺序累加有覆盖 bins 的 `m+u`，省去临时分箱矩阵；不纳入未覆盖 bins，有 coverage 的零甲基化不等同缺失。计算公式、原生reference顺序与观测零值含义保持不变 |
+| Gini | 流式读取 backed CSR，以原生 float32 顺序累加有覆盖 bins 的 `m+u`，省去临时分箱矩阵；不纳入未覆盖 bins，有 coverage 的零甲基化不等同缺失。 |
 | 信号组成 | host/lambda/pUC19/mtDNA coverage 各除以全部 contig 的总 coverage 再×100，其他 decoy 只进分母；不是位点比例 |
 | 原生 mapping | 各 backend 单位/分母不同，不视为同义指标或默认跨 backend HQ 阈值 |
 | TAPS controls | lambda 假阳性 / pUC19 转换率为 `sum(mod)/sum(mod+unmod)`，须同时报告观测数；与 QC 位点均值不同，不混用为化学效率 |
 | TAPS Non-CpG | 可判链宿主分子的 CHG/CHH 原始转换率；零观测缺失，未经 SNP/测序错误校正，不能直接解释为真实 mCH 或 cDNA 污染率；High-CpH 为 NaN |
 
-上表明确各指标的生物学分母及零值含义。Doctor与合成回归仅覆盖相应输入，不代表真实全库科学等价或性能验证。
+完整分母见[分析参数表](../docs/ANALYSIS_PARAMETERS.md#cross-backend-qc-计数口径)与[生物学分母及零值规范](../docs/ANALYSIS_PARAMETERS.md#生物学分母与零值解释)。
 
 | 默认 HQ 条件（同时满足） | 阈值 |
 | --- | --- |
@@ -221,4 +223,4 @@ Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对�
 | 细胞集合 | 两边独立 calling/QC；`DNA_RNA_cell_links.csv` 保留双方全集，整合 QC 只含共同且双方 QC 可用的细胞 |
 | 身份冲突 | 文库冲突或错误交付代际失败；不套用孔板的细胞集合相等约束，未配对不补科学零值 |
 
-Droplet两侧独立calling，不要求细胞集合相等；孔板关联仍要求完整细胞集合对应。
+完整 Droplet 关联契约见 [实现与边界](https://github.com/Felix-owo/Alopex/blob/v16/core/dna_pipeline.py)。

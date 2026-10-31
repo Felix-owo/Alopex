@@ -2085,7 +2085,7 @@ mod output {
 
 mod droplet {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader};
 
     static DESIGN_BARCODES: OnceLock<AHashSet<Vec<u8>>> = OnceLock::new();
     const DESIGN_BYTES: &[u8] =
