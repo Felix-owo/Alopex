@@ -7735,7 +7735,7 @@ _SOURCE_SUFFIXES = {".py", ".sh", ".yaml", ".toml", ".rs", ".lock"}
 
 
 _SOURCE_EXCLUDED_PARTS = {
-    ".git", ".pytest_cache", ".snakemake", "__pycache__", "conda", "target", "vendor"
+    ".git", ".ipynb_checkpoints", ".pytest_cache", ".snakemake", "__pycache__", "conda", "target", "vendor"
 }
 
 
@@ -7746,19 +7746,21 @@ def _pipeline_source_identity(root: Path) -> Mapping[str, object]:
         if not base.exists():
             continue
         for path in sorted(base.rglob("*")):
-            if not path.is_file() or any(part in _SOURCE_EXCLUDED_PARTS for part in path.parts):
+            if not path.is_file() or any(part in _SOURCE_EXCLUDED_PARTS for part in path.relative_to(base).parts):
                 continue
             if path.suffix.lower() not in _SOURCE_SUFFIXES and path.name != "Snakefile":
                 continue
+            identity = stable_file_identity(path)
             records.append({
                 "path": str(path.relative_to(root)),
-                "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
+                "size_bytes": identity["size_bytes"],
+                "sha256": identity["sha256"],
             })
     design = root / DROPLET_DESIGN_RESOURCE
     if design.is_file():
-        records.append({"path": DROPLET_DESIGN_RESOURCE, "size_bytes": design.stat().st_size,
-                        "sha256": sha256_file(design)})
+        identity = stable_file_identity(design)
+        records.append({"path": DROPLET_DESIGN_RESOURCE, "size_bytes": identity["size_bytes"],
+                        "sha256": identity["sha256"]})
     return {
         "method": "production-source-tree-v1",
         "sha256": sha256_bytes(canonical_json_bytes(records)),
@@ -8797,8 +8799,11 @@ def validate_release(current_s: str, expected_subdir: str, envs_path: str) -> No
         record = records[role]
         if not isinstance(record, dict) or record.get("relative_path") != role:
             raise ValueError(f"{role} release record is invalid")
-        recorded_resolved = str(record.get("resolved_prefix", "")).strip()
-        if recorded_resolved and Path(recorded_resolved).resolve() != prefix:
+        recorded_resolved = record.get("resolved_prefix")
+        # producer 已保存解析后的绝对路径；再次 resolve 会掩盖原目录被换成链接的漂移。
+        if (not isinstance(recorded_resolved, str)
+                or not Path(recorded_resolved).is_absolute()
+                or Path(recorded_resolved) != prefix):
             raise ValueError(f"{role} resolved prefix drift")
         environment = read_environment_identity(prefix)
         if environment.get("role") != role:

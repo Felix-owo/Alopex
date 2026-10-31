@@ -1,6 +1,6 @@
-# Alopex v16 下游 QC 与可视化
+# Alopex v16.0.1 下游 QC 与可视化
 
-正式源码以 Git tag `v16` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
+正式源码以 Git tag `v16.0.1` 为准。本文说明 Notebook、矩阵、QC 分母、缓存重算与 RNA 关联；安装与主流程见[主 README](../README.md)。
 
 | 输入边界 | 要求 |
 | --- | --- |
@@ -185,7 +185,7 @@ Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对�
 | TAPS controls | lambda 假阳性 / pUC19 转换率为 `sum(mod)/sum(mod+unmod)`，须同时报告观测数；与 QC 位点均值不同，不混用为化学效率 |
 | TAPS Non-CpG | 可判链宿主分子的 CHG/CHH 原始转换率；零观测缺失，未经 SNP/测序错误校正，不能直接解释为真实 mCH 或 cDNA 污染率；High-CpH 为 NaN |
 
-完整分母见[分析参数表](../docs/ANALYSIS_PARAMETERS.md#cross-backend-qc-计数口径)与[生物学分母及零值规范](../docs/ANALYSIS_PARAMETERS.md#生物学分母与零值解释)。
+
 
 | 默认 HQ 条件（同时满足） | 阈值 |
 | --- | --- |
@@ -222,5 +222,3 @@ Notebook 第二格默认 `TSS_SAMPLE_FRACTION=0.10`、`TSS_SAMPLE_SEED=0`，对�
 | 文库映射 | DNA `rna_sample` 留空；RNA 项目 `00_config/dna_rna_library_map.tsv` 指定 DNA/RNA 文库，按完整 CB17 关联 |
 | 细胞集合 | 两边独立 calling/QC；`DNA_RNA_cell_links.csv` 保留双方全集，整合 QC 只含共同且双方 QC 可用的细胞 |
 | 身份冲突 | 文库冲突或错误交付代际失败；不套用孔板的细胞集合相等约束，未配对不补科学零值 |
-
-完整 Droplet 关联契约见 [实现与边界](https://github.com/Felix-owo/Alopex/blob/v16/core/dna_pipeline.py)。

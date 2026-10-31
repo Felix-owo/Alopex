@@ -1,6 +1,6 @@
-# Alopex v16
+# Alopex v16.0.1
 
-正式源码以 Git tag `v16` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v16.0.1` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 | 协议 / `analysis.protocol` | 后端 | 主要处理 |
 | --- | --- | --- |
@@ -11,7 +11,6 @@
 
 | 查阅内容 | 文档 |
 | --- | --- |
-| 配置默认值、科学阈值、资源与 QC 分母 | [分析参数表](docs/ANALYSIS_PARAMETERS.md) |
 | Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
 
 ## 1. 安装
@@ -20,12 +19,12 @@
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。本版沿用已验证的环境，不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v16 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16) 下载 `Alopex-v16.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；开发测试、实验档案和 GitHub workflow 不进入发行包。
+从 [v16.0.1 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.0.1) 下载 `Alopex-v16.0.1.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v16.tar.gz
-cd Alopex-v16
+tar -xzf Alopex-v16.0.1.tar.gz
+cd Alopex-v16.0.1
 conda --version
 ```
 
@@ -115,7 +114,7 @@ cabernet:
 | Cabernet / SRD | 可选 `methylation_backend: bismark` 或 `biscuit`；Bismark 默认 combined-index end-to-end，`bismark.local_alignment: true` 改为 CT/GA local；Bismark 各协议均固定 `--maxins 1000` |
 | Droplet | backend、spacer=0、non-directional 固定，不声明 `methylation_backend`、`demux.dna_w_spacer_len` 或 `bismark.library_type`；无需 Barcode Map，`rna_sample` 留空 |
 | TAPS | backend 固定 Rastair，不声明 `methylation_backend`；输出 SNP VCF/索引与 Non-CpG QC |
-| 无差异模块 | `taps` / `droplet` 可省略或为 `{}`；完整可调项和资源档位见[参数表](docs/ANALYSIS_PARAMETERS.md) |
+| 无差异模块 | `taps` / `droplet` 可省略或为 `{}` |
 
 | 孔板 Barcode Map | 要求 |
 | --- | --- |
