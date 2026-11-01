@@ -1,6 +1,6 @@
-# Alopex v16.0.1
+# Alopex v16.1
 
-正式源码以 Git tag `v16.0.1` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v16.1` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 | 协议 / `analysis.protocol` | 后端 | 主要处理 |
 | --- | --- | --- |
@@ -19,12 +19,12 @@
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。本版沿用已验证的环境，不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v16.0.1 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.0.1) 下载 `Alopex-v16.0.1.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
+从 [v16.1 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.1) 下载 `Alopex-v16.1.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v16.0.1.tar.gz
-cd Alopex-v16.0.1
+tar -xzf Alopex-v16.1.tar.gz
+cd Alopex-v16.1
 conda --version
 ```
 
@@ -112,7 +112,7 @@ cabernet:
 | 结构与覆盖 | 只接受 schema 3；内置默认 → `common` → 选定协议覆盖，列表整体替换，固定协议策略最终生效 |
 | 共用 / 全局设置 | demux、high-CpH、Bismark、BISCUIT 参数放 `common`；物种/reference、`analysis`、`runtime`、`slurm`、`retention` 为全局设置 |
 | Cabernet / SRD | 可选 `methylation_backend: bismark` 或 `biscuit`；Bismark 默认 combined-index end-to-end，`bismark.local_alignment: true` 改为 CT/GA local；Bismark 各协议均固定 `--maxins 1000` |
-| Droplet | backend、spacer=0、non-directional 固定，不声明 `methylation_backend`、`demux.dna_w_spacer_len` 或 `bismark.library_type`；无需 Barcode Map，`rna_sample` 留空 |
+| Droplet | backend、spacer=0、non-directional 固定，不声明 `methylation_backend`、`demux.dna_w_spacer_len` 或 `bismark.library_type`；无需 Barcode Map，`rna_sample` 可选填外部 RNA 原始 basename |
 | TAPS | backend 固定 Rastair，不声明 `methylation_backend`；输出 SNP VCF/索引与 Non-CpG QC |
 | 无差异模块 | `taps` / `droplet` 可省略或为 `{}` |
 
@@ -153,7 +153,7 @@ mate 支持 `R1/R2` 或 `1/2`，分隔符支持 `_ . -`；lane 为 1–999，chu
 | --- | --- |
 | Cabernet / TAPS | 可选的外部 RNA_DARLIN **原始 RNA basename**，不是 RNA sample_id 或路径；不产生本地 RNA route，也不会被 refresh 自动当成本地 DNA 登记 |
 | SRD | 本地 RNA-enrichment tube，需对应本地输入 |
-| Droplet | 留空；配套 RNA 独立 calling，通过文库映射与完整 CB17 关联 |
+| Droplet | 可选外部 RNA 原始 basename，与 Cabernet 一致；配套 RNA 独立 calling，按对应文库与完整 CB17 关联；留空保持未关联 |
 
 DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联-rna_darlin-结果)。
 

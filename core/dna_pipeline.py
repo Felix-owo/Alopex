@@ -958,8 +958,8 @@ properties:
     - cpg_coordinate_base
     properties:
       protocol:
-        description: 建库协议（srd / cabernet / taps / droplet）；manifest 的 rna_sample 在 srd 为本地 RNA tube，在 cabernet/taps
-          为可选外部 RNA raw 关联，在 droplet 必须留空。
+        description: 建库协议（srd / cabernet / taps / droplet）；manifest 的 rna_sample 在 srd 为本地 RNA tube，在 cabernet/taps/droplet
+          为可选外部 RNA raw 关联。
         type: string
         enum:
         - srd
@@ -1213,7 +1213,7 @@ references:
   mm10: resources/mm10_reference/mm10.primary.lambda.puc19.fa  # primary genome + lambda + pUC19；也接受绝对路径
 
 analysis:
-  protocol: cabernet              # cabernet / srd / taps / droplet；manifest 的 rna_sample 在 srd 为本地输入，cabernet/taps 为外部 RNA raw 关联，droplet 必须留空
+  protocol: cabernet              # cabernet / srd / taps / droplet；manifest 的 rna_sample 在 srd 为本地输入，cabernet/taps/droplet 为可选外部 RNA raw 关联
   cpg_coordinate_base: 1         # CpG pos、RawAdata 与 SingleCpG 位点默认 1-based；设为 0 输出 0-based，原生 BED/VCF/BAM 不变
 
 runtime:
@@ -2938,8 +2938,6 @@ def _parse_project_sample_manifest(
                 f"sample_manifest.tsv line {line_no} species={row['species']!r} "
                 f"does not match config species={species!r}"
             )
-        if protocol == "droplet" and row["rna_sample"]:
-            raise ValueError("Droplet does not support RNA association")
         row_protocol = row["protocol"].lower()
         if not row_protocol:
             raise ValueError(f"sample_manifest.tsv line {line_no} has empty protocol")
