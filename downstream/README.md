@@ -1,6 +1,6 @@
-# Alopex v16.1 下游 QC 与可视化
+# Alopex v16.1.1 下游 QC 与可视化
 
-正式源码以 Git tag `v16.1` 为准。本文说明下游运行、结果读取、缓存恢复与 RNA 关联；安装和上游流程见[主 README](../README.md)。
+正式源码以 Git tag `v16.1.1` 为准。本文说明下游运行、结果读取、缓存恢复与 RNA 关联；安装和上游流程见[主 README](../README.md)。
 
 [运行](#运行) · [输出](#输出) · [指标与筛选](#指标与筛选) · [SingleCpG 矩阵](#保存供下游复用的-single-cpg-矩阵) · [TSS](#tss-profile) · [缓存与重算](#缓存与强制重算) · [RNA 关联](#关联-rna_darlin-结果)
 

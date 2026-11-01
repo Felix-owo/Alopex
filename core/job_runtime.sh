@@ -5,6 +5,21 @@ if [[ -n "${DNA_PIPELINE_ROOT:-}" ]]; then
     export PYTHONPATH="$DNA_PIPELINE_ROOT/core${PYTHONPATH:+:$PYTHONPATH}"
 fi
 
+# Droplet 全开 writer 的 FD 预算必须来自本次规则进程，不能依赖登录 shell/Slurm 的软限制。
+# 硬限制无法提升时仍由 Rust 安全限幅；日志明确记录生效上限，不改变科学结果。
+dna_pipeline_prepare_demux_fds() {
+    local before hard after
+    before="$(ulimit -Sn)" || return $?
+    hard="$(ulimit -Hn)" || return $?
+    if [[ "$before" != unlimited ]] && { [[ "$hard" == unlimited ]] || (( before < hard )); }; then
+        if ! ulimit -Sn "$hard"; then
+            printf 'WARNING: cannot raise demux soft NOFILE to system hard limit %s; bounded writer fallback remains available\n' "$hard" >&2
+        fi
+    fi
+    after="$(ulimit -Sn)" || return $?
+    printf 'INFO: demux_nofile soft_before=%s soft_effective=%s hard=%s\n' "$before" "$after" "$hard"
+}
+
 # 每次尝试建立编号日志硬链接；新一轮首次尝试清理上一轮归档，重试保留本轮证据。
 dna_pipeline_init_attempt_logs() {
     local attempt="$1"

@@ -1,6 +1,6 @@
-# Alopex v16.1
+# Alopex v16.1.1
 
-正式源码以 Git tag `v16.1` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v16.1.1` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 | 协议 / `analysis.protocol` | 后端 | 主要处理 |
 | --- | --- | --- |
@@ -19,12 +19,12 @@
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。本版沿用已验证的环境，不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v16.1 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.1) 下载 `Alopex-v16.1.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
+从 [v16.1.1 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.1.1) 下载 `Alopex-v16.1.1.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v16.1.tar.gz
-cd Alopex-v16.1
+tar -xzf Alopex-v16.1.1.tar.gz
+cd Alopex-v16.1.1
 conda --version
 ```
 

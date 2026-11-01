@@ -791,6 +791,9 @@ checkpoint demux:
             printf 'ERROR: demux_rs is missing or not executable: %s\n' "$demux_tool" >&2
             exit 127
         }}
+        if [[ {params.pipeline_mode:q} == droplet ]]; then
+            dna_pipeline_prepare_demux_fds >> {log:q} 2>&1
+        fi
         {{
             echo "protocol={params.pipeline_mode}"
             echo "demux_mode={params.demux_mode}"
@@ -897,7 +900,7 @@ checkpoint demux:
         fi
 
         run_demux() {{
-            "$demux_tool" \
+            RUST_LOG="${{RUST_LOG:-demux_rs=info}}" "$demux_tool" \
               {params.r1_args} \
               {params.r2_args} \
               --barcode-map {input.barcode_map:q} \
