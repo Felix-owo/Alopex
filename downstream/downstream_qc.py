@@ -37,6 +37,8 @@ from dna_pipeline import (
     load_run_manifest,
     load_run_snapshot,
     sha256_file,
+    reference_sequence_identity,
+    validate_downstream_reference,
 )
 from dna_pipeline import effective_cpu_count
 from dna_pipeline import python_ast_bindings, python_ast_dependencies
@@ -191,11 +193,8 @@ def _snapshot_reference_fai(
     record = _mapping(reference.get("fai"), "snapshot reference FAI")
     if Path(str(record.get("path", ""))).resolve() != expected:
         raise ValueError(f"Sealed run snapshot does not identify exactly one FAI: {expected}")
-    if not expected.is_file():
-        raise FileNotFoundError(f"Sealed reference FAI is missing: {expected}")
-    stat = expected.stat()
-    if stat.st_size != record.get("size_bytes") or stat.st_mtime_ns != record.get("mtime_ns"):
-        raise ValueError(f"Sealed reference FAI changed after the Pipeline run: {expected}")
+    if reference.get("content") != reference_sequence_identity(reference_path):
+        raise ValueError("Sealed reference FASTA/FAI content changed after the Pipeline run")
     return expected
 
 
@@ -1071,6 +1070,8 @@ def build_config(
             "Provide --tss-bed or explicitly use --skip-tss:\n"
             + "\n".join(f"  - {value}" for value in missing)
         )
+    if cfg.tss_bed is not None:
+        validate_downstream_reference(sealed.reference_path, cfg.tss_bed, "tss")
     return cfg
 
 
@@ -1152,13 +1153,18 @@ _THREAD_LIMIT_ENV_VARS = (
 )
 
 
+def _is_primary_chromosome(seq: str) -> bool:
+    """固定hg38/mm10主核染色体名称；辅助/decoy不因chr前缀进入分析分母。"""
+    return re.fullmatch(r"chr(?:[1-9]|1[0-9]|2[0-2]|X|Y)", str(seq)) is not None
+
+
 @lru_cache(maxsize=4096)
 def _classify_seq_name(seq: str) -> tuple[bool, bool, bool, bool]:
     seq = str(seq)
     is_lambda = seq == "lambda"
     is_puc = seq == "pUC19"
     is_mt = bool(re.fullmatch(r"(?i)(chrM|MT|chrMT)", seq))
-    is_host = seq.startswith("chr") and not (is_lambda or is_puc or is_mt)
+    is_host = _is_primary_chromosome(seq)
     return is_lambda, is_puc, is_mt, is_host
 
 
@@ -2284,7 +2290,7 @@ def _validated_composition_cache(
             cached, sample_ids, "CpG_Signal_Composition cache"
         )
         if not cached["Signal_Composition_Rule"].astype(str).eq(
-            "host_chr_prefix"
+            "primary_nuclear_chromosomes"
         ).all():
             return None
         required_finite = [
@@ -2387,7 +2393,7 @@ def compute_cpg_signal_composition(
     base["Signal_pUC19_Rate%"] = 100.0 * f_puc
     base["Signal_mtDNA_Rate%"] = 100.0 * f_mt
     base["Signal_Host_Rate%"] = 100.0 * f_host
-    base["Signal_Composition_Rule"] = "host_chr_prefix"
+    base["Signal_Composition_Rule"] = "primary_nuclear_chromosomes"
     comp_out = base[list(COMPOSITION_CACHE_COLUMNS)].copy()
     _atomic_write_csv(comp_out, cache_path, before_commit=before_commit)
 
@@ -2641,7 +2647,7 @@ def _validated_tss_cache(
 
 
 @njit
-def _coverage_bins_from_csr(indptr, indices, data, chrom_offsets, bin_offsets, bin_size, base):
+def _coverage_bins_from_csr(indptr, indices, data, chrom_offsets, bin_offsets, bin_size, base, primary=None):
     """按原生 reference 顺序分箱，保持原生逐观测 float32 coverage 累加。"""
     # 只存观测分箱；小 bin 也不能按整个基因组长度分配稠密数组。
     capacity = min(len(data), (len(indptr) - 1) * bin_offsets[-1])
@@ -2661,6 +2667,8 @@ def _coverage_bins_from_csr(indptr, indices, data, chrom_offsets, bin_offsets, b
             pos = index - chrom_offsets[chrom] - base
             if pos < 0:
                 raise ValueError("Raw CpG index is outside the configured coordinate base")
+            if primary is not None and not primary[chrom]:
+                continue
             target = bin_offsets[chrom] + pos // bin_size
             coverage = np.float32(data[k] & 0xffff)
             if target != previous:
@@ -2708,6 +2716,8 @@ def compute_gini_index(
                                     np.cumsum(lengths + base)))
     bin_offsets = np.concatenate((np.array([0], dtype=np.int64),
                                   np.cumsum((lengths + bin_size - 1) // bin_size)))
+    primary = np.array([_is_primary_chromosome(str(chrom))
+                        for chrom in reference["reference_seq_name"]], dtype=np.bool_)
     out = np.full(raw_adata.n_obs, np.nan, dtype=np.float64)
     # 直接消费 backed CSR，避免逐位点创建区间对象及临时 tile HDF5 的往返 I/O。
     # 只保留观测分箱；不把无 coverage 的缺失分箱补成零，也不丢弃零甲基化位点。
@@ -2717,7 +2727,7 @@ def compute_gini_index(
     ):
         rows, _, counts = _coverage_bins_from_csr(
             matrix.indptr, matrix.indices, matrix.data,
-            chrom_offsets, bin_offsets, bin_size, base,
+            chrom_offsets, bin_offsets, bin_size, base, primary,
         )
         for local_index in range(end - start):
             values = counts[rows[local_index]:rows[local_index + 1]]
@@ -3191,7 +3201,11 @@ def _run_pipeline_impl(
         paths.project_dir, expected_pipeline_root=_pipeline_dir()
     )
 
-    assert_current = _reference_guard(cfg.ref_fai, cfg.tss_bed, before_commit=sealed.assert_current)
+    if cfg.tss_bed is not None:
+        validate_downstream_reference(sealed.reference_path, cfg.tss_bed, "tss")
+    assert_current = _reference_guard(sealed.reference_path, cfg.ref_fai, cfg.tss_bed,
+        Path(str(cfg.tss_bed) + ".reference.json") if cfg.tss_bed else None,
+        before_commit=sealed.assert_current)
 
     def prepare_cache_commit():
         # 自动修复缓存也须撤旧身份；交付换代后不得提交本次计算结果。
@@ -3365,19 +3379,20 @@ def _run_pipeline_impl(
             _log(f"Removed stale skipped-TSS output: {paths.tss_info.name}")
 
     if raw_adata is not None and not df_qc.empty:
+        primary_empty = set(df_qc.loc[df_qc["Sample_Unique_CpG_Sites"].eq(0), "Sample_ID"].astype(str))
         gini = compute_gini_index(
             raw_adata,
             bin_size=cfg.gini_bin_size,
             cache_path=paths.gini_cache,
             recompute=recompute_gini,
-            empty_cpg_sample_ids=empty_cpg_sample_ids,
+            empty_cpg_sample_ids=primary_empty,
             before_commit=prepare_cache_commit,
         )
         df_qc["Gini_Index"] = df_qc["Sample_ID"].astype(str).map(gini)
         gini_missing = set(
             df_qc.loc[df_qc["Gini_Index"].isna(), "Sample_ID"].astype(str)
         )
-        if gini_missing != empty_cpg_sample_ids:
+        if gini_missing != primary_empty:
             raise ValueError("Gini missingness differs from empty-CpG cells")
 
         if cfg.tss_bed is not None:
@@ -5598,7 +5613,9 @@ def prepare_single_cpg_adata(
         algorithms = completed_qc.algorithms
         genome = str(sealed.config["species"])
         bed = paths.pipeline_root / "resources" / f"{genome}_reference" / "cpg" / f"{genome}.single_cpg.bed.gz"
-        assert_qc_current = _reference_guard(bed, before_commit=assert_qc_current)
+        validate_downstream_reference(sealed.reference_path, bed, "single-cpg")
+        assert_qc_current = _reference_guard(sealed.reference_path, sealed.reference_fai, bed,
+            Path(str(bed) + ".reference.json"), before_commit=assert_qc_current)
         signature = {
             "algorithm_sha256": algorithms["single"],
             **coordinate_metadata,

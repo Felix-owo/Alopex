@@ -36,7 +36,7 @@ import uuid
 import warnings
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
@@ -432,6 +432,28 @@ def disable_snakemake_output_mtime_gate() -> None:
 
     setattr(accept_output_mtime, "_dna_pipeline_nonfatal_output_mtime", True)
     DAG.check_output_mtime = accept_output_mtime
+
+
+def honor_slurm_no_account(workflow: object) -> None:
+    """使空账户配置沿用集群默认值，不触发 executor 的账户猜测。"""
+    if not getattr(getattr(workflow, "executor_settings", None), "no_account", False):
+        return
+    from snakemake_executor_plugin_slurm import Executor
+
+    current = Executor.get_account_arg
+    if getattr(current, "_alopex_no_account", False):
+        return
+
+    def account_arg(executor: object, job: object) -> Iterator[str]:
+        # 当前插件虽接收 no_account，却仍进入猜测；其 sacct 管道还会误作普通 argv。
+        # 每次查询当前 workflow，避免同进程的其他显式账户运行受影响。
+        if getattr(executor.workflow.executor_settings, "no_account", False):
+            yield ""
+        else:
+            yield from current(executor, job)
+
+    setattr(account_arg, "_alopex_no_account", True)
+    Executor.get_account_arg = account_arg
 
 
 # 基础原语：调度资源
@@ -1140,6 +1162,7 @@ $defs:
         description: 单 cell barcode 匹配 read pairs 的最低门槛，低于该值的 cell 不产出结果。
         type: integer
         minimum: 0
+        maximum: 18446744073709551615
       dna_w_spacer_len:
         description: DNA 读段布局中 barcode 与 ME motif 间 W spacer 碱基数，须与实际建库一致。
         type: integer
@@ -1201,6 +1224,7 @@ $defs:
         description: 启用百分比判断所需的最低 informative non-CG C 数量。
         type: integer
         minimum: 1
+        maximum: 18446744073709551615
 """
 
 
@@ -1677,7 +1701,13 @@ def export_config_scalars(config: Mapping[str, object]) -> dict[str, str]:
             rendered[var] = ""
         elif isinstance(value, bool):
             rendered[var] = "true" if value else "false"
-        elif isinstance(value, (str, int, float)):
+        elif isinstance(value, float):
+            # 当前导出的数字叶子均为整数；保持 schema 对 2.0 等整数值的语义，
+            # 只规范 CLI 字面量，不把 2.5 截断成2，也不改配置或 sealed 输入副本。
+            if not math.isfinite(value) or not value.is_integer():
+                raise ValueError(f"config field must be an integer: {dotted}")
+            rendered[var] = str(int(value))
+        elif isinstance(value, (str, int)):
             rendered[var] = str(value)
         else:
             raise ValueError(f"config field must be a scalar: {dotted}")
@@ -2160,6 +2190,18 @@ MANAGED_CONTIGS = {
 }
 
 
+def managed_alignment_contigs(species: str) -> list[tuple[str, int]]:
+    """固定assembly的主染色体＋真实辅助/decoy清单；不影响下游主染色体定义。"""
+    path = Path(__file__).parent / "reference" / f"{species}.alignment_contigs.json"
+    records = [(name, int(length)) for name, length in json.loads(path.read_text())]
+    return [*records, *SPIKE_CONTIGS.items()]
+
+
+def primary_analysis_contigs(species: str, *, include_mitochondrial: bool = False) -> tuple[str, ...]:
+    return tuple(name for name, _length in _PRIMARY_CONTIGS[species]
+                 if include_mitochondrial or name != "chrM")
+
+
 def _fai_contigs(path: Path) -> list[tuple[str, int]]:
 
     try:
@@ -2265,8 +2307,9 @@ def resolve_reference(
             f"Add references.{species}: /path/to/reference.fa to 00_config/config.yaml."
         )
 
-    ref_path = str(refs[species] or "").strip()
-    if not ref_path:
+    # YAML 引号内的空格属于路径；裁剪可能静默选中另一份参考基因组。
+    ref_path = str(refs[species] or "")
+    if not ref_path.strip():
         raise ValueError(f"Reference path for species {species!r} is empty")
 
     configured = Path(ref_path).expanduser()
@@ -2291,7 +2334,7 @@ def resolve_reference(
     setup_script = pipeline_root / "core" / "doctor.sh"
     if species in {"hg38", "mm10"}:
         hint = (
-            "For standard hg38/mm10 references, place hg38.fa, mm10.fa, "
+            "For standard hg38/mm10 references, place hg38.analysis.fa, mm10.fa, "
             "lambda.fa and pUC19.fa under resources/reference_source/, then run:\n"
             f"  bash \"{setup_script}\" reference"
         )
@@ -2306,6 +2349,206 @@ def resolve_reference(
         f"Configured path: {ref_path}\nChecked:\n{checked}\n\n"
         f"{hint}"
     )
+
+
+def _reference_file_state(path: Path) -> tuple[int, ...]:
+    st = path.stat()
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+@lru_cache(maxsize=512)
+def _reference_content_hash(path: str, state: tuple[int, ...]) -> str:
+    """每个实际文件状态只哈希一次；读取期间变化不得生成有效绑定。"""
+    p = Path(path)
+    if _reference_file_state(p) != state:
+        raise RuntimeError(f"reference file changed before hashing: {p}")
+    value = sha256_file(p)
+    if _reference_file_state(p) != state:
+        raise RuntimeError(f"reference file changed while hashing: {p}")
+    return value
+
+
+def _reference_file_record(path: Path, recorded: Mapping | None = None) -> dict:
+    state = _reference_file_state(path)
+    if not path.is_file() or state[2] <= 0:
+        raise ValueError(f"missing/empty reference artifact: {path}")
+    value = (recorded["sha256"] if recorded and list(state) == recorded.get("state")
+             else _reference_content_hash(str(path.resolve()), state))
+    if recorded and (value != recorded.get("sha256") or state[2] != recorded.get("size_bytes")):
+        raise ValueError(f"reference generation content mismatch: {path}")
+    if re.fullmatch(r"[0-9a-f]{64}", str(value)) is None:
+        raise ValueError(f"invalid reference digest: {path}")
+    return {"sha256": value, "size_bytes": state[2], "state": list(state)}
+
+
+def reference_binding_path(reference: Path, kind: str, *, root: Path | None = None) -> Path:
+    """每个独立提交组件各有一个commit-last绑定；不共写全局可变清单。"""
+    if kind == "fasta":
+        return Path(str(reference) + ".reference.json")
+    if kind == "rastair":
+        return (root or Path(str(reference) + ".bwa")) / "reference.json"
+    if kind == "biscuit":
+        return Path(str(reference) + ".biscuit.reference.json")
+    if kind in {"bismark-local", "bismark-combined"}:
+        return (root or Path(str(reference) + ".bismark")) / (kind + ".reference.json")
+    raise ValueError(f"unsupported reference component: {kind}")
+
+
+def _read_reference_binding(path: Path, kind: str) -> dict:
+    payload = json.loads(path.read_text())
+    if payload.get("schema_version") != 1 or payload.get("kind") != kind:
+        raise ValueError(f"invalid reference component binding: {path}")
+    return payload
+
+
+def _check_bound_artifacts(receipt: Path, payload: Mapping) -> None:
+    files = payload.get("files")
+    if not isinstance(files, dict) or not files:
+        raise ValueError(f"empty reference artifact binding: {receipt}")
+    for relative, record in files.items():
+        _reference_file_record(receipt.parent / relative, record)
+
+
+def reference_sequence_identity(reference: str | Path) -> dict:
+    """内容身份与文件布局分离：同内容touch不强制科学重算，内容变化拒用旧派生。"""
+    ref = Path(reference).resolve()
+    receipt = reference_binding_path(ref, "fasta")
+    recorded = {}
+    if receipt.is_file():
+        payload = _read_reference_binding(receipt, "fasta")
+        recorded = payload["files"]
+        if set(recorded) != {ref.name, ref.name + ".fai"}:
+            raise ValueError(f"incomplete FASTA binding: {receipt}")
+    records = {}
+    for role, path in (("fasta", ref), ("fai", Path(str(ref) + ".fai"))):
+        records[role] = _reference_file_record(path, recorded.get(os.path.relpath(path, receipt.parent)))
+    return {role: {k: v for k, v in rec.items() if k != "state"} for role, rec in records.items()}
+
+
+def begin_reference_build(reference: Path, output: Path, annotation: Path | None = None) -> None:
+    """工具启动前绑定实际FASTA/FAI及可选GTF，供完成边界复核，非额外运行gate。"""
+    ref = reference.resolve()
+    payload = {"reference": reference_sequence_identity(ref), "fasta_state": list(_reference_file_state(ref))}
+    if annotation is not None:
+        payload["annotation"] = {"path": str(annotation.resolve()), **_reference_file_record(annotation)}
+    atomic_write_json(output, payload)
+
+
+def reference_component_files(reference: Path, kind: str, root: Path | None = None) -> list[Path]:
+    if kind == "fasta":
+        return [reference, Path(str(reference) + ".fai")]
+    if kind == "rastair":
+        directory = root or Path(str(reference) + ".bwa")
+        return [directory / ("genome" + suffix) for suffix in BWA_INDEX_SUFFIXES]
+    if kind == "biscuit":
+        return [Path(str(reference) + suffix) for suffix in BISCUIT_INDEX_SUFFIXES]
+    if kind in {"bismark-local", "bismark-combined"}:
+        directory = root or Path(str(reference) + ".bismark")
+        return [directory / "genome.fa", *backend_active_index_paths(
+            reference, "bismark", bismark_root=directory,
+            bismark_local_alignment=kind == "bismark-local")]
+    raise ValueError(f"unsupported reference component: {kind}")
+
+
+def seal_reference_component(reference: Path, kind: str, *, build_input: Path | None = None,
+                             root: Path | None = None) -> None:
+    """在现有构建事务内、完整文件组安装后写最后标记，失败由该事务恢复。"""
+    identity = reference_sequence_identity(reference) if kind != "fasta" else None
+    if kind != "fasta":
+        if build_input is None:
+            raise ValueError("reference producer input binding is required")
+        before = json.loads(build_input.read_text())
+        if before["reference"] != identity or before["fasta_state"] != list(_reference_file_state(reference)):
+            raise ValueError("reference changed during component build")
+    receipt = reference_binding_path(reference, kind, root=root)
+    # fasta重建时旧receipt已由组装事务撤销；只在此边界计算每个新工件的一次完整hash。
+    files = {os.path.relpath(p, receipt.parent): _reference_file_record(p)
+             for p in reference_component_files(reference, kind, root)}
+    if kind.startswith("bismark-"):
+        genome = files[os.path.relpath((root or Path(str(reference) + ".bismark")) / "genome.fa", receipt.parent)]
+        if genome["sha256"] != identity["fasta"]["sha256"]:
+            raise ValueError("Bismark genome.fa differs from source FASTA")
+    atomic_write_json(receipt, {"schema_version": 1, "kind": kind, "reference": identity, "files": files})
+
+
+def validate_reference_component(reference: Path, kind: str, *, root: Path | None = None) -> dict:
+    receipt = reference_binding_path(reference, kind, root=root)
+    payload = _read_reference_binding(receipt, kind)
+    expected = {os.path.relpath(p, receipt.parent) for p in reference_component_files(reference, kind, root)}
+    if set(payload["files"]) != expected:
+        raise ValueError(f"incomplete reference file family: {receipt}")
+    if kind != "fasta" and payload["reference"] != reference_sequence_identity(reference):
+        raise ValueError(f"reference/component generation mismatch: {receipt}")
+    _check_bound_artifacts(receipt, payload)
+    return payload
+
+
+def seal_downstream_reference_bindings(reference: Path, annotation: Path, tss: Path, cpg: Path,
+                                       build_input: Path) -> None:
+    before = json.loads(build_input.read_text())
+    identity = reference_sequence_identity(reference)
+    if before["reference"] != identity or before["fasta_state"] != list(_reference_file_state(reference)):
+        raise ValueError("reference changed during downstream reference build")
+    annotation_record = _reference_file_record(annotation, before["annotation"])
+    for role, path in (("tss", tss), ("single-cpg", cpg)):
+        receipt = Path(str(path) + ".reference.json")
+        atomic_write_json(receipt, {"schema_version": 1, "kind": role, "reference": identity,
+                                   "annotation": annotation_record,
+                                   "files": {path.name: _reference_file_record(path)}})
+
+
+def relocate_downstream_bindings(reference: Path, tss: Path, cpg: Path) -> None:
+    """只在持锁Doctor自身rename后刷新ctime，不重复哈希已验证的同inode工件。
+
+    输入/结果在事务期间禁止外部原位改写；该边界与发布硬链接的ctime处理一致，
+    不承诺识别任意并发、同inode等长且恢复mtime的外部篡改。
+    """
+    identity = reference_sequence_identity(reference)
+    for path, kind in ((tss, "tss"), (cpg, "single-cpg")):
+        receipt = Path(str(path) + ".reference.json")
+        payload = _read_reference_binding(receipt, kind)
+        if payload["reference"] != identity or set(payload["files"]) != {path.name}:
+            raise ValueError("downstream binding changed during publication")
+        record = payload["files"][path.name]
+        current = list(_reference_file_state(path))
+        if current[:4] != record["state"][:4]:
+            raise ValueError(f"downstream artifact changed across owned rename: {path}")
+        record["state"] = current
+        atomic_write_json(receipt, payload)
+
+
+def validate_downstream_reference(reference: Path, artifact: Path, kind: str,
+                                  annotation: Path | None = None) -> dict:
+    receipt = Path(str(artifact) + ".reference.json")
+    payload = _read_reference_binding(receipt, kind)
+    if set(payload["files"]) != {artifact.name} or payload["reference"] != reference_sequence_identity(reference):
+        raise ValueError(f"downstream/reference generation mismatch: {artifact}")
+    _check_bound_artifacts(receipt, payload)
+    if annotation is not None and annotation.is_file():
+        if _reference_file_record(annotation, payload["annotation"])["sha256"] != payload["annotation"]["sha256"]:
+            raise ValueError(f"annotation changed; rebuild downstream references: {artifact}")
+    return payload
+
+
+def import_reference_binding(reference: Path, kind: str, *, root: Path | None = None,
+                             artifact: Path | None = None, annotation: Path | None = None) -> None:
+    """接收已封存组件：全内容核对成功后仅刷新目标文件系统状态，不重签科学身份。
+
+    必须已有 producer 回执；缺失、错代或任何 digest 不符均拒绝，不能据此批准旧索引。
+    跨平台索引格式是否可用另由目标平台的实际小数据比对验收。
+    """
+    if artifact is None:
+        receipt = reference_binding_path(reference, kind, root=root)
+        payload = validate_reference_component(reference, kind, root=root)
+    else:
+        receipt = Path(str(artifact) + ".reference.json")
+        payload = validate_downstream_reference(reference, artifact, kind, annotation)
+    records = {relative: _reference_file_record(receipt.parent / relative, record)
+               for relative, record in payload["files"].items()}
+    if artifact is not None and annotation is not None and annotation.is_file():
+        payload["annotation"] = _reference_file_record(annotation, payload["annotation"])
+    payload["files"] = records
+    atomic_write_json(receipt, payload)
 
 
 def reference_identity(
@@ -2325,12 +2568,16 @@ def reference_identity(
     if not fai.is_file() or fai.stat().st_size == 0:
         raise FileNotFoundError(f"reference FAI is missing or empty: {fai}")
     observed = _fai_contigs(fai)
-    if expected_species in MANAGED_SPECIES and observed != MANAGED_CONTIGS[expected_species]:
+    if expected_species in MANAGED_SPECIES and any(
+        dict(observed).get(name) != length for name, length in MANAGED_CONTIGS[expected_species]
+    ):
         raise ValueError(
             f"{expected_species} reference contig/order/length contract mismatch: {resolved_ref}"
         )
+    content = reference_sequence_identity(resolved_ref)
     ref_stat = resolved_ref.stat()
     return {
+        "content": content,
         "public_path": str(public_ref),
         "resolved_path": str(resolved_ref),
         "size_bytes": ref_stat.st_size,
@@ -5218,7 +5465,8 @@ def normalize_read_name(value: str) -> str:
     return str(value).strip().split()[0]
 
 
-def indexed_excluded_contigs(bam_path: Path, samtools: str, excluded: set[str]) -> list[str]:
+def indexed_excluded_contigs(bam_path: Path, samtools: str, excluded: set[str]) -> list[tuple[str, int]]:
+    """从原生索引读取精确 contig 名及全长，供 BED 查询使用。"""
     proc = subprocess.run(
         [samtools, "idxstats", str(bam_path)],
         text=True,
@@ -5231,7 +5479,9 @@ def indexed_excluded_contigs(bam_path: Path, samtools: str, excluded: set[str]) 
     for line in proc.stdout.splitlines():
         fields = line.split("\t")
         if fields and fields[0] in excluded:
-            contigs.append(fields[0])
+            if len(fields) != 4 or not re.fullmatch(r"[0-9]+", fields[1]) or int(fields[1]) < 1:
+                raise ValueError(f"Invalid samtools idxstats contig length for {fields[0]!r}: {bam_path}")
+            contigs.append((fields[0], int(fields[1])))
     return contigs
 
 
@@ -5241,10 +5491,21 @@ def excluded_reads_from_bam(bam_path: Path, samtools: str, excluded: set[str]) -
     if not contigs:
         return set()
 
-    # stdout 必须流式读取；stderr 使用临时文件，避免双 PIPE 互相等待。
-    with tempfile.TemporaryFile(mode="w+t", errors="replace") as diagnostics:
+    # CLI region 会把 -h 当选项、chr1:10-20 当区间，连花括号也不能转义所有合法名称。
+    # BED 的第一列按名称精确关联；通常覆盖完整 contig 并保留索引查询。
+    # 合法的 # 前缀在 BED 中却是注释，此时只能流式按 SAM 的精确 RNAME 选择。
+    # stdout 流式读取，stderr 落临时文件，避免双 PIPE 互相等待。
+    with ExitStack() as temporary, tempfile.TemporaryFile(mode="w+t", errors="replace") as diagnostics:
+        command = [samtools, "view"]
+        if not any(name.startswith('#') for name, _ in contigs):
+            regions = temporary.enter_context(tempfile.NamedTemporaryFile(mode="w+t", encoding="utf-8", suffix=".bed"))
+            for name, length in contigs:
+                regions.write(f"{name}\t0\t{length}\n")
+            regions.flush()
+            command.extend(["-M", "-L", regions.name])
+        command.extend(["--", str(bam_path)])
         proc = subprocess.Popen(
-            [samtools, "view", str(bam_path), *contigs],
+            command,
             text=True,
             stdout=subprocess.PIPE,
             stderr=diagnostics,
@@ -5256,7 +5517,11 @@ def excluded_reads_from_bam(bam_path: Path, samtools: str, excluded: set[str]) -
             for line in proc.stdout:
                 if not line:
                     continue
-                names.add(normalize_read_name(line.split("\t", 1)[0]))
+                fields = line.rstrip("\r\n").split("\t", 3)
+                if len(fields) < 3:
+                    raise ValueError(f"Invalid samtools view record for {bam_path}: {line!r}")
+                if fields[2] in excluded:
+                    names.add(normalize_read_name(fields[0]))
             returncode = proc.wait()
             if returncode != 0:
                 diagnostics.seek(0)
@@ -6623,7 +6888,7 @@ def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str, 
                     raise ValueError(f"TAPS non-CpG QC requires a complete pair: {name}")
                 primary_pairs += 1
                 chrom, bases, orientation, start, seq = _taps_pair_bases(primary, ref)
-                if not chrom.startswith("chr") or re.fullmatch(r"(?i)(chrM|chrMT)", chrom):
+                if re.fullmatch(r"chr(?:[1-9]|1[0-9]|2[0-2]|X|Y)", chrom) is None:
                     continue
                 counts["non_cpg_candidate_pairs"] += 1
                 if not orientation:
@@ -7555,7 +7820,6 @@ def should_skip_biscuit_dup_report(report_path: str) -> str | None:
 
 def _is_multiqc_source_candidate(path: Path) -> bool:
     name = path.name
-    suffixes = "".join(path.suffixes)
 
     if not path.is_file():
         return False
@@ -7590,7 +7854,8 @@ def _is_multiqc_source_candidate(path: Path) -> bool:
 
 
     parts = path.parts
-    if tuple(parts[-4:-2]) == ("biscuit", "qc") and suffixes in {
+    # 细胞 ID 可含点号；不能把 ID 内部的点号当作报告的复合格式后缀而静默丢弃。
+    if tuple(parts[-4:-2]) == ("biscuit", "qc") and path.suffix in {
         ".txt", ".json", ".tsv", ".csv"
     }:
         return True
@@ -7606,6 +7871,39 @@ def _iter_explicit_multiqc_files(inputs: Iterable[str | Path]) -> Iterable[Path]
         if not source.is_file():
             raise ValueError(f"Declared MultiQC source is not a file: {source}")
         yield source
+
+
+def prefetch_multiqc_native_libraries(prefix: Path) -> tuple[int, int]:
+    """有界预读当前 MultiQC 的解释器与 Polars 映像，缓解 Lustre 冷页映射等待。
+
+    不改环境或库的选择；预读失败仅告警，原生 MultiQC 的退出码仍决定规则成败。
+    """
+    seen: set[tuple[int, int]] = set()
+    files, read_bytes = 0, 0
+    for pattern in (
+        "lib/python*/site-packages/_polars_runtime_*/*.so",
+        "lib/python*/site-packages/polars/*.so",
+        "lib/libpython*.so*",
+        "lib/libpython*.dylib",
+        # 解释器也可能在加载 Polars 前阻塞；最后读取，使其在 exec 前保持热页。
+        "bin/python",
+    ):
+        for library in sorted(prefix.glob(pattern)):
+            try:
+                identity = library.stat()
+                if not stat.S_ISREG(identity.st_mode):
+                    continue
+                key = (identity.st_dev, identity.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
+                with library.open("rb") as handle:
+                    while block := handle.read(8 * 1024 * 1024):
+                        read_bytes += len(block)
+                files += 1
+            except OSError as exc:
+                logger.warning("MultiQC 原生库预读失败，继续由原生工具校验环境：%s: %s", library, exc)
+    return files, read_bytes
 
 
 def write_multiqc_file_list(
@@ -7632,13 +7930,10 @@ def write_multiqc_file_list(
         )
 
     file_list = Path(out_list)
-    file_list.parent.mkdir(parents=True, exist_ok=True)
-    file_list_tmp = file_list.with_name(file_list.name + ".tmp")
-    file_list_tmp.write_text(
-        "".join(f"{path}\n" for path in sorted(unique_sources)),
-        encoding="utf-8",
+    atomic_write_bytes(
+        file_list,
+        "".join(f"{path}\n" for path in sorted(unique_sources)).encode("utf-8"),
     )
-    file_list_tmp.replace(file_list)
 
     logger.info(
         "Prepared explicit MultiQC file list with %d sources; skipped %d dup reports",
@@ -7664,9 +7959,19 @@ def prepare_sampled_multiqc_sources(
     out_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(out_dir / "multiqc_config.json", {
         "fn_clean_trim": [],
-        "extra_fn_clean_exts": [{
+        # Cutadapt 对路径内任意连字符的 stdin 误判会退回共用 scratch basename。
+        # 显式使用本 Pipeline 的细胞报告名，且只去掉各模块的末尾工件后缀；
+        # MultiQC 默认的中间子串截断也会破坏合法细胞身份和 custom table 的关联。
+        # BISCUIT 会重复清名；每次从原报告名开始，避免再次截断 ID 自身的同名结尾。
+        "use_filename_as_sample_name": ["cutadapt", "biscuit"],
+        "fn_clean_exts": [{
             "type": "regex", "module": "bismark",
             "pattern": r"(?:_PE_report|_splitting_report|\.deduplication_report|\.M-bias)\.txt$",
+        }, {
+            "type": "regex", "module": "cutadapt", "pattern": r"\.cutadapt\.json$",
+        }, {
+            "type": "regex", "module": "biscuit",
+            "pattern": r"_(?:" + "|".join(map(re.escape, MULTIQC_BISCUIT_SOURCE_SUFFIXES)) + r")$",
         }],
     })
     sources = []
@@ -7723,7 +8028,7 @@ def prepare_high_cph_multiqc_sources(
 
 # 汇总与交付：运行快照和持锁发布
 
-SNAPSHOT_SCHEMA_VERSION = 10
+SNAPSHOT_SCHEMA_VERSION = 11
 
 
 _SOURCE_ROOTS = ("core",)
@@ -7746,7 +8051,7 @@ def _pipeline_source_identity(root: Path) -> Mapping[str, object]:
         for path in sorted(base.rglob("*")):
             if not path.is_file() or any(part in _SOURCE_EXCLUDED_PARTS for part in path.relative_to(base).parts):
                 continue
-            if path.suffix.lower() not in _SOURCE_SUFFIXES and path.name != "Snakefile":
+            if path.suffix.lower() not in _SOURCE_SUFFIXES and path.name != "Snakefile" and path.parent != root / "core/reference":
                 continue
             identity = stable_file_identity(path)
             records.append({
@@ -7831,6 +8136,9 @@ def _backend_reference_observation(
     config: Mapping[str, object], reference: Path
 ) -> Mapping[str, object]:
     backend = get_backend(dict(config))
+    kind = ("bismark-local" if resolve_bismark_alignment(config).local_alignment else "bismark-combined") if backend == "bismark" else backend
+    validate_reference_component(reference, kind)
+
     if backend == "bismark":
         public = Path(f"{reference}.bismark")
         if not public.is_dir():
@@ -8876,13 +9184,15 @@ def build_downstream_references(
     host_contigs = [
         (name, length)
         for name, length in contigs
-        if name not in {"lambda", "pUC19"}
+        if name in primary_analysis_contigs(species)
     ]
     contig_lengths = dict(host_contigs)
     expected_build, expected_release = _annotation_release_signature(species)
     header_lines: list[str] = []
     tss_tmp = _atomic_text_path(tss)
     cpg_tmp = _atomic_text_path(cpg)
+    binding_input = _atomic_text_path(tss.with_suffix(".build-input.json"))
+    begin_reference_build(reference, binding_input, annotation)
     tss_count = 0
     protein_coding_gene_count = 0
     seen_intervals: set[tuple[str, int, int]] = set()
@@ -9012,10 +9322,15 @@ def build_downstream_references(
         if cpg_count == 0:
             raise ValueError(f"reference produced no CpG sites: {reference}")
 
+        # 换成员前先验证构建输入仍同代；外层Doctor持有可恢复发布事务。
+        before = json.loads(binding_input.read_text())
+        if before["reference"] != reference_sequence_identity(reference):
+            raise ValueError("reference changed during downstream build")
         os.replace(tss_tmp, tss)
         os.replace(cpg_tmp, cpg)
+        seal_downstream_reference_bindings(reference, annotation, tss, cpg, binding_input)
     finally:
-        for temporary in (tss_tmp, cpg_tmp):
+        for temporary in (tss_tmp, cpg_tmp, binding_input):
             try:
                 temporary.unlink()
             except FileNotFoundError:
@@ -9052,11 +9367,161 @@ def append_spikein_contigs(lambda_fasta: Path, puc19_fasta: Path, target_fasta: 
                 handle.write(sequence[offset : offset + 60] + "\n")
 
 
+# NCBI GRCh38 analysis-set CEN/PAR/WGS 与 GRC exclusions 的保留序列子集。
+# 原始坐标/内容SHA及稳定来源见 ANALYSIS_PARAMETERS；BED0/half-open，长度不变。
+_ANALYSIS_MASK_INTERVALS = {
+    "hg38": {
+        "chr5": (
+            (47309184, 49591369),
+        ),
+        "chr9": (
+            (70701801, 70719794),
+        ),
+        "chr13": (
+            (86252979, 86269524),
+            (111753855, 111793441),
+        ),
+        "chr14": (
+            (16000000, 16022537),
+            (16140627, 16228649),
+            (16228749, 16282882),
+            (16282982, 16346517),
+            (16346617, 16367287),
+            (16367387, 16374057),
+            (16374157, 16377402),
+            (16377502, 16400063),
+            (16404448, 17538659),
+            (17538759, 17539099),
+            (17539199, 17539539),
+            (17539639, 17540837),
+            (17540937, 18173523),
+        ),
+        "chr16": (
+            (34339329, 34521510),
+        ),
+        "chr19": (
+            (24498980, 24552652),
+            (24552752, 24891256),
+            (24908689, 27190874),
+        ),
+        "chr21": (
+            (5010000, 5166246),
+            (5966593, 6161371),
+            (6427258, 6580181),
+            (6789085, 6934219),
+            (7743700, 7865746),
+            (10864560, 10887097),
+            (10887197, 10975219),
+            (10975319, 11029452),
+            (11029552, 11093087),
+            (11093187, 11113857),
+            (11113957, 11120627),
+            (11120727, 11123972),
+            (11124072, 11146633),
+            (11146733, 12280944),
+            (12281044, 12281384),
+            (12281484, 12281824),
+            (12281924, 12283122),
+            (12283222, 12915808),
+        ),
+        "chr22": (
+            (12954788, 12977325),
+            (12977425, 12986171),
+            (12994027, 13011653),
+            (13014130, 13021322),
+            (13021422, 13109444),
+            (13109544, 13163677),
+            (13163777, 13227312),
+            (13227412, 13248082),
+            (13248182, 13254852),
+            (13254952, 13258197),
+            (13258297, 13280858),
+            (13280958, 13285143),
+            (13285243, 14419454),
+            (14419554, 14419894),
+            (14419994, 14420334),
+            (14420434, 14421632),
+            (14421732, 15054318),
+        ),
+        "chrX": (
+            (37085008, 37099262),
+        ),
+        "chrY": (
+            (10000, 2781479),
+            (56887902, 57217415),
+        ),
+        "chrUn_KI270752v1": (
+            (0, 27745),
+        ),
+        "chr11_KI270721v1_random": (
+            (0, 100316),
+        ),
+        "chr22_KI270734v1_random": (
+            (0, 165050),
+        ),
+    },
+    "mm10": {
+        "chrY": (
+            (90745844, 91644698),
+        ),
+    },
+}
+
+
+def _reference_mask_blocks(species: str, fasta: Path, record: tuple[str, int, int, int, int], intervals):
+    """按 FAI 定位官方 analysis-set 区间，保留原 FASTA 换行及所有坐标（BED0）。"""
+    name, length, offset, line_bases, line_width = record
+    if length != dict(managed_alignment_contigs(species)).get(name):
+        raise ValueError(f"analysis masking requires standard {species} contig {name}")
+    if offset < 0 or line_bases <= 0 or line_width < line_bases:
+        raise ValueError("invalid FASTA/FAI geometry for analysis mask")
+    with fasta.open("rb") as handle:
+        for lo, hi in intervals:
+            start = offset + lo // line_bases * line_width + lo % line_bases
+            stop = offset + (hi - 1) // line_bases * line_width + (hi - 1) % line_bases + 1
+            handle.seek(start)
+            data = handle.read(stop - start)
+            sequence = data.translate(None, b"\r\n")
+            if len(data) != stop - start or len(sequence) != hi - lo or not set(sequence.upper()) <= set(b"ACGTRYSWKMBDHVN"):
+                raise ValueError(f"invalid FASTA/FAI at {name}:{lo}-{hi}")
+            yield start, data, hi - lo
+
+
+def mask_analysis_reference(species: str, fasta: Path) -> None:
+    """仅修改 Doctor 未提交的候选 FASTA；等长屏蔽官方 analysis-set 区间。
+
+    PAR 的可比对同源信号保留在 X，不能再解释为 X 独有覆盖。mm10 PAR
+    含 gap/序列差异，不宣称 X/Y 整段逐碱基相同或全部信号可无损回收。
+    https://www.ncbi.nlm.nih.gov/grc/human （GRCh38 PAR1/PAR2）
+    https://www.ncbi.nlm.nih.gov/grc/mouse （GRCm38 PAR）
+    """
+    if species not in _ANALYSIS_MASK_INTERVALS:
+        raise ValueError(f"unsupported analysis-set assembly: {species}")
+    records = [line.split("\t") for line in Path(str(fasta) + ".fai").read_text().splitlines() if line.strip()]
+    by_name = {r[0]: (r[0], *(int(v) for v in r[1:5])) for r in records}
+    if len(by_name) != len(records):
+        raise ValueError("duplicate contig in candidate FASTA index")
+    # 所有目标区间写前验证；只改碱基、不改布局，原 FAI 仍精确有效。
+    blocks = []
+    for name, intervals in _ANALYSIS_MASK_INTERVALS[species].items():
+        if name not in by_name:
+            raise ValueError(f"missing analysis-set contig: {name}")
+        blocks.extend(_reference_mask_blocks(species, fasta, by_name[name], intervals))
+    translation = bytes(c if c in (10, 13) else ord("N") for c in range(256))
+    with fasta.open("r+b") as handle:
+        for start, data, _length in blocks:
+            masked = data.translate(translation)
+            if data != masked:
+                handle.seek(start)
+                handle.write(masked)
+
+
 def fai_contract_check(mode: str, label: str, fai: Path, fasta: Path) -> bool:
     """校验 source/assembled FASTA 是否满足标准 contig 长度契约。
 
     只读取很小的 .fai 并通过 FAI 几何 + FASTA 大小的算术检查排除截断文件，
-    不扫描序列本身。mode=source 允许 UCSC FASTA 中的额外 contig（primary 与
+    assembled hg38/mm10 额外只读对应 analysis-set 区间以核对 hard-mask，不扫描全基因组。
+    mode=source 允许 UCSC FASTA 中的额外 contig（primary 与
     spike 必须全部存在且长度精确）；mode=assembled 只允许标准 contig 的精确顺序。
     """
 
@@ -9106,7 +9571,17 @@ def fai_contract_check(mode: str, label: str, fai: Path, fasta: Path) -> bool:
             )
         return False
     if mode == "assembled":
-        return label in MANAGED_CONTIGS and length_records == MANAGED_CONTIGS[label]
+        if label not in MANAGED_CONTIGS or length_records != managed_alignment_contigs(label):
+            return False
+        if label in _ANALYSIS_MASK_INTERVALS:
+            by_name = {r[0]: r for r in records}
+            try:
+                return all(data.translate(None, b"\r\n") == b"N" * length
+                           for name, intervals in _ANALYSIS_MASK_INTERVALS[label].items()
+                           for _start, data, length in _reference_mask_blocks(label, fasta, by_name[name], intervals))
+            except ValueError:
+                return False
+        return True
     return False
 
 
@@ -9170,15 +9645,16 @@ def synthesize_route_config(source: Path, destination: Path, route: str) -> None
     """把项目 config 与 route 覆盖合成为 test 模式 effective config。"""
     import yaml
 
-    cfg = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    # Doctor 也必须先拒绝重复键/非法源配置，不能先覆盖路线再把错误输入洗成合法配置。
+    cfg = load_project_config(source)
     apply_common_route_config(cfg, resolve_route(route))
 
 
     runtime = cfg.setdefault("runtime", {})
     runtime["local_executor_cores"] = max(8, int(runtime.get("local_executor_cores", 8)))
-    destination.write_text(
-        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8"
-    )
+    atomic_write_bytes(destination, yaml.safe_dump(
+        finalize_project_config(cfg), sort_keys=False, allow_unicode=True,
+    ).encode("utf-8"))
 
 
 BENCHMARK_SCHEMA_VERSION = 2
@@ -9739,6 +10215,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     spikein = commands.add_parser("append-spikein", help="把 lambda/pUC19 追加到 assembled FASTA。")
     for field in ('--lambda-fasta', '--puc19-fasta', '--target-fasta'):
         spikein.add_argument(field, type=Path, required=True)
+    mask_par = commands.add_parser("mask-analysis-reference", help="等长屏蔽候选 FASTA 的官方 analysis-set 区间。")
+    mask_par.add_argument("--species", choices=sorted(_ANALYSIS_MASK_INTERVALS), required=True)
+    mask_par.add_argument("--fasta", type=Path, required=True)
+    binding = commands.add_parser("reference-binding", help="Doctor reference 组件的构建输入与内容绑定。")
+    binding.add_argument("action", choices=("begin", "seal", "check", "relocate", "import"))
+    binding.add_argument("--reference", type=Path, required=True)
+    binding.add_argument("--kind", choices=("fasta", "biscuit", "rastair", "bismark-local", "bismark-combined", "downstream"), default="fasta")
+    binding.add_argument("--build-input", type=Path)
+    binding.add_argument("--root", type=Path)
+    binding.add_argument("--annotation-gtf", type=Path)
+    binding.add_argument("--tss-bed", type=Path)
+    binding.add_argument("--single-cpg-bed", type=Path)
+    contigs = commands.add_parser("reference-contigs", help="输出固定assembly的比对contig顺序。")
+    contigs.add_argument("--species", required=True, choices=sorted(MANAGED_SPECIES))
     return parser
 
 
@@ -9934,6 +10424,33 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "env-reusable":
             environment_is_reusable(args.prefix, args.role, args.envs)
 
+        elif command == "reference-binding":
+            if args.action == "begin":
+                if args.build_input is None:
+                    raise ValueError("--build-input is required")
+                begin_reference_build(args.reference, args.build_input, args.annotation_gtf)
+            elif args.kind == "downstream":
+                if args.tss_bed is None or args.single_cpg_bed is None:
+                    raise ValueError("downstream bindings require TSS and single-CpG paths")
+                if args.action == "relocate":
+                    relocate_downstream_bindings(args.reference, args.tss_bed, args.single_cpg_bed)
+                elif args.action == "import":
+                    for path, kind in ((args.tss_bed, "tss"), (args.single_cpg_bed, "single-cpg")):
+                        import_reference_binding(args.reference, kind, artifact=path, annotation=args.annotation_gtf)
+                elif args.action == "seal":
+                    seal_downstream_reference_bindings(args.reference, args.annotation_gtf,
+                        args.tss_bed, args.single_cpg_bed, args.build_input)
+                else:
+                    validate_downstream_reference(args.reference, args.tss_bed, "tss", args.annotation_gtf)
+                    validate_downstream_reference(args.reference, args.single_cpg_bed, "single-cpg", args.annotation_gtf)
+            elif args.action == "import":
+                import_reference_binding(args.reference, args.kind, root=args.root)
+            elif args.action == "seal":
+                seal_reference_component(args.reference, args.kind, build_input=args.build_input, root=args.root)
+            else:
+                validate_reference_component(args.reference, args.kind, root=args.root)
+        elif command == "reference-contigs":
+            print("\n".join(name for name, _length in managed_alignment_contigs(args.species) if name not in SPIKE_CONTIGS))
         elif command == "fai-check":
             return 0 if fai_contract_check(args.mode, args.label, args.fai, args.fasta) else 1
         elif command == "index-suffixes":
@@ -9947,6 +10464,8 @@ def main(argv: list[str] | None = None) -> int:
             ))))
         elif command == "append-spikein":
             append_spikein_contigs(args.lambda_fasta, args.puc19_fasta, args.target_fasta)
+        elif command == "mask-analysis-reference":
+            mask_analysis_reference(args.species, args.fasta)
         elif command == "build-downstream":
             payload = build_downstream_references(
                 species=args.species,

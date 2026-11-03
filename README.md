@@ -1,6 +1,6 @@
-# Alopex v16.1.1
+# Alopex v16.2
 
-正式源码以 Git tag `v16.1.1` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v16.2` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 | 协议 / `analysis.protocol` | 后端 | 主要处理 |
 | --- | --- | --- |
@@ -17,14 +17,16 @@
 
 准备可调用的 Conda、git、curl、gzip 和本地 C 编译器（macOS Command Line Tools / Linux `cc`，供 Rust 依赖构建）；Pipeline 与数据项目分开存放。
 
+demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态链接，避免宿主库探测与 Conda 链接器不一致；不要求系统另装 zlib 开发包。
+
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。本版沿用已验证的环境，不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v16.1.1 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.1.1) 下载 `Alopex-v16.1.1.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
+从 [v16.2 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.2) 下载 `Alopex-v16.2.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v16.1.1.tar.gz
-cd Alopex-v16.1.1
+tar -xzf Alopex-v16.2.tar.gz
+cd Alopex-v16.2
 conda --version
 ```
 
@@ -34,7 +36,7 @@ conda --version
 | --- | --- |
 | macOS | 本机执行 workflow |
 | Linux / HPC | 使用 Slurm，需 `sbatch/squeue/sacct` 与作业提交权限；已有 allocation 承载 controller，规则作业仍经 Slurm 提交 |
-| 源码归档 | 可无 `.git` 部署；环境、Rust 二进制和 reference indexes 必须在目标平台构建 |
+| 源码归档 | 可无 `.git` 部署；环境与 Rust 二进制必须在目标平台构建；已封存 reference 索引可按下述流程跨平台接收并验收 |
 
 ## 2. 准备标准 reference
 
@@ -42,12 +44,31 @@ conda --version
 
 | 固定文件名 | 对应版本 / 来源 | 下载链接 |
 | --- | --- | --- |
-| `hg38.fa` | UCSC hg38 | [hg38.fa.gz](https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz) |
-| `mm10.fa` | UCSC mm10 | [mm10.fa.gz](https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.fa.gz) |
+| `hg38.analysis.fa` | GIABv3 / GRCh38 no-ALT analysis set，含 GRC masks 及 MAP2K3/KMT2C/KCNJ18 decoys | [GIABv3 FASTA.gz](https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/references/GRCh38/GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta.gz) |
+| `mm10.fa` | UCSC mm10 / GRCm38 主装配（含未定位／未放置序列） | [mm10.fa.gz](https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.fa.gz) |
 | `lambda.fa` | NCBI J02459.1 | [FASTA](https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=J02459.1&rettype=fasta&retmode=text) |
 | `pUC19.fa` | NCBI L09137.2 | [FASTA](https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=L09137.2&rettype=fasta&retmode=text) |
 | `hg38.genes.gtf` | GENCODE v48 / GRCh38 | [GTF](https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_48/gencode.v48.annotation.gtf.gz) |
 | `mm10.genes.gtf` | GENCODE M25 / GRCm38 | [GTF](https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.annotation.gtf.gz) |
+
+Doctor 保留下载的原始 FASTA，只在临时目录生成分析用 FASTA：hg38 使用 GIABv3 的 no-ALT、CEN/PAR/GRC 屏蔽与定向 decoy；mm10 使用 GRCm38 主装配及其 Y PAR 屏蔽。分别加入 lambda/pUC19 后为 **220／68 条比对序列**；分析 FASTA 仍使用 `<genome>.primary.lambda.puc19.fa` 路径，其内容范围以固定清单为准。
+
+比对包含真实辅助序列，最终 nCG、甲基化 QC、Gini、TSS 和 Single-CpG 矩阵按明确的主核染色体范围计算。RawAdata 保留全参考观测供 QC／审计，controls 单独统计。坐标、屏蔽范围、输入校验值及适用边界见源码 checkout 的 `docs/ANALYSIS_PARAMETERS.md`「标准 reference 与分析范围」。此策略自 v16.2 发布；运行包不包含开发文档。
+
+FASTA/FAI、各 backend 索引、TSS／single-CpG 通过各自的 `.reference.json` 内容回执绑定同一参考。`reference --check` 只读检查；未绑定或失配的旧组件不再报告 READY。修复时 Doctor 通过既有构建事务生成、验证、提交并重建相关派生。请在没有任务使用该受管 reference 时运行修复；旧交付及其矩阵不会被自动重算或转换。
+
+自定义外部参考同样需要在原生索引构建前后绑定。以下示例的 `index_kind` 取实际使用的 `biscuit`、`rastair`、`bismark-local` 或 `bismark-combined`；`seal` 只用于本次新构建，不能给来源未知的旧索引补签：
+
+```bash
+index_kind=bismark-combined
+# 新 FASTA 的 samtools faidx 已完成后封存 FASTA/FAI。
+PYTHONPATH=core conda/current/control/bin/python -m dna_pipeline reference-binding seal --reference /path/reference.fa --kind fasta
+PYTHONPATH=core conda/current/control/bin/python -m dna_pipeline reference-binding begin --reference /path/reference.fa --build-input /path/build/input.json
+# 在此使用对应原生工具，从同一 FASTA 构建完整索引家族。
+PYTHONPATH=core conda/current/control/bin/python -m dna_pipeline reference-binding seal --reference /path/reference.fa --kind "$index_kind" --build-input /path/build/input.json
+```
+
+已有新构建参考可整体传输到另一台机器：先放在独立候选目录，连同所有 `.reference.json` 一起复制；用 `reference-binding import` 依次核 FASTA、各索引家族和 downstream。此动作必须已有有效 producer 回执，逐文件 SHA256 与参考代际完全一致后仅更新目标文件系统的 stat 状态；缺失回执或内容失配会失败，不对未知旧索引补签。随后运行 `reference --check` 和目标平台真实小数据比对／CpG 验收，再切换正式目录。跨平台传输的是索引数据，环境／可执行文件仍使用目标平台版本。
 
 ## 3. 构建与检查
 
@@ -110,6 +131,7 @@ cabernet:
 | 配置主题 | 使用规则 |
 | --- | --- |
 | 结构与覆盖 | 只接受 schema 3；内置默认 → `common` → 选定协议覆盖，列表整体替换，固定协议策略最终生效 |
+| reference 路径 | 保留 YAML 引号内的首尾空格；绝对路径直接定位，相对路径依次查 Pipeline 根和项目根，不裁剪为另一文件名 |
 | 共用 / 全局设置 | demux、high-CpH、Bismark、BISCUIT 参数放 `common`；物种/reference、`analysis`、`runtime`、`slurm`、`retention` 为全局设置 |
 | Cabernet / SRD | 可选 `methylation_backend: bismark` 或 `biscuit`；Bismark 默认 combined-index end-to-end，`bismark.local_alignment: true` 改为 CT/GA local；Bismark 各协议均固定 `--maxins 1000` |
 | Droplet | backend、spacer=0、non-directional 固定，不声明 `methylation_backend`、`demux.dna_w_spacer_len` 或 `bismark.library_type`；无需 Barcode Map，`rna_sample` 可选填外部 RNA 原始 basename |

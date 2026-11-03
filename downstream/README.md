@@ -1,6 +1,6 @@
-# Alopex v16.1.1 下游 QC 与可视化
+# Alopex v16.2 下游 QC 与可视化
 
-正式源码以 Git tag `v16.1.1` 为准。本文说明下游运行、结果读取、缓存恢复与 RNA 关联；安装和上游流程见[主 README](../README.md)。
+正式源码以 Git tag `v16.2` 为准。本文说明下游运行、结果读取、缓存恢复与 RNA 关联；安装和上游流程见[主 README](../README.md)。
 
 [运行](#运行) · [输出](#输出) · [指标与筛选](#指标与筛选) · [SingleCpG 矩阵](#保存供下游复用的-single-cpg-矩阵) · [TSS](#tss-profile) · [缓存与重算](#缓存与强制重算) · [RNA 关联](#关联-rna_darlin-结果)
 
@@ -69,8 +69,8 @@ PY_KERNEL
 | 文件 / 目录 | 用途 |
 | --- | --- |
 | `DNAme_QC_Information.csv` | 下游与 adata 合并的唯一 QC 表，固定20列；[字段、顺序与单位][qc-fields] |
-| `RawAdata.h5ad` / `RawAdata.input_schema.json` | 全细胞 canonical CpG 导入矩阵与复用记录 |
-| `SingleCpG_Adata.h5ad` / `SingleCpG_Adata.input_schema.json` | Notebook 最后一格生成的全细胞 single-CpG 矩阵与完成记录 |
+| `RawAdata.h5ad` / `RawAdata.input_schema.json` | 全细胞、全参考 canonical CpG 导入矩阵与复用记录，保留辅助序列供 QC／审计 |
+| `SingleCpG_Adata.h5ad` / `SingleCpG_Adata.input_schema.json` | Notebook 最后一格生成的全细胞、主核染色体 single-CpG 矩阵与完成记录 |
 | `TSS_Profile_Information.csv` | 未跳过 TSS 时生成，仅含抽中且有覆盖的 bins |
 | `plots/` | QC、Final QC、孔板、信号组成、TSS、CpG density 与 PCA 等 PDF |
 | `.cache/` | CpG 统计、信号组成、Gini 与 QC 完成身份等内部缓存，不手动改写 |
@@ -88,10 +88,12 @@ PY_KERNEL
 | `pUC19_Unique_CpG_Sites`、`pUC19_Meth_CpG_Rate%` | 精确pUC19 contig的同类位点数及均值 |
 | `Non_CpG_Methylation%`、`High_CpH_Flag_Rate%` | 各backend定义的non-CpG统计及flagged/assessed比例；TAPS前者为判链宿主CHG/CHH转换率，后者不适用为NaN |
 | `Signal_Host_Rate%`、`Signal_Lambda_Rate%`、`Signal_pUC19_Rate%`、`Signal_mtDNA_Rate%` | 各类canonical CpG coverage(m+u)/全部contig总coverage×100；其他contig仍进入总分母 |
-| `Gini_Index` | canonical CpG coverage在有覆盖固定宽bin的Gini；不默认排除chrM/chrY，只在空CpG细胞缺失 |
+| `Gini_Index` | canonical CpG coverage在有覆盖固定宽bin的Gini；限主核染色体，含chrY、排除chrM及辅助序列；无主核CpG覆盖为缺失 |
 | `Duplicate_Pair_Rate%`、`Trim_Retention%`、`Final_Pair_Yield%` | 去重率为duplicate/accepted pairs，trim retention为trimmed/input pairs，final yield为final/input pairs（均×100）；Droplet的pair去重率为NaN |
 
 ## 指标与筛选
+
+标准分析范围为 hg38 的 chr1–22/X/Y、mm10 的 chr1–19/X/Y；辅助／decoy 参与比对，不进入宿主 nCG、甲基化率、Gini、TSS 和最终 Single-CpG 矩阵。TSS／single-CpG BED 必须携带与当前参考匹配的 `.reference.json`，不得把旧目录套到新交付。来源与绑定见源码 checkout 的 `docs/ANALYSIS_PARAMETERS.md`「标准 reference 与分析范围」；此策略自 v16.2 发布。
 
 读图时先区分位点均值、coverage 比例和 read-pair 指标。身份列按字符串保留前导零及合法 `NA/nan/None`，数值缺失保持 NaN；观测零值不能当作缺失。字段见[QC 字段][qc-fields]，分母要点见下表。
 
@@ -100,7 +102,7 @@ PY_KERNEL
 | QC 甲基化率 | 宿主、lambda、pUC19 分别对已覆盖位点的 `m/(m+u)` 取均值再×100；无观测为 NaN |
 | SingleCpG | 区间内已覆盖位点的 fraction 均值；`1/4` 与 `9/12` 的均值为0.5。有覆盖全 unmethyl 保显式0，缺覆盖不补0 |
 | TSS | 每个 offset 对有覆盖 bins 的 fraction 取均值；count 为甲基化信号之和 |
-| Gini | 按有 coverage 的固定宽 bins 计算，不默认排除 chrM/chrY；仅空 CpG 细胞缺失 |
+| Gini | 仅主核染色体、按有 coverage 的固定宽 bins 计算，含 chrY、排 chrM 及辅助序列；无主核覆盖为缺失 |
 | 信号组成 | 各类 canonical CpG coverage / 全部 contig 总 coverage；其他 decoy 仍进入分母。controls 仅精确匹配 `lambda` / `pUC19` |
 | mapping / pair 指标 | mapping 的 backend 单位与分母不同；完整 pair funnel、policy/unit 保留在 sealed final manifest 与 MultiQC。Droplet 的 pair 去重率为 NaN，不能用位点 UMI 数代替 pair 数 |
 | TAPS | controls 使用合并计数比率；Non-CpG 为可判链宿主 CHG/CHH 转换率，不能直接解释为真实 mCH 或 cDNA 污染率，High-CpH 为 NaN |

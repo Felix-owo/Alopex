@@ -1103,7 +1103,7 @@ BISMARK_GENOME_PREP_BIN="$BISMARK_ENV/bin/bismark_genome_preparation"
 BOWTIE2_BUILD_BIN="$BISMARK_ENV/bin/bowtie2-build"
 
 SOURCE_DIR="$PIPELINE_ROOT/resources/reference_source"
-HG38_SOURCE="$SOURCE_DIR/hg38.fa"
+HG38_SOURCE="$SOURCE_DIR/hg38.analysis.fa"
 MM10_SOURCE="$SOURCE_DIR/mm10.fa"
 LAMBDA_SOURCE="$SOURCE_DIR/lambda.fa"
 PUC19_SOURCE="$SOURCE_DIR/pUC19.fa"
@@ -1386,12 +1386,16 @@ check_sources_for_build_plan() {
 }
 
 
+reference_binding() {
+    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline reference-binding "$@"
+}
+
 assembled_reference_ready() {
     local species="$1" fasta="$2"
     [[ -s "$fasta" ]] || return 1
 
     [[ -s "$fasta.fai" ]] || return 1
-    primary_contigs_ready "$species" "$fasta"
+    primary_contigs_ready "$species" "$fasta" && reference_binding check --reference "$fasta" --kind fasta
 }
 
 primary_contigs_ready() {
@@ -1413,6 +1417,7 @@ clear_reference_derivatives() {
         [[ -n "$suffix" && "$suffix" != .fai ]] || continue
         rm -f -- "${fasta}${suffix}" || return $?
     done <<< "$transient_suffixes"
+    rm -f -- "$fasta.biscuit.reference.json" || return $?
     rm -rf -- "$fasta.bismark" "$fasta.bwa"
 }
 
@@ -1442,7 +1447,8 @@ recover_assembled_commit() {
             fai_contract_check assembled "$species" "$fasta.fai" "$fasta" || return $?
             clear_reference_derivatives "$fasta" || return $?
             downstream_reference_paths "$species" || return $?
-            rm -f -- "$DOWNSTREAM_TSS" "$DOWNSTREAM_SINGLE_CPG" || return $?
+            rm -f -- "$DOWNSTREAM_TSS" "$DOWNSTREAM_SINGLE_CPG" "$DOWNSTREAM_TSS.reference.json" "$DOWNSTREAM_SINGLE_CPG.reference.json" || return $?
+            reference_binding seal --reference "$fasta" --kind fasta || return $?
         else
             old_fasta="$(cat "$journal/fasta.existed")" || return $?
             old_fai="$(cat "$journal/fai.existed")" || return $?
@@ -1504,11 +1510,11 @@ assemble_reference() {
     local species="$1" genome_source="$2" output="$3" build_dir tmp_fasta
     local -a wanted
 
-    case "$species" in
-        hg38) wanted=(chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19 chr20 chr21 chr22 chrX chrY chrM) ;;
-        mm10) wanted=(chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19 chrX chrY chrM) ;;
-        *) echo "ERROR: 不支持的标准物种： $species" >&2; return 2 ;;
-    esac
+    local contig_list name
+    contig_list="$(env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline reference-contigs --species "$species")" || return $?
+    wanted=()
+    while IFS= read -r name; do [[ -z "$name" ]] || wanted+=("$name"); done <<< "$contig_list"
+    (( ${#wanted[@]} > 0 )) || return 1
 
     mkdir -p "$REFERENCE_BUILD_ROOT" "$(dirname "$output")"
     build_dir="$(mktemp -d "$REFERENCE_BUILD_ROOT/reference.${species}.fasta.XXXXXX")" || return $?
@@ -1520,8 +1526,11 @@ assemble_reference() {
     env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline append-spikein \
         --lambda-fasta "$LAMBDA_SOURCE" --puc19-fasta "$PUC19_SOURCE" --target-fasta "$tmp_fasta" || return $?
     "$SAMTOOLS_BIN" faidx "$tmp_fasta" || return $?
+    echo "等长 hard-mask $species 官方 analysis-set 区间；保留原始坐标。"
+    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline mask-analysis-reference \
+        --species "$species" --fasta "$tmp_fasta" || return $?
     fai_contract_check assembled "$species" "$tmp_fasta.fai" "$tmp_fasta" || {
-        echo "ERROR: 临时组装的 $species FASTA 未通过 contig、顺序或长度校验。" >&2
+        echo "ERROR: 临时组装的 $species FASTA 未通过 contig、顺序、长度或 analysis-set hard-mask 校验。" >&2
         return 1
     }
 
@@ -1541,7 +1550,7 @@ biscuit_index_ready() {
     while IFS= read -r suffix; do
         [[ -n "$suffix" && -s "${fasta}${suffix}" ]] || return 1
     done <<< "$suffixes"
-    return 0
+    reference_binding check --reference "$fasta" --kind biscuit
 }
 
 # 每个物种独占 sidecar journal，允许 hg38/mm10 并行提交与独立恢复。
@@ -1612,6 +1621,7 @@ bwa_index_ready() {
     while IFS= read -r path; do
         [[ -s "$root/${path##*/}" ]] || return 1
     done <<< "$paths"
+    [[ "$root" != "$fasta.bwa" ]] || reference_binding check --reference "$fasta" --kind rastair
 }
 
 # 恢复未完成的普通 BWA 目录替换；完整候选提交后才删除旧索引。
@@ -1640,6 +1650,7 @@ build_bwa_index() {
     build_dir="$(mktemp -d "$REFERENCE_BUILD_ROOT/reference.bwa.XXXXXX")" || return $?
     register_reference_temp "$build_dir" || return $?
     mkdir "$build_dir/new" || return $?
+    reference_binding begin --reference "$fasta" --build-input "$build_dir/input.json" || return $?
     "$BWA_BIN" index -p "$build_dir/new/genome" "$fasta" || return $?
     bwa_index_ready "$fasta" "$build_dir/new" || return 1
     [[ ! -e "$journal" ]] || return 1
@@ -1649,6 +1660,7 @@ build_bwa_index() {
     : > "$journal/PREPARED" || return $?
     if [[ ! -f "$journal/ABSENT" ]]; then mv -- "$fasta.bwa" "$journal/backup" || return $?; fi
     mv -- "$build_dir/new" "$fasta.bwa" || return $?
+    reference_binding seal --reference "$fasta" --kind rastair --build-input "$build_dir/input.json" || return $?
     : > "$journal/FINISHED" || return $?
     retire_reference_journal "$journal" PREPARED || return $?
     rm -rf -- "$build_dir"
@@ -1666,6 +1678,7 @@ build_biscuit_index() {
     register_reference_temp "$build_dir" || return $?
     tmp_fasta="$build_dir/${fasta##*/}"
     echo "在临时目录构建 BISCUIT index： $build_dir"
+    reference_binding begin --reference "$fasta" --build-input "$build_dir/input.json" || return $?
     cp "$fasta" "$tmp_fasta" || return $?
     "$SAMTOOLS_BIN" faidx "$tmp_fasta" || return $?
     "$BISCUIT_BIN" index "$tmp_fasta" || return $?
@@ -1689,13 +1702,16 @@ build_biscuit_index() {
     while IFS= read -r suffix; do
         [[ ! -e "${fasta}${suffix}" ]] || cp -p -- "${fasta}${suffix}" "$backup/sidecar${suffix}" || return $?
     done <<< "$suffixes"
+    if [[ -e "$fasta.biscuit.reference.json" ]]; then cp -p -- "$fasta.biscuit.reference.json" "$backup/binding.json" || return $?; fi
     : > "$journal/BACKUPS_READY" || return $?
+    rm -f -- "$fasta.biscuit.reference.json" || return $?
 
     if ! commit_biscuit_sidecars "$fasta" "$tmp_fasta"; then
         echo "ERROR: BISCUIT sidecar 提交失败，正在恢复上一完整文件族。" >&2
         recover_biscuit_commit "$fasta" || return $?
         return 1
     fi
+    reference_binding seal --reference "$fasta" --kind biscuit --build-input "$journal/input.json" || return $?
     : > "$journal/FINISHED" || return $?
     retire_reference_journal "$journal" BACKUPS_READY
 }
@@ -1714,6 +1730,11 @@ bismark_component_ready() {
     paths="$(PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline index-paths "${args[@]}")" || return $?
     [[ -n "$paths" ]] || return 1
     while IFS= read -r path; do [[ -s "$path" ]] || return 1; done <<< "$paths"
+    if [[ "$root" == "$fasta.bismark" ]]; then
+        local kind=bismark-combined
+        [[ "$mode" != local ]] || kind=bismark-local
+        reference_binding check --reference "$fasta" --kind "$kind" || return $?
+    fi
 }
 
 bismark_standard_index_ready() {
@@ -1749,7 +1770,7 @@ recover_bismark_commit() {
     esac
     [[ -n "$root" && -s "$journal/ENTRIES" ]] || return 1
     while IFS=$'\t' read -r relative existed; do
-        case "$relative" in genome.fa|Bisulfite_Genome/CT_conversion|Bisulfite_Genome/GA_conversion|Bisulfite_Genome/Combined) ;; *) return 1 ;; esac
+        case "$relative" in genome.fa|bismark-local.reference.json|bismark-combined.reference.json|Bisulfite_Genome/CT_conversion|Bisulfite_Genome/GA_conversion|Bisulfite_Genome/Combined) ;; *) return 1 ;; esac
         target="$root/$relative"
         backup="$journal/backup/$relative"
         if [[ "$existed" == 1 ]]; then
@@ -1772,7 +1793,12 @@ recover_bismark_commit() {
 
 commit_bismark_component() {
     local fasta="$1" candidate="$2" mode="$3" root="$1.bismark" journal relative existed
-    local -a components=(genome.fa)
+    local kind=bismark-combined binding
+    local -a components=()
+    [[ "$mode" != local ]] || kind=bismark-local
+    binding="$kind.reference.json"
+    # 同内容genome.fa保持原inode，避免重建另一模式使其有效内容绑定失效。
+    if [[ ! -s "$root/genome.fa" ]] || ! cmp -s "$candidate/genome.fa" "$root/genome.fa"; then components+=(genome.fa); fi
     case "$mode" in
         local) components+=(Bisulfite_Genome/CT_conversion Bisulfite_Genome/GA_conversion) ;;
         combined) components+=(Bisulfite_Genome/Combined) ;;
@@ -1782,14 +1808,19 @@ commit_bismark_component() {
     [[ ! -e "$journal" ]] || return 1
     mkdir -p "$journal/backup/Bisulfite_Genome" "$root/Bisulfite_Genome" || return $?
     printf '%s\n' "$root" > "$journal/TARGET" || return $?
+    components+=("$binding")
     for relative in "${components[@]}"; do
-        [[ -e "$candidate/$relative" ]] || return 1
+        [[ "$relative" == "$binding" || -e "$candidate/$relative" ]] || return 1
         existed=0
         [[ ! -e "$root/$relative" && ! -L "$root/$relative" ]] || existed=1
         printf '%s\t%s\n' "$relative" "$existed" >> "$journal/ENTRIES" || return $?
     done
     : > "$journal/PREPARED" || return $?
     for relative in "${components[@]}"; do
+        if [[ "$relative" == "$binding" ]]; then
+            [[ ! -e "$root/$relative" ]] || mv -- "$root/$relative" "$journal/backup/$relative" || return $?
+            continue
+        fi
         if { [[ ! -e "$root/$relative" && ! -L "$root/$relative" ]] || mv -- "$root/$relative" "$journal/backup/$relative"; } &&
            mv -- "$candidate/$relative" "$root/$relative"; then
             continue
@@ -1797,6 +1828,10 @@ commit_bismark_component() {
         recover_bismark_commit || return $?
         return 1
     done
+    if ! reference_binding seal --reference "$fasta" --kind "$kind" --build-input "$candidate/input.json"; then
+        recover_bismark_commit || return $?
+        return 1
+    fi
     : > "$journal/FINISHED" || return $?
     retire_reference_journal "$journal" PREPARED
 }
@@ -1809,6 +1844,7 @@ build_bismark_standard_index() {
     register_reference_temp "$build_dir" || return $?
     tmp_root="$build_dir/genome"
     mkdir -p "$tmp_root" || return $?
+    reference_binding begin --reference "$fasta" --build-input "$tmp_root/input.json" || return $?
     cp "$fasta" "$tmp_root/genome.fa" || return $?
     echo "在临时目录构建标准 Bismark CT/GA Bowtie2 indexes： $tmp_root"
     echo "Bismark index 线程：CT/GA 各最多 $BISMARK_INDEX_THREADS_PER_STRAND 个 bowtie2-build 线程，总计最多 $((BISMARK_INDEX_THREADS_PER_STRAND * 2)) 个。"
@@ -1835,6 +1871,7 @@ build_bismark_combined_index() {
     register_reference_temp "$build_dir" || return $?
     tmp_root="$build_dir/genome"
     mkdir -p "$tmp_root" || return $?
+    reference_binding begin --reference "$fasta" --build-input "$tmp_root/input.json" || return $?
     cp "$fasta" "$tmp_root/genome.fa" || return $?
     echo "为 Combined 发布构建临时 Bismark index bundle： $tmp_root"
     echo "Bismark Combined index 最多使用 $BISMARK_COMBINED_INDEX_THREADS 个 bowtie2-build 线程。"
@@ -1883,7 +1920,9 @@ downstream_references_ready() {
     downstream_reference_paths "$species"
 
     [[ ! -e "$(downstream_commit_journal "$species")" ]] || return 1
-    downstream_files_ready "$DOWNSTREAM_TSS" "$DOWNSTREAM_SINGLE_CPG"
+    downstream_files_ready "$DOWNSTREAM_TSS" "$DOWNSTREAM_SINGLE_CPG" || return $?
+    reference_binding check --reference "$fasta" --kind downstream --tss-bed "$DOWNSTREAM_TSS" \
+        --single-cpg-bed "$DOWNSTREAM_SINGLE_CPG" --annotation-gtf "$DOWNSTREAM_GTF"
 }
 
 downstream_files_ready() {
@@ -1910,11 +1949,13 @@ recover_downstream_commit() {
     fi
 
     echo "恢复中断的 $species downstream reference 提交。"
-    rm -f -- "$DOWNSTREAM_TSS" "$DOWNSTREAM_SINGLE_CPG" || return $?
+    rm -f -- "$DOWNSTREAM_TSS" "$DOWNSTREAM_SINGLE_CPG" "$DOWNSTREAM_TSS.reference.json" "$DOWNSTREAM_SINGLE_CPG.reference.json" || return $?
     mkdir -p "$(dirname "$DOWNSTREAM_TSS")" "$(dirname "$DOWNSTREAM_SINGLE_CPG")" || return $?
     backup="$journal/backup"
     [[ ! -e "$backup/tss.bed" ]] || cp -p -- "$backup/tss.bed" "$DOWNSTREAM_TSS" || return $?
     [[ ! -e "$backup/single_cpg.bed.gz" ]] || cp -p -- "$backup/single_cpg.bed.gz" "$DOWNSTREAM_SINGLE_CPG" || return $?
+    [[ ! -e "$backup/tss.bed.reference.json" ]] || cp -p -- "$backup/tss.bed.reference.json" "$DOWNSTREAM_TSS.reference.json" || return $?
+    [[ ! -e "$backup/single_cpg.bed.gz.reference.json" ]] || cp -p -- "$backup/single_cpg.bed.gz.reference.json" "$DOWNSTREAM_SINGLE_CPG.reference.json" || return $?
     retire_reference_journal "$journal" BACKUPS_READY
 }
 
@@ -1957,12 +1998,17 @@ build_downstream_references() {
 
     [[ ! -e "$DOWNSTREAM_TSS" ]] || cp -p -- "$DOWNSTREAM_TSS" "$backup/tss.bed" || return $?
     [[ ! -e "$DOWNSTREAM_SINGLE_CPG" ]] || cp -p -- "$DOWNSTREAM_SINGLE_CPG" "$backup/single_cpg.bed.gz" || return $?
+    [[ ! -e "$DOWNSTREAM_TSS.reference.json" ]] || cp -p -- "$DOWNSTREAM_TSS.reference.json" "$backup/tss.bed.reference.json" || return $?
+    [[ ! -e "$DOWNSTREAM_SINGLE_CPG.reference.json" ]] || cp -p -- "$DOWNSTREAM_SINGLE_CPG.reference.json" "$backup/single_cpg.bed.gz.reference.json" || return $?
     : > "$journal/BACKUPS_READY" || return $?
 
     mkdir -p "$(dirname "$DOWNSTREAM_TSS")" "$(dirname "$DOWNSTREAM_SINGLE_CPG")" || return $?
     if ! mv -f -- "$new/tss.bed" "$DOWNSTREAM_TSS" ||
        ! mv -f -- "$new/single_cpg.bed.gz" "$DOWNSTREAM_SINGLE_CPG" ||
-       ! downstream_files_ready "$DOWNSTREAM_TSS" "$DOWNSTREAM_SINGLE_CPG"; then
+       ! mv -f -- "$new/tss.bed.reference.json" "$DOWNSTREAM_TSS.reference.json" ||
+       ! mv -f -- "$new/single_cpg.bed.gz.reference.json" "$DOWNSTREAM_SINGLE_CPG.reference.json" ||
+       ! reference_binding relocate --reference "$fasta" --kind downstream --tss-bed "$DOWNSTREAM_TSS" --single-cpg-bed "$DOWNSTREAM_SINGLE_CPG" ||
+       ! reference_binding check --reference "$fasta" --kind downstream --tss-bed "$DOWNSTREAM_TSS" --single-cpg-bed "$DOWNSTREAM_SINGLE_CPG" --annotation-gtf "$DOWNSTREAM_GTF"; then
         echo "ERROR: $species downstream 提交失败，正在恢复上一完整代。" >&2
         recover_downstream_commit "$species" || return $?
         return 1
@@ -2724,6 +2770,9 @@ build_demux() {
     local jobs="${2:-}"
     local source_revision
     local -a cargo_args=(--release --locked)
+
+    # 使用锁定 libz-sys 自带的 zlib，避免宿主探测成功却被 Conda 链接器漏找 -lz。
+    export LIBZ_SYS_STATIC=1
 
     if [[ "$offline" == "1" ]]; then
         cargo_args+=(--offline)

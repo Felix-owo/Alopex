@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from dna_pipeline import (
     ProjectLayout,
     STATIC_FUSED_RULES,
     backend_active_index_paths,
+    validate_reference_component,
     backend_resource_request,
     resolve_bismark_alignment,
     cutadapt_adapter_specs,
@@ -38,6 +40,7 @@ from dna_pipeline import (
     scientific_code_identity,
     droplet_resource_request,
     disable_snakemake_output_mtime_gate,
+    honor_slurm_no_account,
     discover_samples,
     finalize_project_config,
     get_backend,
@@ -61,6 +64,7 @@ from dna_pipeline import (
     prepare_sampled_multiqc_sources,
     select_multiqc_samples,
     write_multiqc_file_list,
+    prefetch_multiqc_native_libraries,
 )
 
 disable_snakemake_output_mtime_gate()
@@ -276,7 +280,7 @@ REFERENCE_FAI = Path(f"{REFERENCE_GENOME}.fai")
 REFERENCE_SETUP_SCRIPT = PIPELINE_ROOT / "core" / "doctor.sh"
 if SPECIES in MANAGED_SPECIES:
     REFERENCE_SETUP_HINT = (
-        "Standard hg38/mm10 reference setup: place hg38.fa, mm10.fa, lambda.fa "
+        "Standard hg38/mm10 reference setup: place hg38.analysis.fa, mm10.fa, lambda.fa "
         "and pUC19.fa under resources/reference_source/, then run:\n"
         f"  bash \"{REFERENCE_SETUP_SCRIPT}\" reference"
     )
@@ -364,6 +368,13 @@ else:
         REFERENCE_BISMARK_GENOME,
         *REFERENCE_BISMARK_INDEX_PATHS,
     ]
+
+
+# 只读复验当前backend/模式的同代内容绑定；不把receipt当作科学DAG输入。
+_reference_kind = ("bismark-local" if BISMARK_LOCAL_ALIGNMENT else "bismark-combined") if METHYLATION_BACKEND == "bismark" else METHYLATION_BACKEND
+_reference_component = validate_reference_component(REFERENCE_PATH, _reference_kind)
+if RUN_SNAPSHOT and _reference_component["reference"] != RUN_SNAPSHOT["basis"]["reference"]["content"]:
+    raise ValueError("Reference generation differs from the frozen run snapshot")
 
 
 def repeated_cli_flag(flag, values):
@@ -599,6 +610,10 @@ rule all:
     input:
         DELIVERY_READY
 
+
+onstart:
+    # executor_settings 在解析 Snakefile 后才绑定，须在提交首个作业前应用。
+    honor_slurm_no_account(workflow)
 
 onsuccess:
     if PROVENANCE_SNAPSHOT_PATH is not None and DELIVERY_READY.is_file():
@@ -2621,6 +2636,14 @@ rule multiqc:
             handle.write("INFO: multiqc_selected_cells=" + json.dumps(selected_samples) + "\n")
             for item in skipped:
                 handle.write(f"WARNING: skipped_multiqc_source={item}\n")
+            handle.write("INFO: stage=multiqc_native_prefetch status=START\n")
+        started = time.monotonic()
+        native_files, native_bytes = prefetch_multiqc_native_libraries(Path(params.multiqc).parent.parent)
+        with open(str(log), "a", encoding="utf-8") as handle:
+            handle.write(
+                f"INFO: stage=multiqc_native_prefetch status=OK files={native_files} "
+                f"read_bytes={native_bytes} wall_seconds={time.monotonic() - started:.6f}\n"
+            )
         shell(
             r"""
             set -euo pipefail
