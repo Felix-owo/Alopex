@@ -530,7 +530,9 @@ prepare_slurm_executor() {
     [[ "$jobs" =~ ^[1-9][0-9]*$ && "$controller_cores" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: invalid Slurm/runtime numeric settings." >&2; return 2; }
     if [[ -n "$configured_tmp" ]]; then
         DNA_PIPELINE_NODE_TMPDIR="$(PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" \
-            -m alopex resolve-tmpdir --path "$configured_tmp")"
+            -m alopex resolve-tmpdir --path "$configured_tmp" && printf '.')" || return $?
+        # 保留路径末尾换行；只移除CLI打印的一个换行和本次哨兵。
+        DNA_PIPELINE_NODE_TMPDIR="${DNA_PIPELINE_NODE_TMPDIR%$'\n.'}"
         export DNA_PIPELINE_NODE_TMPDIR
     else
         unset DNA_PIPELINE_NODE_TMPDIR

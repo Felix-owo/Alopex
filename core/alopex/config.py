@@ -490,6 +490,9 @@ def apply_config_defaults(config: dict[str, object]) -> dict[str, object]:
             if key not in current:
                 current[key] = copy.deepcopy(value)
             elif isinstance(value, dict):
+                # YAML anchor 可跨 section 共享映射；补默认值只属于当前路径，
+                # 不能向另一协议注入未显式填写（甚至禁止填写）的叶子。
+                current[key] = copy.deepcopy(current[key])
                 merge(current[key], value, f"{path}.{key}" if path else key)
     merge(config, CONFIG_SECTION_DEFAULTS, "")
     for protocol in ("cabernet", "srd", "taps", "droplet"):

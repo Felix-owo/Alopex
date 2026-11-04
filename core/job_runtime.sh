@@ -85,8 +85,10 @@ dna_pipeline_allocate_scratch() {
     for candidate in "${SLURM_TMPDIR:-}" "$node_override" "$configured_tmp" "$project_tmp"; do
         [[ -n "$candidate" && "$candidate" == /* && "$candidate" != "/" ]] || continue
         [[ -d "$candidate" && -w "$candidate" ]] || continue
-        candidate="$(cd "$candidate" && pwd -P)"
-        available_kb="$(df -Pk "$candidate" | awk 'END{print $4}')"
+        # cd -P给出物理路径，哨兵防止命令替换裁掉合法的末尾换行。
+        candidate="$(cd -P -- "$candidate" && printf '%s.' "$PWD")" || return $?
+        candidate="${candidate%.}"
+        available_kb="$(cd -- "$candidate" && df -Pk . | awk 'END{print $4}')"
         [[ "$available_kb" =~ ^[0-9]+$ ]] || continue
         if (( available_kb < required_kb )); then
             echo "WARNING: scratch candidate has insufficient free space: path=$candidate available_kb=$available_kb required_with_margin_kb=$required_kb" >&2

@@ -78,11 +78,15 @@ from alopex.runtime import (
     scratch_mb,
 )
 
-from alopex.identity import scientific_code_identity
+from alopex.identity import PythonSourceGraph, scientific_code_identity
 
 disable_snakemake_output_mtime_gate()
 
 PIPELINE_ROOT = Path(workflow.basedir).parent.resolve()
+# 同一次DAG构建共用源码解析视图；不跨进程或按mtime复用旧源码。
+scientific_code_identity = functools.partial(
+    scientific_code_identity, source_graph=PythonSourceGraph((PIPELINE_ROOT / "core",))
+)
 JOB_RUNTIME = (PIPELINE_ROOT / "core/job_runtime.sh").resolve()
 if not JOB_RUNTIME.is_file():
     raise FileNotFoundError(f"Pipeline helper is missing: {JOB_RUNTIME}")

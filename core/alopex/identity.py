@@ -249,9 +249,13 @@ def python_source_dependencies(
 
 
 @lru_cache(maxsize=None)
-def scientific_code_identity(python: tuple[str, ...] = (), shell: tuple[str, ...] = ()) -> str:
+def scientific_code_identity(
+    python: tuple[str, ...] = (), shell: tuple[str, ...] = (),
+    *, source_graph: PythonSourceGraph | None = None,
+) -> str:
     """按规则实际消费的 Python 根及 Shell 函数计算科学身份，不执行用户启动文件。"""
-    selected = python_source_dependencies(python, exclude=("alopex.runtime.effective_cpu_count",))
+    graph = source_graph if source_graph is not None else PythonSourceGraph()
+    selected = graph.dependencies(python, exclude=("alopex.runtime.effective_cpu_count",))
     shell_code = ""
     if shell:
         identity_env = {key: value for key, value in os.environ.items() if key not in {"BASH_ENV", "ENV"}}
