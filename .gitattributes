@@ -6,7 +6,7 @@ core/Snakefile text eol=lf
 *.yml text eol=lf
 *.md text eol=lf
 
-# 开发仓库保留回归与证据；git archive 的发行包只携带运行文件和使用说明。
+# 公开运行仓归档排除开发文档、测试与规范；开发仓完整归档保留这些文件。
 /.gitattributes export-ignore
 /.gitignore export-ignore
 /AGENTS.md export-ignore
