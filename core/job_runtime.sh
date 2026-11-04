@@ -286,12 +286,12 @@ dna_pipeline_run_bsconv_classification() {
     total_reads="$(awk '{n += $3 + $4} END {print n + 0}' <<< "$idxstats_counts")" || return $?
     if [[ "$total_reads" -eq 0 ]]; then
         echo "WARNING: BAM contains zero reads; high-CpH classification is empty." >> "$log_file"
-        PYTHONPATH="$pipeline_src" "$python" -m dna_pipeline extract-bsconv "${parser_args[@]}" < /dev/null >> "$log_file" 2>&1
+        PYTHONPATH="$pipeline_src" "$python" -m alopex extract-bsconv "${parser_args[@]}" < /dev/null >> "$log_file" 2>&1
     else
         (
             set -o pipefail
             "$biscuit" bsconv -p "$ref" "$bam" 2>> "$log_file" | \
-                PYTHONPATH="$pipeline_src" "$python" -m dna_pipeline extract-bsconv "${parser_args[@]}" >> "$log_file" 2>&1
+                PYTHONPATH="$pipeline_src" "$python" -m alopex extract-bsconv "${parser_args[@]}" >> "$log_file" 2>&1
         )
     fi
 }
@@ -331,7 +331,7 @@ dna_pipeline_coordinate_sort_and_stage() {
     "$samtools" sort -@ "$extra" -o "$tmp_bam" "$src" || return $?
     "$samtools" index -@ "$extra" "$tmp_bam" || return $?
     "$samtools" quickcheck -v "$tmp_bam" || return $?
-    "$python" -m dna_pipeline atomic-publish \
+    "$python" -m alopex atomic-publish \
         --samtools "$samtools" \
         --bam-destination "$final_bam" \
         --commit-last "$final_bam" \

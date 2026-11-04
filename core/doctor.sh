@@ -444,7 +444,7 @@ extract_env_spec() {
     dst="$ENVS_BUILD_DIR/$role.yaml"
     mkdir -p "$ENVS_BUILD_DIR" || return $?
     python_bin="$(envs_spec_python)" || return $?
-    PYTHONPATH="$PIPELINE_ROOT/core" "$python_bin" -m dna_pipeline env-spec \
+    PYTHONPATH="$PIPELINE_ROOT/core" "$python_bin" -m alopex env-spec \
         --envs "$ENVS_SPEC" --role "$role" --destination "$dst" >&2 || return $?
     printf '%s\n' "$dst"
 }
@@ -872,7 +872,7 @@ run_conda_state_cli() {
         -u PYTHONHOME -u PYTHONSTARTUP -u PYTHONUSERBASE -u VIRTUAL_ENV \
         PYTHONPATH="$PIPELINE_ROOT/core" \
         PYTHONNOUSERSITE=1 \
-        "$python_bin" -m dna_pipeline "$@"
+        "$python_bin" -m alopex "$@"
 }
 
 check_current_release() {
@@ -1240,13 +1240,13 @@ MM10_BUNDLE_READY=0
 # BISCUIT index 后缀通过 dna_pipeline index-suffixes CLI 惰性读取，避免 Shell 双写清单。
 _biscuit_index_suffixes() {
     local suffixes
-    suffixes="$(env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline index-suffixes)" || return $?
+    suffixes="$(env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex index-suffixes)" || return $?
     [[ -n "$suffixes" ]] || return 1
     printf '.fai\n%s\n' "$suffixes"
 }
 # index 中断时 BISCUIT 可能留下的工作文件；不属于 READY identity，只用于清理。
 _biscuit_transient_suffixes() {
-    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline index-suffixes --transient
+    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex index-suffixes --transient
 }
 
 usage_reference() {
@@ -1325,7 +1325,7 @@ check_prerequisites_reference() {
 
 fai_contract_check() {
     local mode="$1" label="$2" fai="$3" fasta="$4"
-    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline fai-check \
+    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex fai-check \
         --mode "$mode" --label "$label" --fai "$fai" --fasta "$fasta" >/dev/null 2>&1
 }
 
@@ -1387,7 +1387,7 @@ check_sources_for_build_plan() {
 
 
 reference_binding() {
-    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline reference-binding "$@"
+    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex reference-binding "$@"
 }
 
 assembled_reference_ready() {
@@ -1511,7 +1511,7 @@ assemble_reference() {
     local -a wanted
 
     local contig_list name
-    contig_list="$(env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline reference-contigs --species "$species")" || return $?
+    contig_list="$(env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex reference-contigs --species "$species")" || return $?
     wanted=()
     while IFS= read -r name; do [[ -z "$name" ]] || wanted+=("$name"); done <<< "$contig_list"
     (( ${#wanted[@]} > 0 )) || return 1
@@ -1523,11 +1523,11 @@ assemble_reference() {
     echo "在临时目录组装 $species FASTA： $build_dir"
 
     "$SAMTOOLS_BIN" faidx "$genome_source" "${wanted[@]}" > "$tmp_fasta" || return $?
-    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline append-spikein \
+    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex append-spikein \
         --lambda-fasta "$LAMBDA_SOURCE" --puc19-fasta "$PUC19_SOURCE" --target-fasta "$tmp_fasta" || return $?
     "$SAMTOOLS_BIN" faidx "$tmp_fasta" || return $?
     echo "等长 hard-mask $species 官方 analysis-set 区间；保留原始坐标。"
-    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline mask-analysis-reference \
+    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex mask-analysis-reference \
         --species "$species" --fasta "$tmp_fasta" || return $?
     fai_contract_check assembled "$species" "$tmp_fasta.fai" "$tmp_fasta" || {
         echo "ERROR: 临时组装的 $species FASTA 未通过 contig、顺序、长度或 analysis-set hard-mask 校验。" >&2
@@ -1616,7 +1616,7 @@ commit_biscuit_sidecars() {
 bwa_index_ready() {
     local fasta="$1" root="${2:-$1.bwa}" path paths
     [[ "$root" != "$fasta.bwa" || ! -e "$REFERENCE_BUILD_ROOT/bwa-index.COMMITTING" ]] || return 1
-    paths="$(env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline index-paths --backend rastair --reference "$fasta")" || return $?
+    paths="$(env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex index-paths --backend rastair --reference "$fasta")" || return $?
     [[ -n "$paths" ]] || return 1
     while IFS= read -r path; do
         [[ -s "$root/${path##*/}" ]] || return 1
@@ -1727,7 +1727,7 @@ bismark_component_ready() {
     genome_size="$(stat -c %s "$root/genome.fa" 2>/dev/null || stat -f %z "$root/genome.fa")" || return 1
     [[ "$fasta_size" == "$genome_size" ]] || return 1
     [[ "$mode" != local ]] || args+=(--bismark-local-alignment)
-    paths="$(PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline index-paths "${args[@]}")" || return $?
+    paths="$(PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex index-paths "${args[@]}")" || return $?
     [[ -n "$paths" ]] || return 1
     while IFS= read -r path; do [[ -s "$path" ]] || return 1; done <<< "$paths"
     if [[ "$root" == "$fasta.bismark" ]]; then
@@ -1975,7 +1975,7 @@ build_downstream_references() {
     mkdir -p "$new" || return $?
 
     echo "在临时目录构建 $species downstream TSS + single-CpG references： $build_dir"
-    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m dna_pipeline build-downstream \
+    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex build-downstream \
         --species "$species" \
         --fasta "$fasta" \
         --annotation-gtf "$DOWNSTREAM_GTF" \
@@ -2682,7 +2682,7 @@ run_demux_identity_cli() {
         -u PYTHONHOME -u PYTHONPATH -u PYTHONSTARTUP -u PYTHONUSERBASE -u VIRTUAL_ENV \
         PYTHONPATH="$PIPELINE_ROOT/core" \
         PYTHONNOUSERSITE=1 \
-        "$PYTHON_BIN" -m dna_pipeline demux-identity "$@"
+        "$PYTHON_BIN" -m alopex demux-identity "$@"
 }
 
 # 校验 control 环境与 Rust 工具链齐备、demux_rs 源码身份文件存在；build 模式下准备缓存目录。
@@ -3275,7 +3275,7 @@ BISCUIT_SAMTOOLS="$BISCUIT_ENV/bin/samtools"
 # 在临时沙箱内摆放一条 smoke 项目的目录骨架、FASTQ、Barcode Map 与路线 config。
 stage_smoke_project() {
     local project="$1" route="$2" reference="$3"
-    PYTHONPATH="$PIPELINE_ROOT/core" "$CONTROL_PYTHON" -m dna_pipeline benchmark-stage \
+    PYTHONPATH="$PIPELINE_ROOT/core" "$CONTROL_PYTHON" -m alopex benchmark-stage \
         --project "$project" --reference "$reference" --route "$route" || return 1
 }
 
@@ -3285,14 +3285,14 @@ run_manifest_refresh() {
         unset PYTHONHOME
         export PYTHONNOUSERSITE=1
         export PYTHONPATH="$PIPELINE_ROOT/core"
-        exec "$CONTROL_PYTHON" -m dna_pipeline refresh-manifest --project "$project"
+        exec "$CONTROL_PYTHON" -m alopex refresh-manifest --project "$project"
     )
 }
 
 # 对照 benchmark 基准逐项校验路线的 sealed 输出与 demux 不变量。
 verify_route_outputs() {
     local project="$1" route="$2"
-    PYTHONPATH="$PIPELINE_ROOT/core" "$CONTROL_PYTHON" -m dna_pipeline benchmark-verify \
+    PYTHONPATH="$PIPELINE_ROOT/core" "$CONTROL_PYTHON" -m alopex benchmark-verify \
         --project "$project" --manifest "$BENCHMARK_JSON" --route "$route" || return 1
     cp "$project/04_logs/doctor_verification.json" "$DOCTOR_LOG_ROOT/doctor.$DOCTOR_RUN_ID.$route.json"
 }
@@ -3371,7 +3371,7 @@ run_doctor_section() {
         summary "[FAIL] 缺少固定 Doctor benchmark： $BENCHMARK_ROOT"
         return 1
     }
-    PYTHONPATH="$PIPELINE_ROOT/core" "$CONTROL_PYTHON" -m dna_pipeline benchmark-validate \
+    PYTHONPATH="$PIPELINE_ROOT/core" "$CONTROL_PYTHON" -m alopex benchmark-validate \
         --root "$BENCHMARK_ROOT" --manifest "$BENCHMARK_JSON" >> "$DETAIL_LOG" 2>&1 || {
         summary "[FAIL] 固定 Doctor benchmark 完整性校验失败"
         return 1

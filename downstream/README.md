@@ -1,6 +1,6 @@
-# Alopex v16.2 下游 QC 与可视化
+# Alopex 下游 QC 与可视化
 
-正式源码以 Git tag `v16.2` 为准。本文说明下游运行、结果读取、缓存恢复与 RNA 关联；安装和上游流程见[主 README](../README.md)。
+当前版本为 Git tag `v16.4`，使用正式发行包时请以包内 README 为准。本文说明下游运行、结果读取、缓存恢复与 RNA 关联；安装和上游流程见[主 README](../README.md)。
 
 [运行](#运行) · [输出](#输出) · [指标与筛选](#指标与筛选) · [SingleCpG 矩阵](#保存供下游复用的-single-cpg-矩阵) · [TSS](#tss-profile) · [缓存与重算](#缓存与强制重算) · [RNA 关联](#关联-rna_darlin-结果)
 
@@ -31,8 +31,8 @@
 ```bash
 PIPELINE=/path/to/Alopex
 PATH="$PIPELINE/conda/current/control/bin:$PATH" \
-  "$PIPELINE/conda/current/notebook/bin/python" \
-  "$PIPELINE/downstream/downstream_qc.py" \
+  PYTHONPATH="$PIPELINE/core" \
+  "$PIPELINE/conda/current/notebook/bin/python" -m alopex.downstream.qc \
   --project-dir /path/to/Patient001
 ```
 
@@ -64,7 +64,7 @@ PY_KERNEL
 
 ## 输出
 
-结果写入 `<project>/06_downstream/QC_Results_YYYYMMDD_HHMMSS/`，时间取首次创建的本地时间，同秒冲突加微秒。`.delivery.json` 绑定交付：同交付复用目录与缓存，新交付新建目录；多个匹配会拒绝，不按 mtime 或目录名猜测。
+结果固定写入 `<project>/06_downstream/`。完整交付/输入身份匹配才复用缓存；新结果覆盖对应旧文件，不创建时间戳或哈希代际目录。完成身份最后提交，失败时不能把新旧混合文件当作完整结果；历史目录不自动搬迁或删除。
 
 | 文件 / 目录 | 用途 |
 | --- | --- |
@@ -75,27 +75,13 @@ PY_KERNEL
 | `plots/` | QC、Final QC、孔板、信号组成、TSS、CpG density 与 PCA 等 PDF |
 | `.cache/` | CpG 统计、信号组成、Gini 与 QC 完成身份等内部缓存，不手动改写 |
 
-同一交付只能有一个下游写入者。遇到 `Downstream QC is busy`，等当前 Processor 或 SingleCpG 更新结束后重试。项目和 QC 目录内的 `.qc-write.lock` 是持久锁文件，**不要删除或替换**；进程退出后系统会释放锁，文件仍存在不代表任务在运行。
-
-### QC 字段
-
-| 列（按写出顺序） | 定义与单位 |
-| --- | --- |
-| `Sample_ID`、`CloneID`、`PlateID` | sealed细胞/克隆/孔板身份；不能用行号或静默交集替换 |
-| `Native_Mapping%` | backend原生mapping百分比，保留其原生单位与分母，不当作跨backend同义指标 |
-| `Sample_Unique_CpG_Sites`、`Sample_Meth_CpG_Rate%` | 宿主已覆盖canonical胞嘧啶位点数及逐位点甲基化率均值 |
-| `Lambda_Unique_CpG_Sites`、`Lambda_Meth_CpG_Rate%` | 精确lambda contig的同类位点数及均值，非合并reads比率 |
-| `pUC19_Unique_CpG_Sites`、`pUC19_Meth_CpG_Rate%` | 精确pUC19 contig的同类位点数及均值 |
-| `Non_CpG_Methylation%`、`High_CpH_Flag_Rate%` | 各backend定义的non-CpG统计及flagged/assessed比例；TAPS前者为判链宿主CHG/CHH转换率，后者不适用为NaN |
-| `Signal_Host_Rate%`、`Signal_Lambda_Rate%`、`Signal_pUC19_Rate%`、`Signal_mtDNA_Rate%` | 各类canonical CpG coverage(m+u)/全部contig总coverage×100；其他contig仍进入总分母 |
-| `Gini_Index` | canonical CpG coverage在有覆盖固定宽bin的Gini；限主核染色体，含chrY、排除chrM及辅助序列；无主核CpG覆盖为缺失 |
-| `Duplicate_Pair_Rate%`、`Trim_Retention%`、`Final_Pair_Yield%` | 去重率为duplicate/accepted pairs，trim retention为trimmed/input pairs，final yield为final/input pairs（均×100）；Droplet的pair去重率为NaN |
+同一项目只能有一个下游写入者。遇到 `Downstream QC is busy`，等当前 Processor 或 SingleCpG 更新结束后重试。项目和 QC 目录内的 `.qc-write.lock` 是持久锁文件，**不要删除或替换**；进程退出后系统会释放锁，文件仍存在不代表任务在运行。
 
 ## 指标与筛选
 
-标准分析范围为 hg38 的 chr1–22/X/Y、mm10 的 chr1–19/X/Y；辅助／decoy 参与比对，不进入宿主 nCG、甲基化率、Gini、TSS 和最终 Single-CpG 矩阵。TSS／single-CpG BED 必须携带与当前参考匹配的 `.reference.json`，不得把旧目录套到新交付。来源与绑定见[标准 reference](../README.md#2-准备标准-reference)；此策略自 v16.2 发布。
+标准分析范围为 hg38 的 chr1–22/X/Y、mm10 的 chr1–19/X/Y；辅助／decoy 参与比对，不进入宿主 nCG、甲基化率、Gini、TSS 和最终 Single-CpG 矩阵。TSS／single-CpG BED 必须携带与当前参考匹配的 `.reference.json`，不得把旧目录套到新交付。此策略自 v16.2 发布。
 
-读图时先区分位点均值、coverage 比例和 read-pair 指标。身份列按字符串保留前导零及合法 `NA/nan/None`，数值缺失保持 NaN；观测零值不能当作缺失。字段见[QC 字段][qc-fields]，分母要点见下表。
+读图时先区分位点均值、coverage 比例和 read-pair 指标。身份列按字符串保留前导零及合法 `NA/nan/None`，数值缺失保持 NaN；观测零值不能当作缺失。完整定义见[QC 字段][qc-fields]和[生物学分母][denominators]。
 
 | 指标 | 解读要点 |
 | --- | --- |
@@ -138,12 +124,29 @@ adata.close()
 
 | 使用边界 | 要求 |
 | --- | --- |
-| 完成记录 | 矩阵与 `SingleCpG_Adata.input_schema.json` 配套使用；来源未知或失配时按提示显式重建，见[缓存与强制重算](#缓存与强制重算) |
+| 完成记录 | 矩阵与 `SingleCpG_Adata.input_schema.json` 配套使用；输入身份失配时从当前已核验 Raw 自动重建，见[缓存与强制重算](#缓存与强制重算) |
 | 坐标 | 跟随 sealed `analysis.cpg_coordinate_base`：0-based `chr1:0-2` 为半开区间，1-based `chr1:1-2` 为闭区间，表示同一 CpG；传给 BED/0-based 工具前须按实际 metadata 转换 |
-| reference 顺序 | 保留原生 `reference_sequences` 与索引顺序，不按 FAI 重排；真实长度为 `reference_bp_length=L`，索引长度为 `reference_seq_length=L+base`，base1 时索引0留空 |
+| reference 顺序 | 保留原生 `reference_sequences` 与索引顺序，不按 FAI 重排；坐标与原生索引约束见[矩阵契约][single-contract] |
 | 后续注释 | 只读对象不能回填标签；使用独立可写副本或合适大小的内存子集。MethylTree 分箱后仍按细胞 ID 对齐 `obs` |
 
-固定计算参数见[single-CpG 参数][single-params]；矩阵的 `uns["cpg_coordinate_base"]`、`uns["cpg_interval_convention"]`、`uns["source_cpg_representation"]` 记录实际坐标和来源。
+固定计算参数见[single-CpG 参数][single-params]；矩阵的 `uns` 记录实际坐标 base、区间约定与来源表示。
+
+### QC 字段
+
+`DNAme_QC_Information.csv`按下表分组顺序写20列；完整pair funnel、policy/unit及更细的诊断保留在sealed final manifest与MultiQC。
+身份列按字符串读写，保留前导零及合法`NA/nan/None`；数值缺失保持NaN，CSV按round-trip精度复用。
+
+| 列（按写出顺序） | 定义与单位 |
+| --- | --- |
+| `Sample_ID`、`CloneID`、`PlateID` | sealed细胞/克隆/孔板身份；不能用行号或静默交集替换 |
+| `Native_Mapping%` | backend原生mapping百分比，保留其原生单位与分母，不当作跨backend同义指标 |
+| `Sample_Unique_CpG_Sites`、`Sample_Meth_CpG_Rate%` | 宿主已覆盖canonical胞嘧啶位点数及逐位点甲基化率均值 |
+| `Lambda_Unique_CpG_Sites`、`Lambda_Meth_CpG_Rate%` | 精确lambda contig的同类位点数及均值，非合并reads比率 |
+| `pUC19_Unique_CpG_Sites`、`pUC19_Meth_CpG_Rate%` | 精确pUC19 contig的同类位点数及均值 |
+| `Non_CpG_Methylation%`、`High_CpH_Flag_Rate%` | 各backend定义的non-CpG统计及flagged/assessed比例；TAPS前者为判链宿主CHG/CHH转换率，后者不适用为NaN |
+| `Signal_Host_Rate%`、`Signal_Lambda_Rate%`、`Signal_pUC19_Rate%`、`Signal_mtDNA_Rate%` | 各类canonical CpG coverage(m+u)/全部contig总coverage×100；其他contig仍进入总分母 |
+| `Gini_Index` | canonical CpG coverage在有覆盖固定宽bin的Gini；限主核染色体，含chrY、排除chrM及辅助序列；无主核CpG覆盖为缺失 |
+| `Duplicate_Pair_Rate%`、`Trim_Retention%`、`Final_Pair_Yield%` | 依次为duplicate/backend accepted、trimmed/Cutadapt input、final retained/Cutadapt input的百分比；Droplet不以分子数反推pair去重率，该列为NaN |
 
 ## TSS profile
 
@@ -170,11 +173,11 @@ Notebook 第二格的 `TSS_SAMPLE_FRACTION`、`TSS_SAMPLE_SEED` 控制抽检，�
 | 调整 TSS BED、比例或种子 | 仅 TSS 自动失效，无需强制重建其他 QC 或矩阵 |
 | QC 完成身份缺失、过期或重算中断 | 重新运行 Processor，成功后再加载 QC 或生成 SingleCpG；有效 Raw 仍可复用 |
 | Raw 输入或算法身份过期 | 先运行 Processor 完成必要重建，再处理 SingleCpG；不能仅修改 metadata 或用 Single 强制开关绕过 |
-| SingleCpG 来源未知或变化 | 按提示设置 `RECOMPUTE_SINGLECPG=True`；仅注释变化时可复用矩阵并更新 `obs`，原 QC 列须与当前磁盘 QC 一致 |
+| SingleCpG 来源未知或变化 | 从已核验 Raw 自动重建；`RECOMPUTE_SINGLECPG=True` 可强制重建。仅注释变化时复用矩阵并更新 `obs`，原 QC 列须与当前磁盘 QC 一致 |
 | 输入或参考在计算期间变化 | 确认文件稳定后重跑；失败时不提交完成身份，未完成矩阵不能作为有效缓存使用 |
 | CpG 格式错误或缓存计数矛盾 | 按错误定位 canonical CpG 输入并重算；不把格式失败当作合法空细胞，也不手改缓存绕过校验；输入格式与守恒见[下游契约][qc-contract] |
 
-模块更新后，结束旧写任务并重启 kernel。最终 QC 提交中断后须重跑 Processor 恢复，再继续消费结果。缓存与提交的恢复方式见[缓存与强制重算][qc-contract]。
+模块更新后，结束旧写任务并重启 kernel。最终 QC 提交中断后须重跑 Processor 恢复，再继续消费结果。缓存与提交的完整规则见[下游契约][qc-contract]。
 
 ## 关联 RNA_DARLIN 结果
 
@@ -190,7 +193,7 @@ Cabernet、TAPS、Droplet 均在 DNA manifest 的可选 `rna_sample` 填 RNA_DAR
 
 孔板协议要求参与 QC 的两侧细胞集合完全一致，barcode/Cell_Order 冲突、多对一或非身份列重名均失败，不静默取交集。Droplet 两侧独立 calling/QC，`DNA_RNA_cell_links.csv` 保留双方全集，整合 QC 只含共同且双方 QC 可用的细胞；未配对细胞不补科学零值。文库冲突或错误交付代际均拒绝。
 
-`Integrated_QC_Information.csv` 保留 RNA 身份，RNA 13列与 DNA 20列的独立 QC schema 不变；RNA 下游记录实际关联和输入哈希。文库与细胞的关联边界按本节分别检查。
+`Integrated_QC_Information.csv` 保留 RNA 身份，RNA 13列与 DNA 20列的独立 QC schema 不变；RNA 下游记录实际关联和输入哈希。完整关联边界见[Manifest 契约][manifest-contract]与[Droplet 关联契约][droplet-contract]。
 
 [qc-fields]: #qc-字段
 [denominators]: #指标与筛选

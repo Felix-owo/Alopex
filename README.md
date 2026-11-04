@@ -1,6 +1,8 @@
-# Alopex v16.3
+# Alopex v16.4
 
-正式源码以 Git tag `v16.3` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v16.4` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+
+内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
 | 协议 / `analysis.protocol` | 后端 | 主要处理 |
 | --- | --- | --- |
@@ -13,6 +15,8 @@
 | --- | --- |
 | Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
 
+源码按职责定位：`core/alopex/`包含配置、输入、科学处理、交付与维护，其`downstream/`子包负责QC计算与绘图；`core/`下的Shell入口与Snakefile负责运行编排；顶层`downstream/`承载Notebook与操作说明。运行发行包包含运行、安装自检、Notebook及使用说明；开发规范和完整回归由开发仓库维护。
+
 ## 1. 安装
 
 准备可调用的 Conda、git、curl、gzip 和本地 C 编译器（macOS Command Line Tools / Linux `cc`，供 Rust 依赖构建）；Pipeline 与数据项目分开存放。
@@ -21,12 +25,12 @@ demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态�
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。本版沿用已验证的环境，不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v16.3 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.3) 下载 `Alopex-v16.3.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
+从 [v16.4 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.4) 下载 `Alopex-v16.4.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v16.3.tar.gz
-cd Alopex-v16.3
+tar -xzf Alopex-v16.4.tar.gz
+cd Alopex-v16.4
 conda --version
 ```
 
@@ -53,7 +57,7 @@ conda --version
 
 Doctor 保留下载的原始 FASTA，只在临时目录生成分析用 FASTA：hg38 使用 GIABv3 的 no-ALT、CEN/PAR/GRC 屏蔽与定向 decoy；mm10 使用 GRCm38 主装配及其 Y PAR 屏蔽。分别加入 lambda/pUC19 后为 **220／68 条比对序列**；分析 FASTA 仍使用 `<genome>.primary.lambda.puc19.fa` 路径，其内容范围以固定清单为准。
 
-比对包含真实辅助序列，最终 nCG、甲基化 QC、Gini、TSS 和 Single-CpG 矩阵按明确的主核染色体范围计算。RawAdata 保留全参考观测供 QC／审计，controls 单独统计。此策略自 v16.2 发布；所有 hard-mask 均等长，不改变保留序列的名称、长度或坐标。
+比对包含真实辅助序列，最终 nCG、甲基化 QC、Gini、TSS 和 Single-CpG 矩阵按明确的主核染色体范围计算。RawAdata 保留全参考观测供 QC／审计，controls 单独统计。此策略自 v16.2 发布；运行包不包含开发文档。
 
 FASTA/FAI、各 backend 索引、TSS／single-CpG 通过各自的 `.reference.json` 内容回执绑定同一参考。`reference --check` 只读检查；未绑定或失配的旧组件不再报告 READY。修复时 Doctor 通过既有构建事务生成、验证、提交并重建相关派生。请在没有任务使用该受管 reference 时运行修复；旧交付及其矩阵不会被自动重算或转换。
 
@@ -62,10 +66,10 @@ FASTA/FAI、各 backend 索引、TSS／single-CpG 通过各自的 `.reference.js
 ```bash
 index_kind=bismark-combined
 # 新 FASTA 的 samtools faidx 已完成后封存 FASTA/FAI。
-PYTHONPATH=core conda/current/control/bin/python -m dna_pipeline reference-binding seal --reference /path/reference.fa --kind fasta
-PYTHONPATH=core conda/current/control/bin/python -m dna_pipeline reference-binding begin --reference /path/reference.fa --build-input /path/build/input.json
+PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding seal --reference /path/reference.fa --kind fasta
+PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding begin --reference /path/reference.fa --build-input /path/build/input.json
 # 在此使用对应原生工具，从同一 FASTA 构建完整索引家族。
-PYTHONPATH=core conda/current/control/bin/python -m dna_pipeline reference-binding seal --reference /path/reference.fa --kind "$index_kind" --build-input /path/build/input.json
+PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding seal --reference /path/reference.fa --kind "$index_kind" --build-input /path/build/input.json
 ```
 
 已有新构建参考可整体传输到另一台机器：先放在独立候选目录，连同所有 `.reference.json` 一起复制；用 `reference-binding import` 依次核 FASTA、各索引家族和 downstream。此动作必须已有有效 producer 回执，逐文件 SHA256 与参考代际完全一致后仅更新目标文件系统的 stat 状态；缺失回执或内容失配会失败，不对未知旧索引补签。随后运行 `reference --check` 和目标平台真实小数据比对／CpG 验收，再切换正式目录。跨平台传输的是索引数据，环境／可执行文件仍使用目标平台版本。
@@ -82,7 +86,15 @@ PYTHONPATH=core conda/current/control/bin/python -m dna_pipeline reference-bindi
 | `bash core/doctor.sh demux --check` | 只读核对 Rust 源码与二进制身份 |
 | `bash core/doctor.sh download` | 预热 Conda/Rust 下载缓存，不编译、不发布、不提交作业 |
 
-去掉 `--check` 可维护对应段；显式 `demux` 会测试、构建并原子替换生产二进制。完整 Doctor 先检查并复用就绪资源。Conda 构建在 macOS 或 HPC 登录节点执行，已有 allocation 可作只读检查。
+去掉 `--check` 可维护对应段；显式 `demux` 会测试、构建并原子替换生产二进制。完整 Doctor 先检查并复用就绪资源。
+
+HPC 的标准顺序：
+
+1. 在本机校验正确的 reference、索引及各自 `.reference.json`，再上传到 HPC 的对应位置；按封存清单核对版本和校验值，只补传缺失或不匹配的组件，不在 HPC 临时改用另一套参考。
+2. 在登录节点提前准备 Conda 等依赖下载。需要预热时运行 `bash core/doctor.sh download`；需要安装环境时按 `conda` 段准备。已有正确环境直接复用，不因源码更新重复下载或重建。
+3. 在**现有 JupyterLab 的 Terminal** 中进入 Pipeline 根目录，运行 `bash core/doctor.sh`；确认终端位于 Jupyter 的计算节点和原 allocation。完整 Doctor、科学工具调用不在登录节点运行，也不另起独立 Doctor allocation。
+
+普通更新以“更新 Pipeline → Jupyter 中跑通标准 Doctor”为验收，不默认追加开发全仓回归、配置穷举或额外 benchmark；这些只在明确要求开发验收时单独执行。
 
 | Doctor 路线 | 内容 |
 | --- | --- |
@@ -90,7 +102,7 @@ PYTHONPATH=core conda/current/control/bin/python -m dna_pipeline reference-bindi
 | B | mm10 / SRD / BISCUIT：真实 Cabernet DNA 抽样与合成 RNA 布局/对照 |
 | C | hg38 / TAPS / Rastair：独立合成真值 |
 
-HPC 登录节点提交路线 workers；macOS 或已有 allocation 内串行执行。成功结尾为 `FINAL STATUS: READY`，日志在 `logs/doctor/`；成功清理沙箱，失败保留诊断。READY 证明本次工具链与固定小样本通过，不代表真实全库科学等价或性能验证。
+标准 HPC 操作使用现有 Jupyter allocation；macOS 使用本机执行。成功结尾为 `FINAL STATUS: READY`，默认日志在 `logs/doctor/`；成功清理沙箱，失败保留诊断。READY 证明本次工具链与固定小样本通过，不代表真实全库科学等价或性能验证。
 
 ## 4. 初始化与配置
 
@@ -112,7 +124,7 @@ cd /path/to/Patient001
 | `03_results/` | 当前完整交付的科学结果和 QC |
 | `04_logs/` | controller、规则、Slurm 日志与 provenance |
 | `05_tmp/` | 作业临时文件 |
-| `06_downstream/` | 按交付绑定的下游 QC 与矩阵 |
+| `06_downstream/` | 当前下游 QC、矩阵、plots/ 与.cache/ |
 
 在生成的 `00_config/config.yaml` 上修改关键项，例如：
 
@@ -228,10 +240,10 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 | 操作 / 结果 | 使用方式 |
 | --- | --- |
 | 启动 | 用 `conda/current/notebook` 环境打开 `downstream/DNA_QC_Visualization.ipynb`，填写 `DNA_PROJECT_ROOT`、`DNA_PIPELINE_ROOT`；按需设置 `TSS_BED` / `SKIP_TSS` |
-| 输出代际 | 写入 `06_downstream/QC_Results_<生成时间>/`；同交付复用目录/cache，新交付新建，不按 mtime 猜测输入，不写回公开结果 |
+| 下游输出 | 固定写入 `06_downstream/`；完整身份匹配才复用缓存，新结果覆盖对应旧文件，不扫描历史目录，不写回公开结果 |
 | TSS 抽检 | 默认按 CloneID 抽10%，不足10个全检、超过1000个取100；`TSS_SAMPLE_SEED=0` 可复现，`TSS_SAMPLE_FRACTION=1.0` 全检；抽样只影响 TSS，Raw/QC/Gini/Single 仍处理全部细胞 |
 | 矩阵与零值 | 位点坐标跟随交付；有覆盖全 unmethyl 保留显式0，缺覆盖不补0；QC 位点均值、SingleCpG 区间均值与合并 reads 的比率不同 |
-| 缓存重建 | CpG统计统一用`RECOMPUTE_CPG_STATS`/`--recompute-cpg-stats`同时重建位点统计与信号组成；过期缓存按 Processor 提示重算；Raw 过期时先完成 QC Processor 的必要重建，再用 `RECOMPUTE_SINGLECPG=True` 重建 SingleCpG |
+| 缓存重建 | CpG统计统一用`RECOMPUTE_CPG_STATS`/`--recompute-cpg-stats`同时重建位点统计与信号组成；过期缓存按 Processor 提示重算；Raw 过期时先完成 QC Processor 的必要重建；SingleCpG 身份失配时从已核验 Raw 自动重建 |
 | 绘图 | Final QC 按 CloneID 展示计数直方图，CpG sites 用 log 横轴；CpG density 展示 input pairs / unique CpG sites 散点及拟合，支持 PDF |
 | RNA 关联 | 使用当前完整交付的 sealed manifest 与同代 DNA QC；更新关联后先重发布 DNA 和当前代际 downstream，再整合 RNA |
 

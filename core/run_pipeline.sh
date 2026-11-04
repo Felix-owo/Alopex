@@ -124,7 +124,7 @@ if [[ -n "$DNA_PIPELINE_INIT_PROJECT" ]]; then
             exit 1
         }
     fi
-    PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_INIT_PYTHON" -m dna_pipeline init-project \
+    PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_INIT_PYTHON" -m alopex init-project \
         "$DNA_PIPELINE_INIT_PROJECT" --pipeline-root "$DNA_PIPELINE_ROOT"
     exit $?
 fi
@@ -205,7 +205,7 @@ if (( DNA_PIPELINE_REFRESH_MANIFEST == 1 )); then
     unset PYTHONHOME
     export PYTHONNOUSERSITE=1
     export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
-    "$DNA_PIPELINE_PYTHON" -m dna_pipeline refresh-manifest --project "$DNA_PIPELINE_PROJECT_DIR"
+    "$DNA_PIPELINE_PYTHON" -m alopex refresh-manifest --project "$DNA_PIPELINE_PROJECT_DIR"
     exit $?
 fi
 
@@ -261,7 +261,7 @@ run_snakemake_tracked() {
         polled_seconds=$((polled_seconds + 2))
         kill -0 "$DNA_PIPELINE_ACTIVE_SNAKEMAKE_PID" 2>/dev/null || break
         (( polled_seconds % progress_interval == 0 )) || continue
-        if progress_fields="$("$DNA_PIPELINE_PYTHON" -m dna_pipeline controller-progress --log "$controller_log" --offset "$progress_offset" 2>/dev/null)"; then
+        if progress_fields="$("$DNA_PIPELINE_PYTHON" -m alopex controller-progress --log "$controller_log" --offset "$progress_offset" 2>/dev/null)"; then
             read -r new_offset new_done new_total new_pct <<< "$progress_fields"
             (( new_offset >= progress_offset )) || last=""
             progress_offset="$new_offset"
@@ -273,7 +273,7 @@ run_snakemake_tracked() {
             printf '进度: 已完成 %s/%s 个作业（%s%%；完整输出见 %s）\n' \
                 "$done_n" "$total_n" "$pct_n" "$controller_log"
         else
-            printf '进度: 运行中（完整输出见 %s）\n' "$controller_log"
+            printf '进度: 运行中，尚无已完成作业；已等待 %ss（详情：%s）\n' "$polled_seconds" "$controller_log"
         fi
     done
     wait "$DNA_PIPELINE_ACTIVE_SNAKEMAKE_PID"
@@ -290,6 +290,7 @@ run_snakemake_tracked() {
         fi
         return "$rc"
     fi
+    printf 'INFO: workflow 已完成；结果：%s/03_results；日志：%s\n' "$DNA_PIPELINE_PROJECT_DIR" "$controller_log"
     return 0
 }
 
@@ -297,7 +298,7 @@ run_snakemake_tracked() {
 # 有效配置与独立维护动作
 for internal_helper in \
     "$DNA_PIPELINE_ROOT/core/job_runtime.sh" \
-    "$DNA_PIPELINE_ROOT/core/dna_pipeline.py"; do
+    "$DNA_PIPELINE_ROOT/core/alopex/__main__.py"; do
     [[ -f "$internal_helper" ]] || {
         echo "ERROR: Pipeline helper is missing: $internal_helper" >&2
         exit 2
@@ -315,14 +316,14 @@ install_launcher_signal_traps
 if [[ "$DNA_PIPELINE_DATA_MODE" == test ]]; then
     [[ "$DNA_PIPELINE_TEST_ROUTE" != auto ]] || DNA_PIPELINE_TEST_ROUTE="hg38-cabernet-bismark"
     DNA_PIPELINE_WORKFLOW_CONFIG="$DNA_PIPELINE_RUNTIME_TMP/effective-config.yaml"
-    PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" -m dna_pipeline synthesize-config \
+    PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" -m alopex synthesize-config \
         --source "$DNA_PIPELINE_CONFIG" \
         --destination "$DNA_PIPELINE_WORKFLOW_CONFIG" \
         --route "$DNA_PIPELINE_TEST_ROUTE"
 fi
 
 DNA_PIPELINE_CONFIG_SCALARS="$(PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" \
-    -m dna_pipeline config-scalars --config "$DNA_PIPELINE_WORKFLOW_CONFIG")"
+    -m alopex config-scalars --config "$DNA_PIPELINE_WORKFLOW_CONFIG")"
 eval "$DNA_PIPELINE_CONFIG_SCALARS"
 DNA_PIPELINE_METHYLATION_BACKEND="$CFG_METHYLATION_BACKEND"
 case "$DNA_PIPELINE_METHYLATION_BACKEND" in
@@ -410,7 +411,7 @@ dna_pipeline_prepare_run_snapshot() {
     if [[ "$DNA_PIPELINE_DATA_MODE" == test ]]; then
         snapshot_args+=(--allow-external-config)
     fi
-    DNA_PIPELINE_RUN_SNAPSHOT="$("$DNA_PIPELINE_PYTHON" -m dna_pipeline snapshot-create "${snapshot_args[@]}")"
+    DNA_PIPELINE_RUN_SNAPSHOT="$("$DNA_PIPELINE_PYTHON" -m alopex snapshot-create "${snapshot_args[@]}")"
     [[ -f "$DNA_PIPELINE_RUN_SNAPSHOT" ]] || {
         echo "ERROR: run-start snapshot was not created: $DNA_PIPELINE_RUN_SNAPSHOT" >&2
         exit 2
@@ -440,7 +441,7 @@ DNA_PIPELINE_STATUS_ARGS=(--project "$DNA_PIPELINE_PROJECT_DIR")
 if [[ -n "${DNA_PIPELINE_RUN_SNAPSHOT:-}" ]]; then
     DNA_PIPELINE_STATUS_ARGS+=(--current-snapshot "$DNA_PIPELINE_RUN_SNAPSHOT")
 fi
-DNA_PIPELINE_STATUS_JSON="$("$DNA_PIPELINE_PYTHON" -m dna_pipeline project-status "${DNA_PIPELINE_STATUS_ARGS[@]}")"
+DNA_PIPELINE_STATUS_JSON="$("$DNA_PIPELINE_PYTHON" -m alopex project-status "${DNA_PIPELINE_STATUS_ARGS[@]}")"
 DNA_PIPELINE_STATUS_LINES="$(pipeline_status_fields "$DNA_PIPELINE_STATUS_JSON")"
 DNA_PIPELINE_PROJECT_STATUS="$(printf '%s\n' "$DNA_PIPELINE_STATUS_LINES" | sed -n 1p)"
 DNA_PIPELINE_PROJECT_STATUS_REASON="$(printf '%s\n' "$DNA_PIPELINE_STATUS_LINES" | sed -n 2p)"
@@ -504,7 +505,7 @@ prepare_local_executor() {
     cores="$CFG_LOCAL_CORES"
     [[ -z "$DNA_PIPELINE_DOCTOR_LOCAL_CORES" ]] || cores="$DNA_PIPELINE_DOCTOR_LOCAL_CORES"
     [[ "$cores" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: runtime.local_executor_cores must be positive." >&2; return 2; }
-    cores="$("$DNA_PIPELINE_PYTHON" -c 'import sys; from dna_pipeline import effective_cpu_count; print(effective_cpu_count(int(sys.argv[1])))' "$cores")" || return $?
+    cores="$("$DNA_PIPELINE_PYTHON" -c 'import sys; from alopex.runtime import effective_cpu_count; print(effective_cpu_count(int(sys.argv[1])))' "$cores")" || return $?
     mem_budget="$(dna_pipeline_local_mem_budget_mib)" || return $?
     DNA_PIPELINE_EXECUTOR_ARGS=(--executor local --cores "$cores" --resources mem_mb="$mem_budget")
     DNA_PIPELINE_EXECUTOR_LABEL="local"
@@ -529,7 +530,7 @@ prepare_slurm_executor() {
     [[ "$jobs" =~ ^[1-9][0-9]*$ && "$controller_cores" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: invalid Slurm/runtime numeric settings." >&2; return 2; }
     if [[ -n "$configured_tmp" ]]; then
         DNA_PIPELINE_NODE_TMPDIR="$(PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" \
-            -m dna_pipeline resolve-tmpdir --path "$configured_tmp")"
+            -m alopex resolve-tmpdir --path "$configured_tmp")"
         export DNA_PIPELINE_NODE_TMPDIR
     else
         unset DNA_PIPELINE_NODE_TMPDIR
@@ -538,8 +539,8 @@ prepare_slurm_executor() {
     plugin_version="$("$DNA_PIPELINE_PYTHON" -c 'from importlib.metadata import version;print(version("snakemake-executor-plugin-slurm"))' 2>/dev/null || true)"
     [[ -n "$plugin_version" ]] || { echo "ERROR: SLURM executor plugin is missing." >&2; return 127; }
     default_resources=()
-    if [[ -n "$partition" ]]; then default_resources+=("slurm_partition=$partition"); fi
-    if [[ -n "$account" ]]; then default_resources+=("slurm_account=$account"); fi
+    if [[ -n "$partition" ]]; then default_resources+=("slurm_partition=$CFG_SLURM_PARTITION_LITERAL"); fi
+    if [[ -n "$account" ]]; then default_resources+=("slurm_account=$CFG_SLURM_ACCOUNT_LITERAL"); fi
     plugin_args=(--slurm-jobname-prefix "Alopex_${project_hash}" --slurm-logdir "$logdir" --slurm-delete-logfiles-older-than 0 --slurm-status-command squeue)
     if [[ -n "${SBATCH_EXCLUDE:-}" ]]; then plugin_args+=(--slurm-exclude-failed-nodes "$SBATCH_EXCLUDE"); fi
     if [[ -z "$account" ]]; then plugin_args+=(--slurm-no-account); fi
@@ -567,13 +568,10 @@ run_workflow() {
     if (( DNA_PIPELINE_READ_ONLY == 1 )); then
         dna_pipeline_prepare_read_only_inputs
     fi
-    echo "Starting Alopex with $DNA_PIPELINE_EXECUTOR executor..."
+    echo "INFO: Alopex 开始；执行器：$DNA_PIPELINE_EXECUTOR_LABEL"
     echo "Config: $DNA_PIPELINE_WORKFLOW_CONFIG"
     echo "Project: $DNA_PIPELINE_PROJECT_DIR"
-    echo "Executor: $DNA_PIPELINE_EXECUTOR_LABEL"
-    echo "Protocol: $CFG_PROTOCOL"
-    echo "Backend: $DNA_PIPELINE_METHYLATION_BACKEND"
-    echo "Reference: $CFG_SPECIES"
+    echo "Protocol: $CFG_PROTOCOL | Backend: $DNA_PIPELINE_METHYLATION_BACKEND | Reference: $CFG_SPECIES"
     printf '%s\n' "${DNA_PIPELINE_EXECUTOR_SUMMARY[@]}"
     if (( DNA_PIPELINE_READ_ONLY == 0 )); then echo "Run snapshot: $DNA_PIPELINE_RUN_SNAPSHOT"; fi
     if (( DNA_PIPELINE_READ_ONLY == 1 )); then

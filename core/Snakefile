@@ -18,54 +18,67 @@ src_path = Path(workflow.basedir)
 if str(src_path.resolve()) not in sys.path:
     sys.path.insert(0, str(src_path.resolve()))
 
-from dna_pipeline import (
+from alopex.config import (
     MANAGED_SPECIES,
-    TAPS_MIN_MAPQ, TAPS_MIN_BASEQ, TAPS_INCLUDE_FLAGS, TAPS_EXCLUDE_FLAGS, TAPS_BWA_BATCH_BASES,
-    BISMARK_CELL_RULE_RUNTIME_MIN,
     cell_artifacts,
     ProjectLayout,
-    STATIC_FUSED_RULES,
     backend_active_index_paths,
     validate_reference_component,
-    backend_resource_request,
     resolve_bismark_alignment,
     cutadapt_adapter_specs,
     biscuit_library_mode,
-    combined_runtime_min,
-    controller_resource_request,
-    demux_manifest_index,
-    demux_resource_request,
-    multiqc_resource_request,
-    demux_source_revision,
-    scientific_code_identity,
-    droplet_resource_request,
-    disable_snakemake_output_mtime_gate,
-    honor_slurm_no_account,
-    discover_samples,
     finalize_project_config,
     get_backend,
     get_protocol_policy,
     get_protocol_config,
     get_raw_route,
-    load_run_snapshot,
-    map_discovered_samples_to_manifest,
-    manifest_raw_samples,
-    publish_delivery,
-    read_project_sample_manifest,
-    resolve_demux_fastq_from_manifest,
     resolve_fai_contigs,
     resolve_reference,
-    resource_request,
-    resource_threads,
-    scratch_mb,
-    validate_barcode_map_for_protocol,
     DROPLET_DESIGN_SHA256,
+)
+from alopex.science import (
+    TAPS_MIN_MAPQ,
+    TAPS_MIN_BASEQ,
+    TAPS_INCLUDE_FLAGS,
+    TAPS_EXCLUDE_FLAGS,
+    TAPS_BWA_BATCH_BASES,
+)
+from alopex.inputs import (
+    demux_manifest_index,
+    demux_source_revision,
+    discover_samples,
+    map_discovered_samples_to_manifest,
+    manifest_raw_samples,
+    read_project_sample_manifest,
+    resolve_demux_fastq_from_manifest,
+    validate_barcode_map_for_protocol,
+)
+from alopex.delivery import (
+    load_run_snapshot,
+    publish_delivery,
     prepare_high_cph_multiqc_sources,
     prepare_sampled_multiqc_sources,
     select_multiqc_samples,
     write_multiqc_file_list,
     prefetch_multiqc_native_libraries,
 )
+from alopex.runtime import (
+    BISMARK_CELL_RULE_RUNTIME_MIN,
+    STATIC_FUSED_RULES,
+    backend_resource_request,
+    combined_runtime_min,
+    controller_resource_request,
+    demux_resource_request,
+    multiqc_resource_request,
+    droplet_resource_request,
+    disable_snakemake_output_mtime_gate,
+    honor_slurm_no_account,
+    resource_request,
+    resource_threads,
+    scratch_mb,
+)
+
+from alopex.identity import scientific_code_identity
 
 disable_snakemake_output_mtime_gate()
 
@@ -75,8 +88,8 @@ if not JOB_RUNTIME.is_file():
     raise FileNotFoundError(f"Pipeline helper is missing: {JOB_RUNTIME}")
 config = finalize_project_config(config)
 PROTOCOL_POLICY = get_protocol_policy(config)
-DROPLET_CALLING_IDENTITY = hashlib.sha256((DROPLET_DESIGN_SHA256 + demux_source_revision(PIPELINE_ROOT / "core/demux_rs", count_only=True) + scientific_code_identity(("call_droplet_cells", "stage_droplet_reads"))).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
-DROPLET_UMI_IDENTITY = scientific_code_identity(("call_droplet_cpg",)) if PROTOCOL_POLICY.name == "droplet" else ""
+DROPLET_CALLING_IDENTITY = hashlib.sha256((DROPLET_DESIGN_SHA256 + demux_source_revision(PIPELINE_ROOT / "core/demux_rs", count_only=True) + scientific_code_identity(("alopex.inputs.call_droplet_cells", "alopex.inputs.stage_droplet_reads"))).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
+DROPLET_UMI_IDENTITY = scientific_code_identity(("alopex.science.call_droplet_cpg",)) if PROTOCOL_POLICY.name == "droplet" else ""
 METHYLATION_BACKEND = get_backend(config)
 CPG_COORDINATE_BASE = config["analysis"]["cpg_coordinate_base"]
 
@@ -640,7 +653,7 @@ rule initial_cell_manifest:
             "initial_cell_manifest", attempt
         )
     params:
-        scientific_identity = scientific_code_identity(('write_initial_cell_manifest',), ()),
+        scientific_identity = scientific_code_identity(('alopex.inputs.write_initial_cell_manifest',), ()),
         species = SPECIES,
         protocol = PROTOCOL_POLICY.name,
         barcode_map = shlex.quote(str(BARCODE_MAP) if BARCODE_MAP is not None else ""),
@@ -650,7 +663,7 @@ rule initial_cell_manifest:
         set -euo pipefail
         export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
         mkdir -p "$(dirname {output.manifest:q})" "$(dirname {log:q})"
-        {RULE_PYTHON:q} -m dna_pipeline write-cell-manifest \
+        {RULE_PYTHON:q} -m alopex write-cell-manifest \
             {input.project_manifest:q} \
             {params.barcode_map} \
             {output.manifest:q} \
@@ -690,11 +703,11 @@ if PROTOCOL_POLICY.name == "droplet":
             dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
             export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
             mkdir -p "$(dirname {output.cells:q})" "$(dirname {log:q})"
-            {RULE_PYTHON:q} -m dna_pipeline stage-droplet-reads \
+            {RULE_PYTHON:q} -m alopex stage-droplet-reads \
                 {params.r1_args} {params.r2_args} --threads {threads} \
                 --binary {input.binary:q} --decoder-python {RULE_PYTHON:q} \
                 --spool {output.spool:q} --counts {output.counts:q} --structure {output.structure:q} >> {log:q} 2>&1
-            if ! {RULE_PYTHON:q} -m dna_pipeline call-droplet-cells --counts {output.counts:q} \
+            if ! {RULE_PYTHON:q} -m alopex call-droplet-cells --counts {output.counts:q} \
                 --output {output.cells:q} --metrics {output.metrics:q} \
                 --demux-binary {input.binary:q} --threads {threads} \
                 --spool {output.spool:q} >> {log:q} 2>&1; then
@@ -720,7 +733,7 @@ if PROTOCOL_POLICY.name == "droplet":
             mem_mb = lambda wc, attempt: controller_resource_mem_mb("initial_cell_manifest", attempt),
             runtime = lambda wc, attempt: controller_resource_runtime_min("initial_cell_manifest", attempt)
         params:
-            scientific_identity = scientific_code_identity(('write_initial_cell_manifest',), ()),
+            scientific_identity = scientific_code_identity(('alopex.inputs.write_initial_cell_manifest',), ()),
             species = SPECIES,
             sample_name = lambda wc: RAW_SAMPLES_MAP[wc.sample]["sample_id"],
             called_arg = lambda wc: RAW_SAMPLES_MAP[wc.sample]["sample_id"] + ":" + str(INTERMEDIATE_DIR / "demux/calling" / wc.sample / "called_cells.csv")
@@ -729,7 +742,7 @@ if PROTOCOL_POLICY.name == "droplet":
             set -euo pipefail
             export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
             mkdir -p "$(dirname {output.manifest:q})" "$(dirname {log:q})"
-            {RULE_PYTHON:q} -m dna_pipeline write-cell-manifest \
+            {RULE_PYTHON:q} -m alopex write-cell-manifest \
                 {input.project_manifest:q} "" {output.manifest:q} \
                 --species {params.species:q} --protocol droplet \
                 --project-sample-id={params.sample_name:q} --called-cells={params.called_arg:q} > {log:q} 2>&1
@@ -753,7 +766,7 @@ checkpoint demux:
         json_mqc = update(DEMUX_STATE_DIR / "{sample}" / "demux_mqc.json"),
         manifest = update(DEMUX_STATE_DIR / "{sample}" / "manifest.tsv"),
     params:
-        scientific_identity = scientific_code_identity(('write_run_metadata', 'write_demux_completion') + (('copy_demux_fastq',) if PROTOCOL_POLICY.name == 'droplet' else ()), ()),
+        scientific_identity = scientific_code_identity(('alopex.inputs.write_run_metadata', 'alopex.inputs.write_demux_completion') + (('alopex.inputs.copy_demux_fastq',) if PROTOCOL_POLICY.name == 'droplet' else ()), ()),
         sample_name = lambda wc: RAW_SAMPLES_MAP[wc.sample]["sample_id"],
         raw_sample = lambda wc: RAW_SAMPLES_MAP[wc.sample]["raw_sample"],
         r1_args = lambda wc: repeated_cli_flag("--r1", RAW_SAMPLES_MAP[wc.sample]["r1"]),
@@ -896,7 +909,7 @@ checkpoint demux:
         dna_write_tmp="$dna_tmp"
         rna_write_tmp="$rna_tmp"
         if [[ {params.pipeline_mode:q} == droplet ]]; then
-            scratch_mb="$({RULE_PYTHON:q} -m dna_pipeline droplet-output-disk-mb --spool {params.spool_dir:q})"
+            scratch_mb="$({RULE_PYTHON:q} -m alopex droplet-output-disk-mb --spool {params.spool_dir:q})"
             if dna_pipeline_allocate_scratch {resources.tmpdir:q} {SCRATCH_NAMESPACE:q} demux {params.sample_name:q} "$scratch_mb" {PROJECT_DIR:q} >> {log:q} 2>&1; then
                 demux_scratch_active=1
                 scratch_fs="$(df -Pk "$DNA_PIPELINE_SCRATCH_DIR" | awk 'END{{print $1}}')"
@@ -932,7 +945,7 @@ checkpoint demux:
         if [[ {params.pipeline_mode:q} == droplet ]]; then
             run_demux --droplet-spool {params.spool_dir:q} >> {log:q} 2>&1
             if [[ "$dna_write_tmp" != "$dna_tmp" ]]; then
-                {RULE_PYTHON:q} -m dna_pipeline copy-demux-fastq "$dna_write_tmp" "$dna_tmp" --workers {threads} >> {log:q} 2>&1
+                {RULE_PYTHON:q} -m alopex copy-demux-fastq "$dna_write_tmp" "$dna_tmp" --workers {threads} >> {log:q} 2>&1
             fi
             if (( demux_scratch_active == 1 )); then
                 dna_pipeline_cleanup_scratch
@@ -942,7 +955,7 @@ checkpoint demux:
             run_demux >> {log:q} 2>&1
         fi
 
-        {RULE_PYTHON:q} -m dna_pipeline write-demux-metadata {params.calling_args} -- \
+        {RULE_PYTHON:q} -m alopex write-demux-metadata {params.calling_args} -- \
             "$report_tmp" "$mqc_tmp" "$manifest_tmp" "$dna_final" "$rna_final" \
             {params.pipeline_mode:q} {params.route_id:q} {params.downstream_dna:q} \
             {params.raw_sample:q} {input.cell_manifest:q} >> {log:q} 2>&1
@@ -974,7 +987,7 @@ checkpoint demux:
         mv "$mqc_tmp" {output.json_mqc:q}
         mv "$manifest_tmp" {output.manifest:q}
 
-        {RULE_PYTHON:q} -m dna_pipeline write-demux-completion \
+        {RULE_PYTHON:q} -m alopex write-demux-completion \
             "$completion_tmp" \
             --run-id={wildcards.sample:q} \
             --project-sample-id={params.sample_name:q} \
@@ -1010,14 +1023,14 @@ if PROTOCOL_POLICY.requires_rna_barcode:
         log:
             LOGS_DIR / "rules/demux/{sample}_rna_collect.log"
         params:
-            scientific_identity = scientific_code_identity(('collect_rna_fastq',), ()),
+            scientific_identity = scientific_code_identity(('alopex.inputs.collect_rna_fastq',), ()),
             intermediate_dir = str(INTERMEDIATE_DIR),
         shell:
             r"""
             set -euo pipefail
             export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
             mkdir -p "$(dirname {output.marker:q})" "$(dirname {log:q})"
-            {RULE_PYTHON:q} -m dna_pipeline collect-rna-fastq \
+            {RULE_PYTHON:q} -m alopex collect-rna-fastq \
                 --manifest {input.manifest:q} \
                 --intermediate-dir {params.intermediate_dir:q} \
                 --marker {output.marker:q} \
@@ -1060,7 +1073,7 @@ if METHYLATION_BACKEND == "biscuit":
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
-            scientific_identity = scientific_code_identity(('write_dupsifter_mqc',), ('dna_pipeline_run_cutadapt',)),
+            scientific_identity = scientific_code_identity(('alopex.science.write_dupsifter_mqc',), ('dna_pipeline_run_cutadapt',)),
             demux_spacer_len = DNA_W_SPACER_LEN,
             calling_identity = DROPLET_CALLING_IDENTITY,
             demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
@@ -1188,13 +1201,13 @@ if METHYLATION_BACKEND == "biscuit":
             {params.samtools:q} quickcheck -v "$tmp_bam" >> {log.main:q} 2>&1
             {params.samtools:q} index -@ "$sort_extra_threads" "$tmp_bam" >> {log.sort:q} 2>&1
 
-            {RULE_PYTHON:q} -m dna_pipeline write-dupsifter-qc \
+            {RULE_PYTHON:q} -m alopex write-dupsifter-qc \
                 "$tmp_stat" "$tmp_mqc" \
                 --sample={wildcards.demux_sample:q} \
                 --metadata {params.dupsifter_metadata:q} >> {log.main:q} 2>&1
 
             echo "INFO: stage=publish status=START" >&2
-            {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
+            {RULE_PYTHON:q} -m alopex atomic-publish \
                 --samtools {params.samtools:q} \
                 --bam-destination {output.bam:q} \
                 --commit-last {output.bam:q} \
@@ -1253,7 +1266,7 @@ if METHYLATION_BACKEND == "biscuit":
                 ),
                 attempt_no = lambda wildcards, attempt: int(attempt)
             params:
-                scientific_identity = scientific_code_identity(('run_bsconv_extraction',), ('dna_pipeline_run_bsconv_classification',)),
+                scientific_identity = scientific_code_identity(('alopex.science.run_bsconv_extraction',), ('dna_pipeline_run_bsconv_classification',)),
                 biscuit = BISCUIT,
                 samtools = SAMTOOLS,
                 threshold = BISCUIT_HIGH_CPH_RETENTION_THRESHOLD,
@@ -1333,7 +1346,7 @@ if METHYLATION_BACKEND == "biscuit":
                 {params.samtools:q} quickcheck -v "$tmp_bam" >> {log.filter:q} 2>&1
                 {params.samtools:q} index "$tmp_bam" >> {log.filter:q} 2>&1
 
-                {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
+                {RULE_PYTHON:q} -m alopex atomic-publish \
                     --samtools {params.samtools:q} \
                     --bam-destination {output.dna:q} \
                     --commit-last {output.dna:q} \
@@ -1371,7 +1384,7 @@ if METHYLATION_BACKEND == "biscuit":
                 ),
                 attempt_no = lambda wildcards, attempt: int(attempt)
             params:
-                scientific_identity = scientific_code_identity(('run_bsconv_extraction',), ('dna_pipeline_run_bsconv_classification',)),
+                scientific_identity = scientific_code_identity(('alopex.science.run_bsconv_extraction',), ('dna_pipeline_run_bsconv_classification',)),
                 biscuit = BISCUIT,
                 samtools = SAMTOOLS,
                 threshold = BISCUIT_HIGH_CPH_RETENTION_THRESHOLD,
@@ -1552,7 +1565,7 @@ if METHYLATION_BACKEND == "biscuit":
                 fi
                 {params.samtools:q} quickcheck -v "$tmp_bam" >> {log:q} 2>&1
                 {params.samtools:q} index "$tmp_bam" >> {log:q} 2>&1
-                {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
+                {RULE_PYTHON:q} -m alopex atomic-publish \
                     --samtools {params.samtools:q} \
                     --bam-destination {output.rna_bam:q} \
                     --commit-last {output.rna_bam:q} \
@@ -1654,7 +1667,7 @@ if METHYLATION_BACKEND == "biscuit":
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
-            scientific_identity = scientific_code_identity(('read_pileup_variant_count',), ('dna_pipeline_emit_canonical_cpg',)),
+            scientific_identity = scientific_code_identity(('alopex.science.read_pileup_variant_count',), ('dna_pipeline_emit_canonical_cpg',)),
             cpg_offset = CPG_COORDINATE_BASE,
             biscuit = BISCUIT,
             zstd = ZSTD,
@@ -1675,7 +1688,7 @@ if METHYLATION_BACKEND == "biscuit":
             tmp_cpg="$(mktemp {output.cpg:q}.tmp.XXXXXX)"
             cleanup_cpg_tmp() {{ rm -f -- "$tmp_cpg"; }}
             trap cleanup_cpg_tmp EXIT
-            variant_rows=$({RULE_PYTHON:q} -m dna_pipeline pileup-variant-count --stats {input.stats:q} --sample={wildcards.demux_sample:q})
+            variant_rows=$({RULE_PYTHON:q} -m alopex pileup-variant-count --stats {input.stats:q} --sample={wildcards.demux_sample:q})
             if [ "$variant_rows" -eq 0 ]; then
                 dna_pipeline_emit_canonical_cpg {params.zstd:q} {params.cpg_offset} "$tmp_cpg" {input.vcf:q} < /dev/null
                 echo "WARNING: pileup VCF has no records; publishing a header-only SnapATAC2 CpG table." >> {log:q}
@@ -1684,7 +1697,7 @@ if METHYLATION_BACKEND == "biscuit":
                     dna_pipeline_emit_canonical_cpg {params.zstd:q} {params.cpg_offset} "$tmp_cpg" {input.vcf:q}
             fi
             {params.zstd:q} -q -t "$tmp_cpg" >> {log:q} 2>&1
-            {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
+            {RULE_PYTHON:q} -m alopex atomic-publish \
                 --commit-last {output.cpg:q} \
                 --file "$tmp_cpg" {output.cpg:q} \
                 >> {log:q} 2>&1
@@ -1716,7 +1729,7 @@ if METHYLATION_BACKEND == "biscuit":
                 ),
                 attempt_no = lambda wildcards, attempt: int(attempt)
             params:
-                scientific_identity = scientific_code_identity(('read_pileup_variant_count',), ()),
+                scientific_identity = scientific_code_identity(('alopex.science.read_pileup_variant_count',), ()),
                 biscuit = BISCUIT,
                 bgzip = BGZIP,
                 tabix = TABIX,
@@ -1737,7 +1750,7 @@ if METHYLATION_BACKEND == "biscuit":
                 cleanup_snp_tmp() {{ rm -f -- "$tmp_snp" "$tmp_tbi"; }}
                 trap cleanup_snp_tmp EXIT
 
-                variant_rows=$({RULE_PYTHON:q} -m dna_pipeline pileup-variant-count --stats {input.stats:q} --sample={wildcards.demux_sample:q})
+                variant_rows=$({RULE_PYTHON:q} -m alopex pileup-variant-count --stats {input.stats:q} --sample={wildcards.demux_sample:q})
                 if [ "$variant_rows" -eq 0 ]; then
                     echo "WARNING: pileup VCF has no records; publishing an empty SNP BED." >> {log:q}
                     : | {params.bgzip:q} -@ {params.bgzip_threads} -c > "$tmp_snp"
@@ -1783,7 +1796,7 @@ if METHYLATION_BACKEND == "biscuit":
             attempt_no = lambda wildcards, attempt: int(attempt)
         conda: ENVIRONMENT_YAML
         params:
-            scientific_identity = scientific_code_identity(('read_pileup_variant_count',), ()),
+            scientific_identity = scientific_code_identity(('alopex.science.read_pileup_variant_count',), ()),
             sample_name = lambda wc: wc.demux_sample.replace(os.sep, "_"),
             biscuit = BISCUIT,
             samtools = SAMTOOLS,
@@ -1898,7 +1911,7 @@ EOF_DUP
 
             base_conv="$qc_tmp/${{sample_name}}_totalBaseConversionRate.txt"
             echo "BISCUITqc Conversion Rate by Base Average Table" > "$base_conv"
-            variant_rows=$({RULE_PYTHON:q} -m dna_pipeline pileup-variant-count --stats {input.stats:q} --sample={wildcards.demux_sample:q})
+            variant_rows=$({RULE_PYTHON:q} -m alopex pileup-variant-count --stats {input.stats:q} --sample={wildcards.demux_sample:q})
             if [ "$variant_rows" -eq 0 ]; then
                 printf 'CA\tCC\tCG\tCT\n-1\t-1\t-1\t-1\n' >> "$base_conv"
             else
@@ -1971,7 +1984,7 @@ elif METHYLATION_BACKEND == "rastair":
             disk_mb = lambda wc: static_scratch_mb("preprocess_alignment", wc.demux_sample),
             attempt_no = lambda wc, attempt: int(attempt),
         params:
-            scientific_identity = scientific_code_identity(('write_taps_alignment_qc', 'taps_bwa_insert_model', 'TAPS_BWA_BATCH_BASES'), ('dna_pipeline_run_cutadapt',)),
+            scientific_identity = scientific_code_identity(('alopex.science.write_taps_alignment_qc', 'alopex.science.taps_bwa_insert_model', 'alopex.science.TAPS_BWA_BATCH_BASES'), ('dna_pipeline_run_cutadapt',)),
             demux_spacer_len = DNA_W_SPACER_LEN,
             calling_identity = DROPLET_CALLING_IDENTITY,
             demux_mode = lambda wc: DEMUX_RUN_ROUTES[current_demux_match(wc.demux_sample)[0].parent.name].demux_mode,
@@ -2005,7 +2018,7 @@ elif METHYLATION_BACKEND == "rastair":
             bwa_threads=$(({threads} > 1 ? {threads} - 1 : 1))
             io_threads=$(({threads} - 1))
             sort_mem=$(({resources.mem_mb} / ({threads} + 1)))
-            insert_model=$({RULE_PYTHON:q} -m dna_pipeline taps-bwa-insert-model \
+            insert_model=$({RULE_PYTHON:q} -m alopex taps-bwa-insert-model \
                 --r1 "$tmpdir/R1.fastq.gz" --r2 "$tmpdir/R2.fastq.gz" --bwa {BWA:q} \
                 --prefix {params.bwa_prefix:q} --scratch "$tmpdir" --threads "$bwa_threads")
             if [[ -n "$insert_model" ]]; then set -- -I "$insert_model"; else set --; fi
@@ -2022,9 +2035,9 @@ elif METHYLATION_BACKEND == "rastair":
             {SAMTOOLS:q} markdup -S -s -@ "$io_threads" -T "$tmpdir/markdup" "$tmpdir/sorted.bam" "$tmpdir/marked.bam"
             rm -f -- "$tmpdir/sorted.bam"
             {SAMTOOLS:q} index -@ "$io_threads" "$tmpdir/marked.bam"
-            {RULE_PYTHON:q} -m dna_pipeline taps-alignment-qc --bam "$tmpdir/marked.bam" \
+            {RULE_PYTHON:q} -m alopex taps-alignment-qc --bam "$tmpdir/marked.bam" \
                 --samtools {SAMTOOLS:q} --scratch "$tmpdir" --sample={wildcards.demux_sample:q} --output "$tmpdir/qc.json"
-            {RULE_PYTHON:q} -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
+            {RULE_PYTHON:q} -m alopex atomic-publish --commit-last {output.qc:q} \
                 --bam-destination {output.bam:q} --samtools {SAMTOOLS:q} \
                 --file "$tmpdir/cutadapt.json" {output.report:q} \
                 --file "$tmpdir/marked.bam" {output.bam:q} --file "$tmpdir/marked.bam.bai" {output.bai:q} \
@@ -2057,7 +2070,7 @@ elif METHYLATION_BACKEND == "rastair":
             attempt_no = lambda wc, attempt: int(attempt),
         conda: ENVIRONMENT_YAML
         params:
-            scientific_identity = scientific_code_identity(('emit_rastair_cpg', 'TAPS_MIN_MAPQ', 'TAPS_MIN_BASEQ', 'TAPS_INCLUDE_FLAGS', 'TAPS_EXCLUDE_FLAGS'), ('dna_pipeline_emit_canonical_cpg',)),
+            scientific_identity = scientific_code_identity(('alopex.science.emit_rastair_cpg', 'alopex.science.TAPS_MIN_MAPQ', 'alopex.science.TAPS_MIN_BASEQ', 'alopex.science.TAPS_INCLUDE_FLAGS', 'alopex.science.TAPS_EXCLUDE_FLAGS'), ('dna_pipeline_emit_canonical_cpg',)),
             cpg_offset = CPG_COORDINATE_BASE
         shell:
             r"""
@@ -2078,13 +2091,13 @@ elif METHYLATION_BACKEND == "rastair":
                 --segment-max-length 100000 --all --m-min-depth 1 --nOT 0,0,0,0 --nOB 0,0,0,0 \
                 --vcf-info-fields AS_SB,AS_SS_BQ,AS_SS_MQ,PIR,AF \
                 --bed "$tmpdir/native.bed" --vcf "$tmpdir/native.vcf.gz" {input.bam:q}
-            {RULE_PYTHON:q} -m dna_pipeline rastair-cpg --bed "$tmpdir/native.bed" --reference {input.reference:q} \
+            {RULE_PYTHON:q} -m alopex rastair-cpg --bed "$tmpdir/native.bed" --reference {input.reference:q} \
                 --alignment-qc {input.qc:q} --output-qc "$tmpdir/qc.json" \
                 --bam {input.bam:q} --samtools {SAMTOOLS:q} --scratch "$tmpdir" \
                 --vcf "$tmpdir/native.vcf.gz" --output-snp "$tmpdir/snps.vcf.gz" --sample={wildcards.demux_sample:q} | \
                 dna_pipeline_emit_canonical_cpg {ZSTD:q} {params.cpg_offset} "$tmpdir/cpg.tsv.zst" "$tmpdir/native.bed"
             {ZSTD:q} -q -t "$tmpdir/cpg.tsv.zst"
-            {RULE_PYTHON:q} -m dna_pipeline atomic-publish --commit-last {output.qc:q} \
+            {RULE_PYTHON:q} -m alopex atomic-publish --commit-last {output.qc:q} \
                 --file "$tmpdir/cpg.tsv.zst" {output.cpg:q} \
                 --file "$tmpdir/snps.vcf.gz" {output.snp:q} --file "$tmpdir/snps.vcf.gz.tbi" {output.snp_index:q} \
                 --file "$tmpdir/qc.json" {output.qc:q}
@@ -2176,7 +2189,8 @@ else:
                 set -- -p "$bthreads"
             fi
             echo "INFO: stage=bismark_align allocated_threads={threads} alignment_instances={params.alignment_instances} bowtie_threads_per_instance=$bthreads" >> {log:q}
-            {params.bismark:q} align \
+            # 单线程实例不带 --reorder；避免继承的 OpenMP 线程数打乱 SAM 与原始 read 的同步。
+            OMP_NUM_THREADS=1 {params.bismark:q} align \
                 --genome "$(dirname {input.bismark_genome:q})" \
                 --path_to_bowtie2 {params.bowtie2_dir:q} \
                 --basename={wildcards.demux_sample:q} \
@@ -2204,7 +2218,7 @@ else:
                 set -- --file "$dedup_report" {output.dedup_report:q}
             fi
             {params.samtools:q} quickcheck -v "$final_bam" >> {log:q} 2>&1
-            {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
+            {RULE_PYTHON:q} -m alopex atomic-publish \
                 --samtools {params.samtools:q} \
                 --bam-destination {output.bam:q} \
                 --commit-last {output.bam:q} \
@@ -2241,7 +2255,7 @@ else:
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
-            scientific_identity = scientific_code_identity(('run_bismark_pair_split', 'write_filter_summary'), ('dna_pipeline_find_single_output',)),
+            scientific_identity = scientific_code_identity(('alopex.science.run_bismark_pair_split', 'alopex.science.write_filter_summary'), ('dna_pipeline_find_single_output',)),
             bismark = BISMARK,
             samtools = SAMTOOLS,
             excluded_contigs_json = HIGH_CPH_EXCLUDED_CONTIGS_JSON,
@@ -2277,7 +2291,7 @@ else:
 
             filter_dir="$tmp/filter"
             mkdir -p "$filter_dir"
-            {params.python:q} -m dna_pipeline split-bismark-pairs \
+            {params.python:q} -m alopex split-bismark-pairs \
                 --input-bam {input.bam:q} \
                 --excluded-contigs-json {params.excluded_contigs_json:q} \
                 --bio "$filter_dir/input.bam" --excluded "$tmp/excluded.bam" \
@@ -2316,7 +2330,7 @@ else:
             fi
             {params.samtools:q} quickcheck -v "$tmp/processed.bam" >> {log:q} 2>&1
             export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
-            {RULE_PYTHON:q} -m dna_pipeline write-filter-summary \
+            {RULE_PYTHON:q} -m alopex write-filter-summary \
                 --sample={wildcards.demux_sample:q} \
                 --candidate-pairs "$candidate_pairs" --removed-pairs "$removed_pairs" \
                 --excluded-pairs "$excluded_pairs" \
@@ -2326,7 +2340,7 @@ else:
                 --summary-path "$tmp/summary.json" --multiqc-path "$tmp/mqc.json" >> {log:q} 2>&1
 
             if {params.publish_removed}; then
-                {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
+                {RULE_PYTHON:q} -m alopex atomic-publish \
                     --samtools {params.samtools:q} \
                     --bam-destination {output.bam:q} \
                     --commit-last {output.bam:q} \
@@ -2336,7 +2350,7 @@ else:
                     --file "$tmp/processed.bam" {output.bam:q} \
                     >> {log:q} 2>&1
             else
-                {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
+                {RULE_PYTHON:q} -m alopex atomic-publish \
                     --samtools {params.samtools:q} \
                     --bam-destination {output.bam:q} \
                     --commit-last {output.bam:q} \
@@ -2455,7 +2469,7 @@ else:
 
             if [[ {params.protocol:q} == droplet ]]; then
                 cov="$out/umi.cov.gz"; extract_report="$out/umi.json"; mbias="$out/M-bias.txt"
-                {RULE_PYTHON:q} -m dna_pipeline call-droplet-cpg \
+                {RULE_PYTHON:q} -m alopex call-droplet-cpg \
                     --bam {input.bam:q} --reference {input.reference:q} \
                     --coverage "$cov" --qc "$extract_report" --mbias "$mbias" \
                     --sample={wildcards.demux_sample:q} --scratch "$tmp" \
@@ -2476,7 +2490,7 @@ else:
             test -s "$extract_report"
             test -s "$mbias"
 
-            {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
+            {RULE_PYTHON:q} -m alopex atomic-publish \
                 --commit-last {output.cov:q} \
                 --file "$extract_report" {output.extract_report:q} \
                 --file "$mbias" {output.mbias:q} \
@@ -2530,7 +2544,7 @@ else:
             {params.gzip:q} -dc {input.cov:q} | \
                 dna_pipeline_emit_canonical_cpg {params.zstd:q} {params.cpg_offset} "$tmp_cpg" {input.cov:q}
             {params.zstd:q} -q -t "$tmp_cpg"
-            {RULE_PYTHON:q} -m dna_pipeline atomic-publish \
+            {RULE_PYTHON:q} -m alopex atomic-publish \
                 --commit-last {output.cpg:q} \
                 --file "$tmp_cpg" {output.cpg:q} \
                 >> {log:q} 2>&1
@@ -2611,7 +2625,7 @@ rule multiqc:
         runtime = lambda wildcards, input, attempt: multiqc_resource_request(len(input), attempt).runtime_min,
         attempt_no = lambda wildcards, attempt: int(attempt)
     params:
-        scientific_identity = scientific_code_identity(('prepare_high_cph_multiqc_sources', 'prepare_sampled_multiqc_sources', 'select_multiqc_samples', 'write_multiqc_file_list'), ()),
+        scientific_identity = scientific_code_identity(('alopex.delivery.prepare_high_cph_multiqc_sources', 'alopex.delivery.prepare_sampled_multiqc_sources', 'alopex.delivery.select_multiqc_samples', 'alopex.delivery.write_multiqc_file_list'), ()),
         outdir = STAGED_RESULTS_DIR / "QC_Results",
         tmpout = INTERMEDIATE_DIR / "multiqc" / "output_tmp",
         multiqc = MULTIQC
@@ -2706,7 +2720,7 @@ rule final_sample_manifest:
             "final_sample_manifest", attempt
         )
     params:
-        scientific_identity = scientific_code_identity(('write_final_sample_manifest',), ()),
+        scientific_identity = scientific_code_identity(('alopex.delivery.write_final_sample_manifest',), ()),
         bismark = BISMARK,
         initial_manifest = lambda wc, input: str(input.initial_manifest),
         intermediate = str(INTERMEDIATE_DIR),
@@ -2728,7 +2742,7 @@ rule final_sample_manifest:
         set -euo pipefail
         export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
         mkdir -p "$(dirname {output.manifest:q})" "$(dirname {log:q})"
-        {RULE_PYTHON:q} -m dna_pipeline write-sample-manifest \
+        {RULE_PYTHON:q} -m alopex write-sample-manifest \
             {params.initial_manifest:q} \
             {params.intermediate:q} \
             {params.staged_results:q} \
@@ -2769,7 +2783,7 @@ rule delivery_ready:
         set -euo pipefail
         export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
         mkdir -p "$(dirname {output.ready:q})" "$(dirname {log:q})"
-        {RULE_PYTHON:q} -m dna_pipeline delivery-ready \
+        {RULE_PYTHON:q} -m alopex delivery-ready \
             --ready {output.ready:q} \
             --staged-results {params.staged_results:q} \
             --run-snapshot {params.run_snapshot:q} > {log:q} 2>&1
