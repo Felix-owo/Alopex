@@ -88,14 +88,14 @@ if not JOB_RUNTIME.is_file():
     raise FileNotFoundError(f"Pipeline helper is missing: {JOB_RUNTIME}")
 config = finalize_project_config(config)
 PROTOCOL_POLICY = get_protocol_policy(config)
-DROPLET_CALLING_IDENTITY = hashlib.sha256((DROPLET_DESIGN_SHA256 + demux_source_revision(PIPELINE_ROOT / "core/demux_rs", count_only=True) + scientific_code_identity(("alopex.inputs.call_droplet_cells", "alopex.inputs.stage_droplet_reads"))).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
+DROPLET_CALLING_IDENTITY = hashlib.sha256((DROPLET_DESIGN_SHA256 + demux_source_revision(PIPELINE_ROOT / "core/demux_rs", calling_only=True) + scientific_code_identity(("alopex.inputs.call_droplet_cells", "alopex.inputs.stage_droplet_reads"))).encode()).hexdigest() if PROTOCOL_POLICY.name == "droplet" else ""
 DROPLET_UMI_IDENTITY = scientific_code_identity(("alopex.science.call_droplet_cpg",)) if PROTOCOL_POLICY.name == "droplet" else ""
 METHYLATION_BACKEND = get_backend(config)
 CPG_COORDINATE_BASE = config["analysis"]["cpg_coordinate_base"]
 
 _RULE_ENVIRONMENT_PREFIX_RAW = str(
     os.environ.get("DNA_PIPELINE_RULE_ENV", "") or ""
-).strip()
+)
 if not _RULE_ENVIRONMENT_PREFIX_RAW:
     raise ValueError("DNA_PIPELINE_RULE_ENV must name the selected solved Conda prefix")
 _RULE_ENVIRONMENT_PREFIX = Path(_RULE_ENVIRONMENT_PREFIX_RAW).expanduser().resolve()
@@ -124,7 +124,7 @@ BWA = _rule_executable("bwa")
 RASTAIR = _rule_executable("rastair")
 RULE_PYTHON = _rule_executable("python")
 
-_active_config_env = str(os.environ.get("DNA_PIPELINE_CONFIG", "") or "").strip()
+_active_config_env = str(os.environ.get("DNA_PIPELINE_CONFIG", "") or "")
 if _active_config_env:
     ACTIVE_CONFIG_PATH = Path(_active_config_env).expanduser().resolve()
 else:
@@ -142,7 +142,7 @@ if ACTIVE_CONFIG_PATH.name != "config.yaml" or ACTIVE_CONFIG_PATH.parent.name !=
 PROJECT_DIR = ACTIVE_CONFIG_PATH.parent.parent.resolve()
 if not PROJECT_DIR.is_dir():
     raise FileNotFoundError(f"Project directory does not exist: {PROJECT_DIR}")
-_launcher_project_root = str(os.environ.get("DNA_PIPELINE_PROJECT_DIR", "") or "").strip()
+_launcher_project_root = str(os.environ.get("DNA_PIPELINE_PROJECT_DIR", "") or "")
 if _launcher_project_root and Path(_launcher_project_root).expanduser().resolve() != PROJECT_DIR:
     raise ValueError(
         "Launcher project root and config-derived project root disagree: "
@@ -166,7 +166,7 @@ PROJECT_LAYOUT = ProjectLayout(INTERMEDIATE_DIR, STAGED_RESULTS_DIR, METHYLATION
 CELL_PATH_PATTERN = PROJECT_LAYOUT.cell("{demux_sample}")
 SCRATCH_NAMESPACE = hashlib.sha256(str(PROJECT_DIR).encode("utf-8")).hexdigest()[:16]
 
-_snapshot_env = str(os.environ.get("DNA_PIPELINE_RUN_SNAPSHOT", "") or "").strip()
+_snapshot_env = str(os.environ.get("DNA_PIPELINE_RUN_SNAPSHOT", "") or "")
 PROVENANCE_SNAPSHOT_PATH = (
     Path(_snapshot_env).expanduser().resolve() if _snapshot_env else None
 )

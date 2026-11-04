@@ -8,7 +8,6 @@ import gzip
 import hashlib
 import importlib.metadata
 import json
-import logging
 import os
 import re
 import shutil

@@ -9,7 +9,7 @@ import json
 import os
 import subprocess
 import symtable
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
 
@@ -52,10 +52,14 @@ def python_ast_bindings(source: str, *, conditional_bindings: bool = False) -> d
 
 def _global_loads(node: ast.AST) -> set[str]:
     """区分真实全局读取与参数、推导式和嵌套作用域中的局部同名变量。"""
-    scope_node = copy.deepcopy(node)
-    for child in ast.walk(scope_node):
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not child.body:
-            child.body.append(ast.Pass())
+    scope_node = node
+    # 去掉唯一 docstring 后的空定义才需要补 Pass，普通绑定保持只读，避免深拷贝。
+    if any(isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+           and not child.body for child in ast.walk(node)):
+        scope_node = copy.deepcopy(node)
+        for child in ast.walk(scope_node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not child.body:
+                child.body.append(ast.Pass())
     table = symtable.symtable(ast.unparse(scope_node), "<scientific binding>", "exec")
 
     def collect(scope: symtable.SymbolTable) -> set[str]:

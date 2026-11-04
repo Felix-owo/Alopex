@@ -964,7 +964,7 @@ def print_refresh_result(args, result) -> int:
 
 # 输入与解复用：细胞识别和提交边界
 
-def demux_source_revision(source_root: str | Path, *, count_only: bool = False) -> str:
+def demux_source_revision(source_root: str | Path, *, calling_only: bool = False) -> str:
     """覆盖全部Rust源码；calling仅排除独立输出/replay，保留共享spool校验。"""
     root = Path(source_root).expanduser().resolve()
     main_rs = root / "src" / "main.rs"
@@ -980,7 +980,7 @@ def demux_source_revision(source_root: str | Path, *, count_only: bool = False) 
     output_only = {"src/output.rs", "src/droplet/replay.rs"}
     paths.remove(main_rs)
     paths.extend(path for path in rust_sources
-                 if not count_only or path.relative_to(root).as_posix() not in output_only)
+                 if not calling_only or path.relative_to(root).as_posix() not in output_only)
     digest = hashlib.sha256()
     for path in sorted(paths, key=lambda item: Path(os.path.relpath(item, root)).as_posix()):
         relative = Path(os.path.relpath(path, root)).as_posix().encode()

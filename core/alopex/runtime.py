@@ -272,37 +272,22 @@ def demux_size_tier(total_bytes: object) -> str:
     return "XL"
 
 
-def demux_resource_request(total_bytes: object, attempt: int = 1, count_only: bool = False) -> ResourceRequest:
-    """返回孔板 demux 或 Droplet calling 的调度请求，两次重试仅把内存提高至首次的 1.5 倍、2 倍。
-
-    ``count_only=True``（droplet 细胞调用的全条码计数）按实测斜率外推：峰值内存 ≈
-    2 GiB + 0.048×输入GiB（F-real-2609SG，619 GiB R1 实测 29.5 GiB、12.04B reads），
-    请求值乘 1.3 余量；runtime 按 1.1 min/GiB。``count_only=False`` 用表内保守值，
-    XL 与 L 内存同档。字节数不可得时沿用表内 XL 保底值；Droplet 配对阶段由
-    droplet_resource_request 给出独立阶段预算。
-    """
+def demux_resource_request(total_bytes: object, attempt: int = 1) -> ResourceRequest:
+    """返回孔板 demux 请求；重试仅提高内存，Droplet 各阶段由其独立入口预算。"""
 
     attempt_no = _attempt_number(attempt)
     key, row = _rule("demux")
     tier = demux_size_tier(total_bytes)
     tier_index = _tier_index(tier)
-    total = _read_count(total_bytes)
-    if count_only and tier_index == 3 and total is not None:
-        input_gib = total / 1024 ** 3
-        base_mem_mb = math.ceil((2 + 0.048 * input_gib) * 1.3 * 1024)
-        runtime_min = max(720, math.ceil(1.1 * input_gib))
-    else:
-        base_mem_mb = row.memory_gib[tier_index] * 1024
-        runtime_min = row.runtime_min[tier_index]
-    mem_mb = _attempt_memory_mb(base_mem_mb, attempt_no)
+    mem_mb = _attempt_memory_mb(row.memory_gib[tier_index] * 1024, attempt_no)
     return ResourceRequest(
-        policy=STATIC_POLICY + (":count" if count_only else ""),
+        policy=STATIC_POLICY,
         rule_key=key,
         tier=tier,
         dna_reads=None,
         threads=row.threads[tier_index],
         mem_mb=mem_mb,
-        runtime_min=runtime_min,
+        runtime_min=row.runtime_min[tier_index],
     )
 
 
@@ -311,11 +296,17 @@ def droplet_resource_request(total_r1_bytes: object, stage: str, attempt: int = 
     if stage not in {"calling", "demux"}:
         raise ValueError("Droplet stage must be calling or demux")
     request = resource_request("droplet_" + stage, attempt=1)
+    tier = demux_size_tier(total_r1_bytes)
     base_mem = request.mem_mb
     if stage == "calling":
-        count = demux_resource_request(total_r1_bytes, count_only=True)
-        base_mem = max(base_mem, math.ceil(count.mem_mb / 4) + 4 * 1024)
-    return replace(request, tier=demux_size_tier(total_r1_bytes), mem_mb=_attempt_memory_mb(base_mem, _attempt_number(attempt)))
+        total = _read_count(total_r1_bytes)
+        if tier == "XL" and total is not None:
+            # 保留 F-real-2609SG 全库计数实测斜率、余量及紧凑表换算，逐层向上取整。
+            count_mem_mb = math.ceil((2 + 0.048 * (total / 1024 ** 3)) * 1.3 * 1024)
+        else:
+            count_mem_mb = STATIC_RESOURCE_REQUESTS["demux"].memory_gib[_tier_index(tier)] * 1024
+        base_mem = max(base_mem, math.ceil(count_mem_mb / 4) + 4 * 1024)
+    return replace(request, tier=tier, mem_mb=_attempt_memory_mb(base_mem, _attempt_number(attempt)))
 
 
 MULTIQC_MAX_CELLS = 1000
