@@ -71,6 +71,7 @@ __pypackages__/
 **/03_results/
 **/04_logs/
 **/05_tmp/
+**/06_downstream/
 
 # 测序与比对大文件
 *.fastq
