@@ -35,7 +35,7 @@ from ..config import (
 )
 from ..delivery import load_run_manifest, load_run_snapshot
 from ..identity import PythonSourceGraph
-from ..io import sha256_file
+from ..io import sha256_file, project_temporary_parent
 from ..paths import CORE_ROOT as _CORE_ROOT, PIPELINE_ROOT as _PIPELINE_ROOT
 from ..runtime import effective_cpu_count
 
@@ -1213,7 +1213,7 @@ def _atomic_write_csv(df: pd.DataFrame, path: Path, *, before_commit=None) -> No
             newline="",
             prefix=f".{path.name}.tmp.",
             suffix=".csv",
-            dir=str(path.parent),
+            dir=project_temporary_parent(path),
             delete=False,
         ) as handle:
             temporary = Path(handle.name)
@@ -1251,7 +1251,7 @@ def _atomic_write_json(payload: dict, path: Path, *, before_commit=None) -> None
             newline="",
             prefix=f".{path.name}.tmp.",
             suffix=".json",
-            dir=str(path.parent),
+            dir=project_temporary_parent(path),
             delete=False,
         ) as handle:
             temporary = Path(handle.name)
@@ -1449,8 +1449,8 @@ def _publish_raw_adata_generation(
     temporary = Path(temporary)
     out_file = Path(out_file)
     schema_file = Path(schema_file)
-    if temporary.parent != out_file.parent or schema_file.parent != out_file.parent:
-        raise ValueError("RawAdata temporary, output, and schema must share a directory")
+    if temporary.parent != project_temporary_parent(out_file) or schema_file.parent != out_file.parent:
+        raise ValueError("RawAdata temporary must use the project temporary directory; output and schema must share a directory")
     generation_id = generation_id or uuid.uuid4().hex
     if re.fullmatch(r"[0-9a-f]{32}", generation_id) is None:
         raise ValueError("RawAdata generation_id must be 32 lowercase hex characters")
@@ -1569,17 +1569,9 @@ def make_cpg_peak_matrix(adata, *, peak_file: Path, **kwargs):
 
 
 def _make_cpg_import_dir(output_parent: Path) -> Path:
-    """临时链接优先用节点磁盘；不可写时回到输出目录，不复制或改变 CpG 内容。"""
-    local_tmp = "/tmp" if sys.platform.startswith("linux") else tempfile.gettempdir()
-    roots = [Path(root) for root in (os.environ.get("SLURM_TMPDIR"), local_tmp, output_parent)
-             if root]
-    for root in dict.fromkeys(roots):
-        try:
-            return Path(tempfile.mkdtemp(prefix=".snapatac-cpg-input.", dir=str(root)))
-        except OSError:
-            if root == output_parent:
-                raise
-    raise RuntimeError("Cannot create the private CpG import directory")
+    """在项目05_tmp创建独占导入目录；链接及临时矩阵均不落节点盘。"""
+    return Path(tempfile.mkdtemp(prefix=".snapatac-cpg-input.",
+                                 dir=project_temporary_parent(output_parent / "RawAdata.h5ad")))
 
 
 def load_or_create_raw_adata(
@@ -1715,9 +1707,7 @@ def load_or_create_raw_adata(
     out_file.parent.mkdir(parents=True, exist_ok=True)
     import_dir = _make_cpg_import_dir(out_file.parent)
     _log(f"Raw CpG temporary links: {import_dir}", level="DEBUG")
-    temporary = out_file.with_name(
-        f".{out_file.stem}.tmp.{os.getpid()}.{time.time_ns()}{out_file.suffix}"
-    )
+    temporary = import_dir.parent / f".{out_file.stem}.{uuid.uuid4().hex}.tmp{out_file.suffix}"
     snap_data = None
     try:
 
@@ -1854,7 +1844,7 @@ def _open_cpg_text(path: Path):
         if executable is None:
             raise FileNotFoundError("zstdcat is required to read CpG .zst files")
         # 科学文本保持流式读取；诊断不能占满无人读取的第二条管道。
-        diagnostics = tempfile.TemporaryFile(mode="w+t", errors="replace")
+        diagnostics = tempfile.TemporaryFile(mode="w+t", errors="replace", dir=project_temporary_parent(path))
         try:
             process = subprocess.Popen(
                 [executable, str(path)],
@@ -3824,7 +3814,7 @@ def prepare_single_cpg_adata(
                  and cached.get("input") == signature
                  and cached.get("h5ad") == _raw_adata_stat_binding(output))
         # 固定输出路径下，身份不匹配的旧矩阵从当前已核验Raw重建，绝不复用旧值。
-        temporary = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp.h5ad")
+        temporary = project_temporary_parent(output) / f".{output.stem}.{uuid.uuid4().hex}.tmp.h5ad"
         raw = matrix = None
         try:
             if reuse and not recompute:

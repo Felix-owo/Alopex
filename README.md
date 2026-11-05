@@ -1,8 +1,8 @@
-# Alopex v16.11
+# Alopex v16.12
 
-正式源码以 Git tag `v16.11` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v16.12` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
-本版将科学阶段 scratch 固定到项目 `05_tmp/`；保留空间检查、独占清理与原子提交，不自动选择节点临时盘。
+本版将项目工作、诊断与原子提交临时项统一到项目 `05_tmp/`；保留空间检查、独占清理与原子提交，不自动选择节点临时盘。
 
 内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
@@ -19,6 +19,11 @@
 
 源码按职责定位：`core/alopex/`包含配置、输入、科学处理、交付与维护，其`downstream/`子包负责QC计算与绘图；`core/`下的Shell入口与Snakefile负责运行编排；顶层`downstream/`承载Notebook与操作说明。运行发行包包含运行、安装自检、Notebook及使用说明；开发仓完整归档包含 docs、tests 和维护规范；本公开运行包排除这些开发内容。
 
+项目运行的临时工作与提交文件统一使用本项目 `05_tmp/`，包括预处理、原生工具 spill、诊断、矩阵写出和发布候选；外部 `TMPDIR` / `SLURM_TMPDIR` 不改选节点盘。临时文件关闭并校验后使用同文件系统原子替换；`05_tmp` 不得为符号链接，输出位于另一挂载时明确失败，不回退复制覆盖。仅清理本次创建的临时项，重试所需的事务备份也保留在 `05_tmp/`，运行或恢复未完成时不要手动清空该目录。
+
+`02_work/` 中有明确下游消费者的阶段产物、`.snakemake/` 恢复状态，以及没有项目上下文的环境/参考安装事务保留各自职责位置。安装事务的临时项必须与安装目标处于同一文件系统，不写入任意分析项目。共享空间和配额仍需足以容纳已有结果、新候选及并发作业；空间检查不等于容量预留。
+
+
 ## 1. 安装
 
 准备可调用的 Conda、git、curl、gzip 和本地 C 编译器（macOS Command Line Tools / Linux `cc`，供 Rust 依赖构建）；Pipeline 与数据项目分开存放。
@@ -27,12 +32,12 @@ demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态�
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v16.11 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.11) 下载 `Alopex-v16.11.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
+从 [v16.12 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.12) 下载 `Alopex-v16.12.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v16.11.tar.gz
-cd Alopex-v16.11
+tar -xzf Alopex-v16.12.tar.gz
+cd Alopex-v16.12
 conda --version
 ```
 
@@ -199,7 +204,7 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 
 ## 6. 运行与恢复
 
-科学阶段临时数据固定写入当前项目 `05_tmp/`，每个作业使用独占随机子目录并只清理自身目录。启动前检查预计磁盘需求及10%余量，空间不足直接失败，不自动切换到节点 `/tmp`、`/var/tmp` 或外部 `TMPDIR`。该检查不预留跨作业容量，也不保证共享存储或用户配额永不耗尽。可恢复的跨节点工件保留在 `02_work/`。升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。详见[调度参数](https://github.com/Felix-owo/Alopex_dev/blob/v16.11/docs/ANALYSIS_PARAMETERS.md)。
+科学阶段临时数据固定写入当前项目 `05_tmp/`，每个作业使用独占随机子目录并只清理自身目录。启动前检查预计磁盘需求及10%余量，空间不足直接失败，不自动切换到节点 `/tmp`、`/var/tmp` 或外部 `TMPDIR`。该检查不预留跨作业容量，也不保证共享存储或用户配额永不耗尽。可恢复的跨节点工件保留在 `02_work/`。升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。详见[调度参数](https://github.com/Felix-owo/Alopex_dev/blob/v16.12/docs/ANALYSIS_PARAMETERS.md)。
 
 ```bash
 ./run_pipeline.sh --dry-run

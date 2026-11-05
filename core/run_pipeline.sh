@@ -307,7 +307,9 @@ done
 DNA_PIPELINE_WORKFLOW_CONFIG="$DNA_PIPELINE_CONFIG"
 DNA_PIPELINE_RUNTIME_TMP=""
 if (( DNA_PIPELINE_READ_ONLY == 1 )) || [[ "$DNA_PIPELINE_DATA_MODE" == test ]]; then
-    DNA_PIPELINE_RUNTIME_TMP="$(mktemp -d -t dna-pipeline-launch.XXXXXX)"
+    [[ ! -L "$DNA_PIPELINE_PROJECT_DIR/05_tmp" ]] || { echo "ERROR: 05_tmp must be a real directory" >&2; exit 2; }
+    mkdir -p "$DNA_PIPELINE_PROJECT_DIR/05_tmp"
+    DNA_PIPELINE_RUNTIME_TMP="$(mktemp -d "$DNA_PIPELINE_PROJECT_DIR/05_tmp/dna-pipeline-launch.XXXXXX")"
 fi
 trap cleanup_launcher_tmp EXIT
 install_launcher_signal_traps
@@ -367,8 +369,11 @@ if (( DNA_PIPELINE_READ_ONLY == 1 )); then
 else
     XDG_CACHE_HOME="$DNA_PIPELINE_PROJECT_DIR/05_tmp/xdg_cache"
 fi
-mkdir -p "$XDG_CACHE_HOME"
+[[ ! -L "$DNA_PIPELINE_PROJECT_DIR/05_tmp" ]] || { echo "ERROR: 05_tmp must be a real directory" >&2; exit 2; }
+mkdir -p "$XDG_CACHE_HOME" "$DNA_PIPELINE_PROJECT_DIR/05_tmp"
 export XDG_CACHE_HOME
+export TMPDIR="$DNA_PIPELINE_PROJECT_DIR/05_tmp" TMP="$DNA_PIPELINE_PROJECT_DIR/05_tmp" TEMP="$DNA_PIPELINE_PROJECT_DIR/05_tmp" TEMPDIR="$DNA_PIPELINE_PROJECT_DIR/05_tmp"
+DNA_PIPELINE_TMP_LITERAL="$("$DNA_PIPELINE_PYTHON" -c 'import sys; print(repr(sys.argv[1]))' "$TMPDIR")"
 
 DNA_PIPELINE_SNAKEMAKE_VERSION="$("$DNA_PIPELINE_SNAKEMAKE" --version 2>/dev/null | head -n1)"
 DNA_PIPELINE_SNAKEMAKE_MAJOR="$(printf '%s' "$DNA_PIPELINE_SNAKEMAKE_VERSION" | sed -E 's/^([0-9]+).*/\1/')"
@@ -506,7 +511,7 @@ prepare_local_executor() {
     [[ "$cores" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: runtime.local_executor_cores must be positive." >&2; return 2; }
     cores="$("$DNA_PIPELINE_PYTHON" -c 'import sys; from alopex.runtime import effective_cpu_count; print(effective_cpu_count(int(sys.argv[1])))' "$cores")" || return $?
     mem_budget="$(dna_pipeline_local_mem_budget_mib)" || return $?
-    DNA_PIPELINE_EXECUTOR_ARGS=(--executor local --cores "$cores" --resources mem_mb="$mem_budget")
+    DNA_PIPELINE_EXECUTOR_ARGS=(--executor local --cores "$cores" --resources mem_mb="$mem_budget" --default-resources "tmpdir=$DNA_PIPELINE_TMP_LITERAL")
     DNA_PIPELINE_EXECUTOR_LABEL="local"
     DNA_PIPELINE_EXECUTOR_SUMMARY=("Cores: $cores" "Mem budget: ${mem_budget} MiB")
     export DNA_PIPELINE_LOCAL_CORES="$cores"
@@ -530,7 +535,7 @@ prepare_slurm_executor() {
     project_hash="$(project_hash8)"
     plugin_version="$("$DNA_PIPELINE_PYTHON" -c 'from importlib.metadata import version;print(version("snakemake-executor-plugin-slurm"))' 2>/dev/null || true)"
     [[ -n "$plugin_version" ]] || { echo "ERROR: SLURM executor plugin is missing." >&2; return 127; }
-    default_resources=()
+    default_resources=("tmpdir=$DNA_PIPELINE_TMP_LITERAL")
     if [[ -n "$partition" ]]; then default_resources+=("slurm_partition=$CFG_SLURM_PARTITION_LITERAL"); fi
     if [[ -n "$account" ]]; then default_resources+=("slurm_account=$CFG_SLURM_ACCOUNT_LITERAL"); fi
     plugin_args=(--slurm-jobname-prefix "Alopex_${project_hash}" --slurm-logdir "$logdir" --slurm-delete-logfiles-older-than 0 --slurm-status-command squeue)

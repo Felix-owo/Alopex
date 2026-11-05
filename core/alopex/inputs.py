@@ -50,6 +50,8 @@ from .config import (
     logger,
 )
 from .io import (
+    project_temporary_parent,
+    atomic_write_bytes,
     _read_json,
     atomic_write_bytes,
     atomic_write_json,
@@ -1184,7 +1186,7 @@ def stage_droplet_reads(r1: Sequence[str | Path], r2: Sequence[str | Path], spoo
     spool.parent.mkdir(parents=True, exist_ok=True)
     counts.parent.mkdir(parents=True, exist_ok=True)
     structure.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".droplet_stage.", dir=spool.parent) as root:
+    with tempfile.TemporaryDirectory(prefix=".droplet_stage.", dir=project_temporary_parent(spool)) as root:
         root = Path(root)
         staged = root / "spool"
         command = [str(binary), "droplet-stage", "--spool", str(staged), "--counts-output", str(root / "counts.tsv"),
@@ -1413,7 +1415,7 @@ def call_droplet_cells(
             if spool is None or demux_binary is None or threads < 1:
                 raise ValueError("Droplet error screening requires staged reads and demux binary for molecule evidence")
             selected = [{key: r[key] for key in ("barcode", "parent")} for r in candidates]
-            with tempfile.TemporaryDirectory(prefix=".droplet_evidence.", dir=Path(metrics_path).parent) as tmp:
+            with tempfile.TemporaryDirectory(prefix=".droplet_evidence.", dir=project_temporary_parent(metrics_path)) as tmp:
                 pair_file, evidence_file = Path(tmp) / "pairs.json", Path(tmp) / "molecules.json"
                 pair_file.write_text(json.dumps(selected))
                 command = [str(demux_binary), "--mode", "dna-only-droplet", "--threads", str(threads),
@@ -1492,9 +1494,7 @@ def call_droplet_cells(
     destination.parent.mkdir(parents=True, exist_ok=True)
     content = "DNA_Barcode,Cell_Order\n" + "".join(f"{bc},{i}\n" for i, (bc, _) in enumerate(called, 1))
     if not destination.exists() or destination.read_text() != content:
-        temporary = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".tmp")
-        temporary.write_text(content)
-        os.replace(temporary, destination)
+        atomic_write_bytes(destination, content.encode("utf-8"))
 
 
 def _cell_order_key(value: str) -> tuple[int, int | str]:
@@ -2190,7 +2190,7 @@ def collect_rna_fastq(
                 )
             destination = rna_fastq_collect_destination(Path(intermediate_dir), route_id, cell_id, mate)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(destination.name + f".tmp.{os.getpid()}.{uuid.uuid4().hex}")
+            temporary = project_temporary_parent(destination) / (destination.name + f".tmp.{os.getpid()}.{uuid.uuid4().hex}")
             try:
                 os.link(source, temporary)
                 os.replace(temporary, destination)

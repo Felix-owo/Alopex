@@ -55,6 +55,7 @@ from .inputs import (
     rna_fastq_collect_destination,
 )
 from .io import (
+    project_temporary_parent,
     _make_tree_read_only,
     _read_json,
     _remove_path,
@@ -1265,7 +1266,8 @@ def _snapshot_basis(
 
 
 def _copy_observed_file(
-    source: Path, destination: Path, expected: Mapping[str, object], input_store: Path
+    source: Path, destination: Path, expected: Mapping[str, object], input_store: Path,
+    *, link_parent: Path | None = None,
 ) -> Mapping[str, object]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     input_store.mkdir(parents=True, exist_ok=True)
@@ -1293,7 +1295,7 @@ def _copy_observed_file(
     for key in ("size_bytes", "sha256"):
         if copied.get(key) != expected.get(key):
             raise RuntimeError(f"snapshot input store identity changed: {shared}")
-    destination.symlink_to(os.path.relpath(shared, destination.parent))
+    destination.symlink_to(os.path.relpath(shared, link_parent if link_parent is not None else destination.parent))
     return {
         "source_path": str(source.resolve()),
         "snapshot_path": str(destination.name),
@@ -1337,22 +1339,22 @@ def create_run_snapshot(
         load_run_snapshot(manifest)
         return manifest
 
-    stage = Path(tempfile.mkdtemp(prefix=f".{snapshot_id}.", dir=snapshots_root))
+    stage = Path(tempfile.mkdtemp(prefix=f".{snapshot_id}.", dir=project_temporary_parent(final, project_dir=project)))
     try:
         inputs_dir = stage / "inputs"
         project_basis = basis["project"]
         copies = {
             "config": _copy_observed_file(
                 Path(str(project_basis["config"]["path"])), inputs_dir / "config.yaml",
-                project_basis["config"], input_store
+                project_basis["config"], input_store, link_parent=final / "inputs",
             ),
             "sample_manifest": _copy_observed_file(
                 Path(str(project_basis["sample_manifest"]["path"])),
-                inputs_dir / "sample_manifest.tsv", project_basis["sample_manifest"], input_store,
+                inputs_dir / "sample_manifest.tsv", project_basis["sample_manifest"], input_store, link_parent=final / "inputs",
             ),
             **({} if basis["analysis"]["protocol"] == "droplet" else {"barcode_map": _copy_observed_file(
                 Path(str(project_basis["barcode_map"]["path"])),
-                inputs_dir / "Barcode_Map.csv", project_basis["barcode_map"], input_store,
+                inputs_dir / "Barcode_Map.csv", project_basis["barcode_map"], input_store, link_parent=final / "inputs",
             )}),
         }
         payload = {
@@ -1663,9 +1665,7 @@ _PUBLIC_DIRNAME = "03_results"
 def _publish_hardlink(stage: Path, public: Path, relative: Path) -> None:
     destination = public / relative
     destination.parent.mkdir(parents=True, exist_ok=True)
-    tmp = destination.with_name(
-        f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
-    )
+    tmp = project_temporary_parent(destination) / f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     try:
         os.link(stage / relative, tmp)
         os.replace(tmp, destination)

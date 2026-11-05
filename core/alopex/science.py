@@ -24,6 +24,7 @@ from .config import (
     _integer,
 )
 from .io import (
+    project_temporary_parent,
     _close_native_stream,
     _read_json,
     atomic_write_json,
@@ -285,10 +286,10 @@ def excluded_reads_from_bam(bam_path: Path, samtools: str, excluded: set[str]) -
     # BED 的第一列按名称精确关联；通常覆盖完整 contig 并保留索引查询。
     # 合法的 # 前缀在 BED 中却是注释，此时只能流式按 SAM 的精确 RNAME 选择。
     # stdout 流式读取，stderr 落临时文件，避免双 PIPE 互相等待。
-    with ExitStack() as temporary, tempfile.TemporaryFile(mode="w+t", errors="replace") as diagnostics:
+    with ExitStack() as temporary, tempfile.TemporaryFile(mode="w+t", errors="replace", dir=project_temporary_parent(bam_path)) as diagnostics:
         command = [samtools, "view"]
         if not any(name.startswith('#') for name, _ in contigs):
-            regions = temporary.enter_context(tempfile.NamedTemporaryFile(mode="w+t", encoding="utf-8", suffix=".bed"))
+            regions = temporary.enter_context(tempfile.NamedTemporaryFile(mode="w+t", encoding="utf-8", suffix=".bed", dir=project_temporary_parent(bam_path)))
             for name, length in contigs:
                 regions.write(f"{name}\t0\t{length}\n")
             regions.flush()
@@ -397,7 +398,8 @@ def _parse_excluded_contigs_json(value: str) -> set[str]:
 def _sort_unique_count(source: Path, destination: Path) -> int:
     env = dict(os.environ)
     env["LC_ALL"] = "C"
-    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    env["TMPDIR"] = str(project_temporary_parent(destination))
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=project_temporary_parent(destination))
     os.close(fd)
     temporary_path = Path(temporary)
     try:
@@ -479,21 +481,21 @@ def run_bsconv_extraction(args) -> None:
             encoding="utf-8",
             prefix=args.high_read_names.name + ".",
             suffix=".unsorted",
-            dir=args.high_read_names.parent,
+            dir=project_temporary_parent(args.high_read_names),
             delete=False,
         ) as raw_high_handle, tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
             prefix=args.high_read_names.name + ".",
             suffix=".candidate.unsorted",
-            dir=args.high_read_names.parent,
+            dir=project_temporary_parent(args.high_read_names),
             delete=False,
         ) as raw_candidate_handle, tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
             prefix=args.high_read_names.name + ".",
             suffix=".excluded.unsorted",
-            dir=args.high_read_names.parent,
+            dir=project_temporary_parent(args.high_read_names),
             delete=False,
         ) as raw_excluded_handle:
             raw_high_path = Path(raw_high_handle.name)
@@ -1747,7 +1749,7 @@ def emit_taps_snps(vcf: str, output: str, sample: str, *, reference: str) -> int
     import pysam.bcftools
 
     count = 0
-    with tempfile.TemporaryDirectory(prefix=".taps_select.", dir=Path(output).parent) as selected:
+    with tempfile.TemporaryDirectory(prefix=".taps_select.", dir=project_temporary_parent(output)) as selected:
         selected_vcf = str(Path(selected) / "variants.vcf")
         pysam.bcftools.view("--no-version", "--no-update", "--include", 'FILTER="PASS" && (GT="alt" || GT="mis")',
                             "--output-type", "v", "--output", selected_vcf, vcf, catch_stdout=False)
@@ -1774,7 +1776,7 @@ def emit_taps_snps(vcf: str, output: str, sample: str, *, reference: str) -> int
                         raise ValueError(f"TAPS SNP REF disagrees with reference FASTA: {row.contig}:{row.pos}")
                     target.write(str(row).encode())
                     count += 1
-    with tempfile.TemporaryDirectory(prefix=".taps_snp.", dir=Path(output).parent) as scratch:
+    with tempfile.TemporaryDirectory(prefix=".taps_snp.", dir=project_temporary_parent(output)) as scratch:
         corrected = str(Path(scratch) / "snps.vcf.gz")
         pysam.bcftools.reheader("--fai", f"{reference}.fai", "--output", corrected, output, catch_stdout=False)
         os.replace(corrected, output)

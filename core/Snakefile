@@ -158,6 +158,7 @@ RAW_DATA_DIR = PROJECT_DIR / "01_raw"
 INTERMEDIATE_DIR = PROJECT_DIR / "02_work"
 LOGS_DIR = PROJECT_DIR / "04_logs"
 PROJECT_TMP_DIR = PROJECT_DIR / "05_tmp"
+shell.prefix("set -euo pipefail; test ! -L {tmp}; mkdir -p {tmp}; export DNA_PIPELINE_PROJECT_DIR={project} TMPDIR={tmp} TMP={tmp} TEMP={tmp} TEMPDIR={tmp}; ".format(project=shlex.quote(str(PROJECT_DIR)), tmp=shlex.quote(str(PROJECT_TMP_DIR))).replace("{", "{{").replace("}", "}}"))
 PUBLIC_RESULTS_DIR = PROJECT_DIR / "03_results"
 _delivery_id = str(os.environ.get("DNA_PIPELINE_DELIVERY_ID", "development") or "development").strip()
 if not _delivery_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for char in _delivery_id):
@@ -829,20 +830,27 @@ checkpoint demux:
 
         dna_final={params.dna_dir:q}
         rna_final={params.rna_dir:q}
-        dna_tmp="$(mktemp -d "${{dna_final}}.tmp.XXXXXX")"
-        rna_tmp="$(mktemp -d "${{rna_final}}.tmp.XXXXXX")"
-        report_tmp="$(mktemp {output.json_report:q}.tmp.XXXXXX)"
-        mqc_tmp="$(mktemp {output.json_mqc:q}.tmp.XXXXXX)"
-        manifest_tmp="$(mktemp {output.manifest:q}.tmp.XXXXXX)"
         completion_final={output.completion:q}
-        completion_tmp="$(mktemp {output.completion:q}.tmp.XXXXXX)"
-        backup_suffix=".backup"
+        dna_tmp=""; rna_tmp=""; report_tmp=""; mqc_tmp=""; manifest_tmp=""; completion_tmp=""
+        recovery_dir={PROJECT_TMP_DIR:q}/demux-recovery/{wildcards.sample:q}
+        mkdir -p "$recovery_dir"
+        demux_backup_path() {{
+            case "$1" in
+                "$dna_final") printf '%s/DNA' "$recovery_dir" ;;
+                "$rna_final") printf '%s/RNA' "$recovery_dir" ;;
+                {output.json_report:q}) printf '%s/report.json' "$recovery_dir" ;;
+                {output.json_mqc:q}) printf '%s/demux_mqc.json' "$recovery_dir" ;;
+                {output.manifest:q}) printf '%s/manifest.tsv' "$recovery_dir" ;;
+                "$completion_final") printf '%s/completion.json' "$recovery_dir" ;;
+                *) return 2 ;;
+            esac
+        }}
         publish_in_progress=0
         demux_scratch_active=0
 
         restore_demux_path() {{
             target="$1"
-            backup="${{target}}${{backup_suffix}}"
+            backup="$(demux_backup_path "$target")"
             absent="${{backup}}.absent"
             if [[ -e "$backup" || -L "$backup" ]]; then
                 rm -rf -- "$target"
@@ -864,12 +872,13 @@ checkpoint demux:
 
         discard_demux_backup() {{
             target="$1"
-            rm -rf -- "${{target}}${{backup_suffix}}"
-            rm -f -- "${{target}}${{backup_suffix}}.absent"
+            backup="$(demux_backup_path "$target")"
+            rm -rf -- "$backup"
+            rm -f -- "$backup.absent"
         }}
 
-        if [[ -e "${{completion_final}}${{backup_suffix}}" || \
-              -e "${{completion_final}}${{backup_suffix}}.absent" ]]; then
+        completion_backup="$(demux_backup_path "$completion_final")"
+        if [[ -e "$completion_backup" || -e "$completion_backup.absent" ]]; then
             if [[ -e "$completion_final" ]]; then
                 discard_demux_backup "$dna_final"
                 discard_demux_backup "$rna_final"
@@ -893,6 +902,12 @@ checkpoint demux:
             return "$exit_status"
         }}
         trap cleanup_demux_tmp EXIT
+        dna_tmp="$(dna_pipeline_temporary "$dna_final" directory)"
+        rna_tmp="$(dna_pipeline_temporary "$rna_final" directory)"
+        report_tmp="$(dna_pipeline_temporary {output.json_report:q})"
+        mqc_tmp="$(dna_pipeline_temporary {output.json_mqc:q})"
+        manifest_tmp="$(dna_pipeline_temporary {output.manifest:q})"
+        completion_tmp="$(dna_pipeline_temporary {output.completion:q})"
 
 
         dna_write_tmp="$dna_tmp"
@@ -951,7 +966,7 @@ checkpoint demux:
 
         backup_demux_path() {{
             target="$1"
-            backup="${{target}}${{backup_suffix}}"
+            backup="$(demux_backup_path "$target")"
             absent="${{backup}}.absent"
             rm -rf -- "$backup"
             rm -f -- "$absent"
@@ -1391,9 +1406,9 @@ if METHYLATION_BACKEND == "biscuit":
                     {params.resource_log:q} {resources.attempt_no} {threads} \
                     {resources.mem_mb} {resources.runtime} >> {log:q}
 
-                tmp_names="$(mktemp {output.names:q}.tmp.XXXXXX)"
-                tmp_summary="$(mktemp {output.summary:q}.tmp.XXXXXX)"
-                tmp_mqc="$(mktemp {output.mqc:q}.tmp.XXXXXX)"
+                tmp_names="$(dna_pipeline_temporary {output.names:q})"
+                tmp_summary="$(dna_pipeline_temporary {output.summary:q})"
+                tmp_mqc="$(dna_pipeline_temporary {output.mqc:q})"
                 cleanup_bsconv_filter_tmp() {{
                     rm -f -- "$tmp_names" "$tmp_summary" "$tmp_mqc"
                 }}
@@ -1461,7 +1476,7 @@ if METHYLATION_BACKEND == "biscuit":
                     {params.resource_log:q} {resources.attempt_no} {threads} \
                     {resources.mem_mb} {resources.runtime} >> {log:q}
 
-                tmp_bam="$(mktemp {output.dna:q}.tmp.XXXXXX)"
+                tmp_bam="$(dna_pipeline_temporary {output.dna:q})"
                 tmp_bai="$tmp_bam.bai"
                 cleanup_dna_bam_tmp() {{ rm -f -- "$tmp_bam" "$tmp_bai"; }}
                 trap cleanup_dna_bam_tmp EXIT
@@ -1534,7 +1549,7 @@ if METHYLATION_BACKEND == "biscuit":
                 printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
                     {params.resource_log:q} {resources.attempt_no} {threads} \
                     {resources.mem_mb} {resources.runtime} >> {log:q}
-                tmp_bam="$(mktemp {output.rna_bam:q}.tmp.XXXXXX)"
+                tmp_bam="$(dna_pipeline_temporary {output.rna_bam:q})"
                 cleanup_rna_bam_tmp() {{ rm -f -- "$tmp_bam" "$tmp_bam.bai"; }}
                 trap cleanup_rna_bam_tmp EXIT
 
@@ -1604,8 +1619,8 @@ if METHYLATION_BACKEND == "biscuit":
                 {params.resource_log:q} {resources.attempt_no} {threads} \
                 {resources.mem_mb} {resources.runtime} >> {log:q}
 
-            tmp_vcf="$(mktemp {output.vcf:q}.tmp.XXXXXX)"
-            tmp_stats="$(mktemp {output.stats:q}.tmp.XXXXXX)"
+            tmp_vcf="$(dna_pipeline_temporary {output.vcf:q})"
+            tmp_stats="$(dna_pipeline_temporary {output.stats:q})"
             tmp_count="${{tmp_stats}}.count"
             cleanup_pileup_tmp() {{ rm -f -- "$tmp_vcf" "$tmp_stats" "$tmp_count"; }}
             trap cleanup_pileup_tmp EXIT
@@ -1672,7 +1687,7 @@ if METHYLATION_BACKEND == "biscuit":
                 {params.resource_log:q} {resources.attempt_no} {threads} \
                 {resources.mem_mb} {resources.runtime} >> {log:q}
 
-            tmp_cpg="$(mktemp {output.cpg:q}.tmp.XXXXXX)"
+            tmp_cpg="$(dna_pipeline_temporary {output.cpg:q})"
             cleanup_cpg_tmp() {{ rm -f -- "$tmp_cpg"; }}
             trap cleanup_cpg_tmp EXIT
             variant_rows=$({RULE_PYTHON:q} -m alopex pileup-variant-count --stats {input.stats:q} --sample={wildcards.demux_sample:q})
@@ -1732,7 +1747,7 @@ if METHYLATION_BACKEND == "biscuit":
                 printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
                     {params.resource_log:q} {resources.attempt_no} {threads} \
                     {resources.mem_mb} {resources.runtime} >> {log:q}
-                tmp_snp="$(mktemp {output.snp:q}.tmp.XXXXXX)"
+                tmp_snp="$(dna_pipeline_temporary {output.snp:q})"
                 tmp_tbi="$tmp_snp.tbi"
                 cleanup_snp_tmp() {{ rm -f -- "$tmp_snp" "$tmp_tbi"; }}
                 trap cleanup_snp_tmp EXIT
@@ -1807,8 +1822,9 @@ if METHYLATION_BACKEND == "biscuit":
                 {resources.mem_mb} {resources.runtime} >> {log:q}
             [ -f {input.dna_bai:q} ] || (printf 'BAM index not found: %s\n' {input.dna_bai:q} >&2; exit 1)
 
-            qc_tmp={params.abs_qc_dir:q}.new
-            qc_backup={params.abs_qc_dir:q}.backup
+            qc_tmp="$(dna_pipeline_temporary {params.abs_qc_dir:q} directory)"
+            qc_backup={PROJECT_TMP_DIR:q}/biscuit-qc-recovery/{wildcards.demux_sample:q}
+            mkdir -p "$(dirname "$qc_backup")"
             qc_absent="${{qc_backup}}.absent"
             publish_in_progress=0
 
@@ -1826,8 +1842,6 @@ if METHYLATION_BACKEND == "biscuit":
             if [ -d "$qc_backup" ] || [ -f "$qc_absent" ]; then
                 restore_qc_generation
             fi
-            rm -rf -- "$qc_tmp"
-            mkdir -m 700 "$qc_tmp"
             cleanup_qc_tmp() {{
                 exit_status=$?
                 rm -rf -- "$qc_tmp"
@@ -2381,7 +2395,7 @@ else:
                 printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
                     {params.resource_log:q} {resources.attempt_no} {threads} \
                     {resources.mem_mb} {resources.runtime} >> {log:q}
-                tmp_bam="$(mktemp {output.bam:q}.tmp.XXXXXX)"
+                tmp_bam="$(dna_pipeline_temporary {output.bam:q})"
                 tmp_bai="$tmp_bam.bai"
                 trap 'rm -f -- "$tmp_bam" "$tmp_bai"' EXIT
                 sam_extra=$(({threads} > 1 ? {threads} - 1 : 0))
@@ -2521,7 +2535,7 @@ else:
                 >> {log:q}
             exec 2>> {log:q}
 
-            tmp_cpg="$(mktemp {output.cpg:q}.tmp.XXXXXX)"
+            tmp_cpg="$(dna_pipeline_temporary {output.cpg:q})"
             cleanup_cpg_tmp() {{ rm -f -- "$tmp_cpg"; }}
             trap cleanup_cpg_tmp EXIT
             {params.gzip:q} -t {input.cov:q}
@@ -2611,7 +2625,7 @@ rule multiqc:
     params:
         scientific_identity = scientific_code_identity(('alopex.delivery.prepare_high_cph_multiqc_sources', 'alopex.delivery.prepare_sampled_multiqc_sources', 'alopex.delivery.select_multiqc_samples', 'alopex.delivery.write_multiqc_file_list'), ()),
         outdir = STAGED_RESULTS_DIR / "QC_Results",
-        tmpout = INTERMEDIATE_DIR / "multiqc" / "output_tmp",
+        tmpout = PROJECT_TMP_DIR / "multiqc" / "output_tmp",
         multiqc = MULTIQC
     run:
         shell("source {JOB_RUNTIME:q}; dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}")
@@ -2651,8 +2665,8 @@ rule multiqc:
                 {resource_log:q} {resources.attempt_no} {threads} \
                 {resources.mem_mb} {resources.runtime} >> {log:q}
 
-            tmpout={params.tmpout:q}.attempt{resources.attempt_no}.$$
-            report_partial={output.report:q}.partial.$$
+            tmpout="$(dna_pipeline_temporary {output.report:q} directory)"
+            report_partial="$(dna_pipeline_temporary {output.report:q})"
             cleanup_multiqc_tmp() {{
                 rm -rf -- "$tmpout"
                 rm -f -- "$report_partial"

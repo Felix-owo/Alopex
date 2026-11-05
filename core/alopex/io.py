@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import errno
 import shutil
 import subprocess
 import uuid
@@ -60,12 +61,40 @@ def stable_file_identity(
     return identity
 
 
+def project_temporary_parent(destination: str | Path, *, project_dir: str | Path | None = None) -> Path:
+    """项目运行的工作/提交临时项写入05_tmp；无项目上下文的安装事务保留目标父目录。"""
+    destination = Path(destination)
+    absolute = Path(os.path.abspath(destination))
+    project = Path(project_dir) if project_dir is not None else None
+    if project is None:
+        configured = os.environ.get("DNA_PIPELINE_PROJECT_DIR")
+        if configured:
+            candidate = Path(os.path.abspath(configured))
+            project = candidate
+    if project is None:
+        project = next((parent for parent in absolute.parents
+                        if (parent / "00_config").is_dir()), None)
+    if project is None:
+        return destination.parent
+    temporary = project / "05_tmp"
+    if temporary.is_symlink() or (temporary.exists() and not temporary.is_dir()):
+        raise ValueError(f"Project temporary directory must be a real directory: {temporary}")
+    temporary.mkdir(parents=True, exist_ok=True)
+    # 先拒绝跨挂载提交；不得让后续工具退化为复制覆盖已有科学结果。
+    parent = absolute.parent
+    while not parent.exists():
+        parent = parent.parent
+    if parent.stat().st_dev != temporary.stat().st_dev:
+        raise OSError(errno.EXDEV, "05_tmp and destination must share a filesystem", str(destination))
+    return temporary
+
+
 def atomic_write_bytes(path: str | Path, data: bytes, *, mode: int | None = None) -> None:
-    """在目标路径旁写本次独占的临时文件，再以一次原子 rename 发布；仅清理本次创建的文件。"""
+    """项目05_tmp内独占写入再原子替换；跨文件系统或提交失败保旧，只清本次临时项。"""
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    temporary = project_temporary_parent(destination) / f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     created = False
     try:
         with open(temporary, "xb", opener=lambda name, flags: os.open(
@@ -195,9 +224,7 @@ def publish(
             destination.parent.mkdir(parents=True, exist_ok=True)
 
 
-            partial = destination.with_name(
-                f"{destination.name}.partial.{os.getpid()}.{uuid.uuid4().hex}"
-            )
+            partial = project_temporary_parent(destination) / f"{destination.name}.partial.{os.getpid()}.{uuid.uuid4().hex}"
             with source.open("rb") as reader, partial.open("xb") as writer:
                 partials[destination] = partial
                 shutil.copyfileobj(reader, writer, length=8 * 1024 * 1024)

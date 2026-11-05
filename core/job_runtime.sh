@@ -128,6 +128,28 @@ dna_pipeline_allocate_scratch() {
     export DNA_PIPELINE_SCRATCH_BASE DNA_PIPELINE_SCRATCH_DIR TMPDIR
 }
 
+# 轻量工作/提交临时项；无需重复启动Python或Conda，保持每次独占创建。
+dna_pipeline_temporary() {
+    local destination="$1" kind="${2:-file}" parent candidate device destination_device
+    candidate="${DNA_PIPELINE_PROJECT_DIR:?}/05_tmp"
+    [[ ! -L "$candidate" && ( ! -e "$candidate" || -d "$candidate" ) ]] || return 2
+    mkdir -p -- "$candidate" || return $?
+    parent="$(dirname -- "$destination"; printf '.')"
+    parent="${parent%$'\n'.}"
+    while [[ ! -e "$parent" ]]; do parent="$(dirname -- "$parent")"; done
+    device="$(stat -c %d -- "$candidate" 2>/dev/null)" || device="$(stat -f %d "$candidate")" || return $?
+    destination_device="$(stat -c %d -- "$parent" 2>/dev/null)" || destination_device="$(stat -f %d "$parent")" || return $?
+    [[ "$device" == "$destination_device" ]] || {
+        echo "ERROR: 05_tmp and destination must share a filesystem: $destination" >&2
+        return 2
+    }
+    if [[ "$kind" == directory ]]; then
+        mktemp -d "$candidate/dna-work.XXXXXX"
+    else
+        mktemp "$candidate/dna-publish.XXXXXX"
+    fi
+}
+
 # 安装 EXIT trap：job 以任何方式退出（含失败）时自动清理 scratch。
 dna_pipeline_install_scratch_cleanup() {
     trap dna_pipeline_cleanup_scratch_on_exit EXIT
