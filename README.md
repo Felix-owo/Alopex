@@ -1,6 +1,6 @@
-# Alopex v16.7
+# Alopex v16.8
 
-正式源码以 Git tag `v16.7` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v16.8` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
@@ -23,14 +23,14 @@
 
 demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态链接，避免宿主库探测与 Conda 链接器不一致；不要求系统另装 zlib 开发包。
 
-环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。本版沿用已验证的环境，不需要额外 channel、自建 Conda 包或第三方源码补丁。
+环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v16.7 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.7) 下载 `Alopex-v16.7.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
+从 [v16.8 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.8) 下载 `Alopex-v16.8.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v16.7.tar.gz
-cd Alopex-v16.7
+tar -xzf Alopex-v16.8.tar.gz
+cd Alopex-v16.8
 conda --version
 ```
 
@@ -90,12 +90,15 @@ PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding sea
 
 HPC 的标准顺序：
 
+HPC 更新保留来源仓库的真实 `.git` 与历史，核对正式 tag、commit、工作树和逐文件 SHA256；已有本地修改须先审查保留。归档安装本身仍可不带 Git，不以新建空仓库代替来源历史。
 
 1. 在本机校验正确的 reference、索引及各自 `.reference.json`，再上传到 HPC 的对应位置；按封存清单核对版本和校验值，只补传缺失或不匹配的组件，不在 HPC 临时改用另一套参考。
 2. 在登录节点提前准备 Conda 等依赖下载。需要预热时运行 `bash core/doctor.sh download`；需要安装环境时按 `conda` 段准备。已有正确环境直接复用，不因源码更新重复下载或重建。
 3. 在**现有 JupyterLab 的 Terminal** 中进入 Pipeline 根目录，运行 `bash core/doctor.sh`；确认终端位于 Jupyter 的计算节点和原 allocation。完整 Doctor、科学工具调用不在登录节点运行，也不另起独立 Doctor allocation。
 
-普通更新以“更新 Pipeline → Jupyter 中跑通标准 Doctor”为验收，不默认追加开发全仓回归、配置穷举或额外 benchmark；这些只在明确要求开发验收时单独执行。
+已建环境的 `conda --check` 只读核对身份、已安装版本、平台和必需程序，不重复导入 Notebook 或启动各角色工具；完整工具链检查在创建/修复时执行。计算节点检查失败须回登录节点准备，后续三路线科学验证照常执行。
+
+普通更新以“更新 Pipeline → Jupyter 中跑通标准 Doctor”为验收，不默认追加开发全仓回归、配置穷举或额外 benchmark；这些只在明确要求开发验收时单独执行。代理操作的日志、沙箱和备份均放在已授权的 `MethylTreeAgent` 工作根。
 
 | Doctor 路线 | 内容 |
 | --- | --- |

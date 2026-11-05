@@ -264,6 +264,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     env_validate.add_argument("current")
     env_validate.add_argument("expected_subdir")
     env_validate.add_argument("--envs", required=True)
+    env_validate.add_argument("--installed", action="store_true", help="只读核对实际包版本与平台，不导入目标科学模块。")
     env_reusable = commands.add_parser("env-reusable", help="判断既有 prefix 可否复用。")
     env_reusable.add_argument("prefix")
     env_reusable.add_argument("--envs", required=True)
@@ -494,7 +495,7 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "env-publish":
             publish_release(args.current, args.target)
         elif command == "env-validate":
-            validate_release(args.current, args.expected_subdir, args.envs)
+            validate_release(args.current, args.expected_subdir, args.envs, installed=args.installed)
         elif command == "env-reusable":
             environment_is_reusable(args.prefix, args.role, args.envs)
 

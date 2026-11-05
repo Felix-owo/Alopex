@@ -345,6 +345,10 @@ CLEAN_ENVIRONMENT=(
 
     CONDA_PKGS_DIRS="$PACKAGE_CACHE"
     CONDA_ENVS_PATH="$SETUP_ENVS"
+    # 导出的 YAML 只携带真实频道；禁止继承宿主默认频道，并复核分片索引的新鲜度。
+    CONDA_CHANNELS=
+    CONDA_REPODATA_USE_SHARDS=true
+    CONDA_LOCAL_REPODATA_TTL=0
 )
 
 ENVIRONMENT_LOCK="$CONDA_ROOT/.locks/environments.lock.d"
@@ -375,7 +379,8 @@ Seed Conda 自动搜索顺序：
 参数：
   --check
       只读验证 conda/current、release manifest、5 个 environment identity、
-      YAML spec SHA、native platform 与五套环境 smoke test；不构建、不修复。
+      YAML spec SHA、已安装包版本、native platform 和必需程序；不构建、不修复，
+      不重复启动各角色或导入科学/Notebook 模块。完整 smoke 在创建/修复阶段执行。
 
   -h, --help
       显示本帮助。
@@ -548,7 +553,7 @@ seed_python_path() {
 }
 
 validate_seed_conda_path() {
-    local candidate="$1" version_output
+    local candidate="$1" version_output configuration
 
     [[ "$candidate" == /* ]] || return 1
     [[ "$(basename "$candidate")" == "conda" ]] || return 1
@@ -557,29 +562,28 @@ validate_seed_conda_path() {
     version_output="$(run_conda_probe "$candidate" --version 2>&1)" || return 1
     printf '%s\n' "$version_output" | grep -Eq '^conda[[:space:]]+[0-9]+' || return 1
 
-    run_conda_probe "$candidate" info --json >/dev/null 2>&1 || return 1
-
-    printf '%s/%s\n' \
-        "$(cd "$(dirname "$candidate")" && pwd -P)" \
-        "$(basename "$candidate")"
+    # info --json 会遍历环境注册表；这里只需创建所用的两个已解析配置值。
+    configuration="$(run_conda_probe "$candidate" config --show pkgs_dirs subdir --json)" || return 1
+    SEED_CONDA_DIR="$(cd "$(dirname "$candidate")" && pwd -P)" || return $?
+    SEED_CONDA="$SEED_CONDA_DIR/$(basename "$candidate")"
+    SEED_CONFIG_JSON="$configuration"
 }
 resolve_seed_conda() {
-    local candidate="" resolved=""
+    local candidate=""
+    SEED_CONDA=""
+    SEED_CONDA_DIR=""
+    SEED_CONFIG_JSON=""
 
     candidate="$CURRENT_RELEASE/control/bin/conda"
-    resolved="$(validate_seed_conda_path "$candidate" 2>/dev/null || true)"
-    if [[ -n "$resolved" ]]; then
-        echo "使用 Pipeline 当前 control Conda 作为 Seed：$resolved" >&2
-        printf '%s\n' "$resolved"
+    if validate_seed_conda_path "$candidate" 2>/dev/null; then
+        echo "使用 Pipeline 当前 control Conda 作为 Seed：$SEED_CONDA" >&2
         return 0
     fi
 
     if [[ -n "${CONDA_PREFIX:-}" && -e "$CONDA_PREFIX/bin/conda" ]]; then
         candidate="$CONDA_PREFIX/bin/conda"
-        resolved="$(validate_seed_conda_path "$candidate" 2>/dev/null || true)"
-        if [[ -n "$resolved" ]]; then
-            echo "使用当前 CONDA_PREFIX 中的 Conda 作为 Seed：$resolved" >&2
-            printf '%s\n' "$resolved"
+        if validate_seed_conda_path "$candidate" 2>/dev/null; then
+            echo "使用当前 CONDA_PREFIX 中的 Conda 作为 Seed：$SEED_CONDA" >&2
             return 0
         fi
     fi
@@ -588,10 +592,8 @@ resolve_seed_conda() {
     if [[ -n "$candidate" ]]; then
         candidate="$(cd "$(dirname "$candidate")" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$candidate")")" || candidate=""
         if [[ -n "$candidate" ]]; then
-            resolved="$(validate_seed_conda_path "$candidate" 2>/dev/null || true)"
-            if [[ -n "$resolved" ]]; then
-                echo "使用 PATH 中的 Conda 作为 Seed：$resolved" >&2
-                printf '%s\n' "$resolved"
+            if validate_seed_conda_path "$candidate" 2>/dev/null; then
+                echo "使用 PATH 中的 Conda 作为 Seed：$SEED_CONDA" >&2
                 return 0
             fi
         fi
@@ -607,16 +609,14 @@ resolve_seed_conda() {
 }
 
 validate_seed_context() {
-    local info_json seed_python
+    local seed_python
 
     seed_python="$(seed_python_path "$SEED_CONDA_DIR")" || {
         echo "ERROR: Seed Conda 没有 prefix-local Python。" >&2
         return 1
     }
 
-    info_json="$(run_conda_probe "$SEED_CONDA" info --json)" || return $?
-
-    printf '%s\n' "$info_json" | run_in_sanitized_environment "$SEED_CONDA_DIR" \
+    printf '%s\n' "$SEED_CONFIG_JSON" | run_in_sanitized_environment "$SEED_CONDA_DIR" \
         "$seed_python" -c '
 import json
 import sys
@@ -668,17 +668,19 @@ create_conda_environment() {
         create_args+=(--format environment-yaml)
     fi
 
+    # 原生 CPU 预算仅作用于创建子进程；compileall 的逐文件清单路径不受 -j 加速。
     env \
         "${CLEAN_ENVIRONMENT[@]}" \
         CONDA_ALWAYS_YES=true \
         CONDA_DEFAULT_THREADS=1 \
-        CONDA_EXECUTE_THREADS=1 \
+        CONDA_EXECUTE_THREADS=4 \
         CONDA_FETCH_THREADS=1 \
         CONDA_REMOTE_MAX_RETRIES=5 \
-        CONDA_REPODATA_THREADS=1 \
-        CONDA_VERIFY_THREADS=1 \
+        CONDA_REPODATA_THREADS=4 \
+        CONDA_VERIFY_THREADS=4 \
         PATH="$conda_dir:$HOST_PATH" \
         PYTHONNOUSERSITE=1 \
+        PYTHON_CPU_COUNT=4 \
         "$conda_bin" \
             "${create_args[@]}" \
             --prefix "$target" \
@@ -745,10 +747,21 @@ smoke_notebook() {
     local prefix="$1"
     prefix_has_tools "$prefix" "${NOTEBOOK_REQUIRED[@]}" || return 1
     prefix_matches_native_platform "$prefix" || return 1
-    prefix_python_imports "$prefix" \
-        anndata IPython ipykernel jupyterlab matplotlib numba numpy packaging \
-        pandas polars sklearn seaborn snapatac2 tqdm yaml || return 1
-    run_in_sanitized_environment "$prefix/bin" "$prefix/bin/jupyter" --version >/dev/null || return 1
+    # 同一解释器复用实际导入；仍执行已安装的 Jupyter 入口及其原生退出路径。
+    run_in_sanitized_environment "$prefix/bin" "$prefix/bin/python" - "$prefix/bin/jupyter" <<'PY' >/dev/null || return 1
+import importlib
+import runpy
+import sys
+
+for module_name in (
+    "anndata", "IPython", "ipykernel", "jupyterlab", "matplotlib", "numba", "numpy", "packaging",
+    "pandas", "polars", "sklearn", "seaborn", "snapatac2", "tqdm", "yaml",
+):
+    importlib.import_module(module_name)
+entry = sys.argv[1]
+sys.argv = [entry, "--version"]
+runpy.run_path(entry, run_name="__main__")
+PY
 }
 
 retry_transient_create() {
@@ -784,7 +797,9 @@ create_or_reuse_role() {
     fi
 
     echo "创建/更新 $role 环境：$target"
-    retry_transient_create "$role" "$target" create_conda_environment "$target" "$role"
+    retry_transient_create "$role" "$target" create_conda_environment "$target" "$role" || return $?
+    # 每个角色在创建或复用边界完成一次检查，失败仍阻止后续封存与发布。
+    "$smoke_fn" "$target"
 }
 
 create_all_other_envs() {
@@ -793,14 +808,6 @@ create_all_other_envs() {
     create_or_reuse_role bismark "$BISMARK_TARGET" smoke_bismark || return 1
     create_or_reuse_role rastair "$RASTAIR_TARGET" smoke_rastair || return 1
     create_or_reuse_role notebook "$NOTEBOOK_TARGET" smoke_notebook || return 1
-}
-
-smoke_all_other_envs() {
-    echo "统一检查 biscuit / bismark / rastair / notebook 环境。"
-    smoke_biscuit "$BISCUIT_TARGET" || { echo "ERROR: biscuit 环境未通过 smoke test：$BISCUIT_TARGET" >&2; return 1; }
-    smoke_bismark "$BISMARK_TARGET" || { echo "ERROR: bismark 环境未通过 smoke test：$BISMARK_TARGET" >&2; return 1; }
-    smoke_rastair "$RASTAIR_TARGET" || { echo "ERROR: rastair 环境未通过 smoke test： $RASTAIR_TARGET" >&2; return 1; }
-    smoke_notebook "$NOTEBOOK_TARGET" || { echo "ERROR: notebook 环境未通过 smoke test：$NOTEBOOK_TARGET" >&2; return 1; }
 }
 
 NEW_RELEASE_PATH=""
@@ -872,6 +879,7 @@ run_conda_state_cli() {
         -u PYTHONHOME -u PYTHONSTARTUP -u PYTHONUSERBASE -u VIRTUAL_ENV \
         PYTHONPATH="$PIPELINE_ROOT/core" \
         PYTHONNOUSERSITE=1 \
+        PYTHONDONTWRITEBYTECODE=1 \
         "$python_bin" -m alopex "$@"
 }
 
@@ -887,14 +895,15 @@ check_current_release() {
     [[ -x "$python_bin" ]] || { echo "ERROR: current/control Python 缺失。" >&2; return 1; }
 
     run_conda_state_cli "$python_bin" env-validate \
-        "$CURRENT_RELEASE" "$NATIVE_SUBDIR" --envs "$ENVS_SPEC" >/dev/null || return 1
+        "$CURRENT_RELEASE" "$NATIVE_SUBDIR" --envs "$ENVS_SPEC" --installed >/dev/null || return 1
 
-    smoke_control "$control" || { echo "ERROR: current/control 未通过 smoke test。" >&2; return 1; }
-    smoke_biscuit "$biscuit" || { echo "ERROR: current/biscuit 未通过 smoke test。" >&2; return 1; }
-    smoke_bismark "$bismark" || { echo "ERROR: current/bismark 未通过 smoke test。" >&2; return 1; }
-    smoke_rastair "$rastair" || { echo "ERROR: current/rastair 未通过 smoke test。" >&2; return 1; }
-    smoke_notebook "$notebook" || { echo "ERROR: current/notebook 未通过 smoke test。" >&2; return 1; }
-    echo "READY: Conda current release 已通过 $NATIVE_SUBDIR 校验。"
+    # 创建/修复时已完整 smoke；只读检查不再重复导入五套依赖、启动 Notebook CLI。
+    prefix_has_tools "$control" "${CONTROL_REQUIRED[@]}" || return 1
+    prefix_has_tools "$biscuit" "${BISCUIT_REQUIRED[@]}" || return 1
+    prefix_has_tools "$bismark" "${BISMARK_REQUIRED[@]}" || return 1
+    prefix_has_tools "$rastair" "${RASTAIR_REQUIRED[@]}" || return 1
+    prefix_has_tools "$notebook" "${NOTEBOOK_REQUIRED[@]}" || return 1
+    echo "READY: Conda current release 身份、已安装包、必需程序及 $NATIVE_SUBDIR 平台校验通过。"
 }
 
 record_new_environment() {
@@ -1015,8 +1024,7 @@ run_conda_section() {
         "$SETUP_ENVS" \
         "$SETUP_CACHE" \
         "$SETUP_CONFIG"
-    SEED_CONDA="$(resolve_seed_conda)"
-    SEED_CONDA_DIR="$(cd "$(dirname "$SEED_CONDA")" && pwd -P)"
+    resolve_seed_conda || return $?
     export PATH="$SEED_CONDA_DIR:$HOST_PATH"
     validate_seed_context
     txn_acquire_lock "$ENVIRONMENT_LOCK" "setup_conda transaction"
@@ -1056,9 +1064,7 @@ run_conda_section() {
         echo "ERROR: 其它 Conda 环境未全部创建成功。" >&2
         return 1
     }
-    echo "其它 Conda 环境统一创建：PASS"
-    smoke_all_other_envs || exit 1
-    echo "其它 Conda 环境统一检查：PASS"
+    echo "其它 Conda 环境创建及检查：PASS"
     [[ -L "$CONTROL_TARGET" ]] || record_new_environment "$CONTROL_TARGET" control
     [[ -L "$BISCUIT_TARGET" ]] || record_new_environment "$BISCUIT_TARGET" biscuit
     [[ -L "$BISMARK_TARGET" ]] || record_new_environment "$BISMARK_TARGET" bismark
@@ -2963,8 +2969,7 @@ run_download_section() {
     mkdir -p "$CONDA_ROOT" "$PACKAGE_CACHE" "$SETUP_HOME" "$SETUP_ENVS" "$SETUP_CACHE" "$SETUP_CONFIG" "$ENVS_BUILD_DIR"
     warm_root="$CONDA_ROOT/.build/warm"
     mkdir -p "$warm_root"
-    SEED_CONDA="$(resolve_seed_conda)"
-    SEED_CONDA_DIR="$(cd "$(dirname "$SEED_CONDA")" && pwd -P)"
+    resolve_seed_conda || return $?
     if [[ -x "$CONDA_ROOT/current/control/bin/conda" ]]; then
         conda_bin="$CONDA_ROOT/current/control/bin/conda"
     else
@@ -3256,6 +3261,10 @@ ensure_builder_ready() {
         return 0
     fi
 
+    if [[ "$section" == conda && "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" ]]; then
+        summary "[FAIL] Conda 只读检查未通过；请在登录节点运行 bash core/doctor.sh conda，计算节点不尝试安装或重建。"
+        return 1
+    fi
     summary "[REPAIR] $label 尚未 READY，执行 $section 构建"
     run_logged "$label repair" bash "$DOCTOR_SELF_PATH" "$section" || {
         summary "[FAIL] $label 修复失败"

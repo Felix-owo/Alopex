@@ -136,10 +136,19 @@ def import_reference_binding(reference: Path, kind: str, *, root: Path | None = 
 
 
 def write_envs_section_spec(envs_path: str | Path, role: str, destination: str | Path) -> Path:
-    """把角色 section 抽取为独立 conda spec 文件（conda env create 的输入）。"""
+    """导出原生安装规格；默认频道由 Doctor 的空 CONDA_CHANNELS 禁用。"""
     from ruamel.yaml import YAML
 
-    section = envs_section(envs_path, role)
+    section = dict(envs_section(envs_path, role))
+    channels = section.get("channels")
+    if not isinstance(channels, list) or not channels or any(
+        not isinstance(channel, str) or not channel.strip() for channel in channels
+    ):
+        raise ValueError(f"environment role {role!r} requires explicit channels")
+    # nodefaults 是频道策略，不是下载地址；Conda 的新版 YAML 入口会把它当作频道。
+    section["channels"] = [channel for channel in channels if channel != "nodefaults"]
+    if not section["channels"]:
+        raise ValueError(f"environment role {role!r} has no package channel")
     target = Path(destination)
     parser = YAML(typ="safe", pure=True)
     parser.default_flow_style = False
@@ -240,7 +249,80 @@ def publish_release(current_s: str, target_s: str) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def validate_release(current_s: str, expected_subdir: str, envs_path: str) -> None:
+def _check_installed_environment(prefix: Path, role: str, expected_subdir: str, envs_path: str) -> None:
+    """只读核对已安装包；不导入目标环境的科学、绘图或 Notebook 模块。"""
+    from conda.models.match_spec import MatchSpec
+    from conda.models.version import VersionSpec
+    from importlib.metadata import Distribution
+    from packaging.markers import default_environment
+    from packaging.requirements import Requirement
+
+    records: dict[str, dict[str, Any]] = {}
+    native = False
+    for path in (prefix / "conda-meta").glob("*.json"):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        name = record["name"]
+        if name in records:
+            raise ValueError(f"{role}: duplicate installed package {name}")
+        records[name] = record
+        subdir = record.get("subdir")
+        if subdir and subdir != "noarch":
+            if subdir != expected_subdir:
+                raise ValueError(f"{role}: installed package {name} has platform {subdir}")
+            native = True
+    if not native:
+        raise ValueError(f"{role}: no native package records")
+    section = envs_section(envs_path, role)
+    python_version = records.get("python", {}).get("version", "")
+    python_short = ".".join(python_version.split(".")[:2])
+    site = prefix / "lib" / f"python{python_short}" / "site-packages"
+    marker_environment = default_environment()
+    marker_environment.update(python_version=python_short, python_full_version=python_version)
+    normalize = lambda value: re.sub(r"[-_.]+", "-", value).lower()
+    # Python 包可能由 pip 安装或覆盖；有效版本来自 dist-info，不由残留 Conda 记录代替。
+    python_distributions = {name: name for name in (
+        "anndata", "ipykernel", "jupyterlab", "numba", "numpy", "packaging", "pandas", "polars",
+        "pyyaml", "scikit-learn", "seaborn", "tqdm", "jsonschema", "snakemake",
+        "snakemake-executor-plugin-slurm", "pip", "pysam", "cutadapt", "multiqc", "awscli",
+        "leidenalg", "cykhash", "umi_tools",
+    )}
+    python_distributions.update({"matplotlib-base": "matplotlib", "python-igraph": "igraph"})
+    def distribution_for(name):
+        candidates = list(Distribution.discover(name=name, path=[str(site)]))
+        if len(candidates) != 1:
+            raise ValueError(f"{role}: missing or ambiguous Python metadata for {name}")
+        distribution = candidates[0]
+        if Path(distribution.locate_file("")).resolve() != site.resolve():
+            raise ValueError(f"{role}: Python metadata escaped the managed prefix for {name}")
+        if normalize(distribution.metadata["Name"] or "") != normalize(name):
+            raise ValueError(f"{role}: Python distribution identity mismatch for {name}")
+        return distribution
+    for dependency in section["dependencies"]:
+        if isinstance(dependency, str):
+            spec = MatchSpec(dependency)
+            record = records.get(spec.name)
+            distribution_name = python_distributions.get(spec.name)
+            if distribution_name is not None:
+                distribution = distribution_for(distribution_name)
+                constraint = spec.get_raw_value("version")
+                if constraint and not VersionSpec(constraint).match(distribution.version):
+                    raise ValueError(f"{role}: effective Python package does not satisfy {dependency}")
+                if (spec.get_raw_value("build") is not None or spec.get_raw_value("channel") is not None):
+                    if record is None or not spec.match(record):
+                        raise ValueError(f"{role}: installed artifact does not satisfy {dependency}")
+            elif record is None or not spec.match(record):
+                raise ValueError(f"{role}: installed package does not satisfy {dependency}")
+        else:
+            for item in dependency["pip"]:
+                requirement = Requirement(item)
+                if requirement.marker and not requirement.marker.evaluate(marker_environment):
+                    continue
+                distribution = distribution_for(requirement.name)
+                if distribution.version not in requirement.specifier:
+                    raise ValueError(f"{role}: installed pip package does not satisfy {item}")
+
+
+def validate_release(current_s: str, expected_subdir: str, envs_path: str, *, installed: bool = False) -> None:
     """只读校验 current 指针、release manifest、role prefix 与 envs section SHA 契约。"""
     current = Path(current_s).expanduser().absolute()
     if not current.is_symlink():
@@ -280,6 +362,8 @@ def validate_release(current_s: str, expected_subdir: str, envs_path: str) -> No
         recorded = (environment.get("specification") or {}).get("sha256")
         if recorded != envs_section_sha256(envs_path, role):
             raise ValueError(f"{role} specification changed; rebuild required")
+        if installed:
+            _check_installed_environment(prefix, role, expected_subdir, envs_path)
 
 
 def environment_is_reusable(prefix_s: str, role: str, envs_path: str) -> None:

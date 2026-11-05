@@ -39,7 +39,7 @@ bismark:
   - bioconda
   - nodefaults
   dependencies:
-  - python>=3.12,<3.13
+  - python>=3.13,<3.14
   - pyyaml>=6,<7
   - pysam>=0.23,<0.24
   - bismark>=3.1,<4
@@ -48,8 +48,8 @@ bismark:
     - rapidgzip==0.16.0
   - bowtie2>=2.5,<3
   - cutadapt>=5.2,<6
-  - samtools>=1.24,<1.25
-  - htslib>=1.24,<1.25
+  - samtools>=1.25,<1.26
+  - htslib>=1.25,<1.26
   - gawk>=5.4,<6
   - coreutils>=9.5,<10
   - multiqc>=1.35,<2
