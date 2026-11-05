@@ -52,8 +52,20 @@ dna_pipeline_init_attempt_logs() {
     done
 }
 
-# 独占 scratch 生命周期
-# 在有空间余量的首选候选盘上创建本 job 专属 scratch 目录并导出为 TMPDIR；请求 110% 余量且路径锁定在 namespace 内。
+# GNU/BSD stat 都只查询所在文件系统，不遍历目录；无法识别时不得声称是本地盘。
+dna_pipeline_scratch_filesystem() {
+    local filesystem
+    if filesystem="$(stat -f -c %T -- "$1" 2>/dev/null)"; then
+        printf '%s\n' "$filesystem"
+    elif filesystem="$(stat -f %T "$1" 2>/dev/null)"; then
+        printf '%s\n' "$filesystem"
+    else
+        printf 'unknown\n'
+    fi
+}
+
+# 独占 scratch 生命周期：先选有 110% 空间的本地磁盘，再显式回退共享/未知盘。
+# tmpfs 的 df 容量不是本作业可用内存，不能用于磁盘 scratch。跨 job 的 DAG 工件仍在项目目录。
 dna_pipeline_allocate_scratch() {
     local configured_tmp="$1"
     local namespace="$2"
@@ -64,6 +76,8 @@ dna_pipeline_allocate_scratch() {
     local node_override="${DNA_PIPELINE_NODE_TMPDIR:-}"
     local project_tmp="${project_root:+$project_root/05_tmp}"
     local base_tmp="" candidate available_kb required_kb scratch_parent scratch_suffix token
+    local filesystem storage_class pass node_tmp="" node_var_tmp=""
+    local -a candidates=()
 
     for token in "$namespace" "$group" "$cell"; do
         [[ -n "$token" && "$token" != . && "$token" != .. && "$token" != *[!A-Za-z0-9_.-]* ]] || {
@@ -79,15 +93,34 @@ dna_pipeline_allocate_scratch() {
         echo "ERROR: an absolute non-root project path is required for scratch fallback" >&2
         return 2
     }
-    mkdir -p "$project_tmp"
     required_kb=$(((disk_mb * 1024 * 110 + 99) / 100))
-
-    for candidate in "${SLURM_TMPDIR:-}" "$node_override" "$configured_tmp" "$project_tmp"; do
+    # 只有 Slurm 任务自动发现系统节点盘；本机执行保留项目 scratch 的定位。
+    if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+        node_tmp=/tmp
+        node_var_tmp=/var/tmp
+    fi
+    candidates=("${SLURM_TMPDIR:-}" "$node_override" "$configured_tmp" "$node_tmp" "$node_var_tmp" "$project_tmp")
+    for pass in local fallback; do
+    for candidate in "${candidates[@]}"; do
         [[ -n "$candidate" && "$candidate" == /* && "$candidate" != "/" ]] || continue
+        if [[ "$candidate" == "$project_tmp" && ! -e "$candidate" ]]; then
+            mkdir -p -- "$candidate" || return $?
+        fi
         [[ -d "$candidate" && -w "$candidate" ]] || continue
         # cd -P给出物理路径，哨兵防止命令替换裁掉合法的末尾换行。
         candidate="$(cd -P -- "$candidate" && printf '%s.' "$PWD")" || return $?
         candidate="${candidate%.}"
+        filesystem="$(dna_pipeline_scratch_filesystem "$candidate")" || return $?
+        case "$filesystem" in
+            tmpfs|ramfs|devtmpfs)
+                if [[ "$pass" == local ]]; then
+                    printf 'WARNING: scratch candidate skipped: path=%s filesystem=%s reason=memory_backed\n' "$candidate" "$filesystem" >&2
+                fi
+                continue ;;
+            ext2/ext3|ext2|ext3|ext4|xfs|btrfs|zfs|apfs|hfs|ufs) storage_class=local ;;
+            *) storage_class=fallback ;;
+        esac
+        [[ "$storage_class" == "$pass" ]] || continue
         available_kb="$(cd -- "$candidate" && df -Pk . | awk 'END{print $4}')"
         [[ "$available_kb" =~ ^[0-9]+$ ]] || continue
         if (( available_kb < required_kb )); then
@@ -95,6 +128,9 @@ dna_pipeline_allocate_scratch() {
             continue
         fi
         base_tmp="$candidate"
+        if [[ "$storage_class" == fallback ]]; then
+            printf 'WARNING: no eligible local disk; using shared or unverified scratch: path=%s filesystem=%s\n' "$candidate" "$filesystem" >&2
+        fi
         scratch_suffix="${SLURM_JOB_ID:-local}.$$"
         [[ "$scratch_suffix" != *[!A-Za-z0-9_.-]* ]] || scratch_suffix="local.$$"
         scratch_parent="$candidate"
@@ -107,7 +143,12 @@ dna_pipeline_allocate_scratch() {
             mkdir -p "$scratch_parent" || return $?
         done
         DNA_PIPELINE_SCRATCH_DIR="$(mktemp -d "$scratch_parent/$cell.$scratch_suffix.XXXXXX")" || return $?
-        break
+        DNA_PIPELINE_SCRATCH_FILESYSTEM="$filesystem"
+        DNA_PIPELINE_SCRATCH_STORAGE_CLASS="$storage_class"
+        DNA_PIPELINE_SCRATCH_REQUIRED_KB="$required_kb"
+        DNA_PIPELINE_SCRATCH_AVAILABLE_KB="$available_kb"
+        break 2
+    done
     done
     [[ -n "$base_tmp" ]] || {
         echo "ERROR: no writable scratch candidate has the requested space plus 10% margin" >&2
@@ -185,6 +226,9 @@ dna_pipeline_log_scratch() {
     printf 'INFO: scratch_path=%s scratch_mount=%s\n' \
         "$DNA_PIPELINE_SCRATCH_DIR" \
         "$(df -P "$DNA_PIPELINE_SCRATCH_BASE" | awk 'END{print $6}')"
+    printf 'INFO: scratch_filesystem=%s storage_class=%s available_kb=%s required_with_margin_kb=%s\n' \
+        "$DNA_PIPELINE_SCRATCH_FILESYSTEM" "$DNA_PIPELINE_SCRATCH_STORAGE_CLASS" \
+        "$DNA_PIPELINE_SCRATCH_AVAILABLE_KB" "$DNA_PIPELINE_SCRATCH_REQUIRED_KB"
     df -h "$DNA_PIPELINE_SCRATCH_BASE"
 }
 

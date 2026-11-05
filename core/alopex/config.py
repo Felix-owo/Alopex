@@ -181,7 +181,7 @@ properties:
           minLength: 1
         - type: 'null'
       node_tmpdir:
-        description: 计算节点本地 scratch 目录；null 表示优先使用作业自带的 $SLURM_TMPDIR。
+        description: scratch 候选根；优先容量足够的本地磁盘，Slurm 中自动探测 /tmp 和 /var/tmp；跳过内存盘，无本地盘时警告并回退共享/未知盘。
         oneOf:
         - type: string
           pattern: ^/.*
@@ -385,7 +385,7 @@ slurm:
   account: null                  # 仅在集群要求时填写账户
   partition: null                 # 提交作业的默认分区；null 沿用集群默认分区
   qos: huge                       # 提交作业的默认 QoS；设为 null 时沿用集群默认 QoS
-  node_tmpdir: /tmp               # 优先 SLURM_TMPDIR；此路径不可写时回退项目 05_tmp/
+  node_tmpdir: /tmp               # 本地磁盘优先；Slurm 自动探测 /tmp、/var/tmp；无本地盘时警告回退，跳过内存盘
 
 common:
   demux:

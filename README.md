@@ -1,8 +1,8 @@
-# Alopex v16.9
+# Alopex v16.10
 
-正式源码以 Git tag `v16.9` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v16.10` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
-本版修复跨账号复用快照输入时的权限失败：封存只处理本次 stage，不沿输入软链接修改共享文件权限；共享输入保持只读，内容与身份仍完整核验。
+本版修正节点 scratch 选择：优先使用容量足够的本地磁盘，跳过内存盘；无合格本地盘时明确记录共享或未知文件系统回退，保留独占清理和共享结果原子提交。
 
 内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
@@ -27,12 +27,12 @@ demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态�
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v16.9 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.9) 下载 `Alopex-v16.9.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
+从 [v16.10 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.10) 下载 `Alopex-v16.10.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v16.9.tar.gz
-cd Alopex-v16.9
+tar -xzf Alopex-v16.10.tar.gz
+cd Alopex-v16.10
 conda --version
 ```
 
@@ -198,6 +198,8 @@ mate 支持 `R1/R2` 或 `1/2`，分隔符支持 `_ . -`；lane 为 1–999，chu
 DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联-rna_darlin-结果)。
 
 ## 6. 运行与恢复
+
+Slurm 作业的临时数据优先放在容量足够的节点本地磁盘，自动检查 `/tmp`、`/var/tmp`；共享盘配置不会抢在合格本地盘前面。tmpfs 等内存盘不作为磁盘 scratch。无合格本地盘时，日志会明确警告共享/未知盘回退，并记录实际路径、文件系统和容量。各 job 只清理自己的随机临时目录；可恢复的跨节点中间工件和正式结果仍保存在项目目录。详见[调度参数](https://github.com/Felix-owo/Alopex_dev/blob/v16.10/docs/ANALYSIS_PARAMETERS.md)。
 
 ```bash
 ./run_pipeline.sh --dry-run
