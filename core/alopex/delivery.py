@@ -1287,6 +1287,8 @@ def _copy_observed_file(
         destination.unlink()
     if shared.is_symlink():
         raise ValueError(f"snapshot input store may not contain a symlink: {shared}")
+    if shared.stat().st_mode & 0o222:
+        raise ValueError(f"snapshot input store must be read-only: {shared}")
     copied = stable_file_identity(shared, hash_content=True)
     for key in ("size_bytes", "sha256"):
         if copied.get(key) != expected.get(key):

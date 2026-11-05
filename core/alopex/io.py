@@ -271,9 +271,10 @@ def write_tsv_atomic(
 
 
 def _make_tree_read_only(root: Path) -> None:
-
-
+    # snapshot 的输入链接指向已封存的共享内容；不得修改链接外的文件或其他账号权限。
     for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_symlink():
+            continue
         os.chmod(path, 0o755 if path.is_dir() else 0o444)
     os.chmod(root, 0o755)
 
