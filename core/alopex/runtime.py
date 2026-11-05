@@ -504,7 +504,7 @@ def backend_resource_request(
 
 
 def scratch_mb(scratch_group: str, dna_reads: object) -> int:
-    """返回 fused job 固定的 node scratch 容量（MiB）。"""
+    """返回 fused job 固定的项目 scratch 容量（MiB）。"""
 
     key = str(scratch_group).strip()
     try:

@@ -1,8 +1,8 @@
-# Alopex v16.10
+# Alopex v16.11
 
-正式源码以 Git tag `v16.10` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v16.11` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
-本版修正节点 scratch 选择：优先使用容量足够的本地磁盘，跳过内存盘；无合格本地盘时明确记录共享或未知文件系统回退，保留独占清理和共享结果原子提交。
+本版将科学阶段 scratch 固定到项目 `05_tmp/`；保留空间检查、独占清理与原子提交，不自动选择节点临时盘。
 
 内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
@@ -27,12 +27,12 @@ demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态�
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v16.10 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.10) 下载 `Alopex-v16.10.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
+从 [v16.11 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.11) 下载 `Alopex-v16.11.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v16.10.tar.gz
-cd Alopex-v16.10
+tar -xzf Alopex-v16.11.tar.gz
+cd Alopex-v16.11
 conda --version
 ```
 
@@ -199,7 +199,7 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 
 ## 6. 运行与恢复
 
-Slurm 作业的临时数据优先放在容量足够的节点本地磁盘，自动检查 `/tmp`、`/var/tmp`；共享盘配置不会抢在合格本地盘前面。tmpfs 等内存盘不作为磁盘 scratch。无合格本地盘时，日志会明确警告共享/未知盘回退，并记录实际路径、文件系统和容量。各 job 只清理自己的随机临时目录；可恢复的跨节点中间工件和正式结果仍保存在项目目录。详见[调度参数](https://github.com/Felix-owo/Alopex_dev/blob/v16.10/docs/ANALYSIS_PARAMETERS.md)。
+科学阶段临时数据固定写入当前项目 `05_tmp/`，每个作业使用独占随机子目录并只清理自身目录。启动前检查预计磁盘需求及10%余量，空间不足直接失败，不自动切换到节点 `/tmp`、`/var/tmp` 或外部 `TMPDIR`。该检查不预留跨作业容量，也不保证共享存储或用户配额永不耗尽。可恢复的跨节点工件保留在 `02_work/`。升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。详见[调度参数](https://github.com/Felix-owo/Alopex_dev/blob/v16.11/docs/ANALYSIS_PARAMETERS.md)。
 
 ```bash
 ./run_pipeline.sh --dry-run

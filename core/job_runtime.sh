@@ -52,7 +52,7 @@ dna_pipeline_init_attempt_logs() {
     done
 }
 
-# GNU/BSD stat 都只查询所在文件系统，不遍历目录；无法识别时不得声称是本地盘。
+# GNU/BSD stat 都只查询所在文件系统，不遍历目录；无法识别时如实记录 unknown。
 dna_pipeline_scratch_filesystem() {
     local filesystem
     if filesystem="$(stat -f -c %T -- "$1" 2>/dev/null)"; then
@@ -64,21 +64,11 @@ dna_pipeline_scratch_filesystem() {
     fi
 }
 
-# 独占 scratch 生命周期：先选有 110% 空间的本地磁盘，再显式回退共享/未知盘。
-# tmpfs 的 df 容量不是本作业可用内存，不能用于磁盘 scratch。跨 job 的 DAG 工件仍在项目目录。
+# 所有科学阶段的 scratch 固定在当前项目 05_tmp；不接受节点盘或外部 TMPDIR 覆盖。
+# 空间检查保留 10% 余量，不代表跨作业容量预留；不足时拒绝执行，不改选其他磁盘。
 dna_pipeline_allocate_scratch() {
-    local configured_tmp="$1"
-    local namespace="$2"
-    local group="$3"
-    local cell="$4"
-    local disk_mb="$5"
-    local project_root="${6:-${DNA_PIPELINE_PROJECT_DIR:-}}"
-    local node_override="${DNA_PIPELINE_NODE_TMPDIR:-}"
-    local project_tmp="${project_root:+$project_root/05_tmp}"
-    local base_tmp="" candidate available_kb required_kb scratch_parent scratch_suffix token
-    local filesystem storage_class pass node_tmp="" node_var_tmp=""
-    local -a candidates=()
-
+    local namespace="$1" group="$2" cell="$3" disk_mb="$4" project_root="${5:-}"
+    local candidate required_kb available_kb filesystem scratch_parent scratch_suffix token
     for token in "$namespace" "$group" "$cell"; do
         [[ -n "$token" && "$token" != . && "$token" != .. && "$token" != *[!A-Za-z0-9_.-]* ]] || {
             echo "ERROR: unsafe scratch path component: $token" >&2
@@ -89,77 +79,51 @@ dna_pipeline_allocate_scratch() {
         echo "ERROR: invalid scratch request: $disk_mb MiB" >&2
         return 2
     }
-    [[ -n "$project_root" && "$project_root" == /* && "$project_root" != "/" ]] || {
-        echo "ERROR: an absolute non-root project path is required for scratch fallback" >&2
+    [[ -n "$project_root" && "$project_root" == /* && "$project_root" != / ]] || {
+        echo "ERROR: an absolute non-root project path is required for scratch" >&2
         return 2
     }
+    candidate="$project_root/05_tmp"
+    [[ ! -L "$candidate" && ( ! -e "$candidate" || -d "$candidate" ) ]] || {
+        echo "ERROR: project scratch must be a real directory: $candidate" >&2
+        return 2
+    }
+    mkdir -p -- "$candidate" || return $?
+    # 哨兵保留项目路径合法的末尾换行；所有后续分配与清理绑定同一物理根。
+    candidate="$(cd -P -- "$candidate" && printf '%s.' "$PWD")" || return $?
+    candidate="${candidate%.}"
+    filesystem="$(dna_pipeline_scratch_filesystem "$candidate")" || return $?
+    case "$filesystem" in
+        tmpfs|ramfs|devtmpfs)
+            echo "ERROR: project scratch is memory-backed: path=$candidate filesystem=$filesystem" >&2
+            return 2 ;;
+    esac
     required_kb=$(((disk_mb * 1024 * 110 + 99) / 100))
-    # 只有 Slurm 任务自动发现系统节点盘；本机执行保留项目 scratch 的定位。
-    if [[ -n "${SLURM_JOB_ID:-}" ]]; then
-        node_tmp=/tmp
-        node_var_tmp=/var/tmp
-    fi
-    candidates=("${SLURM_TMPDIR:-}" "$node_override" "$configured_tmp" "$node_tmp" "$node_var_tmp" "$project_tmp")
-    for pass in local fallback; do
-    for candidate in "${candidates[@]}"; do
-        [[ -n "$candidate" && "$candidate" == /* && "$candidate" != "/" ]] || continue
-        if [[ "$candidate" == "$project_tmp" && ! -e "$candidate" ]]; then
-            mkdir -p -- "$candidate" || return $?
-        fi
-        [[ -d "$candidate" && -w "$candidate" ]] || continue
-        # cd -P给出物理路径，哨兵防止命令替换裁掉合法的末尾换行。
-        candidate="$(cd -P -- "$candidate" && printf '%s.' "$PWD")" || return $?
-        candidate="${candidate%.}"
-        filesystem="$(dna_pipeline_scratch_filesystem "$candidate")" || return $?
-        case "$filesystem" in
-            tmpfs|ramfs|devtmpfs)
-                if [[ "$pass" == local ]]; then
-                    printf 'WARNING: scratch candidate skipped: path=%s filesystem=%s reason=memory_backed\n' "$candidate" "$filesystem" >&2
-                fi
-                continue ;;
-            ext2/ext3|ext2|ext3|ext4|xfs|btrfs|zfs|apfs|hfs|ufs) storage_class=local ;;
-            *) storage_class=fallback ;;
-        esac
-        [[ "$storage_class" == "$pass" ]] || continue
-        available_kb="$(cd -- "$candidate" && df -Pk . | awk 'END{print $4}')"
-        [[ "$available_kb" =~ ^[0-9]+$ ]] || continue
-        if (( available_kb < required_kb )); then
-            echo "WARNING: scratch candidate has insufficient free space: path=$candidate available_kb=$available_kb required_with_margin_kb=$required_kb" >&2
-            continue
-        fi
-        base_tmp="$candidate"
-        if [[ "$storage_class" == fallback ]]; then
-            printf 'WARNING: no eligible local disk; using shared or unverified scratch: path=%s filesystem=%s\n' "$candidate" "$filesystem" >&2
-        fi
-        scratch_suffix="${SLURM_JOB_ID:-local}.$$"
-        [[ "$scratch_suffix" != *[!A-Za-z0-9_.-]* ]] || scratch_suffix="local.$$"
-        scratch_parent="$candidate"
-        for token in dna_pipeline "$namespace" "$group"; do
-            scratch_parent="$scratch_parent/$token"
-            [[ ! -L "$scratch_parent" && ( ! -e "$scratch_parent" || -d "$scratch_parent" ) ]] || {
-                echo "ERROR: scratch parent must be a real directory: $scratch_parent" >&2
-                return 2
-            }
-            mkdir -p "$scratch_parent" || return $?
-        done
-        DNA_PIPELINE_SCRATCH_DIR="$(mktemp -d "$scratch_parent/$cell.$scratch_suffix.XXXXXX")" || return $?
-        DNA_PIPELINE_SCRATCH_FILESYSTEM="$filesystem"
-        DNA_PIPELINE_SCRATCH_STORAGE_CLASS="$storage_class"
-        DNA_PIPELINE_SCRATCH_REQUIRED_KB="$required_kb"
-        DNA_PIPELINE_SCRATCH_AVAILABLE_KB="$available_kb"
-        break 2
-    done
-    done
-    [[ -n "$base_tmp" ]] || {
-        echo "ERROR: no writable scratch candidate has the requested space plus 10% margin" >&2
+    available_kb="$(cd -- "$candidate" && df -Pk . | awk 'END{print $4}')"
+    [[ "$available_kb" =~ ^[0-9]+$ ]] || {
+        echo "ERROR: cannot determine free space for project scratch: $candidate" >&2
         return 1
     }
-
-    case "$DNA_PIPELINE_SCRATCH_DIR" in
-        "$base_tmp"/dna_pipeline/"$namespace"/"$group"/"$cell".*) ;;
-        *) echo "ERROR: resolved scratch path escaped its namespace" >&2; return 2 ;;
-    esac
-    DNA_PIPELINE_SCRATCH_BASE="$base_tmp"
+    if (( available_kb < required_kb )); then
+        echo "ERROR: project scratch has insufficient free space: path=$candidate available_kb=$available_kb required_with_margin_kb=$required_kb" >&2
+        return 1
+    fi
+    scratch_parent="$candidate"
+    for token in dna_pipeline "$namespace" "$group"; do
+        scratch_parent="$scratch_parent/$token"
+        [[ ! -L "$scratch_parent" && ( ! -e "$scratch_parent" || -d "$scratch_parent" ) ]] || {
+            echo "ERROR: scratch parent must be a real directory: $scratch_parent" >&2
+            return 2
+        }
+        mkdir -p -- "$scratch_parent" || return $?
+    done
+    scratch_suffix="${SLURM_JOB_ID:-local}.$$"
+    [[ "$scratch_suffix" != *[!A-Za-z0-9_.-]* ]] || scratch_suffix="local.$$"
+    DNA_PIPELINE_SCRATCH_DIR="$(mktemp -d "$scratch_parent/$cell.$scratch_suffix.XXXXXX")" || return $?
+    DNA_PIPELINE_SCRATCH_BASE="$candidate"
+    DNA_PIPELINE_SCRATCH_FILESYSTEM="$filesystem"
+    DNA_PIPELINE_SCRATCH_REQUIRED_KB="$required_kb"
+    DNA_PIPELINE_SCRATCH_AVAILABLE_KB="$available_kb"
     TMPDIR="$DNA_PIPELINE_SCRATCH_DIR"
     export DNA_PIPELINE_SCRATCH_BASE DNA_PIPELINE_SCRATCH_DIR TMPDIR
 }
@@ -226,8 +190,8 @@ dna_pipeline_log_scratch() {
     printf 'INFO: scratch_path=%s scratch_mount=%s\n' \
         "$DNA_PIPELINE_SCRATCH_DIR" \
         "$(df -P "$DNA_PIPELINE_SCRATCH_BASE" | awk 'END{print $6}')"
-    printf 'INFO: scratch_filesystem=%s storage_class=%s available_kb=%s required_with_margin_kb=%s\n' \
-        "$DNA_PIPELINE_SCRATCH_FILESYSTEM" "$DNA_PIPELINE_SCRATCH_STORAGE_CLASS" \
+    printf 'INFO: scratch_filesystem=%s available_kb=%s required_with_margin_kb=%s\n' \
+        "$DNA_PIPELINE_SCRATCH_FILESYSTEM" \
         "$DNA_PIPELINE_SCRATCH_AVAILABLE_KB" "$DNA_PIPELINE_SCRATCH_REQUIRED_KB"
     df -h "$DNA_PIPELINE_SCRATCH_BASE"
 }

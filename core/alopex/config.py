@@ -152,7 +152,6 @@ properties:
     - account
     - partition
     - qos
-    - node_tmpdir
     properties:
       jobs:
         description: 同时占用的最大 SLURM 作业数，含 Droplet 全库 calling、demux 块和后续 cell 作业。
@@ -180,17 +179,7 @@ properties:
         - type: string
           minLength: 1
         - type: 'null'
-      node_tmpdir:
-        description: scratch 候选根；优先容量足够的本地磁盘，Slurm 中自动探测 /tmp 和 /var/tmp；跳过内存盘，无本地盘时警告并回退共享/未知盘。
-        oneOf:
-        - type: string
-          pattern: ^/.*
-          not:
-            const: /
-          allOf:
-          - not:
-              pattern: (^|/)\.\.?(/|$)
-        - type: 'null'
+
   retention:
     description: 恢复边界策略；控制昂贵中间文件的保留面。
     type: object
@@ -385,7 +374,6 @@ slurm:
   account: null                  # 仅在集群要求时填写账户
   partition: null                 # 提交作业的默认分区；null 沿用集群默认分区
   qos: huge                       # 提交作业的默认 QoS；设为 null 时沿用集群默认 QoS
-  node_tmpdir: /tmp               # 本地磁盘优先；Slurm 自动探测 /tmp、/var/tmp；无本地盘时警告回退，跳过内存盘
 
 common:
   demux:
@@ -435,7 +423,6 @@ CONFIG_SECTION_DEFAULTS: dict[str, dict[str, object]] = {
         "account": None,
         "partition": None,
         "qos": "huge",
-        "node_tmpdir": "/tmp",
     },
     "retention": {
         "keep_final_bam": False,
@@ -681,14 +668,6 @@ def validate_config_semantics(config: Mapping[str, object]) -> None:
         if value is not None and (not value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value)):
             raise ValueError(f"slurm.{field} must be a non-blank string without control characters or null")
 
-    node_tmpdir = slurm.get("node_tmpdir")
-    if node_tmpdir is not None:
-        if not isinstance(node_tmpdir, str) or not str(node_tmpdir).strip():
-            raise ValueError("slurm.node_tmpdir must be a non-empty path or null")
-        if Path(str(node_tmpdir)).expanduser().resolve(strict=False) == Path(
-            Path(str(node_tmpdir)).expanduser().resolve(strict=False).anchor
-        ):
-            raise ValueError("slurm.node_tmpdir must not resolve to the filesystem root")
     for section in ("common", "cabernet", "srd"):
         biscuit = config[section].get("biscuit", {})
         if "high_cph_retention_threshold" not in biscuit:
@@ -837,7 +816,6 @@ _EXPORTED_SCALARS = {
     "CFG_SLURM_ACCOUNT": "slurm.account",
     "CFG_SLURM_PARTITION": "slurm.partition",
     "CFG_SLURM_QOS": "slurm.qos",
-    "CFG_SLURM_NODE_TMPDIR": "slurm.node_tmpdir",
 }
 
 

@@ -101,8 +101,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     progress = commands.add_parser("controller-progress", help="增量读取 controller 日志进度，不写状态文件。")
     progress.add_argument("--log", required=True)
     progress.add_argument("--offset", type=int, default=0)
-    resolve_tmp = commands.add_parser("resolve-tmpdir", help="把 slurm.node_tmpdir 展开为绝对路径（根目录由语义校验拒绝）。")
-    resolve_tmp.add_argument("--path", required=True)
     synthesize = commands.add_parser("synthesize-config", help="合成 test 模式 effective config。")
     for field in ('--source', '--destination', '--route'):
         synthesize.add_argument(field, required=True)
@@ -216,7 +214,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         split.add_argument(field, type=Path, required=True)
     disk = commands.add_parser("droplet-output-disk-mb", help="估算 Droplet 完整文件输出 scratch。")
     disk.add_argument("--spool", required=True, type=Path)
-    copy_fastq = commands.add_parser("copy-demux-fastq", help="将完整 FASTQ 从节点 scratch 复制到共享暂存。")
+    copy_fastq = commands.add_parser("copy-demux-fastq", help="将完整 FASTQ 从作业 scratch 复制到持久暂存。")
     copy_fastq.add_argument("source", type=Path)
     copy_fastq.add_argument("destination", type=Path)
     copy_fastq.add_argument("--workers", type=int, default=1)
@@ -327,8 +325,6 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "controller-progress":
             offset, progress = read_controller_progress(args.log, args.offset)
             print(offset, progress)
-        elif command == "resolve-tmpdir":
-            print(Path(args.path).expanduser().resolve(strict=False))
         elif command == "synthesize-config":
             synthesize_route_config(Path(args.source), Path(args.destination), args.route)
         elif command == "refresh-manifest":

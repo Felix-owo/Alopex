@@ -142,7 +142,6 @@ while IFS= read -r variable_name; do
             ;;
     esac
 done < <(compgen -e)
-unset DNA_PIPELINE_NODE_TMPDIR
 
 require_environment_tools() {
     local prefix="$1" role="$2" relative
@@ -515,7 +514,7 @@ prepare_local_executor() {
 
 # 为 Slurm 准备提交参数，controller 始终留在当前 shell 或 allocation。
 prepare_slurm_executor() {
-    local jobs controller_cores account partition qos configured_tmp project_hash plugin_version logdir
+    local jobs controller_cores account partition qos project_hash plugin_version logdir
     local -a default_resources plugin_args
     command -v sbatch >/dev/null 2>&1 || { echo "ERROR: sbatch not found." >&2; return 127; }
     command -v squeue >/dev/null 2>&1 || { echo "ERROR: squeue not found." >&2; return 127; }
@@ -526,17 +525,8 @@ prepare_slurm_executor() {
     fi
     mkdir -p "$logdir"
     jobs="$CFG_SLURM_JOBS"; controller_cores="$CFG_SLURM_CONTROLLER_CORES"
-    account="$CFG_SLURM_ACCOUNT"; partition="$CFG_SLURM_PARTITION"; qos="$CFG_SLURM_QOS"; configured_tmp="$CFG_SLURM_NODE_TMPDIR"
+    account="$CFG_SLURM_ACCOUNT"; partition="$CFG_SLURM_PARTITION"; qos="$CFG_SLURM_QOS"
     [[ "$jobs" =~ ^[1-9][0-9]*$ && "$controller_cores" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: invalid Slurm/runtime numeric settings." >&2; return 2; }
-    if [[ -n "$configured_tmp" ]]; then
-        DNA_PIPELINE_NODE_TMPDIR="$(PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" \
-            -m alopex resolve-tmpdir --path "$configured_tmp" && printf '.')" || return $?
-        # 保留路径末尾换行；只移除CLI打印的一个换行和本次哨兵。
-        DNA_PIPELINE_NODE_TMPDIR="${DNA_PIPELINE_NODE_TMPDIR%$'\n.'}"
-        export DNA_PIPELINE_NODE_TMPDIR
-    else
-        unset DNA_PIPELINE_NODE_TMPDIR
-    fi
     project_hash="$(project_hash8)"
     plugin_version="$("$DNA_PIPELINE_PYTHON" -c 'from importlib.metadata import version;print(version("snakemake-executor-plugin-slurm"))' 2>/dev/null || true)"
     [[ -n "$plugin_version" ]] || { echo "ERROR: SLURM executor plugin is missing." >&2; return 127; }

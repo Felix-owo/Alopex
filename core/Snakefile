@@ -213,21 +213,6 @@ try:
     LOCAL_EXECUTOR_CORES = int(str(os.environ.get("DNA_PIPELINE_LOCAL_CORES", "0") or "0"))
 except ValueError:
     LOCAL_EXECUTOR_CORES = 0
-if PIPELINE_EXECUTOR == "local":
-    NODE_TMPDIR = str(PROJECT_TMP_DIR.resolve())
-else:
-    configured_node_tmp = config["slurm"].get("node_tmpdir")
-    if configured_node_tmp is None:
-        NODE_TMPDIR = ""
-    else:
-        configured_node_tmp = Path(str(configured_node_tmp)).expanduser()
-        if not configured_node_tmp.is_absolute():
-            raise ValueError("slurm.node_tmpdir must be null or a non-root absolute path")
-        configured_node_tmp = configured_node_tmp.resolve()
-        if configured_node_tmp == Path("/"):
-            raise ValueError("slurm.node_tmpdir must not resolve to the filesystem root")
-        NODE_TMPDIR = str(configured_node_tmp)
-
 DEMUX_BINARY = PIPELINE_ROOT / "conda" / "rust" / "bin" / "demux_rs"
 
 SAMPLE_MANIFEST_ROWS = read_project_sample_manifest(
@@ -914,7 +899,7 @@ checkpoint demux:
         rna_write_tmp="$rna_tmp"
         if [[ {params.pipeline_mode:q} == droplet ]]; then
             scratch_mb="$({RULE_PYTHON:q} -m alopex droplet-output-disk-mb --spool {params.spool_dir:q})"
-            if dna_pipeline_allocate_scratch {resources.tmpdir:q} {SCRATCH_NAMESPACE:q} demux {params.sample_name:q} "$scratch_mb" {PROJECT_DIR:q} >> {log:q} 2>&1; then
+            if dna_pipeline_allocate_scratch {SCRATCH_NAMESPACE:q} demux {params.sample_name:q} "$scratch_mb" {PROJECT_DIR:q} >> {log:q} 2>&1; then
                 demux_scratch_active=1
                 scratch_fs="$(df -Pk "$DNA_PIPELINE_SCRATCH_DIR" | awk 'END{{print $1}}')"
                 project_fs="$(df -Pk {PROJECT_DIR:q} | awk 'END{{print $1}}')"
@@ -923,7 +908,7 @@ checkpoint demux:
                     rna_write_tmp="$DNA_PIPELINE_SCRATCH_DIR/RNA"
                 fi
             else
-                printf 'WARNING: local output scratch unavailable; using shared staging directory\n' >> {log:q}
+                printf 'WARNING: project scratch unavailable; keeping persistent demux staging in project\n' >> {log:q}
             fi
             printf 'demux_write_dir=%s shared_stage_dir=%s scratch_mb=%s\n' "$dna_write_tmp" "$dna_tmp" "$scratch_mb" >> {log:q}
             worker_threads={threads}
@@ -1044,7 +1029,7 @@ if PROTOCOL_POLICY.requires_rna_barcode:
 
 if METHYLATION_BACKEND == "biscuit":
     rule align_sort_dedup:
-        """在单个节点 scratch 作业内完成一个细胞的 Cutadapt trimming、BISCUIT 比对、Dupsifter 去重与坐标排序。"""
+        """在单个项目 scratch 作业内完成一个细胞的 Cutadapt trimming、BISCUIT 比对、Dupsifter 去重与坐标排序。"""
         input:
             r1 = lambda wc: current_demux_fastq(wc.demux_sample, 1),
             r2 = lambda wc: current_demux_fastq(wc.demux_sample, 2),
@@ -1093,7 +1078,6 @@ if METHYLATION_BACKEND == "biscuit":
             biscuit = BISCUIT,
             dupsifter_metadata = lambda wc: dupsifter_metadata_json(wc.demux_sample),
             samtools = SAMTOOLS,
-            local_tmp = NODE_TMPDIR,
             scratch_namespace = SCRATCH_NAMESPACE,
             biscuit_library_mode = BISCUIT_LIBRARY_MODE,
             dupsifter_extra = "--remove-dups",
@@ -1124,7 +1108,7 @@ if METHYLATION_BACKEND == "biscuit":
             exec 2>> {log.main:q}
 
             dna_pipeline_allocate_scratch \
-                {params.local_tmp:q} {params.scratch_namespace:q} \
+                {params.scratch_namespace:q} \
                 preprocess_alignment \
                 {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
             dna_pipeline_install_scratch_cleanup
@@ -1278,7 +1262,6 @@ if METHYLATION_BACKEND == "biscuit":
                 sample_name = lambda wc: wc.demux_sample.replace(os.sep, "_"),
                 protocol = PROTOCOL_POLICY.name,
                 high_cph_role = PROTOCOL_POLICY.high_cph_role,
-                local_tmp = NODE_TMPDIR,
                 scratch_namespace = SCRATCH_NAMESPACE,
                 resource_log = lambda wc: static_resource_log(
                     "high_cph_read_names", wc.demux_sample
@@ -1299,7 +1282,7 @@ if METHYLATION_BACKEND == "biscuit":
                     {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log.filter:q}
 
                 dna_pipeline_allocate_scratch \
-                    {params.local_tmp:q} {params.scratch_namespace:q} \
+                    {params.scratch_namespace:q} \
                     high_cph_filter \
                     {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
                 dna_pipeline_install_scratch_cleanup
@@ -2011,7 +1994,7 @@ elif METHYLATION_BACKEND == "rastair":
             exec >> {log.main:q} 2>&1
             printf 'stage=taps_align_mark attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s\n' \
                 {resources.attempt_no} {threads} {resources.mem_mb} {resources.runtime} {resources.disk_mb}
-            dna_pipeline_allocate_scratch {NODE_TMPDIR:q} {SCRATCH_NAMESPACE:q} preprocess_alignment \
+            dna_pipeline_allocate_scratch {SCRATCH_NAMESPACE:q} preprocess_alignment \
                 {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
             dna_pipeline_install_scratch_cleanup
             tmpdir="$DNA_PIPELINE_SCRATCH_DIR"
@@ -2086,7 +2069,7 @@ elif METHYLATION_BACKEND == "rastair":
             exec >> {log:q} 2>&1
             printf 'stage=taps_call_cpg attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
                 {resources.attempt_no} {threads} {resources.mem_mb} {resources.runtime}
-            dna_pipeline_allocate_scratch {NODE_TMPDIR:q} {SCRATCH_NAMESPACE:q} preprocess_alignment \
+            dna_pipeline_allocate_scratch {SCRATCH_NAMESPACE:q} preprocess_alignment \
                 {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
             dna_pipeline_install_scratch_cleanup
             tmpdir="$DNA_PIPELINE_SCRATCH_DIR"
@@ -2160,7 +2143,6 @@ else:
             reseed_r = BISMARK_RESEED_R,
             max_insert = BISMARK_MAX_INSERT,
             samtools = SAMTOOLS,
-            local_tmp = NODE_TMPDIR,
             scratch_namespace = SCRATCH_NAMESPACE,
             resource_log = lambda wc: backend_stage_resource_log(
                 "bismark", "align", wc.demux_sample
@@ -2176,7 +2158,7 @@ else:
                 {params.resource_log:q} {resources.attempt_no} {threads} \
                 {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log:q}
             exec 2>> {log:q}
-            dna_pipeline_allocate_scratch {params.local_tmp:q} {params.scratch_namespace:q} preprocess_alignment {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
+            dna_pipeline_allocate_scratch {params.scratch_namespace:q} preprocess_alignment {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
             dna_pipeline_install_scratch_cleanup
             dna_pipeline_log_scratch >> {log:q} 2>&1
             tmpdir="$DNA_PIPELINE_SCRATCH_DIR"; out="$tmpdir/bismark"; mkdir -p "$out"
@@ -2269,7 +2251,6 @@ else:
             protocol = PROTOCOL_POLICY.name,
             high_cph_role = PROTOCOL_POLICY.high_cph_role,
             python = _rule_executable("python"),
-            local_tmp = NODE_TMPDIR,
             scratch_namespace = SCRATCH_NAMESPACE,
             resource_log = lambda wc: static_resource_log(
                 "high_cph_read_names", wc.demux_sample
@@ -2286,7 +2267,7 @@ else:
                 {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log:q}
             exec 2>> {log:q}
             dna_pipeline_allocate_scratch \
-                {params.local_tmp:q} {params.scratch_namespace:q} \
+                {params.scratch_namespace:q} \
                 high_cph_filter \
                 {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
             dna_pipeline_install_scratch_cleanup
@@ -2443,7 +2424,6 @@ else:
             protocol = PROTOCOL_POLICY.name,
             bismark = BISMARK,
             samtools = SAMTOOLS,
-            local_tmp = NODE_TMPDIR,
             scratch_namespace = SCRATCH_NAMESPACE,
             resource_log = lambda wc: static_resource_log(
                 "bismark_extract", wc.demux_sample
@@ -2460,7 +2440,7 @@ else:
                 {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log:q}
             exec 2>> {log:q}
             dna_pipeline_allocate_scratch \
-                {params.local_tmp:q} {params.scratch_namespace:q} \
+                {params.scratch_namespace:q} \
                 bismark_extract \
                 {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
             dna_pipeline_install_scratch_cleanup
