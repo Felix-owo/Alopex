@@ -45,6 +45,7 @@ from .config import (
     reference_component_files,
     reference_sequence_identity,
     validate_downstream_reference,
+    validate_tss_reference,
     validate_reference_component,
 )
 from .io import (
@@ -97,6 +98,7 @@ def seal_downstream_reference_bindings(reference: Path, annotation: Path, tss: P
         receipt = Path(str(path) + ".reference.json")
         atomic_write_json(receipt, {"schema_version": 1, "kind": role, "reference": identity,
                                    "annotation": annotation_record,
+                                   **({"bin_unit": "protein_coding_gene"} if role == "tss" else {}),
                                    "files": {path.name: _reference_file_record(path)}})
 
 
@@ -110,13 +112,18 @@ def relocate_downstream_bindings(reference: Path, tss: Path, cpg: Path) -> None:
     for path, kind in ((tss, "tss"), (cpg, "single-cpg")):
         receipt = Path(str(path) + ".reference.json")
         payload = _read_reference_binding(receipt, kind)
-        if payload["reference"] != identity or set(payload["files"]) != {path.name}:
+        files = payload.get("files")
+        if payload["reference"] != identity or not isinstance(files, dict) or len(files) != 1:
             raise ValueError("downstream binding changed during publication")
-        record = payload["files"][path.name]
+        previous_name, record = next(iter(files.items()))
+        if not previous_name or Path(previous_name).name != previous_name:
+            raise ValueError("downstream binding has an invalid artifact name")
         current = list(_reference_file_state(path))
         if current[:4] != record["state"][:4]:
             raise ValueError(f"downstream artifact changed across owned rename: {path}")
         record["state"] = current
+        # 标准构建候选使用tss.bed等内部名称；同inode rename后同步正式basename，保原内容摘要。
+        payload["files"] = {path.name: record}
         atomic_write_json(receipt, payload)
 
 
@@ -132,7 +139,8 @@ def import_reference_binding(reference: Path, kind: str, *, root: Path | None = 
         payload = validate_reference_component(reference, kind, root=root)
     else:
         receipt = Path(str(artifact) + ".reference.json")
-        payload = validate_downstream_reference(reference, artifact, kind, annotation)
+        payload = (validate_tss_reference(reference, artifact, annotation) if kind == "tss" else
+                   validate_downstream_reference(reference, artifact, kind, annotation))
     records = {relative: _reference_file_record(receipt.parent / relative, record)
                for relative, record in payload["files"].items()}
     if artifact is not None and annotation is not None and annotation.is_file():
@@ -454,7 +462,7 @@ def build_downstream_references(
     begin_reference_build(reference, binding_input, annotation)
     tss_count = 0
     protein_coding_gene_count = 0
-    seen_intervals: set[tuple[str, int, int]] = set()
+    seen_genes: set[str] = set()
 
     try:
         with annotation.open("rt", encoding="utf-8") as source, tss_tmp.open(
@@ -496,6 +504,9 @@ def build_downstream_references(
                         "protein-coding GTF gene lacks gene_id on line "
                         f"{line_number}: {annotation}"
                     )
+                if gene_id in seen_genes:
+                    raise ValueError(f"duplicate protein-coding gene_id {gene_id!r}: {annotation}:{line_number}")
+                seen_genes.add(gene_id)
                 try:
                     gene_start = int(start_s) - 1
                     gene_end = int(end_s)
@@ -523,10 +534,7 @@ def build_downstream_references(
                         bin_start = bin_end - 20
                     if bin_start < 0 or bin_end > contig_lengths[chrom]:
                         continue
-                    interval = (chrom, bin_start, bin_end)
-                    if interval in seen_intervals:
-                        continue
-                    seen_intervals.add(interval)
+                    # 同一基因组区间可属于多个gene的不同offset；不能按坐标删掉这些观测。
                     region = f"{chrom}:{bin_start}-{bin_end}"
                     output.write(
                         f"{chrom}\t{bin_start}\t{bin_end}\t{region}\t.\t{strand}\t"

@@ -1,8 +1,8 @@
-# Alopex v17.9
+# Alopex v17.10
 
-正式源码以 Git tag `v17.9` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v17.10` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
-v17.9 完成本轮官方文档与失败边界审查，修复目录扫描错误被当作空目录的问题：样本刷新、源码身份和完整 FASTQ 复制遇到权限或 I/O 错误时明确失败，避免漏样本、漏文件或批准局部身份。包含此前全部 Notebook、绘图、Gini 与 Slurm 修复；科学算法及缓存身份保持不变。默认 jobs=60，TAPS 默认保留最终 BAM；显式配置优先。更新后重启 Notebook kernel，从首格重跑。验证范围见[发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.9/docs/benchmarks/config-audit.md#release-v179)。
+v17.10 修复 TSS 按基因组坐标去重而丢失重叠基因关联的问题，保留每个蛋白编码 gene/bin 的真实相对距离和权重；同时修复标准 reference 候选改为正式文件名后的绑定提交。两物种全部基因关联及原始坐标已核验，Single-CpG 文件字节不变，实际算法身份仅 TSS 改变。包含此前全部扫描完整性、Notebook 和绘图更新。默认 jobs=60，TAPS 默认保留最终 BAM；显式配置优先。更新后重启 Notebook kernel，从首格重跑。已有旧 TSS 参考的安装须按下述 reference 步骤从原 GTF 重建，不能补签旧 BED；本次受管安装同步已核验的参考，不重跑科学分析。验证范围见[发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/docs/benchmarks/config-audit.md#release-v1710)。
 
 内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
@@ -16,9 +16,9 @@ v17.9 完成本轮官方文档与失败边界审查，修复目录扫描错误�
 | 查阅内容 | 文档 |
 | --- | --- |
 | Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
-| 配置参数、QC 字段与计数口径 | [ANALYSIS_PARAMETERS](https://github.com/Felix-owo/Alopex_dev/blob/v17.9/docs/ANALYSIS_PARAMETERS.md) |
-| 流程与维护契约 | [pipeline.drawio](https://github.com/Felix-owo/Alopex_dev/blob/v17.9/docs/pipeline.drawio)、[AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/v17.9/AGENTS.md) |
-| 实测结果、验证范围与失败教训 | [BENCHMARKS](https://github.com/Felix-owo/Alopex_dev/blob/v17.9/docs/BENCHMARKS.md) |
+| 配置参数、QC 字段与计数口径 | [ANALYSIS_PARAMETERS](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/docs/ANALYSIS_PARAMETERS.md) |
+| 流程与维护契约 | [pipeline.drawio](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/docs/pipeline.drawio)、[AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/AGENTS.md) |
+| 实测结果、验证范围与失败教训 | [BENCHMARKS](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/docs/BENCHMARKS.md) |
 
 源码按职责定位：`core/alopex/`包含配置、输入、科学处理、交付与维护，其`downstream/`子包负责QC计算与绘图；`core/`下的Shell入口与Snakefile负责运行编排；顶层`downstream/`承载Notebook与操作说明。开发测试在`tests/`，详细契约和证据在`docs/`，私有 Alopex_dev 的完整发行包包含 docs、tests 和维护规范；公开 Alopex 的运行包才排除开发内容。
 
@@ -35,16 +35,16 @@ demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态�
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v17.9 Release](https://github.com/Felix-owo/Alopex_dev/releases/tag/v17.9) 下载 `Alopex-v17.9.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。Alopex_dev 完整发行包保留全部受版本控制的源码、固定资源、下游 Notebook、docs、tests 与维护规范。公开 Alopex 另发运行包，排除 docs、tests 和开发规范；Conda、生成参考、科学结果及未跟踪日志均不入包。
+从 [v17.10 Release](https://github.com/Felix-owo/Alopex_dev/releases/tag/v17.10) 下载 `Alopex-v17.10.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。Alopex_dev 完整发行包保留全部受版本控制的源码、固定资源、下游 Notebook、docs、tests 与维护规范。公开 Alopex 另发运行包，排除 docs、tests 和开发规范；Conda、生成参考、科学结果及未跟踪日志均不入包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v17.9.tar.gz
-cd Alopex-v17.9
+tar -xzf Alopex-v17.10.tar.gz
+cd Alopex-v17.10
 conda --version
 ```
 
-跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。运行快照会记录实际源码、环境和输入身份，实验及验收范围见 [发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.9/docs/benchmarks/config-audit.md#release-v179)。
+跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。运行快照会记录实际源码、环境和输入身份，实验及验收范围见 [发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/docs/benchmarks/config-audit.md#release-v1710)。
 
 | 平台 / 部署方式 | 要求 |
 | --- | --- |
@@ -280,7 +280,7 @@ Alopex 以 [GPL-3.0](LICENSE) 发布。
 开发仓 `.gitattributes` 不排除 docs/tests；公开仓单独用 `export-ignore` 固定运行发行内容。两者都使用 [Git 原生归档](https://git-scm.com/docs/git-archive) 重建，无独立打包脚本：
 
 ```bash
-git archive --format=tar.gz --prefix=Alopex-v17.9/ -o Alopex-v17.9.tar.gz v17.9
+git archive --format=tar.gz --prefix=Alopex-v17.10/ -o Alopex-v17.10.tar.gz v17.10
 ```
 
 源码 checkout 的当前文档结构见 [docs 导航](https://github.com/Felix-owo/Alopex_dev/blob/main/docs/README.md)，修改前按 [AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/main/AGENTS.md) 的任务清单读取详细契约。上文固定 tag 链接用于对应正式发行版的历史说明。

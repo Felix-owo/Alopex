@@ -34,6 +34,7 @@ from ..config import (
     load_project_config,
     reference_sequence_identity,
     validate_downstream_reference,
+    validate_tss_reference,
 )
 from ..delivery import load_run_manifest, load_run_snapshot
 from ..identity import PythonSourceGraph, capture_loaded_source_codes, assert_loaded_sources_current
@@ -1025,7 +1026,7 @@ def build_config(
             + "\n".join(f"  - {value}" for value in missing)
         )
     if cfg.tss_bed is not None:
-        validate_downstream_reference(sealed.reference_path, cfg.tss_bed, "tss")
+        validate_tss_reference(sealed.reference_path, cfg.tss_bed)
     return cfg
 
 
@@ -2394,24 +2395,28 @@ def _aggregate_tss_matrix(
     *,
     chunk_size: int = 4,
 ) -> pl.DataFrame:
-    pos_arr = pos_map.reindex(pd.Index(tss_mat.var_names, dtype=str)).to_numpy()
+    # 原生矩阵每个唯一基因组区间只计算一次；在稀疏观测上展开完整gene/bin关联。
+    regions = pd.Index(tss_mat.var_names, dtype=str)
+    features = pd.Series(np.arange(len(regions), dtype=np.int64),
+                         index=regions).reindex(pos_map.index)
+    known = features.notna().to_numpy()
+    membership = pl.DataFrame({
+        "feature_index": features[known].to_numpy(dtype=np.int64),
+        "position_coarse": pos_map.to_numpy(dtype=np.int32)[known],
+    })
     obs_names = np.asarray(tss_mat.obs_names, dtype=str)
     parts = []
     for matrix, start, end in tss_mat.chunked_X(chunk_size):
         coo = matrix.tocoo(copy=False)
-        mask = ~pd.isna(pos_arr[coo.col])
-        if not np.any(mask):
-            continue
         parts.append(
             pl.DataFrame(
                 {
-                    "Sample_ID": obs_names[start:end][coo.row[mask]],
-                    "position_coarse": pos_arr[coo.col[mask]].astype(
-                        np.int32, copy=False
-                    ),
-                    value_name: coo.data[mask].astype(np.float64, copy=False),
+                    "Sample_ID": obs_names[start:end][coo.row],
+                    "feature_index": coo.col.astype(np.int64, copy=False),
+                    value_name: coo.data.astype(np.float64, copy=False),
                 }
             )
+            .join(membership, on="feature_index", how="inner", maintain_order="left")
             .group_by(["Sample_ID", "position_coarse"])
             .agg(getattr(pl.col(value_name), agg_expr)())
         )
@@ -2436,8 +2441,8 @@ def _read_tss_offset_map(
     reference_ranges: Mapping[str, tuple[int, int]] | None = None,
 ) -> pd.Series:
     try:
-        pos_df = pd.read_csv(tss_bed_path, sep="\t", header=None, comment="#", usecols=[0, 1, 2, 8],
-                             converters={0: str})
+        pos_df = pd.read_csv(tss_bed_path, sep="\t", header=None, comment="#", usecols=[0, 1, 2, 6, 8],
+                             converters={0: str, 6: str})
     except (ValueError, pd.errors.ParserError) as exc:
         raise ValueError(f"TSS BED must have at least 9 columns: {tss_bed_path}") from exc
 
@@ -2461,8 +2466,10 @@ def _read_tss_offset_map(
         raise ValueError(f"TSS BED must contain nonempty nonnegative intervals: {tss_bed_path}")
     starts, ends = starts.astype(np.int64), ends.astype(np.int64)
     pos_df[1], pos_df[2] = starts, ends
-    if pos_df.duplicated(subset=[0, 1, 2]).any():
-        raise ValueError(f"TSS BED contains duplicate genomic intervals: {tss_bed_path}")
+    if pos_df[6].str.strip().eq("").any():
+        raise ValueError(f"TSS BED contains an empty gene_id: {tss_bed_path}")
+    if pos_df.duplicated(subset=[0, 1, 2, 6]).any():
+        raise ValueError(f"TSS BED contains duplicate gene/bin membership: {tss_bed_path}")
     if covered_positions is not None:
         if reference_ranges is None:
             raise ValueError("TSS covered positions require reference ranges")
@@ -2904,7 +2911,7 @@ def compute_tss_profile(
                 [chrom in indexed_lengths and int(span.split('-')[0]) < int(indexed_lengths[chrom])
                  for chrom, span in (region.rsplit(':', 1) for region in pos_series.index)]
             ]
-        tss_regions = pos_series.index.to_list()
+        tss_regions = sorted(pos_series.index.unique())
         if not tss_regions:
             prof = pd.DataFrame(columns=TSS_REQUIRED_COLUMNS)
             _atomic_write_csv(prof, out_csv, before_commit=prepare_tss_commit)
@@ -3180,7 +3187,7 @@ def _run_pipeline_impl(
     )
 
     if cfg.tss_bed is not None:
-        validate_downstream_reference(sealed.reference_path, cfg.tss_bed, "tss")
+        validate_tss_reference(sealed.reference_path, cfg.tss_bed)
     def assert_runtime_current():
         assert_loaded_sources_current(_LOADED_SOURCE_CODES)
         sealed.assert_current()

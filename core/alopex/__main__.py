@@ -20,6 +20,7 @@ from .config import (
     load_project_config,
     managed_alignment_contigs,
     validate_downstream_reference,
+    validate_tss_reference,
     validate_reference_component,
 )
 from .delivery import (
@@ -527,7 +528,7 @@ def main(argv: list[str] | None = None) -> int:
                     seal_downstream_reference_bindings(args.reference, args.annotation_gtf,
                         args.tss_bed, args.single_cpg_bed, args.build_input)
                 else:
-                    validate_downstream_reference(args.reference, args.tss_bed, "tss", args.annotation_gtf)
+                    validate_tss_reference(args.reference, args.tss_bed, args.annotation_gtf)
                     validate_downstream_reference(args.reference, args.single_cpg_bed, "single-cpg", args.annotation_gtf)
             elif args.action == "import":
                 import_reference_binding(args.reference, args.kind, root=args.root)

@@ -1610,6 +1610,15 @@ def validate_downstream_reference(reference: Path, artifact: Path, kind: str,
     return payload
 
 
+def validate_tss_reference(reference: Path, artifact: Path,
+                           annotation: Path | None = None) -> dict:
+    """核对TSS完整gene/bin语义；独立于Single-CpG，避免无关矩阵因TSS修复失效。"""
+    payload = validate_downstream_reference(reference, artifact, "tss", annotation)
+    if payload.get("bin_unit") != "protein_coding_gene":
+        raise ValueError(f"TSS reference lacks complete gene-bin membership; rebuild downstream references: {artifact}")
+    return payload
+
+
 def reference_identity(
     reference: str | Path,
     *,
