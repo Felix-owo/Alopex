@@ -512,6 +512,11 @@ prepare_local_executor() {
     cores="$("$DNA_PIPELINE_PYTHON" -c 'import sys; from alopex.runtime import effective_cpu_count; print(effective_cpu_count(int(sys.argv[1])))' "$cores")" || return $?
     mem_budget="$(dna_pipeline_local_mem_budget_mib)" || return $?
     DNA_PIPELINE_EXECUTOR_ARGS=(--executor local --cores "$cores" --resources mem_mb="$mem_budget" --default-resources "tmpdir=$DNA_PIPELINE_TMP_LITERAL")
+    # Doctor 的唯一 run-rule 为 MultiQC；复用当前控制进程，避免为小型路线
+    # 再启动 Python、重读整份 DAG 与共享文件系统依赖。原生命令仍按规则环境启动。
+    if [[ "$DNA_PIPELINE_DATA_MODE" == test && -n "$DNA_PIPELINE_DOCTOR_LOCAL_CORES" ]]; then
+        DNA_PIPELINE_EXECUTOR_ARGS+=(--force-use-threads)
+    fi
     DNA_PIPELINE_EXECUTOR_LABEL="local"
     DNA_PIPELINE_EXECUTOR_SUMMARY=("Cores: $cores" "Mem budget: ${mem_budget} MiB")
     export DNA_PIPELINE_LOCAL_CORES="$cores"

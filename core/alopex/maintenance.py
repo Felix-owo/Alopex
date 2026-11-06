@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,7 @@ from .io import (
     sha256_file,
 )
 from .paths import PIPELINE_ROOT
+from .runtime import effective_cpu_count
 
 
 def begin_reference_build(reference: Path, output: Path, annotation: Path | None = None) -> None:
@@ -259,17 +261,23 @@ def _check_installed_environment(prefix: Path, role: str, expected_subdir: str, 
 
     records: dict[str, dict[str, Any]] = {}
     native = False
-    for path in (prefix / "conda-meta").glob("*.json"):
-        record = json.loads(path.read_text(encoding="utf-8"))
-        name = record["name"]
-        if name in records:
-            raise ValueError(f"{role}: duplicate installed package {name}")
-        records[name] = record
-        subdir = record.get("subdir")
-        if subdir and subdir != "noarch":
-            if subdir != expected_subdir:
-                raise ValueError(f"{role}: installed package {name} has platform {subdir}")
-            native = True
+    # 包记录在共享文件系统上逐个同步读取会累积 I/O 等待；有界重叠读取，
+    # 按原枚举顺序消费全部记录，保留坏 JSON、重复包和未请求包的平台拒绝。
+    with ThreadPoolExecutor(max_workers=min(4, effective_cpu_count())) as reader:
+        loaded = reader.map(
+            lambda path: json.loads(path.read_text(encoding="utf-8")),
+            (prefix / "conda-meta").glob("*.json"),
+        )
+        for record in loaded:
+            name = record["name"]
+            if name in records:
+                raise ValueError(f"{role}: duplicate installed package {name}")
+            records[name] = record
+            subdir = record.get("subdir")
+            if subdir and subdir != "noarch":
+                if subdir != expected_subdir:
+                    raise ValueError(f"{role}: installed package {name} has platform {subdir}")
+                native = True
     if not native:
         raise ValueError(f"{role}: no native package records")
     section = envs_section(envs_path, role)
