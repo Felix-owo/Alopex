@@ -584,6 +584,61 @@ def _final_qc_histogram_bins(values, use_log):
     return edges, scale
 
 
+def _format_final_qc_xaxis(ax, edges, scale):
+    """对数轴按原始计数的十进数量级定位并标为 1En；log1p 另保留零刻度。"""
+    if scale == 'linear':
+        ax.set_xscale('linear')
+        ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
+        ax.ticklabel_format(style='plain', axis='x', useOffset=False)
+    else:
+        if scale == 'log':
+            ax.set_xscale('log')
+            transformed_limits = np.log10(edges[[0, -1]])
+            inverse = lambda x: np.power(10.0, x)
+        else:
+            ax.set_xscale('function', functions=(
+                lambda x: np.sign(x) * np.log1p(np.abs(x)),
+                lambda x: np.sign(x) * np.expm1(np.abs(x)),
+            ))
+            transformed_limits = np.sign(edges[[0, -1]]) * np.log1p(np.abs(edges[[0, -1]])) / np.log(10.0)
+            inverse = lambda x: np.sign(x) * np.expm1(np.abs(x) * np.log(10.0))
+        lower, upper = edges[0], edges[-1]
+        max_exponent = math.floor(math.log10(max(abs(lower), abs(upper))))
+        includes_zero = lower <= 0 <= upper
+        min_exponent = (min(1, max_exponent) if includes_zero else
+                        math.ceil(math.log10(min(abs(lower), abs(upper)))))
+        powers = np.power(10.0, np.arange(min_exponent, max_exponent + 1))
+
+        def visible_ticks(powers):
+            candidates = np.concatenate((-powers[::-1], [0.0], powers))
+            return candidates[(candidates >= lower) & (candidates <= upper)]
+
+        ticks = visible_ticks(powers)
+        if len(ticks) > 7:
+            stride = math.ceil((len(ticks) - int(includes_zero)) / (7 - int(includes_zero)))
+            ticks = visible_ticks(powers[::stride])
+        if not len(ticks):
+            # 窄范围内可能没有整数数量级；用范围中点显示一个真实数值，不能伪标为 1En。
+            ticks = inverse(np.array([np.mean(transformed_limits)]))
+
+        def format_tick(value, _):
+            if value == 0:
+                return '0'
+            exponent = math.floor(math.log10(abs(value)))
+            mantissa = value / 10.0 ** exponent
+            return f'{mantissa:.10g}E{exponent}'
+
+        ax.xaxis.set_major_locator(ticker.FixedLocator(ticks))
+        ax.xaxis.set_major_formatter(ticker.FuncFormatter(format_tick))
+        ax.xaxis.set_minor_locator(ticker.NullLocator())
+        ax.xaxis.set_minor_formatter(ticker.NullFormatter())
+    # 留白按实际横轴的显示空间计算，使零值柱和最大值处的曲线都完整落在图内。
+    transform = ax.xaxis.get_transform()
+    limits = transform.transform(edges[[0, -1]])
+    padding = 0.04 * (limits[1] - limits[0])
+    ax.set_xlim(transform.inverted().transform(limits + np.array([-padding, padding])))
+
+
 def _draw_final_qc_histogram(ax, counts, edges, scale, color, fill_alpha=0.32):
     transformed = (np.log10(edges) if scale == 'log' else
                    np.sign(edges) * np.log1p(np.abs(edges)) if scale == 'log1p' else edges)
@@ -599,19 +654,10 @@ def _draw_final_qc_histogram(ax, counts, edges, scale, color, fill_alpha=0.32):
     ax.stairs(counts, edges, fill=True, color=color, alpha=fill_alpha / 2, linewidth=0)
     ax.fill_between(curve_x, curve_y, color=color, alpha=fill_alpha, linewidth=0)
     ax.plot(curve_x, curve_y, color=color, linewidth=1.6)
-    if scale == 'log':
-        ax.set_xscale('log')
-    elif scale == 'log1p':
-        ax.set_xscale('function', functions=(
-            lambda x: np.sign(x) * np.log1p(np.abs(x)),
-            lambda x: np.sign(x) * np.expm1(np.abs(x)),
-        ))
-    if scale == 'log':
-        ax.xaxis.set_major_locator(ticker.LogLocator(base=10, subs=(1, 2, 5), numticks=7))
-        ax.xaxis.set_minor_formatter(ticker.NullFormatter())
-        ax.xaxis.set_major_formatter(ticker.FuncFormatter(
-            lambda x, _: f'{x / 1e6:g}M' if x >= 1e6 else f'{x / 1e3:g}K' if x >= 1e3 else f'{x:g}'
-        ))
+    _format_final_qc_xaxis(ax, edges, scale)
+    # dataLim 包含此前叠加的全部组；最高柱也要留出顶部空间，不能只按平滑峰设范围。
+    peak = max(1.0, ax.dataLim.ymax)
+    ax.set_ylim(-0.03 * peak, 1.20 * peak)
     ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
 
 
@@ -773,11 +819,6 @@ def plot_final_qc_dashboard(
                 ylabel='Counts',
             )
             add_panel_letter(ax, panel_label(i))
-            ax.set_xlim(bin_edges[0], bin_edges[-1])
-
-            if not use_log:
-                ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
-                ax.ticklabel_format(style='plain', axis='x')
 
         for j in range(len(valid_metrics), len(axes)):
             axes[j].axis('off')
@@ -858,12 +899,8 @@ def plot_final_qc_dashboard(
             xlabel=f"{display_name}{' (log scale)' if scale == 'log' else ' (log1p scale)' if scale == 'log1p' else ''}",
             ylabel='Counts',
         )
-        ax.set_xlim(bin_edges[0], bin_edges[-1])
         ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
         add_panel_letter(ax, panel_label(i))
-        if not use_log:
-            ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
-            ax.ticklabel_format(style='plain', axis='x')
 
     for j in range(len(clones), len(axes)):
         axes[j].axis('off')
