@@ -3074,7 +3074,6 @@ def _export_qc(
     df_qc: pd.DataFrame,
     pipeline_qc: pd.DataFrame,
     manifest_sample_ids: list[str],
-    empty_cpg_sample_ids: set[str],
     identity: Mapping[str, object],
     sealed: SealedQCContext,
     *, before_commit=None,
@@ -3082,6 +3081,14 @@ def _export_qc(
     assert_current = before_commit or sealed.assert_current
     with _qc_write_lock(paths.qc_results_dir):
         if not df_qc.empty:
+            missing_qc_info_columns = [
+                column for column in QC_INFO_COLUMNS if column not in df_qc.columns
+            ]
+            if missing_qc_info_columns:
+                raise ValueError(
+                    "DNAme QC information is missing column(s): "
+                    + ", ".join(missing_qc_info_columns)
+                )
             computed_columns = [
                 "Sample_ID",
                 "CloneID",
@@ -3090,16 +3097,9 @@ def _export_qc(
                 "Final_Pair_Yield%",
                 "Gini_Index",
             ]
-            missing_computed_columns = [
-                column for column in computed_columns if column not in df_qc.columns
-            ]
-            if missing_computed_columns:
-                raise ValueError(
-                    "Final QC computation is missing required field(s): "
-                    + ", ".join(missing_computed_columns)
-                )
             sample_id_values = df_qc["Sample_ID"].astype(str)
-            empty_cpg_mask = sample_id_values.isin(empty_cpg_sample_ids)
+            # Gini只定义于宿主主核覆盖；对照/线粒体/辅助序列有信号仍可无此分母。
+            primary_empty_mask = df_qc["Sample_Unique_CpG_Sites"].eq(0)
             umi_consensus_sample_ids = set(
                 pipeline_qc.loc[
                     pipeline_qc["dedup_policy"] == "per_cytosine_umi_consensus_hamming1",
@@ -3110,7 +3110,7 @@ def _export_qc(
                 values = pd.to_numeric(df_qc[column], errors="raise").to_numpy(dtype=float)
                 nan_mask = None
                 if column == "Gini_Index":
-                    nan_mask = empty_cpg_mask
+                    nan_mask = primary_empty_mask
                 elif column == "Duplicate_Pair_Rate%":
                     nan_mask = sample_id_values.isin(umi_consensus_sample_ids)
                 if (
@@ -3130,14 +3130,6 @@ def _export_qc(
             if clone_ids.isna().any() or clone_ids.eq("").any():
                 raise ValueError("Final QC output contains an empty CloneID")
 
-            missing_qc_info_columns = [
-                column for column in QC_INFO_COLUMNS if column not in df_qc.columns
-            ]
-            if missing_qc_info_columns:
-                raise ValueError(
-                    "DNAme QC information is missing column(s): "
-                    + ", ".join(missing_qc_info_columns)
-                )
             df_qc = df_qc[list(QC_INFO_COLUMNS)]
 
             df_qc = _require_exact_sample_ids(
@@ -3422,7 +3414,7 @@ def _run_pipeline_impl(
     _log("提交 QC 表和完成身份")
     _export_qc(
         paths, df_qc, pipeline_qc, manifest_sample_ids,
-        empty_cpg_sample_ids, identity, sealed, before_commit=assert_current,
+        identity, sealed, before_commit=assert_current,
     )
     dt = timer.stop("export")
     if dt is not None:
