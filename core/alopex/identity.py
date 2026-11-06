@@ -240,14 +240,6 @@ class PythonSourceGraph:
         return selected
 
 
-def python_source_dependencies(
-    roots: Sequence[str], *, source_roots: Sequence[Path] | None = None,
-    exclude: Sequence[str] = (),
-) -> dict[str, str]:
-    """沿真实本地导入收集限定名 AST；未知本地根/依赖失败，忽略注释与文档。"""
-    return PythonSourceGraph(source_roots).dependencies(roots, exclude)
-
-
 @lru_cache(maxsize=None)
 def scientific_code_identity(
     python: tuple[str, ...] = (), shell: tuple[str, ...] = (),

@@ -1,8 +1,8 @@
-# Alopex v16.12
+# Alopex v17.0
 
-正式源码以 Git tag `v16.12` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v17.0` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
-本版将项目工作、诊断与原子提交临时项统一到项目 `05_tmp/`；保留空间检查、独占清理与原子提交，不自动选择节点临时盘。
+v17.0 清理无生产消费者的源码身份转发函数与旧 Python API 回退，使用现有受管 Python 3.13/3.14。升级后 CpG 统计缓存按真实传递源码身份正常重建；Raw、Gini、TSS 与 Single 的算法身份不变。审查与回归范围见[发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.0/docs/benchmarks/structure-refactor.md#release-v170)。
 
 内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
@@ -32,12 +32,12 @@ demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态�
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v16.12 Release](https://github.com/Felix-owo/Alopex/releases/tag/v16.12) 下载 `Alopex-v16.12.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
+从 [v17.0 Release](https://github.com/Felix-owo/Alopex/releases/tag/v17.0) 下载 `Alopex-v17.0.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v16.12.tar.gz
-cd Alopex-v16.12
+tar -xzf Alopex-v17.0.tar.gz
+cd Alopex-v17.0
 conda --version
 ```
 
@@ -204,7 +204,7 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 
 ## 6. 运行与恢复
 
-科学阶段临时数据固定写入当前项目 `05_tmp/`，每个作业使用独占随机子目录并只清理自身目录。启动前检查预计磁盘需求及10%余量，空间不足直接失败，不自动切换到节点 `/tmp`、`/var/tmp` 或外部 `TMPDIR`。该检查不预留跨作业容量，也不保证共享存储或用户配额永不耗尽。可恢复的跨节点工件保留在 `02_work/`。升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。详见[调度参数](https://github.com/Felix-owo/Alopex_dev/blob/v16.12/docs/ANALYSIS_PARAMETERS.md)。
+科学阶段临时数据固定写入当前项目 `05_tmp/`，每个作业使用独占随机子目录并只清理自身目录。启动前检查预计磁盘需求及10%余量，空间不足直接失败，不自动切换到节点 `/tmp`、`/var/tmp` 或外部 `TMPDIR`。该检查不预留跨作业容量，也不保证共享存储或用户配额永不耗尽。可恢复的跨节点工件保留在 `02_work/`。升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。详见[调度参数](https://github.com/Felix-owo/Alopex_dev/blob/v17.0/docs/ANALYSIS_PARAMETERS.md)。
 
 ```bash
 ./run_pipeline.sh --dry-run

@@ -18,7 +18,7 @@ def effective_cpu_count(requested: int = 0) -> int:
             limits.append(max(1, len(os.sched_getaffinity(0))))
         except OSError:
             pass
-    process_count = getattr(os, "process_cpu_count", lambda: None)()
+    process_count = os.process_cpu_count()
     if process_count:
         limits.append(process_count)
     for name in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
