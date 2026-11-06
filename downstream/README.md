@@ -24,6 +24,8 @@
 | `TSS_BED=None` | 自动使用当前物种的 TSS reference；外部 BED 须与 sealed reference 使用同一 genome build |
 | `SKIP_TSS=False` | 确实无需 TSS 时设为 `True`；不能同时指定外部 `TSS_BED` |
 
+首格只负责参数、源码导入和路径确认；后续计算与绘图分别调用 `qc`、`plotting` 模块。显式项目缺少 manifest 时立即报错，不借用当前目录的其他项目定位 Pipeline。更换 Pipeline 或更新源码后须重启 kernel，从首格重跑。
+
 ### CLI
 
 仅计算 QC 可直接运行 Processor，之后再打开 Notebook 绘图。CLI 不生成 `SingleCpG_Adata.h5ad`。
