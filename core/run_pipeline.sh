@@ -568,6 +568,8 @@ prepare_slurm_executor() {
         logdir="$DNA_PIPELINE_PROJECT_DIR/04_logs/slurm"
     fi
     mkdir -p "$logdir"
+    # 插件会对Path设置展开环境变量；传相对项目路径，保留根目录中的字面$字符。
+    logdir="${logdir#"$DNA_PIPELINE_PROJECT_DIR"/}"
     jobs="$CFG_SLURM_JOBS"; controller_cores="$CFG_SLURM_CONTROLLER_CORES"
     account="$CFG_SLURM_ACCOUNT"; partition="$CFG_SLURM_PARTITION"; qos="$CFG_SLURM_QOS"
     [[ "$jobs" =~ ^[1-9][0-9]*$ && "$controller_cores" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: invalid Slurm/runtime numeric settings." >&2; return 2; }
@@ -577,7 +579,8 @@ prepare_slurm_executor() {
     default_resources=("tmpdir=$DNA_PIPELINE_TMP_LITERAL")
     if [[ -n "$partition" ]]; then default_resources+=("slurm_partition=$CFG_SLURM_PARTITION_LITERAL"); fi
     if [[ -n "$account" ]]; then default_resources+=("slurm_account=$CFG_SLURM_ACCOUNT_LITERAL"); fi
-    plugin_args=(--slurm-jobname-prefix "Alopex_${project_hash}" --slurm-logdir "$logdir" --slurm-delete-logfiles-older-than 0 --slurm-status-command squeue)
+    # 经原生脚本stdin传worker命令，避免--wrap外层双引号在提交端展开路径中的$或反引号。
+    plugin_args=(--slurm-jobname-prefix "Alopex_${project_hash}" --slurm-logdir "$logdir" --slurm-delete-logfiles-older-than 0 --slurm-status-command squeue --slurm-pass-command-as-script)
     if [[ -n "${SBATCH_EXCLUDE:-}" ]]; then plugin_args+=(--slurm-exclude-failed-nodes "$SBATCH_EXCLUDE"); fi
     if [[ -z "$account" ]]; then plugin_args+=(--slurm-no-account); fi
     if [[ -n "$qos" ]]; then plugin_args+=(--slurm-qos "$qos"); fi

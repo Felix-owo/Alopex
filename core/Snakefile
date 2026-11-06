@@ -73,6 +73,7 @@ from alopex.runtime import (
     droplet_resource_request,
     disable_snakemake_output_mtime_gate,
     honor_slurm_no_account,
+    preserve_executor_cli_paths,
     resource_request,
     resource_threads,
     scratch_mb,
@@ -81,6 +82,7 @@ from alopex.runtime import (
 from alopex.identity import PythonSourceGraph, scientific_code_identity
 
 disable_snakemake_output_mtime_gate()
+preserve_executor_cli_paths()
 
 PIPELINE_ROOT = Path(workflow.basedir).parent.resolve()
 # 同一次DAG构建共用源码解析视图；不跨进程或按mtime复用旧源码。

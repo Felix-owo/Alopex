@@ -94,6 +94,24 @@ def honor_slurm_no_account(workflow: object) -> None:
     Executor.get_account_arg = account_arg
 
 
+def preserve_executor_cli_paths() -> None:
+    """需shell引用的绝对路径使用原生Path序列化，保留换行、反斜线与命令字符。"""
+    import snakemake_interface_executor_plugins.utils as executor_utils
+
+    current = executor_utils.format_cli_value
+    if getattr(current, "_alopex_literal_paths", False):
+        return
+
+    def format_value(value, quote=False, base64_encode=False):
+        # 路径已经过Alopex定位；只校正传输类型，不resolve或改变科学文件身份。
+        if isinstance(value, str) and value.startswith("/") and quote and not base64_encode:
+            value = Path(value)
+        return current(value, quote=quote, base64_encode=base64_encode)
+
+    setattr(format_value, "_alopex_literal_paths", True)
+    executor_utils.format_cli_value = format_value
+
+
 STATIC_POLICY = "static_reads"
 
 
