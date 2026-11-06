@@ -58,6 +58,7 @@ from .io import (
     atomic_write_bytes,
     _read_json,
     atomic_write_json,
+    iter_tree_files,
     render_tsv,
     sha256_bytes,
     sha256_file,
@@ -113,10 +114,10 @@ def _iter_fastq_inventory(
     raw_names: dict[str, str] = {}
     ignored_count = 0
     ignored_preview: list[str] = []
-    for path in sorted(dir_raw.rglob("*")):
-        if not path.is_file():
-            continue
+    for path in sorted(iter_tree_files(dir_raw)):
         if not path.name.lower().endswith(FASTQ_SUFFIXES):
+            continue
+        if not stat.S_ISREG(path.stat().st_mode):
             continue
         if planned_renames:
             path = planned_renames.get(path, path)
@@ -980,7 +981,7 @@ def demux_source_revision(source_root: str | Path, *, calling_only: bool = False
         raise FileNotFoundError(
             "missing Rust source identity file(s): " + ", ".join(map(str, missing))
         )
-    rust_sources = sorted((root / "src").rglob("*.rs"))
+    rust_sources = sorted(path for path in iter_tree_files(root / "src") if path.name.endswith(".rs"))
     # 新增共享源码默认进入两种身份，不以固定文件清单漏掉实际依赖。
     output_only = {"src/output.rs", "src/droplet/replay.rs"}
     paths.remove(main_rs)
@@ -1428,7 +1429,7 @@ def copy_demux_fastq(source: str | Path, destination: str | Path, workers: int =
     if any(destination.iterdir()):
         raise ValueError("FASTQ materialization destination must be empty")
     paths = []
-    for path in source.rglob("*"):
+    for path in iter_tree_files(source):
         info = path.lstat()
         if stat.S_ISDIR(info.st_mode):
             continue

@@ -68,6 +68,7 @@ from .io import (
     atomic_write_bytes,
     atomic_write_json,
     canonical_json_bytes,
+    iter_tree_files,
     sha256_bytes,
     sha256_file,
     stable_file_identity,
@@ -1071,12 +1072,14 @@ def _pipeline_source_identity(root: Path) -> Mapping[str, object]:
     records: list[dict[str, object]] = []
     for top in _SOURCE_ROOTS:
         base = root / top
-        if not base.exists():
+        try:
+            base.stat()
+        except FileNotFoundError:
             continue
-        for path in sorted(base.rglob("*")):
-            if not path.is_file() or any(part in _SOURCE_EXCLUDED_PARTS for part in path.relative_to(base).parts):
-                continue
+        for path in sorted(iter_tree_files(base, exclude_names=_SOURCE_EXCLUDED_PARTS)):
             if path.suffix.lower() not in _SOURCE_SUFFIXES and path.name != "Snakefile" and path.parent != root / "core/reference":
+                continue
+            if not stat.S_ISREG(path.stat().st_mode):
                 continue
             identity = stable_file_identity(path)
             records.append({
@@ -1085,7 +1088,11 @@ def _pipeline_source_identity(root: Path) -> Mapping[str, object]:
                 "sha256": identity["sha256"],
             })
     design = root / DROPLET_DESIGN_RESOURCE
-    if design.is_file():
+    try:
+        design_stat = design.stat()
+    except FileNotFoundError:
+        design_stat = None
+    if design_stat is not None and stat.S_ISREG(design_stat.st_mode):
         identity = stable_file_identity(design)
         records.append({"path": DROPLET_DESIGN_RESOURCE, "size_bytes": identity["size_bytes"],
                         "sha256": identity["sha256"]})

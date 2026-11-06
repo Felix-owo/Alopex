@@ -15,8 +15,31 @@ import errno
 import shutil
 import subprocess
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from pathlib import Path
+
+
+def iter_tree_files(root: Path, *, exclude_names: Collection[str] = ()) -> Iterator[Path]:
+    """枚举非目录成员，不沿目录链接递归；扫描失败须阻止清单被当作完整结果。
+
+    rglob会吞掉目录扫描错误；身份、输入和完整复制不能把不可读分支当作空目录。
+    排除生成物在进入目录前生效，目录句柄在返回成员前关闭。
+    """
+    pending = [Path(root)]
+    excluded = frozenset(exclude_names)
+    while pending:
+        directory = pending.pop()
+        members = []
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name in excluded:
+                    continue
+                path = Path(entry.path)
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                else:
+                    members.append(path)
+        yield from members
 
 
 def sha256_bytes(data: bytes) -> str:
