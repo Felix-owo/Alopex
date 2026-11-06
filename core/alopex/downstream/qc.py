@@ -2838,12 +2838,12 @@ def compute_tss_profile(
             raise ValueError("Computed empty TSS profile violates the output contract")
         return validated
 
+    temporary_parent = project_temporary_parent(out_csv)
+
     def make_and_aggregate(
         value_type: str, summary_type: str, value_name: str, aggregate: str
     ) -> pl.DataFrame:
-        temporary = out_csv.with_name(
-            f".tss-{value_type}.{os.getpid()}.{time.time_ns()}.h5ad"
-        )
+        temporary = temporary_parent / f".tss-{value_type}.{os.getpid()}.{time.time_ns()}.h5ad"
         matrix = None
         try:
             matrix = snap.pp.make_peak_matrix(
@@ -2868,7 +2868,7 @@ def compute_tss_profile(
             finally:
                 temporary.unlink(missing_ok=True)
 
-    subset_file = out_csv.with_name(f".tss-cells.{os.getpid()}.{time.time_ns()}.h5ad")
+    subset_file = temporary_parent / f".tss-cells.{os.getpid()}.{time.time_ns()}.h5ad"
     selected_raw = None
     try:
         raw_ids = [str(value) for value in raw_adata.obs_names]
@@ -3497,20 +3497,23 @@ def main() -> None:
 
 
 def load_cpg_density_frame(
-    project_dir: str | Path,
-    qc_info_path: Path,
-    composition_cache_path: Path,
-    *,
-    sealed_context: SealedQCContext | None = None,
+    paths: NotebookPaths,
 ) -> pd.DataFrame:
     """从原始来源组装 CpG_Density 输入帧，不依赖 20 列 QC 表之外的衍生列。
 
     pair 计数来自 sealed final manifest（build_qc_records 唯一加载链），
     Sample_CpG_Signals 来自 composition cache，CloneID 与 unique CpG sites
-    来自当前 QC 表；三个来源的样本集合必须与 QC 表完全一致。
+    来自当前 QC 表；三个来源须属于 Notebook 捕获的同一次已完成 QC。
     """
+    sealed = load_sealed_qc_context(paths.project_dir, expected_pipeline_root=paths.pipeline_root)
+    if sealed.delivery_id != paths.delivery_id:
+        raise ValueError("Delivery changed; rerun the Notebook from its first cell")
+    run_paths = build_paths(paths.project_dir)
+    if run_paths.qc_results_dir != paths.qc_results_dir:
+        raise ValueError("Notebook QC directory differs from the current delivery")
+    assert_qc_current = _require_completed_qc(run_paths, sealed).assert_current
     qc = pd.read_csv(
-        qc_info_path, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
+        run_paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
         float_precision="round_trip",
     )
     required = ("Sample_ID", "CloneID", "Sample_Unique_CpG_Sites")
@@ -3521,7 +3524,7 @@ def load_cpg_density_frame(
         )
     qc["Sample_ID"] = qc["Sample_ID"].astype(str).str.strip()
 
-    records = build_qc_records(project_dir, sealed_context=sealed_context)
+    records = build_qc_records(paths.project_dir, sealed_context=sealed)
     pairs = pd.DataFrame(
         {
             "Sample_ID": [str(record["sample_id"]) for record in records],
@@ -3534,6 +3537,7 @@ def load_cpg_density_frame(
         }
     )
 
+    composition_cache_path = run_paths.composition_cache
     if not composition_cache_path.is_file():
         raise FileNotFoundError(
             f"CpG composition cache is absent: {composition_cache_path}"
@@ -3569,6 +3573,7 @@ def load_cpg_density_frame(
         "Sample_CpG_Signals",
     ):
         frame[column] = pd.to_numeric(frame[column], errors="raise")
+    assert_qc_current()
     return frame
 
 
@@ -3910,6 +3915,25 @@ def load_notebook_qc_frame(
         clone_color_map = generate_clone_color_map(unique_clones)
     assert_qc_current()
     return df_qc, clone_color_map
+
+
+def load_notebook_tss_frame(paths: NotebookPaths) -> pd.DataFrame:
+    """读取当前已完成 QC 的 TSS 缓存，独立重跑绘图单元也须核对交付。"""
+    sealed = load_sealed_qc_context(paths.project_dir, expected_pipeline_root=paths.pipeline_root)
+    if sealed.delivery_id != paths.delivery_id:
+        raise ValueError("Delivery changed; rerun the Notebook from its first cell")
+    run_paths = build_paths(paths.project_dir)
+    if run_paths.qc_results_dir != paths.qc_results_dir:
+        raise ValueError("Notebook QC directory differs from the current delivery")
+    completed = _require_completed_qc(run_paths, sealed)
+    frame = _validated_tss_cache(
+        run_paths.tss_info, set(completed.sample_ids),
+        set(completed.raw_schema["empty_cpg_sample_ids"]),
+    )
+    if frame is None:
+        raise ValueError("TSS cache is incomplete or invalid; rerun the QC Processor")
+    completed.assert_current()
+    return frame
 
 
 if __name__ == "__main__":

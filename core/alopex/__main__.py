@@ -25,6 +25,7 @@ from .config import (
 from .delivery import (
     create_run_snapshot,
     project_status,
+    run_multiqc_report,
     write_delivery_ready,
     write_final_sample_manifest,
 )
@@ -75,6 +76,7 @@ from .runtime import (
 from .science import (
     _count_bam_pairs,
     call_droplet_cpg,
+    emit_biscuit_cpg,
     emit_rastair_cpg,
     read_pileup_variant_count,
     run_bismark_pair_split,
@@ -91,6 +93,12 @@ from .science import (
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m alopex", description="Alopex 核心模块内部 CLI。")
     commands = parser.add_subparsers(dest="command", required=True)
+
+    multiqc_report = commands.add_parser("multiqc-report", help="生成配置隔离的 Pipeline MultiQC 报告。")
+    multiqc_report.add_argument("--file-list", type=Path, required=True, help="Pipeline 生成的 JSON 源路径清单。")
+    multiqc_report.add_argument("--config", type=Path, required=True)
+    multiqc_report.add_argument("--output-dir", type=Path, required=True)
+    multiqc_report.add_argument("--comment", default="")
 
 
     init = commands.add_parser("init-project", help="初始化项目骨架（目录/模板/launcher symlink）。")
@@ -132,6 +140,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     pileup_count = commands.add_parser("pileup-variant-count", help="校验当前细胞的 BISCUIT pileup 计数。")
     pileup_count.add_argument("--stats", required=True)
     pileup_count.add_argument("--sample", required=True)
+
+    biscuit_cpg = commands.add_parser("biscuit-cpg", help="从原生 SP/CV 输出 BISCUIT CpG 整数计数。")
+    biscuit_cpg.add_argument("--vcf", required=True)
 
     taps_insert = commands.add_parser("taps-bwa-insert-model", help="推断 TAPS BWA 插入分布并保留长片段。")
     for field in ("r1", "r2", "bwa", "prefix", "scratch"):
@@ -310,7 +321,9 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command
     try:
 
-        if command == "init-project":
+        if command == "multiqc-report":
+            return run_multiqc_report(args.file_list, args.config, args.output_dir, args.comment)
+        elif command == "init-project":
             project = init_project_directory(args.path, args.pipeline_root)
             print(f"Initialized Alopex project: {project}")
             print("Next:")
@@ -381,6 +394,8 @@ def main(argv: list[str] | None = None) -> int:
 
         elif command == "pileup-variant-count":
             print(read_pileup_variant_count(args.stats, args.sample))
+        elif command == "biscuit-cpg":
+            emit_biscuit_cpg(args.vcf, sys.stdout)
         elif command == "call-droplet-cpg":
             call_droplet_cpg(args.bam, args.reference, args.coverage, args.qc, args.mbias, sample=args.sample, scratch=args.scratch, samtools=args.samtools, threads=args.threads)
         elif command == "call-droplet-cells":

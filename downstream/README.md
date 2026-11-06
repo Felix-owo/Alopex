@@ -79,7 +79,7 @@ PY_KERNEL
 
 ## 指标与筛选
 
-标准分析范围为 hg38 的 chr1–22/X/Y、mm10 的 chr1–19/X/Y；辅助／decoy 参与比对，不进入宿主 nCG、甲基化率、Gini、TSS 和最终 Single-CpG 矩阵。TSS／single-CpG BED 必须携带与当前参考匹配的 `.reference.json`，不得把旧目录套到新交付。此策略自 v16.2 发布。
+标准分析范围为 hg38 的 chr1–22/X/Y、mm10 的 chr1–19/X/Y；辅助／decoy 参与比对，不进入宿主 nCG、甲基化率、Gini、TSS 和最终 Single-CpG 矩阵。TSS／single-CpG BED 必须携带与当前参考匹配的 `.reference.json`，不得把旧目录套到新交付。来源与绑定见源码 checkout 的 `docs/ANALYSIS_PARAMETERS.md`「标准 reference 与分析范围」；此策略自 v16.2 发布。
 
 读图时先区分位点均值、coverage 比例和 read-pair 指标。身份列按字符串保留前导零及合法 `NA/nan/None`，数值缺失保持 NaN；观测零值不能当作缺失。完整定义见[QC 字段][qc-fields]和[生物学分母][denominators]。
 
@@ -109,6 +109,7 @@ Notebook 默认同时要求 lambda methylation `<10%`、pUC19 methylation `>90%`
 | 拟合与 `CpG_Density.pdf` | 散点拟合线与斜率汇总共用联合有效样本、异常点筛选及 `min_slope_ratio_change`；过原点 `slope=sum(x*y)/sum(x*x)`，单位 sites/input pair，不能拟合则 N/A |
 | density 输入 | QC 身份/sites、sealed final manifest pairs、composition cache host signals 的样本集合须完全一致，不静默取交集 |
 | 其他图 | `WGBS_QC_Panel.pdf`、`Plate_View_Native_Mapping%.pdf`、`CpG_Signal_Composition.pdf`、可选 `TSS_Profile.pdf`、`Batch_Effect_PCA.pdf` |
+| PCA | 使用所选QC特征均有效的细胞，保留真实0值，缺失甲基化率不补成0%；图注列出纳入/输入细胞数及排除数。空输入、特征不足、少于2个完整细胞或无变异则跳过并清掉明确指定位置的旧PCA图；QC表及其他图的细胞集合不受影响 |
 
 ## 保存供下游复用的 single-CpG 矩阵
 
@@ -130,23 +131,6 @@ adata.close()
 | 后续注释 | 只读对象不能回填标签；使用独立可写副本或合适大小的内存子集。MethylTree 分箱后仍按细胞 ID 对齐 `obs` |
 
 固定计算参数见[single-CpG 参数][single-params]；矩阵的 `uns` 记录实际坐标 base、区间约定与来源表示。
-
-### QC 字段
-
-`DNAme_QC_Information.csv`按下表分组顺序写20列；完整pair funnel、policy/unit及更细的诊断保留在sealed final manifest与MultiQC。
-身份列按字符串读写，保留前导零及合法`NA/nan/None`；数值缺失保持NaN，CSV按round-trip精度复用。
-
-| 列（按写出顺序） | 定义与单位 |
-| --- | --- |
-| `Sample_ID`、`CloneID`、`PlateID` | sealed细胞/克隆/孔板身份；不能用行号或静默交集替换 |
-| `Native_Mapping%` | backend原生mapping百分比，保留其原生单位与分母，不当作跨backend同义指标 |
-| `Sample_Unique_CpG_Sites`、`Sample_Meth_CpG_Rate%` | 宿主已覆盖canonical胞嘧啶位点数及逐位点甲基化率均值 |
-| `Lambda_Unique_CpG_Sites`、`Lambda_Meth_CpG_Rate%` | 精确lambda contig的同类位点数及均值，非合并reads比率 |
-| `pUC19_Unique_CpG_Sites`、`pUC19_Meth_CpG_Rate%` | 精确pUC19 contig的同类位点数及均值 |
-| `Non_CpG_Methylation%`、`High_CpH_Flag_Rate%` | 各backend定义的non-CpG统计及flagged/assessed比例；TAPS前者为判链宿主CHG/CHH转换率，后者不适用为NaN |
-| `Signal_Host_Rate%`、`Signal_Lambda_Rate%`、`Signal_pUC19_Rate%`、`Signal_mtDNA_Rate%` | 各类canonical CpG coverage(m+u)/全部contig总coverage×100；其他contig仍进入总分母 |
-| `Gini_Index` | canonical CpG coverage在有覆盖固定宽bin的Gini；限主核染色体，含chrY、排除chrM及辅助序列；无主核CpG覆盖为缺失 |
-| `Duplicate_Pair_Rate%`、`Trim_Retention%`、`Final_Pair_Yield%` | 依次为duplicate/backend accepted、trimmed/Cutadapt input、final retained/Cutadapt input的百分比；Droplet不以分子数反推pair去重率，该列为NaN |
 
 ## TSS profile
 
@@ -177,7 +161,7 @@ Notebook 第二格的 `TSS_SAMPLE_FRACTION`、`TSS_SAMPLE_SEED` 控制抽检，�
 | 输入或参考在计算期间变化 | 确认文件稳定后重跑；失败时不提交完成身份，未完成矩阵不能作为有效缓存使用 |
 | CpG 格式错误或缓存计数矛盾 | 按错误定位 canonical CpG 输入并重算；不把格式失败当作合法空细胞，也不手改缓存绕过校验；输入格式与守恒见[下游契约][qc-contract] |
 
-模块更新后，结束旧写任务并重启 kernel。最终 QC 提交中断后须重跑 Processor 恢复，再继续消费结果。缓存与提交的完整规则见[下游契约][qc-contract]。
+模块更新后，结束旧写任务并重启 kernel。最终 QC 提交中断后须重跑 Processor 恢复，再继续消费结果。缓存与提交的完整规则见[下游契约][qc-contract]；实测与验证范围见[BENCHMARKS][benchmarks]。
 
 ## 关联 RNA_DARLIN 结果
 
@@ -195,11 +179,12 @@ Cabernet、TAPS、Droplet 均在 DNA manifest 的可选 `rna_sample` 填 RNA_DAR
 
 `Integrated_QC_Information.csv` 保留 RNA 身份，RNA 13列与 DNA 20列的独立 QC schema 不变；RNA 下游记录实际关联和输入哈希。完整关联边界见[Manifest 契约][manifest-contract]与[Droplet 关联契约][droplet-contract]。
 
-[qc-fields]: #qc-字段
-[denominators]: #指标与筛选
-[recompute]: #缓存与强制重算
-[single-params]: #保存供下游复用的-single-cpg-矩阵
-[single-contract]: #保存供下游复用的-single-cpg-矩阵
-[qc-contract]: #缓存与强制重算
-[manifest-contract]: #关联-rna_darlin-结果
-[droplet-contract]: #关联-rna_darlin-结果
+[qc-fields]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/ANALYSIS_PARAMETERS.md#下游-qc-字段
+[denominators]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/ANALYSIS_PARAMETERS.md#生物学分母与零值解释
+[recompute]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/ANALYSIS_PARAMETERS.md#下游重算与-tss-抽检控制
+[single-params]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/ANALYSIS_PARAMETERS.md#notebook-末尾-single-cpg-矩阵
+[single-contract]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/contracts/downstream.md#83-single-cpg-reference
+[qc-contract]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/contracts/downstream.md#9-qc-与-multiqc
+[manifest-contract]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/contracts/inputs.md#manifest-与-rna-关联
+[droplet-contract]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/contracts/droplet.md#droplet-的配套-rna-独立关联
+[benchmarks]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/BENCHMARKS.md

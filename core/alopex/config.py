@@ -188,8 +188,10 @@ properties:
     - keep_final_bam
     properties:
       keep_final_bam:
-        description: true 保留 02_work/ 最终 BAM；false 在持锁成功发布后回收活跃 cell 的最终 BAM/索引，SRD RNA BAM 除外；默认 false。
-        type: boolean
+        description: true 保留 02_work/ 最终 BAM；false 在持锁成功发布后回收最终 BAM/索引，SRD RNA BAM 除外；null/省略按协议默认，TAPS 为 true，其余为 false。
+        type:
+        - boolean
+        - 'null'
   cabernet:
     $ref: '#/$defs/plate_protocol'
   srd:
@@ -366,10 +368,10 @@ runtime:
   latency_wait_seconds: 120       # snakemake --latency-wait：等待输出文件在文件系统可见的秒数
 
 retention:
-  keep_final_bam: false          # true 保留最终 BAM/索引；false 在持锁成功发布后回收，SRD RNA BAM 除外
+  keep_final_bam: null           # null 按协议默认：TAPS=true，其余=false；显式 true/false 覆盖，SRD RNA BAM 独立保留
 
 slurm:
-  jobs: 30                        # SLURM 全局并发上限，含 Droplet 全库 calling、demux 块和后续 cell 作业
+  jobs: 60                        # SLURM 全局并发上限，含 Droplet 全库 calling、demux 块和后续 cell 作业
   controller_cores: 2             # Snakemake controller 本地进程的 CPU 数（--local-cores）
   account: null                  # 仅在集群要求时填写账户
   partition: null                 # 提交作业的默认分区；null 沿用集群默认分区
@@ -418,14 +420,14 @@ CONFIG_SECTION_DEFAULTS: dict[str, dict[str, object]] = {
         "latency_wait_seconds": 120,
     },
     "slurm": {
-        "jobs": 30,
+        "jobs": 60,
         "controller_cores": 2,
         "account": None,
         "partition": None,
         "qos": "huge",
     },
     "retention": {
-        "keep_final_bam": False,
+        "keep_final_bam": None,
     },
     "common": {
         "demux": {
@@ -482,6 +484,9 @@ def apply_config_defaults(config: dict[str, object]) -> dict[str, object]:
                 current[key] = copy.deepcopy(current[key])
                 merge(current[key], value, f"{path}.{key}" if path else key)
     merge(config, CONFIG_SECTION_DEFAULTS, "")
+    # 模板用 null 保留协议默认选择；密封/执行配置仍只消费已求解的布尔值。
+    if config["retention"]["keep_final_bam"] is None:
+        config["retention"]["keep_final_bam"] = config["analysis"].get("protocol") == "taps"
     for protocol in ("cabernet", "srd", "taps", "droplet"):
         for key, value in config[protocol].items():
             if key in ("demux", "high_cph", "bismark", "biscuit") and not isinstance(value, dict):

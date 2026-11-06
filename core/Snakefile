@@ -119,7 +119,6 @@ DUPSIFTER_BINARY = _rule_executable("dupsifter")
 SAMTOOLS = _rule_executable("samtools")
 BGZIP = _rule_executable("bgzip")
 TABIX = _rule_executable("tabix")
-MULTIQC = _rule_executable("multiqc")
 ZSTD = _rule_executable("zstd")
 GZIP = _rule_executable("gzip")
 BISMARK = _rule_executable("bismark")
@@ -850,24 +849,26 @@ checkpoint demux:
 
         restore_demux_path() {{
             target="$1"
-            backup="$(demux_backup_path "$target")"
+            backup="$(demux_backup_path "$target")" || return $?
             absent="${{backup}}.absent"
             if [[ -e "$backup" || -L "$backup" ]]; then
-                rm -rf -- "$target"
-                mv "$backup" "$target"
+                rm -rf -- "$target" || return $?
+                mv "$backup" "$target" || return $?
             elif [[ -e "$absent" ]]; then
-                rm -rf -- "$target"
-                rm -f -- "$absent"
+                rm -rf -- "$target" || return $?
+                rm -f -- "$absent" || return $?
             fi
         }}
 
         rollback_demux_publish() {{
-            restore_demux_path "$dna_final"
-            restore_demux_path "$rna_final"
-            restore_demux_path {output.json_report:q}
-            restore_demux_path {output.json_mqc:q}
-            restore_demux_path {output.manifest:q}
-            restore_demux_path "$completion_final"
+            # EXIT条件调用会关闭隐式errexit；任一成员恢复失败都须保留备份，
+            # 不能继续移动目录或恢复completion来批准未完整恢复的文件组。
+            restore_demux_path "$dna_final" || return $?
+            restore_demux_path "$rna_final" || return $?
+            restore_demux_path {output.json_report:q} || return $?
+            restore_demux_path {output.json_mqc:q} || return $?
+            restore_demux_path {output.manifest:q} || return $?
+            restore_demux_path "$completion_final" || return $?
         }}
 
         discard_demux_backup() {{
@@ -894,7 +895,13 @@ checkpoint demux:
         cleanup_demux_tmp() {{
             exit_status=$?
             if (( publish_in_progress == 1 )); then
-                rollback_demux_publish || true
+                if rollback_demux_publish; then
+                    :
+                else
+                    recovery_status=$?
+                    printf 'ERROR: demux rollback failed (rc=%s); recovery state retained at %s\n' "$recovery_status" "$recovery_dir" >&2
+                    if (( exit_status == 0 )); then exit_status=$recovery_status; fi
+                fi
             fi
             rm -rf -- "$dna_tmp" "$rna_tmp"
             rm -f -- "$report_tmp" "$mqc_tmp" "$manifest_tmp" "$completion_tmp"
@@ -1118,7 +1125,7 @@ if METHYLATION_BACKEND == "biscuit":
                 {params.resource_log:q} {resources.attempt_no} {threads} \
                 {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log.main:q}
             printf 'stage=cutadapt attempt=%s threads=%s merged_runtime_min=%s\n' \
-                {resources.attempt_no} {params.cutadapt_threads} {resources.runtime} >> {log.cutadapt:q}
+                {resources.attempt_no} "$(( {threads} < {params.cutadapt_threads} ? {threads} : {params.cutadapt_threads} ))" {resources.runtime} >> {log.cutadapt:q}
 
             exec 2>> {log.main:q}
 
@@ -1142,7 +1149,7 @@ if METHYLATION_BACKEND == "biscuit":
 
             echo "INFO: stage=cutadapt status=START" >&2
             dna_pipeline_run_cutadapt \
-                {params.cutadapt:q} {GZIP:q} {params.cutadapt_threads} \
+                {params.cutadapt:q} {GZIP:q} "$(( {threads} < {params.cutadapt_threads} ? {threads} : {params.cutadapt_threads} ))" \
                 {params.cutadapt_quality:q} {params.cutadapt_min_length} \
                 {params.adapter_r1_spec:q} {params.adapter_r2_spec:q} \
                 {input.r1:q} {input.r2:q} "$tmp_r1" "$tmp_r2" "$tmp_report" {log.cutadapt:q}
@@ -1182,7 +1189,8 @@ if METHYLATION_BACKEND == "biscuit":
 
             sort_extra_threads=$(({threads} - 1))
             (( sort_extra_threads > 15 )) && sort_extra_threads=15
-            (( sort_extra_threads >= 1 )) || sort_extra_threads=1
+            # index 的 -@ 是主线程之外的附加线程，单核分配须允许 0。
+            (( sort_extra_threads >= 0 )) || sort_extra_threads=0
             echo "INFO: stage=samtools_sort status=START extra_threads=$sort_extra_threads mem_per_thread=768M" >&2
             set +e
             {params.samtools:q} sort \
@@ -1669,9 +1677,8 @@ if METHYLATION_BACKEND == "biscuit":
             ),
             attempt_no = lambda wildcards, attempt: int(attempt)
         params:
-            scientific_identity = scientific_code_identity(('alopex.science.read_pileup_variant_count',), ('dna_pipeline_emit_canonical_cpg',)),
+            scientific_identity = scientific_code_identity(('alopex.science.read_pileup_variant_count', 'alopex.science.emit_biscuit_cpg'), ('dna_pipeline_emit_canonical_cpg',)),
             cpg_offset = CPG_COORDINATE_BASE,
-            biscuit = BISCUIT,
             zstd = ZSTD,
             resource_log = lambda wc: static_resource_log("generate_cpg_input", wc.demux_sample)
         conda: ENVIRONMENT_YAML
@@ -1695,7 +1702,7 @@ if METHYLATION_BACKEND == "biscuit":
                 dna_pipeline_emit_canonical_cpg {params.zstd:q} {params.cpg_offset} "$tmp_cpg" {input.vcf:q} < /dev/null
                 echo "WARNING: pileup VCF has no records; publishing a header-only SnapATAC2 CpG table." >> {log:q}
             else
-                {params.biscuit:q} vcf2bed -t cg -k 1 -c {input.vcf:q} 2>> {log:q} | \
+                {RULE_PYTHON:q} -m alopex biscuit-cpg --vcf {input.vcf:q} 2>> {log:q} | \
                     dna_pipeline_emit_canonical_cpg {params.zstd:q} {params.cpg_offset} "$tmp_cpg" {input.vcf:q}
             fi
             {params.zstd:q} -q -t "$tmp_cpg" >> {log:q} 2>&1
@@ -1830,12 +1837,12 @@ if METHYLATION_BACKEND == "biscuit":
 
             restore_qc_generation() {{
                 if [ -d "$qc_backup" ]; then
-                    rm -rf -- {params.abs_qc_dir:q}
-                    mv "$qc_backup" {params.abs_qc_dir:q}
-                    rm -f -- "$qc_absent"
+                    rm -rf -- {params.abs_qc_dir:q} || return $?
+                    mv "$qc_backup" {params.abs_qc_dir:q} || return $?
+                    rm -f -- "$qc_absent" || return $?
                 elif [ -f "$qc_absent" ]; then
-                    rm -rf -- {params.abs_qc_dir:q}
-                    rm -f -- "$qc_absent"
+                    rm -rf -- {params.abs_qc_dir:q} || return $?
+                    rm -f -- "$qc_absent" || return $?
                 fi
             }}
 
@@ -1846,7 +1853,13 @@ if METHYLATION_BACKEND == "biscuit":
                 exit_status=$?
                 rm -rf -- "$qc_tmp"
                 if (( publish_in_progress == 1 )); then
-                    restore_qc_generation || true
+                    if restore_qc_generation; then
+                        :
+                    else
+                        recovery_status=$?
+                        printf 'ERROR: BISCUIT QC rollback failed (rc=%s); recovery state retained at %s\n' "$recovery_status" "$qc_backup" >&2
+                        if (( exit_status == 0 )); then exit_status=$recovery_status; fi
+                    fi
                 fi
                 return "$exit_status"
             }}
@@ -2013,7 +2026,7 @@ elif METHYLATION_BACKEND == "rastair":
             dna_pipeline_install_scratch_cleanup
             tmpdir="$DNA_PIPELINE_SCRATCH_DIR"
             dna_pipeline_log_scratch
-            dna_pipeline_run_cutadapt {CUTADAPT:q} {GZIP:q} {params.trim_threads} \
+            dna_pipeline_run_cutadapt {CUTADAPT:q} {GZIP:q} "$(( {threads} < {params.trim_threads} ? {threads} : {params.trim_threads} ))" \
                 {params.quality:q} {params.min_length} {params.adapter1:q} {params.adapter2:q} \
                 {input.r1:q} {input.r2:q} "$tmpdir/R1.fastq.gz" "$tmpdir/R2.fastq.gz" "$tmpdir/cutadapt.json" {log.cutadapt:q}
             bwa_threads=$(({threads} > 1 ? {threads} - 1 : 1))
@@ -2178,7 +2191,7 @@ else:
             tmpdir="$DNA_PIPELINE_SCRATCH_DIR"; out="$tmpdir/bismark"; mkdir -p "$out"
             r1="$tmpdir/trim.1.fastq.gz"; r2="$tmpdir/trim.2.fastq.gz"; cj="$tmpdir/cutadapt.json"
             dna_pipeline_run_cutadapt \
-                {params.cutadapt:q} {GZIP:q} {params.cutadapt_threads} \
+                {params.cutadapt:q} {GZIP:q} "$(( {threads} < {params.cutadapt_threads} ? {threads} : {params.cutadapt_threads} ))" \
                 {params.cutadapt_quality:q} {params.cutadapt_min_length} \
                 {params.adapter_r1_spec:q} {params.adapter_r2_spec:q} \
                 {input.r1:q} {input.r2:q} "$r1" "$r2" "$cj" {log:q}
@@ -2611,7 +2624,7 @@ rule multiqc:
         cutadapt_qc = FINAL_SAMPLE_CUTADAPT_QC,
     output:
         report = STAGED_RESULTS_DIR / "QC_Results" / "multiqc_report.html",
-        file_list = temp(INTERMEDIATE_DIR / "multiqc" / "multiqc_sources.txt"),
+        file_list = temp(INTERMEDIATE_DIR / "multiqc" / "multiqc_sources.json"),
         high_cph = temp(INTERMEDIATE_DIR / "multiqc" / "high_cph_rebuilt_mqc.json"),
         sampled_sources = temp(directory(INTERMEDIATE_DIR / "multiqc" / "sampled_sources")),
     log:
@@ -2623,10 +2636,9 @@ rule multiqc:
         runtime = lambda wildcards, input, attempt: multiqc_resource_request(len(input), attempt).runtime_min,
         attempt_no = lambda wildcards, attempt: int(attempt)
     params:
-        scientific_identity = scientific_code_identity(('alopex.delivery.prepare_high_cph_multiqc_sources', 'alopex.delivery.prepare_sampled_multiqc_sources', 'alopex.delivery.select_multiqc_samples', 'alopex.delivery.write_multiqc_file_list'), ()),
+        scientific_identity = scientific_code_identity(('alopex.delivery.prepare_high_cph_multiqc_sources', 'alopex.delivery.prepare_sampled_multiqc_sources', 'alopex.delivery.select_multiqc_samples', 'alopex.delivery.write_multiqc_file_list', 'alopex.delivery.run_multiqc_report'), ()),
         outdir = STAGED_RESULTS_DIR / "QC_Results",
-        tmpout = PROJECT_TMP_DIR / "multiqc" / "output_tmp",
-        multiqc = MULTIQC
+        tmpout = PROJECT_TMP_DIR / "multiqc" / "output_tmp"
     run:
         shell("source {JOB_RUNTIME:q}; dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}")
         request = multiqc_resource_request(len(input), resources.attempt_no)
@@ -2650,7 +2662,7 @@ rule multiqc:
                 handle.write(f"WARNING: skipped_multiqc_source={item}\n")
             handle.write("INFO: stage=multiqc_native_prefetch status=START\n")
         started = time.monotonic()
-        native_files, native_bytes = prefetch_multiqc_native_libraries(Path(params.multiqc).parent.parent)
+        native_files, native_bytes = prefetch_multiqc_native_libraries(Path(RULE_PYTHON).parent.parent)
         with open(str(log), "a", encoding="utf-8") as handle:
             handle.write(
                 f"INFO: stage=multiqc_native_prefetch status=OK files={native_files} "
@@ -2674,9 +2686,8 @@ rule multiqc:
             trap cleanup_multiqc_tmp EXIT
             mkdir -p "$tmpout"
 
-            {params.multiqc:q} -f \
-                -o "$tmpout" \
-                -n multiqc_report.html \
+            {RULE_PYTHON:q} -m alopex multiqc-report \
+                --output-dir "$tmpout" \
                 --file-list {output.file_list:q} \
                 --config {multiqc_config:q} \
                 --comment {report_comment:q} \

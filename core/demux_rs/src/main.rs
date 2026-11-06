@@ -1410,9 +1410,25 @@ mod tests {
 
     #[test]
     fn paired_read_ids_normalize_mate_suffix_and_description() {
-        let normalized = validate_paired_read_ids(b"@read-1/1 lane", b"read-1/2 other")
+        let normalized = validate_paired_read_ids(b"read-1/1 lane", b"read-1/2 other")
             .expect("paired IDs should normalize");
         assert_eq!(normalized, b"read-1");
+    }
+
+    #[test]
+    fn parsed_fastq_ids_keep_literal_at_and_reject_blank_identifiers() {
+        let input = b"@read/1 lane\nACGT\n+\nIIII\n@@read/1 lane\nACGT\n+\nIIII\n@read/1/1 lane\nACGT\n+\nIIII\n";
+        let mut reader = needletail::parse_fastx_reader(&input[..]).unwrap();
+        let mut names = Vec::new();
+        while let Some(record) = reader.next() {
+            names.push(normalize_read_id(record.unwrap().id()).unwrap().to_vec());
+        }
+        assert_eq!(names, [b"read".to_vec(), b"@read".to_vec(), b"read/1".to_vec()]);
+        assert!(validate_paired_read_ids(b"@read/1", b"read/2").is_err());
+        assert!(validate_paired_read_ids(b"read/1", b"@read/2").is_err());
+        for id in [b"".as_slice(), b" read", b"\tread", b"/1"] {
+            assert!(normalize_read_id(id).is_err());
+        }
     }
 
     #[test]

@@ -1695,8 +1695,14 @@ def plot_pca_batch_effect(
     clone_color_map: dict = None,
     out_path: Path = None,
 ):
-    """将 QC 指标投影到 PCA 空间以检查 CloneID 批次效应。"""
+    """仅用指标完整的细胞绘制 QC PCA；保留观测零，注明缺失/非法值排除数。"""
+    def skip(message: str) -> None:
+        if out_path is not None:
+            Path(out_path).unlink(missing_ok=True)
+        print(message)
+
     if df.empty:
+        skip('No cells: PCA skipped.')
         return
     features = [
         'Native_Mapping%',
@@ -1707,16 +1713,23 @@ def plot_pca_batch_effect(
     valid_f = [f for f in features if f in df.columns]
     if len(valid_f) >= 3 and len(df) >= 2:
         _load_plot_dependencies()
-        plot_df = df.copy()
+        numeric = df[valid_f].apply(pd.to_numeric, errors='coerce')
+        complete = np.isfinite(numeric.to_numpy(dtype=float, na_value=np.nan)).all(axis=1)
+        excluded = int((~complete).sum())
+        plot_df = df.loc[complete].copy()
+        if len(plot_df) < 2:
+            skip(f'PCA skipped: fewer than 2 complete cells ({len(plot_df)}/{len(df)}; excluded {excluded}).')
+            return
         plot_df['CloneID'] = plot_df['CloneID'].map(normalize_clone_id_value)
-        values = StandardScaler().fit_transform(plot_df[valid_f].fillna(0))
+        # 未定义的宿主甲基化率不等于真实0%；不能通过填零改变投影输入。
+        values = StandardScaler().fit_transform(numeric.loc[complete])
         if np.all(np.var(values, axis=0) <= np.finfo(float).eps):
-            print('No variation: PCA skipped.')
+            skip('No variation: PCA skipped.')
             return
         pca = PCA(n_components=2)
         coords = pca.fit_transform(values)
         if not np.all(np.isfinite(pca.explained_variance_ratio_)):
-            print('No variation: PCA skipped.')
+            skip('No variation: PCA skipped.')
             return
         group_levels = sorted(
             plot_df['CloneID'].dropna().astype(str).unique().tolist()
@@ -1731,6 +1744,11 @@ def plot_pca_batch_effect(
             for group in group_levels
         }
         fig, ax = plt.subplots(figsize=(8, 6), dpi=PlotParams.DPI)
+        fig.text(
+            0.5, 0.98,
+            f'PCA: {len(plot_df)} / {len(df)} cells; excluded {excluded} with missing or invalid QC',
+            ha='center', va='top', fontsize=FontSizes.LEGEND,
+        )
         sns.scatterplot(
             x=coords[:, 0],
             y=coords[:, 1],
@@ -1757,7 +1775,7 @@ def plot_pca_batch_effect(
         plt.show()
         plt.close(fig)
     else:
-        print('⚠️ 核心特征不足，无法进行 PCA。')
+        skip('⚠️ 核心特征不足，无法进行 PCA。')
 
 
 def plot_final_qc_dashboard_batch(

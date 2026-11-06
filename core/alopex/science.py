@@ -245,6 +245,65 @@ def read_pileup_variant_count(path: str | Path, sample: str) -> int:
     return value["variant_records"]
 
 
+def emit_biscuit_cpg(vcf: str | Path, stream: TextIO) -> None:
+    """从单样本原生 VCF 的 SP/CV 输出 CpG 原始整数，不从三位小数 BT 反推。
+
+    BISCUIT 同一过滤循环中，参考 C 的 BSW 转换计入 SP.Y，参考 G 的
+    BSC 转换计入 SP.R；CV 为可调用链的 retention+conversion。相反链的
+    非甲基化信息也可能计入 SP.C/G，因此 retention 必须用 CV-conversion。
+    保留原生可调用/SNP/质量/重叠过滤、逐链位置及文件顺序，不合并 CpG dyad。
+    """
+    path = Path(vcf)
+    opener = gzip.open if path.suffix == ".gz" else open
+    header_seen = False
+    with opener(path, "rt", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            label = f"BISCUIT VCF {path} line {line_no}"
+            if line.startswith("##"):
+                continue
+            fields = line.rstrip("\r\n").split("\t")
+            if line.startswith("#CHROM\t"):
+                if (header_seen or len(fields) != 10 or fields[:9] != [
+                        "#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"]):
+                    raise ValueError(f"{label}: requires one native sample header")
+                header_seen = True
+                continue
+            if not header_seen or len(fields) != 10:
+                raise ValueError(f"{label}: missing header or malformed single-sample row")
+            contexts = [item[3:] for item in fields[7].split(";") if item.startswith("CX=")]
+            if len(contexts) > 1:
+                raise ValueError(f"{label}: duplicate CX context")
+            if contexts != ["CG"]:
+                continue
+            if fields[3] not in {"C", "G"} or re.fullmatch(r"[0-9]+", fields[1]) is None or int(fields[1]) < 1:
+                raise ValueError(f"{label}: invalid CpG reference base or position")
+            names, values = fields[8].split(":"), fields[9].split(":")
+            if len(names) != len(set(names)) or len(names) != len(values):
+                raise ValueError(f"{label}: malformed or duplicate FORMAT fields")
+            sample = dict(zip(names, values))
+            # 原生 SNP 干扰可使此行没有 CV；CV=0 同样表示本样本不可调用。
+            if "CV" not in sample:
+                continue
+            if re.fullmatch(r"[0-9]+", sample["CV"]) is None:
+                raise ValueError(f"{label}: invalid integer CV")
+            coverage = int(sample["CV"])
+            if not coverage:
+                continue
+            support = sample.get("SP", "")
+            tokens = re.findall(r"([ACGTYR])([0-9]+)", support)
+            if (not tokens or "".join(base + count for base, count in tokens) != support
+                    or len({base for base, count in tokens}) != len(tokens)):
+                raise ValueError(f"{label}: malformed or duplicate integer SP support")
+            counts = {base: int(count) for base, count in tokens}
+            conversion = counts.get("Y" if fields[3] == "C" else "R", 0)
+            if conversion > coverage or coverage > sum(counts.values()):
+                raise ValueError(f"{label}: inconsistent SP/CV counts")
+            start = int(fields[1]) - 1
+            stream.write(f"{fields[0]}\t{start}\t{start + 1}\t.\t{coverage - conversion}\t{conversion}\n")
+    if not header_seen:
+        raise ValueError(f"BISCUIT VCF {path}: missing native sample header")
+
+
 def open_text(path: Path) -> TextIO:
     if str(path) == "-":
         return sys.stdin

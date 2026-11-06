@@ -17,10 +17,9 @@ pub(super) fn write_fastq_record(
         output.extend_from_slice(normalize_read_id(id)?);
         output.push(b':');
         output.extend_from_slice(umi_seq);
-        let header = id.trim_ascii_start();
         if keep_comment {
-            if let Some(comment_start) = header.iter().position(u8::is_ascii_whitespace) {
-                output.extend_from_slice(&header[comment_start..]);
+            if let Some(comment_start) = id.iter().position(u8::is_ascii_whitespace) {
+                output.extend_from_slice(&id[comment_start..]);
             }
         }
     } else {
@@ -46,18 +45,13 @@ pub(super) fn write_fastq_record(
 }
 
 pub(super) fn normalize_read_id(id: &[u8]) -> Result<&[u8]> {
-    let mut normalized = id;
-    while normalized.first().is_some_and(u8::is_ascii_whitespace) {
-        normalized = &normalized[1..];
-    }
-    if normalized.first() == Some(&b'@') {
-        normalized = &normalized[1..];
-    }
-    let end = normalized
+    // needletail 的 id() 已移除 FASTQ marker；名称中的 @ 不能再删，
+    // 否则不同分子会同名。首字符为空白时没有 ID，不能把备注提升成名称。
+    let end = id
         .iter()
         .position(|base| base.is_ascii_whitespace())
-        .unwrap_or(normalized.len());
-    normalized = &normalized[..end];
+        .unwrap_or(id.len());
+    let mut normalized = &id[..end];
     if normalized.ends_with(b"/1") || normalized.ends_with(b"/2") {
         normalized = &normalized[..normalized.len() - 2];
     }

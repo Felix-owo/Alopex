@@ -4,6 +4,7 @@ from __future__ import annotations
 import stat
 import csv
 import datetime as dt
+import glob
 import hashlib
 import io
 import json
@@ -900,11 +901,42 @@ def prefetch_multiqc_native_libraries(prefix: Path) -> tuple[int, int]:
     return files, read_bytes
 
 
+def run_multiqc_report(file_list: Path, config_file: Path, output_dir: Path, comment: str) -> int:
+    """在独立 backend 进程内，仅以原生默认值及 Pipeline 显式配置生成报告。"""
+    import multiqc
+    from multiqc.core.update_config import ClConfig
+
+    sources = json.loads(file_list.read_text(encoding="utf-8"))
+    if (not isinstance(sources, list) or not sources
+            or any(not isinstance(path, str) or not path for path in sources)):
+        raise ValueError("MultiQC source list must be a nonempty JSON array of paths")
+
+    # 原生 CLI 无禁用隐式配置的选项；其递归合并还会保留外部改名、过滤和
+    # custom_data 设置。只隔离加载入口，不改 HOME、包文件或原生解析/退出行为。
+    find_user_files = multiqc.config.find_user_files
+    multiqc.config.find_user_files = lambda: None
+    try:
+        result = multiqc.run(
+            # 原生逐行清单无法表示含换行的路径；positional API 又会做glob。
+            # JSON保留路径字符，逐个转义后交原生搜索，防止误纳入同名诱饵。
+            *(glob.escape(path) for path in sources),
+            cfg=ClConfig(
+                config_files=[config_file.resolve(strict=True)],
+                output_dir=output_dir, filename="multiqc_report.html",
+                force=True, report_comment=comment,
+            ),
+            interactive=False,
+        )
+        return result.sys_exit_code
+    finally:
+        multiqc.config.find_user_files = find_user_files
+
+
 def write_multiqc_file_list(
     inputs: Iterable[str | Path],
     out_list: str,
 ) -> tuple[int, list[str]]:
-    """写出 MultiQC 消费的唯一显式源列表，源依赖由 Snakemake 追踪。"""
+    """写出报告进程消费的唯一 JSON 源列表，保留路径字符及完整 DAG 依赖。"""
     unique_sources: dict[str, Path] = {}
     skipped: list[str] = []
     for candidate in _iter_explicit_multiqc_files(inputs):
@@ -924,10 +956,7 @@ def write_multiqc_file_list(
         )
 
     file_list = Path(out_list)
-    atomic_write_bytes(
-        file_list,
-        "".join(f"{path}\n" for path in sorted(unique_sources)).encode("utf-8"),
-    )
+    atomic_write_bytes(file_list, canonical_json_bytes(sorted(unique_sources)) + b"\n")
 
     logger.info(
         "Prepared explicit MultiQC file list with %d sources; skipped %d dup reports",

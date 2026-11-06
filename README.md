@@ -16,13 +16,16 @@ v17.0 清理无生产消费者的源码身份转发函数与旧 Python API 回�
 | 查阅内容 | 文档 |
 | --- | --- |
 | Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
+| 配置参数、QC 字段与计数口径 | [ANALYSIS_PARAMETERS](https://github.com/Felix-owo/Alopex_dev/blob/v17.0/docs/ANALYSIS_PARAMETERS.md) |
+| 流程与维护契约 | [pipeline.drawio](https://github.com/Felix-owo/Alopex_dev/blob/v17.0/docs/pipeline.drawio)、[AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/v17.0/AGENTS.md) |
+| 实测结果、验证范围与失败教训 | [BENCHMARKS](https://github.com/Felix-owo/Alopex_dev/blob/v17.0/docs/BENCHMARKS.md) |
 
-源码按职责定位：`core/alopex/`包含配置、输入、科学处理、交付与维护，其`downstream/`子包负责QC计算与绘图；`core/`下的Shell入口与Snakefile负责运行编排；顶层`downstream/`承载Notebook与操作说明。运行发行包包含运行、安装自检、Notebook及使用说明；开发仓完整归档包含 docs、tests 和维护规范；本公开运行包排除这些开发内容。
+源码按职责定位：`core/alopex/`包含配置、输入、科学处理、交付与维护，其`downstream/`子包负责QC计算与绘图；`core/`下的Shell入口与Snakefile负责运行编排；顶层`downstream/`承载Notebook与操作说明。开发测试在`tests/`，详细契约和证据在`docs/`，私有 Alopex_dev 的完整发行包包含 docs、tests 和维护规范；公开 Alopex 的运行包才排除开发内容。
+
 
 项目运行的临时工作与提交文件统一使用本项目 `05_tmp/`，包括预处理、原生工具 spill、诊断、矩阵写出和发布候选；外部 `TMPDIR` / `SLURM_TMPDIR` 不改选节点盘。临时文件关闭并校验后使用同文件系统原子替换；`05_tmp` 不得为符号链接，输出位于另一挂载时明确失败，不回退复制覆盖。仅清理本次创建的临时项，重试所需的事务备份也保留在 `05_tmp/`，运行或恢复未完成时不要手动清空该目录。
 
 `02_work/` 中有明确下游消费者的阶段产物、`.snakemake/` 恢复状态，以及没有项目上下文的环境/参考安装事务保留各自职责位置。安装事务的临时项必须与安装目标处于同一文件系统，不写入任意分析项目。共享空间和配额仍需足以容纳已有结果、新候选及并发作业；空间检查不等于容量预留。
-
 
 ## 1. 安装
 
@@ -32,7 +35,7 @@ demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态�
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v17.0 Release](https://github.com/Felix-owo/Alopex/releases/tag/v17.0) 下载 `Alopex-v17.0.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。发行包保留 core、固定 resources、下游 Notebook/模块及使用说明；docs、开发测试、实验档案和 GitHub workflow 不进入发行包。
+从 [v17.0 Release](https://github.com/Felix-owo/Alopex_dev/releases/tag/v17.0) 下载 `Alopex-v17.0.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。Alopex_dev 完整发行包保留全部受版本控制的源码、固定资源、下游 Notebook、docs、tests 与维护规范。公开 Alopex 另发运行包，排除 docs、tests 和开发规范；Conda、生成参考、科学结果及未跟踪日志均不入包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
@@ -41,7 +44,7 @@ cd Alopex-v17.0
 conda --version
 ```
 
-跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。运行快照会记录实际源码、环境和输入身份。
+跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。运行快照会记录实际源码、环境和输入身份，实验及验收范围见 [发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.0/docs/benchmarks/structure-refactor.md#release-v170)。
 
 | 平台 / 部署方式 | 要求 |
 | --- | --- |
@@ -64,7 +67,7 @@ conda --version
 
 Doctor 保留下载的原始 FASTA，只在临时目录生成分析用 FASTA：hg38 使用 GIABv3 的 no-ALT、CEN/PAR/GRC 屏蔽与定向 decoy；mm10 使用 GRCm38 主装配及其 Y PAR 屏蔽。分别加入 lambda/pUC19 后为 **220／68 条比对序列**；分析 FASTA 仍使用 `<genome>.primary.lambda.puc19.fa` 路径，其内容范围以固定清单为准。
 
-比对包含真实辅助序列，最终 nCG、甲基化 QC、Gini、TSS 和 Single-CpG 矩阵按明确的主核染色体范围计算。RawAdata 保留全参考观测供 QC／审计，controls 单独统计。此策略自 v16.2 发布；运行包不包含开发文档。
+比对包含真实辅助序列，最终 nCG、甲基化 QC、Gini、TSS 和 Single-CpG 矩阵按明确的主核染色体范围计算。RawAdata 保留全参考观测供 QC／审计，controls 单独统计。坐标、屏蔽范围、输入校验值及适用边界见源码 checkout 的 `docs/ANALYSIS_PARAMETERS.md`「标准 reference 与分析范围」。此策略自 v16.2 发布；运行包不包含开发文档。
 
 FASTA/FAI、各 backend 索引、TSS／single-CpG 通过各自的 `.reference.json` 内容回执绑定同一参考。`reference --check` 只读检查；未绑定或失配的旧组件不再报告 READY。修复时 Doctor 通过既有构建事务生成、验证、提交并重建相关派生。请在没有任务使用该受管 reference 时运行修复；旧交付及其矩阵不会被自动重算或转换。
 
@@ -96,6 +99,8 @@ PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding sea
 去掉 `--check` 可维护对应段；显式 `demux` 会测试、构建并原子替换生产二进制。完整 Doctor 先检查并复用就绪资源。
 
 HPC 的标准顺序：
+
+当前 HPC 存储根为 `/storage2/wangshouwenLab/`，部署目录为 `/storage2/wangshouwenLab/limited_shared_folder/analysis/cmy/Alopex/`。更新前核对上传目标；Jupyter 的工作目录和 `ServerApp.root_dir` 应使用新根，解释器及 kernel 也须核对实际解析路径。登录 shell 的 `cd` 不会改变已运行的服务。已有任务继续使用启动时路径，切换入口时保留运行中任务；旧 `/storage/wangshouwenLab/` 仅用于明确的历史读取，不再接收更新。
 
 HPC 更新保留来源仓库的真实 `.git` 与历史，核对正式 tag、commit、工作树和逐文件 SHA256；已有本地修改须先审查保留。归档安装本身仍可不带 Git，不以新建空仓库代替来源历史。
 
@@ -204,7 +209,7 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 
 ## 6. 运行与恢复
 
-科学阶段临时数据固定写入当前项目 `05_tmp/`，每个作业使用独占随机子目录并只清理自身目录。启动前检查预计磁盘需求及10%余量，空间不足直接失败，不自动切换到节点 `/tmp`、`/var/tmp` 或外部 `TMPDIR`。该检查不预留跨作业容量，也不保证共享存储或用户配额永不耗尽。可恢复的跨节点工件保留在 `02_work/`。升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。详见[调度参数](https://github.com/Felix-owo/Alopex_dev/blob/v17.0/docs/ANALYSIS_PARAMETERS.md)。
+科学阶段临时数据固定写入当前项目 `05_tmp/`，每个作业使用独占随机子目录并只清理自身目录。启动前检查预计磁盘需求及10%余量，空间不足直接失败，不自动切换到节点 `/tmp`、`/var/tmp` 或外部 `TMPDIR`。该检查不预留跨作业容量，也不保证共享存储或用户配额永不耗尽。可恢复的跨节点工件保留在 `02_work/`。升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。详见[调度参数](docs/ANALYSIS_PARAMETERS.md)。
 
 ```bash
 ./run_pipeline.sh --dry-run
@@ -219,7 +224,7 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 | 规则失败 | 先查对应日志并修正原因，再运行同一 launcher；保留 `02_work/` 和 `.snakemake/`，由 Snakemake 决定重算范围 |
 | 残留锁 | 确认没有运行中的 launcher 后，才手动移除项目 `.snakemake/locks` |
 | 发布中断 | 保留 `02_work/results_stage/` 后重跑；stage 与 `03_results/` 必须同一文件系统，公开 `run_manifest.json` 最后提交 |
-| 最终 DNA BAM | `retention.keep_final_bam: true` 保留 BAM 及适用索引，缺失时进入 DAG 恢复；`false` 在成功发布后回收当前 backend 活跃细胞的最终 BAM/索引 |
+| 最终 DNA BAM | 模板`retention.keep_final_bam: null`按协议默认：TAPS保留、其余回收；显式true/false覆盖。`true` 保留 BAM 及适用索引，缺失时进入 DAG 恢复；`false` 在成功发布后回收当前 backend 活跃细胞的最终 BAM/索引 |
 | SRD RNA | FASTQ 和被筛除 BAM 固定保存在 `02_work/RNA/{FASTQ,BAM}/`，不受最终 DNA BAM 开关影响 |
 | 上游重新发布 | 旧下游 context 会拒绝继续读取或提交 QC，需重新启动下游 |
 | reference 构建中断 | 重跑对应 Doctor 段，恢复未完成事务并复验；未完成不报告 READY |
@@ -265,3 +270,15 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 ## 许可证
 
 Alopex 以 [GPL-3.0](LICENSE) 发布。
+
+## 开发与发行
+
+回归测试包含在 Alopex_dev 完整发行包；公开 Alopex 运行包不包含开发回归。开发时 checkout 正式 tag 后执行 `bash tests/run_regression.sh --preflight`；该入口将完整 discovery 主矩阵分成普通/工作流两组，与集成矩阵通过三个独立进程组并行执行，各自保留日志，失败回收本次 worker。全部主测试的整体执行 wall 单列于 `.workers.json` 的 `core_matrix_wall_seconds`，不以拆分后的较短组耗时替代性能验收；测试名和条件跳过原因逐项记录。完整下游回归需设置 `DNA_PIPELINE_DOWNSTREAM_PYTHON="$PWD/conda/current/notebook/bin/python"` 与 `DNA_PIPELINE_REQUIRE_DOWNSTREAM_TESTS=1`。
+
+开发仓 `.gitattributes` 不排除 docs/tests；公开仓单独用 `export-ignore` 固定运行发行内容。两者都使用 [Git 原生归档](https://git-scm.com/docs/git-archive) 重建，无独立打包脚本：
+
+```bash
+git archive --format=tar.gz --prefix=Alopex-v17.0/ -o Alopex-v17.0.tar.gz v17.0
+```
+
+源码 checkout 的当前文档结构见 [docs 导航](https://github.com/Felix-owo/Alopex_dev/blob/main/docs/README.md)，修改前按 [AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/main/AGENTS.md) 的任务清单读取详细契约。上文固定 tag 链接用于对应正式发行版的历史说明。

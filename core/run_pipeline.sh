@@ -5,20 +5,25 @@ set -euo pipefail
 # 按脚本真实路径定位 Pipeline，支持 launcher 符号链接。
 dna_pipeline_resolve_launcher_source() {
     local source="${BASH_SOURCE[0]}" directory target
+    [[ "$source" == /* ]] || source="$PWD/$source"
     while [[ -L "$source" ]]; do
-        directory="$(cd -P "$(dirname "$source")" && pwd)"
-        target="$(readlink "$source")"
+        directory="$(cd -P -- "${source%/*}" && printf '%s.' "$PWD")" || return $?
+        directory="${directory%.}"
+        target="$(readlink "$source" && printf '.')" || return $?
+        target="${target%$'\n'.}"
         if [[ "$target" == /* ]]; then
             source="$target"
         else
             source="$directory/$target"
         fi
     done
-    directory="$(cd -P "$(dirname "$source")" && pwd)"
-    printf '%s/%s\n' "$directory" "$(basename "$source")"
+    directory="$(cd -P -- "${source%/*}" && printf '%s.' "$PWD")" || return $?
+    DNA_PIPELINE_LAUNCHER_SOURCE="${directory%.}/${source##*/}"
 }
-DNA_PIPELINE_LAUNCHER_SOURCE="$(dna_pipeline_resolve_launcher_source)"
-DNA_PIPELINE_ROOT="$(cd "$(dirname "$DNA_PIPELINE_LAUNCHER_SOURCE")/.." && pwd -P)"
+dna_pipeline_resolve_launcher_source
+# 命令替换会删掉末尾换行；哨兵只保护路径字面值，不改变实际目录。
+DNA_PIPELINE_ROOT="$(cd -P -- "${DNA_PIPELINE_LAUNCHER_SOURCE%/*}/.." && printf '%s.' "$PWD")"
+DNA_PIPELINE_ROOT="${DNA_PIPELINE_ROOT%.}"
 export DNA_PIPELINE_ROOT
 
 source "$DNA_PIPELINE_ROOT/core/doctor.sh"
@@ -59,6 +64,9 @@ Alopex 项目启动器
 EOF
 }
 
+DNA_PIPELINE_LAUNCH_DIR="$(pwd -P && printf '.')"
+DNA_PIPELINE_LAUNCH_DIR="${DNA_PIPELINE_LAUNCH_DIR%$'\n'.}"
+
 while (( $# > 0 )); do
     case "$1" in
         --help|-h)
@@ -68,7 +76,7 @@ while (( $# > 0 )); do
                 [[ -n "$2" ]] || { echo "ERROR: --init-project requires a non-empty path." >&2; exit 2; }
                 DNA_PIPELINE_INIT_PROJECT="$2"; shift 2
             else
-                DNA_PIPELINE_INIT_PROJECT="$(pwd -P)"; shift
+                DNA_PIPELINE_INIT_PROJECT="$DNA_PIPELINE_LAUNCH_DIR"; shift
             fi ;;
         --init-project=*)
             DNA_PIPELINE_INIT_PROJECT="${1#--init-project=}"
@@ -107,8 +115,6 @@ if (( DNA_PIPELINE_REFRESH_MANIFEST == 1 )); then
         exit 2
     }
 fi
-
-DNA_PIPELINE_LAUNCH_DIR="$(pwd -P)"
 
 DNA_PIPELINE_CONTROL_ENV="$DNA_PIPELINE_ROOT/conda/current/control"
 
@@ -165,14 +171,16 @@ export DNA_PIPELINE_CONTROL_ENV
 # 从当前目录逐级向上查找最近的 <project>/00_config/config.yaml。
 discover_project_config() {
     local cursor="$1" candidate parent
-    cursor="$(cd "$cursor" && pwd -P)"
+    cursor="$(cd -P -- "$cursor" && printf '%s.' "$PWD")" || return $?
+    cursor="${cursor%.}"
     while :; do
         candidate="$cursor/00_config/config.yaml"
         if [[ -f "$candidate" ]]; then
             printf '%s\n' "$candidate"
             return 0
         fi
-        parent="$(dirname "$cursor")"
+        parent="${cursor%/*}"
+        [[ -n "$parent" ]] || parent=/
         [[ "$parent" != "$cursor" ]] || break
         cursor="$parent"
     done
@@ -185,19 +193,46 @@ DNA_PIPELINE_CONFIG="$(discover_project_config "$DNA_PIPELINE_LAUNCH_DIR" || tru
     echo "Initialize the current directory with: /path/to/Alopex/core/run_pipeline.sh --init-project" >&2
     exit 2
 }
-DNA_PIPELINE_PROJECT_DIR="$(cd "$(dirname "$DNA_PIPELINE_CONFIG")/.." && pwd -P)"
+DNA_PIPELINE_PROJECT_DIR="$(cd -P -- "${DNA_PIPELINE_CONFIG%/*}/.." && printf '%s.' "$PWD")"
+DNA_PIPELINE_PROJECT_DIR="${DNA_PIPELINE_PROJECT_DIR%.}"
 export DNA_PIPELINE_CONFIG DNA_PIPELINE_PROJECT_DIR
 
 # 日志、中断与启动器临时文件
 # 清理 launcher 临时合成目录。
 cleanup_launcher_tmp() {
-    if [[ -n "${DNA_PIPELINE_RUNTIME_TMP:-}" && -d "${DNA_PIPELINE_RUNTIME_TMP:-}" ]]; then
-        case "$(basename "$DNA_PIPELINE_RUNTIME_TMP")" in
-            dna-pipeline-launch.*) rm -rf -- "$DNA_PIPELINE_RUNTIME_TMP" ;;
-            *) printf 'WARNING: refusing to remove unexpected launcher temp path: %s\n' "$DNA_PIPELINE_RUNTIME_TMP" >&2 ;;
-        esac
+    local temporary="${DNA_PIPELINE_RUNTIME_TMP:-}" parent leaf
+    [[ -n "$temporary" ]] || return 0
+    leaf="${temporary##*/}"
+    case "$temporary" in
+        /*/dna-pipeline-launch.?*) ;;
+        *) printf 'ERROR: refusing to remove unexpected launcher temp path: %s\n' "$temporary" >&2; return 2 ;;
+    esac
+    # 与科学 scratch 一样在清理时重验父目录；rm 不跟随末级链接，仍会跟随父链接。
+    parent="$temporary"
+    while [[ "$parent" != / ]]; do
+        [[ ! -L "$parent" && ( ! -e "$parent" || -d "$parent" ) ]] || {
+            printf 'ERROR: refusing to clean launcher temp through a non-directory or symlink: %s\n' "$parent" >&2
+            return 2
+        }
+        parent="${parent%/*}"
+        [[ -n "$parent" ]] || parent=/
+    done
+    if [[ -d "$temporary" ]]; then
+        (
+            cd -P -- "${temporary%/*}" || exit $?
+            [[ "$PWD" == "${temporary%/*}" && ! -L "$leaf" ]] || exit 2
+            rm -rf -- "$leaf"
+        ) || return $?
     fi
     DNA_PIPELINE_RUNTIME_TMP=""
+}
+
+cleanup_launcher_tmp_on_exit() {
+    local exit_status=$? cleanup_status=0
+    trap - EXIT
+    cleanup_launcher_tmp || cleanup_status=$?
+    (( exit_status != 0 )) || exit_status=$cleanup_status
+    exit "$exit_status"
 }
 
 if (( DNA_PIPELINE_REFRESH_MANIFEST == 1 )); then
@@ -227,9 +262,9 @@ pipeline_interrupt_tracked_run() {
 
 # 安装 launcher 外层信号处理，恢复临时目录清理与约定退出码。
 install_launcher_signal_traps() {
-    trap 'cleanup_launcher_tmp; exit 130' INT
-    trap 'cleanup_launcher_tmp; exit 143' TERM
-    trap 'cleanup_launcher_tmp; exit 129' HUP
+    trap 'cleanup_launcher_tmp || true; exit 130' INT
+    trap 'cleanup_launcher_tmp || true; exit 143' TERM
+    trap 'cleanup_launcher_tmp || true; exit 129' HUP
 }
 
 # 受控执行 Snakemake：接管中断信号；完整输出进 controller log，进度以 Snakemake 原生输出为准。
@@ -311,7 +346,7 @@ if (( DNA_PIPELINE_READ_ONLY == 1 )) || [[ "$DNA_PIPELINE_DATA_MODE" == test ]];
     mkdir -p "$DNA_PIPELINE_PROJECT_DIR/05_tmp"
     DNA_PIPELINE_RUNTIME_TMP="$(mktemp -d "$DNA_PIPELINE_PROJECT_DIR/05_tmp/dna-pipeline-launch.XXXXXX")"
 fi
-trap cleanup_launcher_tmp EXIT
+trap cleanup_launcher_tmp_on_exit EXIT
 install_launcher_signal_traps
 
 if [[ "$DNA_PIPELINE_DATA_MODE" == test ]]; then
@@ -439,7 +474,6 @@ dna_pipeline_prepare_read_only_inputs() {
 if (( DNA_PIPELINE_READ_ONLY == 0 )); then
     dna_pipeline_prepare_run_snapshot
     cleanup_launcher_tmp
-    trap cleanup_launcher_tmp EXIT
 fi
 DNA_PIPELINE_STATUS_ARGS=(--project "$DNA_PIPELINE_PROJECT_DIR")
 if [[ -n "${DNA_PIPELINE_RUN_SNAPSHOT:-}" ]]; then

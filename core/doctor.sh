@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 DOCTOR_SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
-PIPELINE_ROOT="$(cd "$(dirname "$DOCTOR_SELF_PATH")/.." && pwd -P)"
+PIPELINE_ROOT="$(cd -P -- "${DOCTOR_SELF_PATH%/*}/.." && printf '%s.' "$PWD")"
+PIPELINE_ROOT="${PIPELINE_ROOT%.}"
 if [[ ! -f "$PIPELINE_ROOT/core/doctor.sh" && -n "${DNA_PIPELINE_ROOT:-}" && -f "$DNA_PIPELINE_ROOT/core/doctor.sh" ]]; then
     PIPELINE_ROOT="$DNA_PIPELINE_ROOT"
 fi
@@ -927,23 +928,40 @@ publish_release() {
 
 # 保留当前、上一代 release 及其复用角色的实际目录，避免清理后产生悬空链接。
 prune_superseded_releases() {
-    local candidate remaining release prefix resolved referenced scan_index=0
+    local previous="$1" candidate release prefix resolved referenced physical_store scan_index=0 remaining_index
+    local GLOBIGNORE=
     local -a kept=("$NEW_RELEASE_PATH")
-    remaining="$(find "$RELEASE_STORE" -mindepth 1 -maxdepth 1 -type d -name '20*' \
-        ! -path "$NEW_RELEASE_PATH" | LC_ALL=C sort -r)"
-    while IFS= read -r candidate; do
-        [[ -n "$candidate" ]] || continue
-        kept+=("$candidate")
-        break
-    done <<< "$remaining"
+    local -a remaining=()
+    [[ -d "$RELEASE_STORE" ]] || return 0
+    physical_store="$(cd -P -- "$RELEASE_STORE" && printf '%s.' "$PWD")" || return $?
+    physical_store="${physical_store%.}"
+    # 上一代由持锁发布事务传入，不能按目录名称猜测：中断候选也可能已经封存。
+    if [[ -n "$previous" && -d "$previous" ]]; then
+        previous="$(cd -P -- "$previous" && printf '%s.' "$PWD")" || return $?
+        previous="${previous%.}"
+        case "$previous" in
+            "$physical_store"/*)
+                previous="$RELEASE_STORE/${previous#"$physical_store"/}"
+                kept+=("$previous")
+                ;;
+        esac
+    fi
+    # 路径含换行时不能经逐行find/sort清单，否则可能把兄弟目录当旧release删除。
+    for candidate in "$RELEASE_STORE"/20*; do
+        [[ -d "$candidate" && ! -L "$candidate" && "$candidate" != "$NEW_RELEASE_PATH" ]] || continue
+        remaining+=("$candidate")
+    done
     while (( scan_index < ${#kept[@]} )); do
         release="${kept[$scan_index]}"
         scan_index=$((scan_index + 1))
         for prefix in "$release"/*; do
             [[ -L "$prefix" && -d "$prefix" ]] || continue
-            resolved="$(cd "$prefix" && pwd -P)" || return $?
+            resolved="$(cd -P -- "$prefix" && printf '%s.' "$PWD")" || return $?
+            resolved="${resolved%.}"
             case "$resolved" in
-                "$RELEASE_STORE"/*/*)
+                "$physical_store"/*/*)
+                    # Conda父目录可为链接；以真实store确认归属，再映回候选的同一路径。
+                    resolved="$RELEASE_STORE/${resolved#"$physical_store"/}"
                     resolved="${resolved%/*}"
                     referenced=0
                     for candidate in "${kept[@]}"; do
@@ -954,8 +972,8 @@ prune_superseded_releases() {
             esac
         done
     done
-    while IFS= read -r candidate; do
-        [[ -n "$candidate" ]] || continue
+    for (( remaining_index=0; remaining_index < ${#remaining[@]}; remaining_index++ )); do
+        candidate="${remaining[$remaining_index]}"
         referenced=0
         for release in "${kept[@]}"; do
             [[ "$candidate" != "$release" ]] || { referenced=1; break; }
@@ -963,13 +981,14 @@ prune_superseded_releases() {
         (( referenced == 0 )) || continue
         echo "回收过期 Conda release：$candidate"
         rm -rf -- "$candidate" || true
-    done <<< "$remaining"
+    done
 }
 
 
 # conda 段入口：分派的唯一调用目标；flow 首行自带 set 严格模式。
 run_conda_section() {
     set -euo pipefail
+    local previous_release_path=""
     CHECK_ONLY=0
     NEW_RELEASE_PATH=""
     CONTROL_TARGET=""
@@ -1071,9 +1090,13 @@ run_conda_section() {
     [[ -L "$RASTAIR_TARGET" ]] || record_new_environment "$RASTAIR_TARGET" rastair
     [[ -L "$NOTEBOOK_TARGET" ]] || record_new_environment "$NOTEBOOK_TARGET" notebook
     finalize_release
+    if [[ -L "$CURRENT_RELEASE" && -d "$CURRENT_RELEASE" ]]; then
+        previous_release_path="$(cd -P -- "$CURRENT_RELEASE" && printf '%s.' "$PWD")" || return $?
+        previous_release_path="${previous_release_path%.}"
+    fi
     publish_release
     echo "已原子发布 Conda release：$NEW_RELEASE_PATH"
-    prune_superseded_releases
+    prune_superseded_releases "$previous_release_path"
     txn_release_lock "$ENVIRONMENT_LOCK" || return $?
     trap - EXIT
     echo
@@ -1590,11 +1613,16 @@ recover_biscuit_commit() {
         fi
         echo "恢复中断的 BISCUIT sidecar 提交： $fasta"
         backup="$journal/backup"
+        # 绑定回执也是旧文件族的一员；恢复前撤候选回执，全部成员恢复后再放回。
+        rm -f -- "$fasta.biscuit.reference.json" || return $?
         while IFS= read -r suffix; do
             [[ -n "$suffix" ]] || return 1
             rm -f -- "${fasta}${suffix}" || return $?
             [[ ! -e "$backup/sidecar${suffix}" ]] || cp -p -- "$backup/sidecar${suffix}" "${fasta}${suffix}" || return $?
         done <<< "$suffixes"
+        if [[ -e "$backup/binding.json" ]]; then
+            cp -p -- "$backup/binding.json" "$fasta.biscuit.reference.json" || return $?
+        fi
         retire_reference_journal "$journal" BACKUPS_READY || return $?
     done
 }
