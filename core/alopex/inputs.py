@@ -57,7 +57,6 @@ from .io import (
     project_temporary_parent,
     atomic_write_bytes,
     _read_json,
-    atomic_write_bytes,
     atomic_write_json,
     render_tsv,
     sha256_bytes,
@@ -1180,6 +1179,91 @@ def _parse_demux_report(raw: object, source: Path) -> DemuxReport:
     return cast(DemuxReport, report)
 
 
+def _validate_droplet_stage_paths(inputs: Sequence[str | Path], spool: Path,
+                                  counts: Path, structure: Path) -> None:
+    """最终提交路径也须隔离；原生程序只看得到本次临时输出，无法代替这层核对。"""
+    protected: dict[Path, tuple[int, int]] = {}
+    def protect_input_entries(path: Path, current: Path) -> Path:
+        parts = path.parts
+        if path.is_absolute():
+            current, parts = Path(path.anchor), parts[1:]
+        for index, part in enumerate(parts):
+            if part == "..":
+                current = current.parent
+                continue
+            current = current / part
+            # 连输入入口的链接/祖先也保护，不能删掉指向外部raw的入口后再尝试读取。
+            metadata = current.lstat()
+            protected[current] = (metadata.st_dev, metadata.st_ino)
+            if stat.S_ISLNK(metadata.st_mode):
+                current.resolve(strict=True)  # 保留循环/无效链接拒绝，再逐跳保护中间入口。
+                current = protect_input_entries(current.readlink(), current.parent)
+                metadata = current.stat()
+                protected[current] = (metadata.st_dev, metadata.st_ino)
+            if index < len(parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+                raise NotADirectoryError(f"Droplet stage input ancestor must be a directory: {path}")
+        return current
+    for source in inputs:
+        path = Path(source)
+        expected = path.resolve(strict=True)
+        expected_metadata = expected.stat()
+        actual = protect_input_entries(path, Path.cwd())
+        actual_metadata = actual.stat()
+        if (actual_metadata.st_dev, actual_metadata.st_ino) != (expected_metadata.st_dev, expected_metadata.st_ino):
+            raise RuntimeError(f"Droplet stage input changed while resolving: {source}")
+        protected[actual] = (actual_metadata.st_dev, actual_metadata.st_ino)
+
+    outputs: list[tuple[Path, bool, tuple[int, int] | None, set[tuple[int, int]]]] = []
+    for destination, directory in ((spool, True), (counts, False), (structure, False)):
+        absolute = destination.absolute()
+        resolved = Path(absolute.anchor).resolve(strict=True)
+        parts = absolute.parts[1:]
+        for index, part in enumerate(parts):
+            if part == "..":
+                resolved = resolved.parent
+                continue
+            resolved = resolved / part
+            try:
+                metadata = resolved.lstat()
+            except FileNotFoundError:
+                continue
+            last = index == len(parts) - 1
+            if stat.S_ISLNK(metadata.st_mode):
+                if last:
+                    raise ValueError(f"Droplet stage output must not be a symlink: {destination}")
+                resolved = resolved.resolve(strict=True)
+                metadata = resolved.stat()
+            if not last and not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError(f"Droplet stage output ancestor must be a directory: {destination}")
+        identity = None
+        if resolved.exists():
+            metadata = resolved.stat()
+            identity = (metadata.st_dev, metadata.st_ino)
+            valid_type = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
+            if not valid_type or (not directory and metadata.st_nlink != 1):
+                raise ValueError(f"Droplet stage output must have an exclusive valid type: {destination}")
+        if (identity is not None and identity in protected.values()) or any(
+                resolved == source or (directory and source.is_relative_to(resolved)) for source in protected):
+            raise ValueError(f"Droplet stage output overlaps an input: {destination}")
+        parents = set()
+        for parent in resolved.parents:
+            try:
+                metadata = parent.stat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError(f"Droplet stage output ancestor must be a directory: {destination}")
+            parents.add((metadata.st_dev, metadata.st_ino))
+        for other, other_directory, other_identity, other_parents in outputs:
+            if (resolved == other or (directory and other.is_relative_to(resolved))
+                    or (other_directory and resolved.is_relative_to(other))
+                    or (identity is not None and identity == other_identity)
+                    or (directory and identity is not None and identity in other_parents)
+                    or (other_directory and other_identity is not None and other_identity in parents)):
+                raise ValueError(f"Droplet stage outputs overlap: {destination}")
+        outputs.append((resolved, directory, identity, parents))
+
+
 def stage_droplet_reads(r1: Sequence[str | Path], r2: Sequence[str | Path], spool: str | Path,
                         counts: str | Path, structure: str | Path, *, binary: str | Path,
                         decoder_python: str | Path, threads: int) -> None:
@@ -1187,11 +1271,17 @@ def stage_droplet_reads(r1: Sequence[str | Path], r2: Sequence[str | Path], spoo
     if not r1 or len(r1) != len(r2) or threads < 1:
         raise ValueError("Droplet stage requires ordered paired FASTQs and positive threads")
     spool, counts, structure = map(Path, (spool, counts, structure))
+    _validate_droplet_stage_paths([*r1, *r2, binary, decoder_python], spool, counts, structure)
     spool.parent.mkdir(parents=True, exist_ok=True)
     counts.parent.mkdir(parents=True, exist_ok=True)
     structure.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".droplet_stage.", dir=project_temporary_parent(spool)) as root:
-        root = Path(root)
+    root = Path(tempfile.mkdtemp(prefix=".droplet_stage.", dir=project_temporary_parent(spool)))
+    owned_root = root.stat()
+    preserve_backup = False
+    try:
+        for destination in (spool, counts, structure):
+            if destination.parent.stat().st_dev != root.stat().st_dev:
+                raise OSError("Droplet stage outputs and temporary directory must share a filesystem")
         staged = root / "spool"
         command = [str(binary), "droplet-stage", "--spool", str(staged), "--counts-output", str(root / "counts.tsv"),
                    "--count-metrics", str(root / "structure.json"), "--decoder-python", str(decoder_python), "--threads", str(threads)]
@@ -1199,21 +1289,76 @@ def stage_droplet_reads(r1: Sequence[str | Path], r2: Sequence[str | Path], spoo
             for path in paths:
                 command.extend((flag, str(path)))
         subprocess.run(command, check=True)
+        current_root = root.lstat()
+        if (current_root.st_dev, current_root.st_ino) != (owned_root.st_dev, owned_root.st_ino):
+            raise RuntimeError(f"Droplet stage temporary directory changed: {root}")
         plan = json.loads((staged / "manifest.json").read_text())
         metrics = json.loads((root / "structure.json").read_text())
         if plan["version"] != 1 or plan["input_fastq_pairs"] != len(r1) or plan["pairs"] != metrics["input_reads"]:
             raise ValueError("Droplet staged pair accounting differs from structure counts")
-        os.replace(root / "counts.tsv", counts)
-        os.replace(root / "structure.json", structure)
+        _validate_droplet_stage_paths([*r1, *r2, binary, decoder_python], spool, counts, structure)
         backup = root / "previous"
-        if spool.exists():
-            spool.rename(backup)
+        backup.mkdir()
+        saved: dict[Path, tuple[Path, tuple[int, int, int, int]]] = {}
+        installed: dict[Path, tuple[int, int, int, int]] = {}
+        def path_identity(path: Path) -> tuple[int, int, int, int]:
+            metadata = path.lstat()
+            return metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
         try:
-            staged.rename(spool)
-        except BaseException:
-            if backup.exists():
-                backup.rename(spool)
+            # 先撤含manifest的spool，再换两个成员；spool最后提交，回滚也最后恢复。
+            for name, destination in (("spool", spool), ("counts.tsv", counts), ("structure.json", structure)):
+                if destination.exists():
+                    previous = backup / name
+                    # 先登记再rename，覆盖rename已生效、Python尚未记录时到达的中断。
+                    saved[destination] = (previous, path_identity(destination))
+                    os.replace(destination, previous)
+            for source, destination in ((root / "counts.tsv", counts),
+                                        (root / "structure.json", structure), (staged, spool)):
+                installed[destination] = path_identity(source)
+                os.replace(source, destination)
+        except BaseException as error:
+            try:
+                for destination, identity in reversed(installed.items()):
+                    if not destination.exists():
+                        continue
+                    if path_identity(destination) != identity:
+                        raise OSError(f"Droplet stage rollback destination changed: {destination}")
+                    if destination.is_dir():
+                        shutil.rmtree(destination)
+                    else:
+                        destination.unlink()
+                for destination in (counts, structure, spool):
+                    if destination not in saved:
+                        continue
+                    previous, identity = saved[destination]
+                    if not previous.exists() and not previous.is_symlink():
+                        if (not destination.exists() or path_identity(destination) != identity):
+                            raise OSError(f"Droplet stage backup and original destination changed: {destination}")
+                        continue
+                    if path_identity(previous) != identity:
+                        raise OSError(f"Droplet stage backup changed: {previous}")
+                    if destination.exists() or destination.is_symlink():
+                        raise FileExistsError(f"Droplet stage rollback destination is occupied: {destination}")
+                    os.replace(previous, destination)
+            except BaseException as recovery_error:
+                preserve_backup = True
+                message = f"Droplet stage rollback failed; original backups retained at {root}"
+                logger.error(message)
+                error.add_note(message)
+                raise error from recovery_error
             raise
+    finally:
+        if not preserve_backup:
+            try:
+                current_root = root.lstat()
+                if (current_root.st_dev, current_root.st_ino) != (owned_root.st_dev, owned_root.st_ino):
+                    logger.warning("Refusing to clean replaced Droplet stage directory: %s", root)
+                else:
+                    shutil.rmtree(root)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                logger.warning("Droplet stage temporary cleanup failed at %s: %s", root, cleanup_error)
 
 
 def droplet_output_disk_mb(spool: str | Path) -> int:

@@ -37,22 +37,78 @@ fn resolve_output_path(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
+struct ProtectedInput<'a> {
+    label: &'a str,
+    path: PathBuf,
+    subtree: bool,
+    identity: (u64, u64),
+}
+
+struct PlannedOutput<'a> {
+    label: &'a str,
+    path: PathBuf,
+    directory: bool,
+    identity: Option<(u64, u64)>,
+    parents: Vec<(u64, u64)>,
+}
+
+fn protect_input_entries<'a>(
+    path: &Path, base: &Path, label: &'a str, protected: &mut Vec<ProtectedInput<'a>>,
+) -> Result<PathBuf> {
+    let mut resolved = base.to_path_buf();
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        match component {
+            Component::RootDir => resolved = PathBuf::from("/"),
+            Component::CurDir => {},
+            Component::ParentDir => { resolved.pop(); },
+            Component::Normal(name) => {
+                resolved.push(name);
+                // 目录重置不能删掉输入所经的链接；只保canonical目标会漏掉入口及中间跳。
+                let mut metadata = std::fs::symlink_metadata(&resolved)?;
+                protected.push(ProtectedInput { label, path: resolved.clone(), subtree: false,
+                    identity: (metadata.dev(), metadata.ino()) });
+                if metadata.file_type().is_symlink() {
+                    // 沿用文件系统的循环/无效链接拒绝，再逐跳记录实际读取路径。
+                    resolved.canonicalize()?;
+                    let target = std::fs::read_link(&resolved)?;
+                    let parent = resolved.parent().context("Input symlink has no parent")?;
+                    resolved = protect_input_entries(&target, parent, label, protected)?;
+                    metadata = std::fs::metadata(&resolved)?;
+                }
+                anyhow::ensure!(components.peek().is_none() || metadata.is_dir(),
+                    "{label} input ancestor must be a directory: {}", path.display());
+            },
+            Component::Prefix(_) => anyhow::bail!("Unsupported input path: {}", path.display()),
+        }
+    }
+    Ok(resolved)
+}
+
 /// 在任何输出创建、清理或截断之前验证整组路径；主流程、stage和evidence共用。
 pub(crate) fn validate_io_paths(
     inputs: &[(&str, &Path)], directories: &[(&str, &Path)], files: &[(&str, &Path)],
 ) -> Result<()> {
-    let protected = inputs.iter().map(|(label, path)| {
+    let mut protected = Vec::new();
+    for (label, path) in inputs {
         let resolved = path.canonicalize().with_context(||
             format!("Cannot resolve {label}: {}", path.display()))?;
-        let directory = std::fs::metadata(&resolved)?.is_dir();
-        Ok((*label, resolved, directory))
-    }).collect::<Result<Vec<_>>>()?;
-    let mut outputs: Vec<(&str, PathBuf, bool)> = Vec::new();
+        let metadata = std::fs::metadata(&resolved)?;
+        let traced = protect_input_entries(path, &std::env::current_dir()?, label, &mut protected)?;
+        let traced_metadata = std::fs::metadata(&traced)?;
+        anyhow::ensure!((metadata.dev(), metadata.ino()) == (traced_metadata.dev(), traced_metadata.ino()),
+            "{label} changed while resolving input: {}", path.display());
+        protected.push(ProtectedInput { label, path: resolved, subtree: metadata.is_dir(),
+            identity: (metadata.dev(), metadata.ino()) });
+    }
+    let mut outputs: Vec<PlannedOutput<'_>> = Vec::new();
     for (directory, paths) in [(true, directories), (false, files)] {
         for (label, path) in paths {
             let resolved = resolve_output_path(path)?;
+            let mut identity = None;
             match std::fs::symlink_metadata(&resolved) {
                 Ok(metadata) => {
+                    identity = Some((metadata.dev(), metadata.ino()));
                     anyhow::ensure!(!metadata.file_type().is_symlink(),
                         "{label} must not be a symlink: {}", path.display());
                     anyhow::ensure!(if directory { metadata.is_dir() } else { metadata.is_file() },
@@ -65,22 +121,84 @@ pub(crate) fn validate_io_paths(
                 Err(error) => return Err(error).with_context(||
                     format!("Cannot inspect {label}: {}", path.display())),
             }
-            for (input_label, input, input_directory) in &protected {
-                anyhow::ensure!(resolved != *input
-                    && !(directory && input.starts_with(&resolved))
-                    && !(*input_directory && resolved.starts_with(input)),
-                    "{label} overlaps protected {input_label}: {}", path.display());
+            let mut parents = Vec::new();
+            for parent in resolved.ancestors().skip(1) {
+                match std::fs::metadata(parent) {
+                    Ok(metadata) => {
+                        anyhow::ensure!(metadata.is_dir(), "Output ancestor must be a directory: {}", parent.display());
+                        parents.push((metadata.dev(), metadata.ino()));
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(error) => return Err(error).with_context(|| format!("Cannot inspect output ancestor: {}", parent.display())),
+                }
             }
-            for (other_label, other, other_directory) in &outputs {
-                anyhow::ensure!(resolved != *other
-                    && !(directory && other.starts_with(&resolved))
-                    && !(*other_directory && resolved.starts_with(other)),
-                    "{label} overlaps {other_label}: {}", path.display());
+            for input in &protected {
+                anyhow::ensure!(resolved != input.path
+                    && !(directory && input.path.starts_with(&resolved))
+                    && !(input.subtree && resolved.starts_with(&input.path))
+                    && identity != Some(input.identity)
+                    && !(input.subtree && parents.contains(&input.identity)),
+                    "{label} overlaps protected {}: {}", input.label, path.display());
             }
-            outputs.push((*label, resolved, directory));
+            for other in &outputs {
+                anyhow::ensure!(resolved != other.path
+                    && !(directory && other.path.starts_with(&resolved))
+                    && !(other.directory && resolved.starts_with(&other.path))
+                    && !(identity.is_some() && identity == other.identity)
+                    && !(directory && identity.is_some_and(|id| other.parents.contains(&id)))
+                    && !(other.directory && other.identity.is_some_and(|id| parents.contains(&id))),
+                    "{label} overlaps {}: {}", other.label, path.display());
+            }
+            outputs.push(PlannedOutput { label, path: resolved, directory, identity, parents });
         }
     }
     Ok(())
+}
+
+#[test]
+fn input_entries_and_existing_aliases_are_protected_without_mutation() {
+    use std::os::unix::fs::symlink;
+    let root = std::env::temp_dir().join(format!("alopex_input_entries.{}.{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let raw = root.join("Raw");
+    let output = root.join("Output");
+    std::fs::create_dir_all(&raw).unwrap();
+    std::fs::create_dir(&output).unwrap();
+    let input = raw.join("R1.fastq.gz");
+    std::fs::write(&input, b"original input").unwrap();
+    let marker = output.join("old");
+    std::fs::write(&marker, b"old output").unwrap();
+    let middle = output.join("middle");
+    symlink(&input, &middle).unwrap();
+    let entry = root.join("entry");
+    symlink("Output/middle", &entry).unwrap();
+    assert!(validate_io_paths(&[("raw", &entry)], &[("DNA", &output)], &[]).is_err());
+    let middle_directory = output.join("reads");
+    symlink(&raw, &middle_directory).unwrap();
+    let directory_entry = root.join("reads");
+    symlink("Output/reads", &directory_entry).unwrap();
+    assert!(validate_io_paths(&[("raw", &directory_entry.join("R1.fastq.gz"))], &[("DNA", &output)], &[]).is_err());
+    // 合法相对链接链及重复经过同一目录链接仍可读，不把再次出现的链接误判为环。
+    symlink("Raw", root.join("legal")).unwrap();
+    let legal = root.join("legal/../legal/R1.fastq.gz");
+    let report = root.join("report.json");
+    validate_io_paths(&[("raw", &legal)], &[("DNA", &root.join("new"))], &[("report", &report)]).unwrap();
+    symlink("cycle", root.join("cycle")).unwrap();
+    assert!(validate_io_paths(&[("raw", &root.join("cycle"))], &[], &[("report", &report)]).is_err());
+    // 大小写别名仅在当前文件系统确实支持时检查；其他平台仍执行上面的完整路径用例。
+    let raw_alias = root.join("raw");
+    if raw_alias.exists() {
+        assert!(validate_io_paths(&[("raw", &input)], &[("DNA", &raw_alias)], &[]).is_err());
+        assert!(validate_io_paths(&[("spool", &raw)], &[], &[("evidence", &raw_alias.join("new.json"))]).is_err());
+        assert!(validate_io_paths(&[("raw", &input)], &[("DNA", &output), ("RNA", &root.join("output"))], &[]).is_err());
+        assert!(validate_io_paths(&[("raw", &input)], &[("DNA", &output)], &[("report", &root.join("output/report.json"))]).is_err());
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), b"original input");
+    assert_eq!(std::fs::read(&marker).unwrap(), b"old output");
+    assert_eq!(std::fs::read_link(&entry).unwrap(), PathBuf::from("Output/middle"));
+    assert!(!root.join("new").exists());
+    assert!(!report.exists());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
