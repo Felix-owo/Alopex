@@ -3,6 +3,10 @@ use super::spool::*;
 use crate::*;
 
 pub(crate) fn run(args: &Args, spool: &Path) -> Result<()> {
+    crate::cli::validate_io_paths(
+        &[("--evidence-pairs", args.evidence_pairs.as_deref().unwrap()),
+          ("--droplet-spool", spool)], &[],
+        &[("--evidence-output", args.evidence_output.as_deref().unwrap())])?;
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Pair {

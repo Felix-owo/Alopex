@@ -693,6 +693,13 @@ pub(crate) fn run() -> Result<()> {
         !args.r1.is_empty() && args.r1.len() == args.r2.len(),
         "paired input list mismatch"
     );
+    let inputs: Vec<_> = args.r1.iter().map(|p| ("--r1", p.as_path()))
+        .chain(args.r2.iter().map(|p| ("--r2", p.as_path())))
+        .chain(std::iter::once(("--decoder-python", args.decoder_python.as_path())))
+        .collect();
+    crate::cli::validate_io_paths(&inputs, &[("--spool", args.spool.as_path())],
+        &[("--counts-output", args.counts_output.as_path()),
+          ("--count-metrics", args.count_metrics.as_path())])?;
     let compute_threads = args.threads.saturating_sub(13).max(1);
     rayon::ThreadPoolBuilder::new()
         .num_threads(compute_threads)

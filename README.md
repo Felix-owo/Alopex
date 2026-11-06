@@ -1,8 +1,8 @@
-# Alopex v17.1
+# Alopex v17.2
 
-正式源码以 Git tag `v17.1` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v17.2` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
-v17.1 汇总官方包审查修复：保留 BISCUIT 原始整数 CpG 计数，校验 Notebook 运行中源码身份，修复报告/缓存/失败恢复边界。默认 jobs=60，TAPS 默认保留最终 BAM；Final QC 两种模式均按所选指标绘图。更新源码后须重启 Notebook kernel。验证范围与限制见[发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.1/docs/benchmarks/config-audit.md#release-v171)。
+v17.2 修复原生 demux/stage/evidence/replay 的输出路径重叠：在写入或清理前保护 FASTQ、Barcode Map、request 和 spool，覆盖符号链接、硬链接及缺失目录组合。默认 jobs=60，TAPS 默认保留最终 BAM；显式配置仍优先。更新源码后须重启 Notebook kernel。验证范围与限制见[发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.2/docs/benchmarks/config-audit.md#release-v172)。
 
 内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
@@ -16,9 +16,9 @@ v17.1 汇总官方包审查修复：保留 BISCUIT 原始整数 CpG 计数，校
 | 查阅内容 | 文档 |
 | --- | --- |
 | Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
-| 配置参数、QC 字段与计数口径 | [ANALYSIS_PARAMETERS](https://github.com/Felix-owo/Alopex_dev/blob/v17.1/docs/ANALYSIS_PARAMETERS.md) |
-| 流程与维护契约 | [pipeline.drawio](https://github.com/Felix-owo/Alopex_dev/blob/v17.1/docs/pipeline.drawio)、[AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/v17.1/AGENTS.md) |
-| 实测结果、验证范围与失败教训 | [BENCHMARKS](https://github.com/Felix-owo/Alopex_dev/blob/v17.1/docs/BENCHMARKS.md) |
+| 配置参数、QC 字段与计数口径 | [ANALYSIS_PARAMETERS](https://github.com/Felix-owo/Alopex_dev/blob/v17.2/docs/ANALYSIS_PARAMETERS.md) |
+| 流程与维护契约 | [pipeline.drawio](https://github.com/Felix-owo/Alopex_dev/blob/v17.2/docs/pipeline.drawio)、[AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/v17.2/AGENTS.md) |
+| 实测结果、验证范围与失败教训 | [BENCHMARKS](https://github.com/Felix-owo/Alopex_dev/blob/v17.2/docs/BENCHMARKS.md) |
 
 源码按职责定位：`core/alopex/`包含配置、输入、科学处理、交付与维护，其`downstream/`子包负责QC计算与绘图；`core/`下的Shell入口与Snakefile负责运行编排；顶层`downstream/`承载Notebook与操作说明。开发测试在`tests/`，详细契约和证据在`docs/`，私有 Alopex_dev 的完整发行包包含 docs、tests 和维护规范；公开 Alopex 的运行包才排除开发内容。
 
@@ -35,16 +35,16 @@ demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态�
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v17.1 Release](https://github.com/Felix-owo/Alopex_dev/releases/tag/v17.1) 下载 `Alopex-v17.1.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。Alopex_dev 完整发行包保留全部受版本控制的源码、固定资源、下游 Notebook、docs、tests 与维护规范。公开 Alopex 另发运行包，排除 docs、tests 和开发规范；Conda、生成参考、科学结果及未跟踪日志均不入包。
+从 [v17.2 Release](https://github.com/Felix-owo/Alopex_dev/releases/tag/v17.2) 下载 `Alopex-v17.2.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。Alopex_dev 完整发行包保留全部受版本控制的源码、固定资源、下游 Notebook、docs、tests 与维护规范。公开 Alopex 另发运行包，排除 docs、tests 和开发规范；Conda、生成参考、科学结果及未跟踪日志均不入包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v17.1.tar.gz
-cd Alopex-v17.1
+tar -xzf Alopex-v17.2.tar.gz
+cd Alopex-v17.2
 conda --version
 ```
 
-跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。运行快照会记录实际源码、环境和输入身份，实验及验收范围见 [发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.1/docs/benchmarks/config-audit.md#release-v171)。
+跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。运行快照会记录实际源码、环境和输入身份，实验及验收范围见 [发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.2/docs/benchmarks/config-audit.md#release-v172)。
 
 | 平台 / 部署方式 | 要求 |
 | --- | --- |
@@ -280,7 +280,7 @@ Alopex 以 [GPL-3.0](LICENSE) 发布。
 开发仓 `.gitattributes` 不排除 docs/tests；公开仓单独用 `export-ignore` 固定运行发行内容。两者都使用 [Git 原生归档](https://git-scm.com/docs/git-archive) 重建，无独立打包脚本：
 
 ```bash
-git archive --format=tar.gz --prefix=Alopex-v17.1/ -o Alopex-v17.1.tar.gz v17.1
+git archive --format=tar.gz --prefix=Alopex-v17.2/ -o Alopex-v17.2.tar.gz v17.2
 ```
 
 源码 checkout 的当前文档结构见 [docs 导航](https://github.com/Felix-owo/Alopex_dev/blob/main/docs/README.md)，修改前按 [AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/main/AGENTS.md) 的任务清单读取详细契约。上文固定 tag 链接用于对应正式发行版的历史说明。

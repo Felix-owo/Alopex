@@ -726,53 +726,35 @@ pub(super) fn ensure_parent_dir(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn prepare_output_roots(config: &Config) -> Result<()> {
-    let dna_root = materialize_output_root(&config.dna_out_dir, "--dna-out-dir")?;
-    let mut roots = vec![("--dna-out-dir", dna_root.clone())];
+pub(super) fn prepare_output_roots(config: &Config, spool: Option<&Path>) -> Result<()> {
+    let mut inputs: Vec<_> = config.r1.iter().map(|p| ("--r1", p.as_path()))
+        .chain(config.r2.iter().map(|p| ("--r2", p.as_path())))
+        .chain(std::iter::once(("--barcode-map", config.barcode_map.as_path())))
+        .collect();
+    if let Some(spool) = spool { inputs.push(("--droplet-spool", spool)); }
+    let mut directories = vec![("--dna-out-dir", config.dna_out_dir.as_path())];
     if config.mode == DemuxMode::DnaRna {
-        let rna_root = materialize_output_root(&config.rna_out_dir, "--rna-out-dir")?;
-        if dna_root.starts_with(&rna_root) || rna_root.starts_with(&dna_root) {
-            anyhow::bail!("--dna-out-dir and --rna-out-dir must be distinct, non-nested run roots");
-        }
-        roots.push(("--rna-out-dir", rna_root));
+        directories.push(("--rna-out-dir", config.rna_out_dir.as_path()));
     }
-    for (label, root) in &roots {
-        for (input_label, input_path) in config
-            .r1
-            .iter()
-            .map(|path| ("--r1", path))
-            .chain(config.r2.iter().map(|path| ("--r2", path)))
-            .chain(std::iter::once(("--barcode-map", &config.barcode_map)))
-        {
-            if matches!(input_label, "--r1" | "--r2")
-                && input_path.parent() == Some(Path::new("/dev/fd"))
-            {
-                continue;
-            }
-            let input = input_path.canonicalize().with_context(|| {
-                format!("Cannot resolve {input_label}: {}", input_path.display())
-            })?;
-            if input.starts_with(root) {
-                anyhow::bail!(
-                    "Refusing to reset {label} because it contains {input_label}: {}",
-                    input.display()
-                );
-            }
-        }
+    crate::cli::validate_io_paths(&inputs, &directories,
+        &[("--json-report", config.json_report.as_path())])?;
+    ensure_parent_dir(&config.json_report, "--json-report")?;
+    for (label, path) in directories {
+        let root = materialize_output_root(path, label)?;
         if root.exists() {
-            let metadata = std::fs::symlink_metadata(root)
+            let metadata = std::fs::symlink_metadata(&root)
                 .with_context(|| format!("Cannot inspect {label}: {}", root.display()))?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 anyhow::bail!("{label} must be a real directory: {}", root.display());
             }
-            std::fs::remove_dir_all(root).with_context(|| {
+            std::fs::remove_dir_all(&root).with_context(|| {
                 format!(
                     "Cannot reset exclusive run output root {label}: {}",
                     root.display()
                 )
             })?;
         }
-        std::fs::create_dir_all(root)
+        std::fs::create_dir_all(&root)
             .with_context(|| format!("Cannot create {label}: {}", root.display()))?;
     }
     Ok(())

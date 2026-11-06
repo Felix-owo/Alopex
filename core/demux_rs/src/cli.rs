@@ -1,5 +1,128 @@
 use clap::{Parser, ValueEnum};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
+use std::os::unix::fs::MetadataExt;
+use crate::{Context, Result};
+
+fn resolve_output_path(path: &Path) -> Result<PathBuf> {
+    let mut resolved = std::env::current_dir()?;
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        match component {
+            Component::RootDir => resolved = PathBuf::from("/"),
+            Component::CurDir => {},
+            Component::ParentDir => { resolved.pop(); },
+            Component::Normal(name) => {
+                resolved.push(name);
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        anyhow::ensure!(components.peek().is_some(),
+                            "Output must not be a symlink: {}", path.display());
+                        resolved = resolved.canonicalize().with_context(||
+                            format!("Cannot resolve output symlink: {}", resolved.display()))?;
+                        anyhow::ensure!(std::fs::metadata(&resolved)?.is_dir(),
+                            "Output ancestor must be a directory: {}", resolved.display());
+                    },
+                    Ok(metadata) => {
+                        anyhow::ensure!(components.peek().is_none() || metadata.is_dir(),
+                            "Output ancestor must be a directory: {}", resolved.display());
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(error) => return Err(error).with_context(||
+                        format!("Cannot inspect output path: {}", resolved.display())),
+                }
+            },
+            Component::Prefix(_) => anyhow::bail!("Unsupported output path: {}", path.display()),
+        }
+    }
+    Ok(resolved)
+}
+
+/// 在任何输出创建、清理或截断之前验证整组路径；主流程、stage和evidence共用。
+pub(crate) fn validate_io_paths(
+    inputs: &[(&str, &Path)], directories: &[(&str, &Path)], files: &[(&str, &Path)],
+) -> Result<()> {
+    let protected = inputs.iter().map(|(label, path)| {
+        let resolved = path.canonicalize().with_context(||
+            format!("Cannot resolve {label}: {}", path.display()))?;
+        let directory = std::fs::metadata(&resolved)?.is_dir();
+        Ok((*label, resolved, directory))
+    }).collect::<Result<Vec<_>>>()?;
+    let mut outputs: Vec<(&str, PathBuf, bool)> = Vec::new();
+    for (directory, paths) in [(true, directories), (false, files)] {
+        for (label, path) in paths {
+            let resolved = resolve_output_path(path)?;
+            match std::fs::symlink_metadata(&resolved) {
+                Ok(metadata) => {
+                    anyhow::ensure!(!metadata.file_type().is_symlink(),
+                        "{label} must not be a symlink: {}", path.display());
+                    anyhow::ensure!(if directory { metadata.is_dir() } else { metadata.is_file() },
+                        "{label} has an invalid output type: {}", path.display());
+                    // Pipeline的report可预先由mktemp创建；不得沿共享inode截断输入或备份。
+                    anyhow::ensure!(directory || metadata.nlink() == 1,
+                        "{label} must not be hard-linked: {}", path.display());
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error).with_context(||
+                    format!("Cannot inspect {label}: {}", path.display())),
+            }
+            for (input_label, input, input_directory) in &protected {
+                anyhow::ensure!(resolved != *input
+                    && !(directory && input.starts_with(&resolved))
+                    && !(*input_directory && resolved.starts_with(input)),
+                    "{label} overlaps protected {input_label}: {}", path.display());
+            }
+            for (other_label, other, other_directory) in &outputs {
+                anyhow::ensure!(resolved != *other
+                    && !(directory && other.starts_with(&resolved))
+                    && !(*other_directory && resolved.starts_with(other)),
+                    "{label} overlaps {other_label}: {}", path.display());
+            }
+            outputs.push((*label, resolved, directory));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn io_plan_rejects_aliases_without_creating_or_changing_files() {
+    use std::os::unix::fs::symlink;
+    let root = std::env::temp_dir().join(format!("alopex_io_plan.{}.{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let raw = root.join("raw");
+    std::fs::create_dir_all(&raw).unwrap();
+    let input = raw.join("R1.fastq.gz");
+    std::fs::write(&input, b"original molecule records").unwrap();
+    let redirect = root.join("redirect");
+    symlink(&raw, &redirect).unwrap();
+    let missing = root.join("not-created");
+    let directory = missing.join("../redirect");
+    let report = root.join("report.json");
+    let inputs = [("input", input.as_path())];
+    assert!(validate_io_paths(&inputs, &[("DNA", &directory)], &[]).is_err());
+    assert!(validate_io_paths(&inputs, &[], &[("report", &input)]).is_err());
+    let linked = root.join("linked-report.json");
+    symlink(&input, &linked).unwrap();
+    assert!(validate_io_paths(&inputs, &[], &[("report", &linked)]).is_err());
+    let hard = root.join("shared-report.json");
+    std::fs::hard_link(&input, &hard).unwrap();
+    assert!(validate_io_paths(&inputs, &[], &[("report", &hard)]).is_err());
+    assert!(validate_io_paths(&inputs, &[], &[("report", &missing.join("../shared-report.json"))]).is_err());
+    let not_directory = root.join("file");
+    std::fs::write(&not_directory, b"not a directory").unwrap();
+    assert!(validate_io_paths(&inputs, &[("RNA", &missing.join("../file/../RNA"))], &[]).is_err());
+    let output = missing.join("DNA");
+    assert!(validate_io_paths(&inputs, &[("DNA", &output)],
+        &[("report", &output.join("report.json"))]).is_err());
+    assert!(validate_io_paths(&inputs, &[], &[("counts", &report), ("metrics", &report)]).is_err());
+    assert!(validate_io_paths(&[("spool", raw.as_path())], &[], &[("report", &raw.join("manifest.json"))]).is_err());
+    // Pipeline独占mktemp report和正常独立目录仍合法；校验不提前创建目录或截断文件。
+    std::fs::write(&report, b"").unwrap();
+    validate_io_paths(&inputs, &[("DNA", &output)], &[("report", &report)]).unwrap();
+    assert!(!missing.exists());
+    assert_eq!(std::fs::read(&input).unwrap(), b"original molecule records");
+    assert!(std::fs::read(&report).unwrap().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "DNA/RNA FASTQ 高通量解复用器")]
