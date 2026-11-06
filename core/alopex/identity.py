@@ -1,6 +1,10 @@
 """按实际 Python 导入及 Shell 定义追踪阶段的科学源码身份。"""
 from __future__ import annotations
 
+import sys
+
+_LOADED_MODULE_CODE = sys._getframe().f_code
+
 import ast
 import copy
 import hashlib
@@ -12,8 +16,93 @@ import symtable
 from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
+from types import CodeType, ModuleType
 
 from .paths import CORE_ROOT
+
+
+def capture_loaded_source_codes() -> tuple[tuple[str, ModuleType, Path, CodeType], ...]:
+    """固定本次已导入的 Alopex 实现；reload 或替换 sys.modules 不能刷新旧的 from-import 引用。"""
+    records = []
+    for name, module in tuple(sys.modules.items()):
+        canonical = getattr(getattr(module, "__spec__", None), "name", None) or name
+        if canonical != "alopex" and not canonical.startswith("alopex."):
+            continue
+        path = Path(module.__file__).resolve()
+        if path.name in {"__init__.py", "__main__.py", "plotting.py"}:
+            continue
+        code = getattr(module, "_LOADED_MODULE_CODE", None)
+        if not isinstance(code, CodeType):
+            raise RuntimeError(f"Alopex module was loaded before this update; restart the kernel: {name}")
+        records.append((name, module, path, code))
+    return tuple(records)
+
+
+def _loaded_constant_structure(value) -> tuple:
+    if isinstance(value, CodeType):
+        return _loaded_code_structure(value)
+    if isinstance(value, (tuple, frozenset)):
+        items = tuple(_loaded_constant_structure(item) for item in value)
+        return (type(value).__name__, tuple(sorted(items, key=repr)) if isinstance(value, frozenset) else items)
+    return type(value).__name__, repr(value)
+
+
+def _loaded_code_structure(code: CodeType) -> tuple:
+    # 行号、源路径和调试行表不定义算法；保留常量的类型/精确字面值及异常表。
+    # 只比较 code object，不执行或 reload 磁盘上的模块。
+    return (code.co_name, code.co_qualname, code.co_argcount, code.co_posonlyargcount,
+            code.co_kwonlyargcount, code.co_nlocals, code.co_stacksize, code.co_flags,
+            code.co_code, code.co_exceptiontable, code.co_names, code.co_varnames,
+            code.co_freevars, code.co_cellvars,
+            tuple(_loaded_constant_structure(value) for value in code.co_consts))
+
+
+
+def _loaded_code_contains(module_code: CodeType, active_code: CodeType) -> bool:
+    return module_code is active_code or any(
+        isinstance(value, CodeType) and _loaded_code_contains(value, active_code)
+        for value in module_code.co_consts)
+
+
+_LOADED_SOURCE_CHECKS: dict[tuple[Path, int], tuple[CodeType, str]] = {}
+
+
+def _verify_loaded_source(path: Path, source: str | bytes, code: CodeType) -> None:
+    data = source.encode("utf-8") if isinstance(source, str) else source
+    digest = hashlib.sha256(data).hexdigest()
+    key = (path, id(code))
+    checked = _LOADED_SOURCE_CHECKS.get(key)
+    if checked is not None and checked[0] is code and checked[1] == digest:
+        return
+    current = compile(source, str(path), "exec", dont_inherit=True, optimize=sys.flags.optimize)
+    if _loaded_code_structure(current) != _loaded_code_structure(code):
+        raise RuntimeError(f"Alopex source changed after import; restart the kernel: {path}")
+    _LOADED_SOURCE_CHECKS[key] = (code, digest)
+
+
+def assert_loaded_sources_current(records: Sequence[tuple[str, ModuleType, Path, CodeType]]) -> None:
+    """拒绝旧内核实现与新磁盘源码混用；成功内容可复用编译比较，逐次读取内容确认未变。"""
+    # Notebook 的 from-import 可在 reload 后继续持有旧函数；其 globals 已换新，
+    # 因而还须核实际调用栈中的 code object，不能只看 sys.modules 的新记录。
+    modules = {id(module.__dict__): code for _, module, _, code in records}
+    frame = sys._getframe(1)
+    try:
+        while frame is not None:
+            owner = modules.get(id(frame.f_globals))
+            if owner is not None and not _loaded_code_contains(owner, frame.f_code):
+                raise RuntimeError("Alopex caller predates a module reload; restart the kernel")
+            frame = frame.f_back
+    finally:
+        del frame
+    for name, module, path, code in records:
+        if (sys.modules.get(name) is not module
+                or getattr(module, "_LOADED_MODULE_CODE", None) is not code):
+            raise RuntimeError(f"Alopex was reloaded during this session; restart the kernel: {name}")
+        try:
+            _verify_loaded_source(path, path.read_bytes(), code)
+        except (OSError, SyntaxError) as exc:
+            raise RuntimeError(f"Cannot verify loaded Alopex source; restart the kernel: {path}") from exc
+
 
 def python_ast_bindings(source: str, *, conditional_bindings: bool = False) -> dict[str, ast.AST]:
     """提取去 docstring 的模块绑定；可选保留条件定义的外围条件，不登记推导式局部变量。"""
@@ -75,7 +164,8 @@ def _global_loads(node: ast.AST) -> set[str]:
 class PythonSourceGraph:
     """只读源码，不 import 或执行被审查模块；每次收集固定一份解析视图。"""
 
-    def __init__(self, source_roots: Sequence[Path] | None = None):
+    def __init__(self, source_roots: Sequence[Path] | None = None, *,
+                 loaded_sources: Sequence[tuple[str, ModuleType, Path, CodeType]] = ()):
         if source_roots is None:
             source_roots = (CORE_ROOT,)
         self.source_roots = tuple(Path(root).resolve() for root in source_roots)
@@ -83,6 +173,7 @@ class PythonSourceGraph:
             if not root.is_dir():
                 raise FileNotFoundError(f"Scientific source root is not a directory: {root}")
         self.modules: dict[str, tuple[dict[str, ast.AST], dict[str, tuple[str, str | None]]]] = {}
+        self.loaded_codes = {path: code for _, _, path, code in loaded_sources}
 
     def module_path(self, module: str) -> Path | None:
         if not module or any(not part.isidentifier() for part in module.split(".")):
@@ -125,6 +216,10 @@ class PythonSourceGraph:
         if path is None:
             raise ValueError(f"Missing local scientific module: {module}")
         source = path.read_text(encoding="utf-8")
+        code = self.loaded_codes.get(path.resolve())
+        if code is not None:
+            # 校验将要进入 AST 指纹的同一份内容，不能另读已回滚的磁盘版本批准它。
+            _verify_loaded_source(path.resolve(), source, code)
         bindings = python_ast_bindings(source, conditional_bindings=True)
         imports: dict[str, tuple[str, str | None]] = {}
         def register(node: ast.AST) -> None:

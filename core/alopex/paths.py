@@ -1,4 +1,7 @@
 """定位当前安装；不依赖工作目录或相邻 Pipeline。"""
+import sys
+
+_LOADED_MODULE_CODE = sys._getframe().f_code
 from pathlib import Path
 
 PIPELINE_ROOT = Path(__file__).resolve().parents[2]

@@ -1,6 +1,10 @@
 """环境与reference构建事务、Doctor固定路线和原始输入自检。"""
 from __future__ import annotations
 
+import sys
+
+_LOADED_MODULE_CODE = sys._getframe().f_code
+
 import csv
 import datetime as dt
 import gzip

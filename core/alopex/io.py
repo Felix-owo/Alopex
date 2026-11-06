@@ -1,6 +1,10 @@
 """原子文件、基础内容身份及原生进程流；仅清理本次拥有的临时项。"""
 from __future__ import annotations
 
+import sys
+
+_LOADED_MODULE_CODE = sys._getframe().f_code
+
 import csv
 import datetime as dt
 import hashlib

@@ -1,6 +1,10 @@
 """配置、协议、数据类型及只读参考契约；不调用交付或构建。"""
 from __future__ import annotations
 
+import sys
+
+_LOADED_MODULE_CODE = sys._getframe().f_code
+
 import copy
 import json
 import logging

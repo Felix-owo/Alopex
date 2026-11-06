@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 import sys
+
+_LOADED_MODULE_CODE = sys._getframe().f_code
 import tempfile
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence

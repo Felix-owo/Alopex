@@ -103,8 +103,9 @@ Notebook 默认同时要求 lambda methylation `<10%`、pUC19 methylation `>90%`
 
 | 图 / Notebook 控制 | 解读与输出 |
 | --- | --- |
-| Final QC | `FINAL_QC_MODE=per_clone_samples` 按 CloneID 分面，`distribution` 叠加；`FINAL_QC_METRIC` 支持单指标/列表，`FINAL_QC_CLONE_ID` 选组，逐项展示并保存 PDF |
-| Final QC 横纵轴 | 100 bins、组间共用边界；CpG 正值用 log 横轴，含非正值改 signed-log1p 并标明，其他指标线性；纵轴 Counts，保留有效 N/中位数，实际直方图加 sigma=1.5、半径6、对称边界的高斯平滑，在变换空间插值；平滑保总计数且不参与 QC 筛选，仅排缺失/非数值/无穷 |
+| Final QC | `FINAL_QC_MODE=per_clone_samples`：每个指标一张图，按 CloneID 分面，适合逐组检查；`distribution`：每个指标一张图，各 CloneID 按固定颜色叠加，适合比较组间分布，组数多时降低填充透明度以减少遮挡。两种模式均严格使用 `FINAL_QC_METRIC` 的单指标/有序列表，不自动替换成预设指标；`FINAL_QC_CLONE_ID=None` 选全部，也支持单个 CloneID 或列表 |
+| Final QC 指标与保存 | 支持 QC 表全部17个数值字段（含 `Lambda_Meth_CpG_Rate%`、`pUC19_Meth_CpG_Rate%`）；未知/缺列指标明确报错。Notebook 统一调用 batch，每项保存 `Final_QC_Dashboard_<mode>_<metric>_<clone_selection>.pdf`（`%` 转为 `pct`）；两模式文件独立。仅展示与保存绘图，无需重跑 Processor；更新绘图库后须重启 kernel，重新运行首格和 QC 加载格再绘图 |
+| Final QC 横纵轴 | 两模式共用配色、100 bins、组间共用边界；CpG 位点数正值用 log 横轴，含非正值改 signed-log1p 并标明，甲基化率等其他指标线性；纵轴 Counts（受各组样本量影响，不是概率密度）。分面标注各组有效 N/输入 N 与中位数，叠加标注全部所选组的有效 N/输入 N 与总体中位数（虚线）；无有限值明确标注 No finite data，不填0、不切换指标。实际直方图加 sigma=1.5、半径6、对称边界的高斯平滑，在变换空间插值；平滑保总计数且不参与 QC 筛选，仅排缺失/非数值/无穷 |
 | `CpG_Density_Unique_vs_Input_Pairs.pdf` | 横轴 trimming 前 input pairs，纵轴最终宿主 unique CpG sites，CloneID 配色；散点用原始计数，不作深度归一化或异常点剔除 |
 | 拟合与 `CpG_Density.pdf` | 散点拟合线与斜率汇总共用联合有效样本、异常点筛选及 `min_slope_ratio_change`；过原点 `slope=sum(x*y)/sum(x*x)`，单位 sites/input pair，不能拟合则 N/A |
 | density 输入 | QC 身份/sites、sealed final manifest pairs、composition cache host signals 的样本集合须完全一致，不静默取交集 |

@@ -584,7 +584,7 @@ def _final_qc_histogram_bins(values, use_log):
     return edges, scale
 
 
-def _draw_final_qc_histogram(ax, counts, edges, scale, color):
+def _draw_final_qc_histogram(ax, counts, edges, scale, color, fill_alpha=0.32):
     transformed = (np.log10(edges) if scale == 'log' else
                    np.sign(edges) * np.log1p(np.abs(edges)) if scale == 'log1p' else edges)
     offsets = np.arange(-6, 7, dtype=float)
@@ -596,8 +596,8 @@ def _draw_final_qc_histogram(ax, counts, edges, scale, color):
     curve_x = (np.power(10.0, curve_x) if scale == 'log' else
                np.sign(curve_x) * np.expm1(np.abs(curve_x)) if scale == 'log1p' else curve_x)
     curve_y = np.interp(positions, np.arange(len(counts)) + 0.5, smoothed)
-    ax.stairs(counts, edges, fill=True, color=color, alpha=0.16, linewidth=0)
-    ax.fill_between(curve_x, curve_y, color=color, alpha=0.32, linewidth=0)
+    ax.stairs(counts, edges, fill=True, color=color, alpha=fill_alpha / 2, linewidth=0)
+    ax.fill_between(curve_x, curve_y, color=color, alpha=fill_alpha, linewidth=0)
     ax.plot(curve_x, curve_y, color=color, linewidth=1.6)
     if scale == 'log':
         ax.set_xscale('log')
@@ -620,12 +620,18 @@ def plot_final_qc_dashboard(
     group_col: str = 'CloneID',
     clone_id: Any = None,
     mode: str = 'distribution',
-    metric: str = 'Native_Mapping%',
+    metric: Any = 'Native_Mapping%',
     clone_color_map: dict = None,
     out_path: Path = None,
     figsize: tuple = (16.5, 12),
 ):
-    """按 CloneID 绘制 100 分箱及平滑计数峰；CpG 横轴用对数，含零值时保留并用 log1p。"""
+    """绘制所选指标：distribution 叠加各组，per_clone_samples 按组分面。
+
+    distribution 支持单指标或有序列表；per_clone_samples 的多指标由 batch 逐项绘制。
+    位点数使用对数横轴，真实零值保留并使用 signed-log1p；不填补缺失值。
+    """
+    if mode not in ('distribution', 'per_clone_samples'):
+        raise ValueError("Unsupported mode. Use 'distribution' or 'per_clone_samples'.")
     if df.empty or group_col not in df.columns:
         print(f"Error: column '{group_col}' not found.")
         return
@@ -669,17 +675,35 @@ def plot_final_qc_dashboard(
         'Native_Mapping%': ('Native Mapping (%)', False),
         'Final_Pair_Yield%': ('Final Pair Yield (%)', False),
         'Duplicate_Pair_Rate%': ('Duplicate Pair Rate (%)', False),
+        'Sample_Meth_CpG_Rate%': ('Host CpG Methylation (%)', False),
+        'Lambda_Unique_CpG_Sites': ('Lambda Unique CpG Sites', True),
+        'Lambda_Meth_CpG_Rate%': ('Lambda CpG Methylation (%)', False),
+        'pUC19_Unique_CpG_Sites': ('pUC19 Unique CpG Sites', True),
+        'pUC19_Meth_CpG_Rate%': ('pUC19 CpG Methylation (%)', False),
+        'High_CpH_Flag_Rate%': ('High-CpH Flag Rate (%)', False),
+        'Trim_Retention%': ('Trim Retention (%)', False),
+        'Signal_Host_Rate%': ('Host CpG Signal Share (%)', False),
+        'Signal_Lambda_Rate%': ('Lambda CpG Signal Share (%)', False),
+        'Signal_pUC19_Rate%': ('pUC19 CpG Signal Share (%)', False),
+        'Signal_mtDNA_Rate%': ('mtDNA CpG Signal Share (%)', False),
     }
+    valid_metrics = normalize_metric_list(metric)
+    if not valid_metrics:
+        raise ValueError('No QC metric selected; specify a metric or a nonempty list.')
+    unsupported = [name for name in valid_metrics if name not in metric_configs]
+    if unsupported:
+        raise ValueError(f'Unsupported QC metrics: {unsupported}. Supported: {list(metric_configs)}')
+    missing_metrics = [name for name in valid_metrics if name not in plot_df.columns]
+    if missing_metrics:
+        raise ValueError(f'QC metrics not found in dataframe: {missing_metrics}')
+    if mode == 'per_clone_samples' and len(valid_metrics) != 1:
+        raise ValueError('Use plot_final_qc_dashboard_batch for multiple per_clone_samples metrics.')
+    metric = valid_metrics[0]
 
     if mode == 'distribution':
         label_map, omitted = make_cloneid_diff_labels(group_ids)
         plot_df[f'{group_col}_Display'] = plot_df[group_col].map(label_map).fillna(plot_df[group_col])
         plot_df[f'{group_col}_Display'] = plot_df[f'{group_col}_Display'].astype('category')
-
-        valid_metrics = [m for m in metric_configs if m in plot_df.columns]
-        if len(valid_metrics) == 0:
-            print('Error: no valid QC metrics found in dataframe.')
-            return
 
         display_levels = [label_map.get(g, g) for g in group_ids]
         if clone_color_map:
@@ -690,12 +714,12 @@ def plot_final_qc_dashboard(
         else:
             color_map = generate_clone_color_map(display_levels)
 
-        n_cols = 2
+        n_cols = min(2, len(valid_metrics))
         n_rows = math.ceil(len(valid_metrics) / n_cols)
         fig, axes = plt.subplots(
             n_rows,
             n_cols,
-            figsize=(figsize[0], 5 * n_rows),
+            figsize=(figsize[0] if n_cols == 2 else figsize[0] * 0.68, 4.9 * n_rows),
             dpi=PlotParams.DPI,
         )
         axes = np.array(axes).reshape(-1)
@@ -710,11 +734,11 @@ def plot_final_qc_dashboard(
             panel_df = panel_df.dropna(subset=[metric_name])
 
             if panel_df.empty:
+                format_ax(ax, title=display_name, xlabel=display_name, ylabel='Counts')
                 ax.text(
-                    0.5, 0.5, 'No data', transform=ax.transAxes,
+                    0.5, 0.5, f'No finite data (n = 0 / {len(plot_df)})', transform=ax.transAxes,
                     ha='center', va='center', fontsize=12, color=Colors.ANNOT
                 )
-                ax.set_axis_off()
                 continue
 
             bin_edges, scale = _final_qc_histogram_bins(panel_df[metric_name].to_numpy(dtype=float), use_log)
@@ -726,14 +750,20 @@ def plot_final_qc_dashboard(
                 if len(vals) == 0:
                     continue
                 counts, _ = np.histogram(vals, bins=bin_edges)
-                _draw_final_qc_histogram(ax, counts, bin_edges, scale, color_map.get(display_group, UNKNOWN_COLOR))
+                # 组数多时降低填充遮挡；分箱、计数和平滑算法与分面模式完全相同。
+                _draw_final_qc_histogram(
+                    ax, counts, bin_edges, scale, color_map.get(display_group, UNKNOWN_COLOR),
+                    fill_alpha=0.32 * min(1.0, math.sqrt(2 / len(group_ids))),
+                )
 
             median_val = panel_df[metric_name].median()
             ax.axvline(median_val, ls='--', lw=1.0, color=Colors.MEDIAN, alpha=0.9, zorder=5)
             ax.text(
-                0.02, 0.975, f'Median: {_format_metric_stat(median_val)}',
+                0.02, 0.975,
+                f'All groups: n = {len(panel_df)} / {len(plot_df)} | Median: {_format_metric_stat(median_val)}',
                 transform=ax.transAxes, ha='left', va='top',
                 fontsize=10.2, color=Colors.ANNOT,
+                bbox=dict(facecolor='white', edgecolor='none', alpha=0.9, pad=2), zorder=6,
             )
 
             format_ax(
@@ -743,6 +773,7 @@ def plot_final_qc_dashboard(
                 ylabel='Counts',
             )
             add_panel_letter(ax, panel_label(i))
+            ax.set_xlim(bin_edges[0], bin_edges[-1])
 
             if not use_log:
                 ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
@@ -775,44 +806,37 @@ def plot_final_qc_dashboard(
         plt.close(fig)
         return
 
-    if mode != 'per_clone_samples':
-        print("Error: unsupported mode. Use 'distribution' or 'per_clone_samples'.")
-        return
-
-    if metric not in metric_configs:
-        print(f"Error: unsupported metric '{metric}'.")
-        print("Supported metrics:")
-        for name in metric_configs:
-            print(f"  - {name}")
-        return
-
-    if metric not in plot_df.columns:
-        print(f"Error: metric '{metric}' not found in dataframe.")
-        return
-
     display_name, use_log = metric_configs[metric]
+    group_totals = plot_df.groupby(group_col, observed=True).size()
     plot_df[metric] = pd.to_numeric(plot_df[metric], errors='coerce')
     plot_df = plot_df.loc[np.isfinite(plot_df[metric])].copy()
-    if plot_df.empty:
-        print(f"Error: no finite values for metric '{metric}'.")
-        return
-    bin_edges, scale = _final_qc_histogram_bins(plot_df[metric].to_numpy(dtype=float), use_log)
+    bin_edges, scale = (_final_qc_histogram_bins(plot_df[metric].to_numpy(dtype=float), use_log)
+                        if not plot_df.empty else (None, 'linear'))
     clones = group_ids
     clone_display_map, omitted = make_cloneid_diff_labels(clones)
 
     if clone_color_map is None:
         clone_color_map = generate_clone_color_map(clones)
 
-    n_cols = 2
+    n_cols = min(2, len(clones))
     n_rows = max(1, math.ceil(len(clones) / n_cols))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 4.9 * n_rows), dpi=PlotParams.DPI)
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(figsize[0] if n_cols == 2 else figsize[0] * 0.68, 4.9 * n_rows),
+        dpi=PlotParams.DPI,
+    )
     axes = np.array(axes).reshape(-1)
     for i, clone in enumerate(clones):
         ax = axes[i]
         values = plot_df.loc[plot_df[group_col] == clone, metric]
 
         if values.empty:
-            ax.axis('off')
+            format_ax(
+                ax, title=f"{clone_display_map.get(clone, clone)} - {display_name}",
+                xlabel=display_name, ylabel='Counts',
+            )
+            ax.text(0.5, 0.5, f'No finite data (n = 0 / {group_totals[clone]})',
+                    transform=ax.transAxes, ha='center', va='center', color=Colors.ANNOT)
             continue
 
         counts, _ = np.histogram(values.to_numpy(dtype=float), bins=bin_edges)
@@ -821,9 +845,11 @@ def plot_final_qc_dashboard(
         median_val = values.median()
         ax.axvline(median_val, ls='--', lw=1.0, color=Colors.MEDIAN, alpha=0.9, zorder=4)
         ax.text(
-            0.02, 0.975, f'n = {len(values)} | Median: {_format_metric_stat(median_val)}',
+            0.02, 0.975,
+            f'n = {len(values)} / {group_totals[clone]} | Median: {_format_metric_stat(median_val)}',
             transform=ax.transAxes, ha='left', va='top',
             fontsize=10.2, color=Colors.ANNOT,
+            bbox=dict(facecolor='white', edgecolor='none', alpha=0.9, pad=2), zorder=6,
         )
 
         format_ax(
@@ -835,6 +861,9 @@ def plot_final_qc_dashboard(
         ax.set_xlim(bin_edges[0], bin_edges[-1])
         ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
         add_panel_letter(ax, panel_label(i))
+        if not use_log:
+            ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
+            ax.ticklabel_format(style='plain', axis='x')
 
     for j in range(len(clones), len(axes)):
         axes[j].axis('off')
@@ -1792,8 +1821,7 @@ def plot_final_qc_dashboard_batch(
     """为指标列表生成一个或多个最终 QC 面板。"""
     metric_list = normalize_metric_list(metrics)
     if not metric_list:
-        print("Error: no metric specified.")
-        return
+        raise ValueError('No QC metric selected; specify a metric or a nonempty list.')
 
     if out_dir is not None:
         out_dir = Path(out_dir)

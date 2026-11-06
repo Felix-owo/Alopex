@@ -1,6 +1,10 @@
 """原始输入、manifest、barcode及解复用提交边界。"""
 from __future__ import annotations
 
+import sys
+
+_LOADED_MODULE_CODE = sys._getframe().f_code
+
 import stat
 import csv
 import gzip

@@ -1,6 +1,10 @@
 """资源预算、重试及执行器适配；不依赖科学处理、交付或 Doctor。"""
 from __future__ import annotations
 
+import sys
+
+_LOADED_MODULE_CODE = sys._getframe().f_code
+
 import math
 import os
 import re

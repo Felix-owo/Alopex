@@ -14,6 +14,8 @@ import shutil
 import stat as _qc_lock_stat
 import subprocess
 import sys
+
+_LOADED_MODULE_CODE = sys._getframe().f_code
 import tempfile
 import threading
 import time
@@ -34,10 +36,13 @@ from ..config import (
     validate_downstream_reference,
 )
 from ..delivery import load_run_manifest, load_run_snapshot
-from ..identity import PythonSourceGraph
+from ..identity import PythonSourceGraph, capture_loaded_source_codes, assert_loaded_sources_current
 from ..io import sha256_file, project_temporary_parent
 from ..paths import CORE_ROOT as _CORE_ROOT, PIPELINE_ROOT as _PIPELINE_ROOT
 from ..runtime import effective_cpu_count
+
+
+_LOADED_SOURCE_CODES = capture_loaded_source_codes()
 
 
 FINAL_MANIFEST = Path("03_results/QC_Results/sample_manifest.tsv")
@@ -1396,6 +1401,7 @@ class CompletedQCContext:
 
 def _require_completed_qc(paths: RunPaths, sealed: SealedQCContext) -> CompletedQCContext:
     """统一核对 QC 与 Raw 的交付、算法及细胞集合，保留提交前复验边界。"""
+    assert_loaded_sources_current(_LOADED_SOURCE_CODES)
     try:
         marker_state = _delivery_marker_state(paths.input_identity)
         identity = json.loads(paths.input_identity.read_text())
@@ -1423,6 +1429,7 @@ def _require_completed_qc(paths: RunPaths, sealed: SealedQCContext) -> Completed
         raise ValueError("QC is incomplete or stale; rerun the QC Processor") from exc
 
     def assert_current():
+        assert_loaded_sources_current(_LOADED_SOURCE_CODES)
         sealed.assert_current()
         try:
             if (_delivery_marker_state(paths.input_identity) != marker_state
@@ -1798,7 +1805,7 @@ def _raw_adata_schema_mode(out_file: Path) -> str:
 
 def _algorithm_fingerprints() -> dict[str, str]:
 
-    sources = PythonSourceGraph((_CORE_ROOT,))
+    sources = PythonSourceGraph((_CORE_ROOT,), loaded_sources=_LOADED_SOURCE_CODES)
     versions = {name: importlib.metadata.version(name)
                 for name in ("numpy", "pandas", "scipy", "numba", "snapatac2")}
     roots = {
@@ -3182,9 +3189,13 @@ def _run_pipeline_impl(
 
     if cfg.tss_bed is not None:
         validate_downstream_reference(sealed.reference_path, cfg.tss_bed, "tss")
+    def assert_runtime_current():
+        assert_loaded_sources_current(_LOADED_SOURCE_CODES)
+        sealed.assert_current()
+
     assert_current = _reference_guard(sealed.reference_path, cfg.ref_fai, cfg.tss_bed,
         Path(str(cfg.tss_bed) + ".reference.json") if cfg.tss_bed else None,
-        before_commit=sealed.assert_current)
+        before_commit=assert_runtime_current)
 
     def prepare_cache_commit():
         # 自动修复缓存也须撤旧身份；交付换代后不得提交本次计算结果。
@@ -3433,6 +3444,7 @@ def run_pipeline(
 ) -> None:
     """运行 QC 流程，并保证所有退出路径都关闭自有的 RawAdata 句柄。"""
     with _qc_write_lock(paths.qc_results_dir):
+        assert_loaded_sources_current(_LOADED_SOURCE_CODES)
         raw_adata_owner: list = []
         try:
             _run_pipeline_impl(
@@ -3652,6 +3664,7 @@ def resolve_notebook_paths(
     source_root。alopex.downstream.qc 位于 Pipeline 树内，Notebook 第一格
     的定位 bootstrap 之外的完整校验以本函数为唯一实现。
     """
+    assert_loaded_sources_current(_LOADED_SOURCE_CODES)
     project_dir = _notebook_project_root(dna_project_root)
     manifest = load_run_manifest(project_dir, validate_outputs=False)
     pipeline_root = _notebook_pipeline_root(dna_pipeline_root, manifest)
@@ -3689,6 +3702,7 @@ def run_qc_processor(
     TSS 默认每个 CloneID 抽检 10%（不足 10 个全检，最多 100 个）；
     比例设为 1.0 时全量检查，比例与种子只影响 TSS 缓存。
     """
+    assert_loaded_sources_current(_LOADED_SOURCE_CODES)
     _validate_tss_sampling(tss_sample_fraction, tss_sample_seed)
     if skip_tss and tss_bed is not None:
         raise ValueError("skip_tss cannot be combined with an explicit TSS bed")
