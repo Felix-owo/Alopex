@@ -1263,6 +1263,55 @@ def _validate_droplet_stage_paths(inputs: Sequence[str | Path], spool: Path,
                 raise ValueError(f"Droplet stage outputs overlap: {destination}")
         outputs.append((resolved, directory, identity, parents))
 
+    # 尚不存在的输出没有inode；在同一实际命名空间中试建，才能识别大小写/Unicode等别名。
+    groups: dict[tuple[int, int], tuple[Path, list[tuple[Path, bool]]]] = {}
+    for resolved, directory, _, _ in outputs:
+        parent = resolved.parent
+        while not parent.exists():
+            parent = parent.parent
+        metadata = parent.stat()
+        members = groups.setdefault((metadata.st_dev, metadata.st_ino), (parent, []))[1]
+        members.append((resolved.relative_to(parent), directory))
+    for parent, members in groups.values():
+        if len(members) < 2:
+            continue
+        parent = parent.resolve(strict=True)
+        parent_metadata = parent.stat()
+        probe = Path(tempfile.mkdtemp(prefix=".alopex_output_names.", dir=parent))
+        probe_metadata = probe.stat()
+        failure = None
+        try:
+            planned: list[tuple[Path, bool]] = []
+            for suffix, directory in members:
+                path = probe / suffix
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if directory:
+                    path.mkdir(exist_ok=True)
+                else:
+                    with path.open("xb"):
+                        pass
+                for other, other_directory in planned:
+                    if (path.samefile(other)
+                            or (directory and any(path.samefile(p) for p in other.parents))
+                            or (other_directory and any(other.samefile(p) for p in path.parents))):
+                        raise ValueError(f"Droplet stage output names overlap on the target filesystem: {suffix}")
+                planned.append((path, directory))
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            try:
+                current_parent, current_probe = parent.lstat(), probe.lstat()
+                if (stat.S_ISLNK(current_parent.st_mode) or stat.S_ISLNK(current_probe.st_mode)
+                        or (current_parent.st_dev, current_parent.st_ino) != (parent_metadata.st_dev, parent_metadata.st_ino)
+                        or (current_probe.st_dev, current_probe.st_ino) != (probe_metadata.st_dev, probe_metadata.st_ino)):
+                    raise OSError(f"Droplet output namespace probe changed before cleanup: {probe}")
+                shutil.rmtree(probe)
+            except OSError as cleanup_error:
+                if failure is None:
+                    raise
+                logger.warning("Droplet output namespace probe cleanup failed; preserved %s: %s", probe, cleanup_error)
+
 
 def stage_droplet_reads(r1: Sequence[str | Path], r2: Sequence[str | Path], spool: str | Path,
                         counts: str | Path, structure: str | Path, *, binary: str | Path,

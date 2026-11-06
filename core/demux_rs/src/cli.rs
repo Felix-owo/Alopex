@@ -52,6 +52,92 @@ struct PlannedOutput<'a> {
     parents: Vec<(u64, u64)>,
 }
 
+/// 在目标文件系统独占临时目录中模拟尚未存在的命名空间；不创建最终输出。
+pub(crate) fn validate_prospective_paths(
+    directories: &[&Path], files: &[&Path], replaced_root: Option<&Path>,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::fs::{self, OpenOptions};
+    use std::os::unix::fs::DirBuilderExt;
+    let replacement = replaced_root.map(|root| resolve_output_path(root).map(|path| (root, path))).transpose()?;
+    let mut groups: BTreeMap<(u64, u64), (PathBuf, Vec<(PathBuf, bool)>)> = BTreeMap::new();
+    for (directory, paths) in [(true, directories), (false, files)] {
+        for path in paths {
+            // 独占根将被删除重建；旧根权限/目录标志/子链接不定义新根的名称语义。
+            let path = if let Some((root, resolved)) = &replacement {
+                resolved.join(path.strip_prefix(root)?)
+            } else { resolve_output_path(path)? };
+            let namespace = replacement.as_ref().map(|(_, root)| root.as_path()).unwrap_or(&path);
+            let mut parent = namespace.parent().context("Output has no parent")?;
+            while !parent.exists() {
+                parent = parent.parent().context("Output has no existing ancestor")?;
+            }
+            let metadata = fs::metadata(parent)?;
+            anyhow::ensure!(metadata.is_dir(), "Output ancestor must be a directory: {}", parent.display());
+            let suffix = path.strip_prefix(parent)?.to_path_buf();
+            groups.entry((metadata.dev(), metadata.ino()))
+                .or_insert_with(|| (parent.to_path_buf(), Vec::new())).1.push((suffix, directory));
+        }
+    }
+    for (parent_identity, (parent, members)) in groups {
+        if members.len() < 2 { continue; }
+        let parent = parent.canonicalize()?;
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let probe = (0..128).find_map(|attempt| {
+            let path = parent.join(format!(".alopex_output_names.{}.{nonce}.{attempt}", std::process::id()));
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => Some(Ok(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        }).context("Cannot allocate exclusive output namespace probe")??;
+        let metadata = fs::symlink_metadata(&probe)?;
+        let probe_identity = (metadata.dev(), metadata.ino());
+        let result = (|| -> Result<()> {
+            let mut outputs = crate::AHashSet::new();
+            let mut output_directories = crate::AHashSet::new();
+            let mut output_ancestors = crate::AHashSet::new();
+            for (suffix, directory) in &members {
+                let path = probe.join(suffix);
+                fs::create_dir_all(path.parent().context("Probe output has no parent")?)?;
+                if *directory { fs::create_dir_all(&path)?; }
+                else { OpenOptions::new().write(true).create_new(true).open(&path)
+                    .context("Output names overlap on the target filesystem")?; }
+                let metadata = fs::metadata(&path)?;
+                let identity = (metadata.dev(), metadata.ino());
+                let parents: Vec<_> = path.ancestors().skip(1).map(|p| {
+                    fs::metadata(p).map(|m| (m.dev(), m.ino()))
+                }).collect::<std::io::Result<_>>()?;
+                anyhow::ensure!(!outputs.contains(&identity)
+                    && !(*directory && output_ancestors.contains(&identity))
+                    && !parents.iter().any(|id| output_directories.contains(id)),
+                    "Output names overlap on the target filesystem: {}", suffix.display());
+                outputs.insert(identity);
+                if *directory { output_directories.insert(identity); }
+                output_ancestors.extend(parents);
+            }
+            Ok(())
+        })();
+        let cleanup = (|| -> Result<()> {
+            // 清理只认本次父目录和临时根身份，不按前缀搜索，也不跟随替换后的根。
+            let parent_metadata = fs::symlink_metadata(&parent)?;
+            let metadata = fs::symlink_metadata(&probe)?;
+            anyhow::ensure!(!parent_metadata.file_type().is_symlink() && !metadata.file_type().is_symlink()
+                && (parent_metadata.dev(), parent_metadata.ino()) == parent_identity
+                && (metadata.dev(), metadata.ino()) == probe_identity,
+                "Output namespace probe changed before cleanup: {}", probe.display());
+            fs::remove_dir_all(&probe)?;
+            Ok(())
+        })();
+        if let Err(error) = cleanup {
+            if result.is_ok() { return Err(error); }
+            log::warn!("Output namespace probe cleanup failed; preserved {}: {error:#}", probe.display());
+        }
+        result?;
+    }
+    Ok(())
+}
+
 fn protect_input_entries<'a>(
     path: &Path, base: &Path, label: &'a str, protected: &mut Vec<ProtectedInput<'a>>,
 ) -> Result<PathBuf> {
@@ -152,7 +238,11 @@ pub(crate) fn validate_io_paths(
             outputs.push(PlannedOutput { label, path: resolved, directory, identity, parents });
         }
     }
-    Ok(())
+    validate_prospective_paths(
+        &outputs.iter().filter(|p| p.directory).map(|p| p.path.as_path()).collect::<Vec<_>>(),
+        &outputs.iter().filter(|p| !p.directory).map(|p| p.path.as_path()).collect::<Vec<_>>(),
+        None,
+    )
 }
 
 #[test]

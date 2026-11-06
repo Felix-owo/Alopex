@@ -726,7 +726,25 @@ pub(super) fn ensure_parent_dir(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn prepare_output_roots(config: &Config, spool: Option<&Path>) -> Result<()> {
+fn validate_cell_output_names(root: &Path, names: &[String]) -> Result<()> {
+    let mut spellings: AHashMap<String, &String> = AHashMap::new();
+    let mut candidates = AHashSet::new();
+    for name in names {
+        if let Some(previous) = spellings.insert(name.to_ascii_lowercase(), name) {
+            candidates.insert(previous);
+            candidates.insert(name);
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let paths: Vec<_> = candidates.into_iter().map(|name| root.join(name)).collect();
+    let directories: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+    crate::cli::validate_prospective_paths(&directories, &[], Some(root))
+        .context("Cannot validate distinct cell output names")
+}
+
+pub(super) fn prepare_output_roots(config: &Config, spool: Option<&Path>, rows: &[CellRow]) -> Result<()> {
     let mut inputs: Vec<_> = config.r1.iter().map(|p| ("--r1", p.as_path()))
         .chain(config.r2.iter().map(|p| ("--r2", p.as_path())))
         .chain(std::iter::once(("--barcode-map", config.barcode_map.as_path())))
@@ -738,6 +756,11 @@ pub(super) fn prepare_output_roots(config: &Config, spool: Option<&Path>) -> Res
     }
     crate::cli::validate_io_paths(&inputs, &directories,
         &[("--json-report", config.json_report.as_path())])?;
+    let names: Vec<_> = rows.iter().map(|row| format!("{}_{}", config.sample_name,
+        if config.mode == DemuxMode::DnaOnlyDroplet { &row.dna_barcode } else { &row.plate_id })).collect();
+    for (_, root) in &directories {
+        validate_cell_output_names(root, &names)?;
+    }
     ensure_parent_dir(&config.json_report, "--json-report")?;
     for (label, path) in directories {
         let root = materialize_output_root(path, label)?;

@@ -731,7 +731,7 @@ fn run() -> Result<()> {
     let cell_rows = load_barcode_map(&config.barcode_map, config.mode)?;
     let (dna_bc_lengths, rna_bc_len) = resolve_barcode_lengths(&cell_rows, config.mode)?;
     validate_effective_barcode_prefixes(&cell_rows, &dna_bc_lengths, rna_bc_len, config.mode)?;
-    prepare_output_roots(&config, droplet_spool.as_deref())?;
+    prepare_output_roots(&config, droplet_spool.as_deref(), &cell_rows)?;
     let dna_bc_lengths_label = dna_bc_lengths
         .iter()
         .map(usize::to_string)
