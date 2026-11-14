@@ -700,7 +700,7 @@ smoke_control() {
     prefix_has_tools "$prefix" "${CONTROL_REQUIRED[@]}" || return 1
     prefix_matches_native_platform "$prefix" || return 1
     validate_control_conda "$prefix" || return 1
-    run_in_sanitized_environment "$prefix/bin" "$prefix/bin/python" - <<'PY' >/dev/null
+    run_in_sanitized_environment "$prefix/bin" "$prefix/bin/python" - <<'PY' >/dev/null || return 1
 from importlib.metadata import version
 import jsonschema
 import yaml
@@ -756,7 +756,7 @@ import sys
 
 for module_name in (
     "anndata", "IPython", "ipykernel", "jupyterlab", "matplotlib", "numba", "numpy", "packaging",
-    "pandas", "polars", "sklearn", "seaborn", "snapatac2", "tqdm", "yaml",
+    "pandas", "h5py", "sklearn", "seaborn", "tqdm", "yaml",
 ):
     importlib.import_module(module_name)
 entry = sys.argv[1]
@@ -776,7 +776,7 @@ retry_transient_create() {
             return 1
         fi
         echo "WARNING: $label Conda create 失败；清理未完成 prefix 后重试 ($attempt/$max_attempts)..." >&2
-        rm -rf -- "$target"
+        rm -rf -- "$target" || return $?
         sleep $(( attempt * 3 ))
         attempt=$((attempt + 1))
     done
@@ -790,8 +790,8 @@ create_or_reuse_role() {
             "$current_prefix" --envs "$ENVS_SPEC" --role "$role" >/dev/null 2>&1 \
             && "$smoke_fn" "$current_prefix" >/dev/null 2>&1; then
             local resolved_current_prefix
-            resolved_current_prefix="$(cd "$current_prefix" && pwd -P)"
-            ln -s "$resolved_current_prefix" "$target"
+            resolved_current_prefix="$(cd "$current_prefix" && pwd -P)" || return $?
+            ln -s "$resolved_current_prefix" "$target" || return $?
             echo "复用未变化的 $role 环境：$resolved_current_prefix"
             return 0
         fi
@@ -3174,7 +3174,7 @@ start_doctor_route() {
     local worker job_output job_id worker_mem
     case "$route" in
         hg38-cabernet-bismark) worker_mem=16G ;;
-        mm10-srd-biscuit|hg38-taps-rastair) worker_mem=24G ;;
+        mm10-cabernet-biscuit|hg38-taps-rastair) worker_mem=24G ;;
         *) return 2 ;;
     esac
     if [[ "$SYSTEM_NAME" == Linux && -z "${SLURM_JOB_ID:-}" ]]; then
@@ -3197,6 +3197,10 @@ EOF
             bash -c 'cd "$1" && exec bash "$2"' _ "$project" "$RUN_PIPELINE" > "$route_log" 2>&1 &
     fi
     printf -v "$pid_var" '%s' "$!"
+    if [[ -n "${FINAL_LOG:-}" ]]; then
+        summary "[Alopex route] $route running"
+        [[ -z "${job_id:-}" ]] || summary "[Alopex job] $job_id $route"
+    fi
 }
 remove_doctor_sandbox() {
     local expected_prefix="$DOCTOR_TMP_PARENT/doctor."
@@ -3331,7 +3335,8 @@ verify_route_outputs() {
     local project="$1" route="$2"
     PYTHONPATH="$PIPELINE_ROOT/core" "$CONTROL_PYTHON" -m alopex benchmark-verify \
         --project "$project" --manifest "$BENCHMARK_JSON" --route "$route" || return 1
-    cp "$project/04_logs/doctor_verification.json" "$DOCTOR_LOG_ROOT/doctor.$DOCTOR_RUN_ID.$route.json"
+    cp "$project/04_logs/doctor_verification.json" "$DOCTOR_LOG_ROOT/doctor.$DOCTOR_RUN_ID.$route.json" || return $?
+    if [[ -n "${FINAL_LOG:-}" ]]; then summary "[Alopex route] $route verified"; fi
 }
 
 # doctor 段入口：分派的唯一调用目标；flow 首行自带 set 严格模式。
@@ -3349,7 +3354,7 @@ run_doctor_section() {
     LATEST_DETAIL_LOG="$DOCTOR_LOG_ROOT/latest.detail.log"
     LATEST_SUMMARY_LOG="$DOCTOR_LOG_ROOT/latest.summary.log"
     SMOKE_HG38="$TMP_ROOT/smoke_hg38_cabernet_bismark"
-    SMOKE_MM10="$TMP_ROOT/smoke_mm10_srd_biscuit"
+    SMOKE_MM10="$TMP_ROOT/smoke_mm10_cabernet_biscuit"
     : > "$DETAIL_LOG"; : > "$FINAL_LOG"
     ln -sfn "$(basename "$DETAIL_LOG")" "$LATEST_DETAIL_LOG"
     ln -sfn "$(basename "$FINAL_LOG")" "$LATEST_SUMMARY_LOG"
@@ -3367,7 +3372,7 @@ run_doctor_section() {
     trap finish_doctor EXIT
     printf 'Host: %s\nPlatform: %s/%s\n' "$HOST_NAME" "$SYSTEM_NAME" "$MACHINE_NAME" >> "$DETAIL_LOG"
     summary "Route A  : hg38 / Cabernet / Bismark / 真实 hg38_cabernet raw + 合成对照"
-    summary "Route B  : mm10 / SRD / BISCUIT / 真实 mm10_srd Cabernet DNA + 合成 RNA 布局/对照"
+    summary "Route B  : mm10 / Cabernet / BISCUIT / 真实 Cabernet DNA + 合成对照"
     summary "Route C  : hg38 / Cabernet-TAPS+ / Rastair / 独立合成真值"
     summary ""
     doctor_step_start "平台 / executor 检测"
@@ -3419,8 +3424,8 @@ run_doctor_section() {
         summary "[FAIL] 无法准备 hg38/Cabernet/Bismark smoke 项目"
         return 1
     }
-    stage_smoke_project "$SMOKE_MM10" mm10-srd-biscuit "$MM10_REFERENCE" >> "$DETAIL_LOG" 2>&1 || {
-        summary "[FAIL] 无法准备 mm10/SRD/BISCUIT smoke 项目"
+    stage_smoke_project "$SMOKE_MM10" mm10-cabernet-biscuit "$MM10_REFERENCE" >> "$DETAIL_LOG" 2>&1 || {
+        summary "[FAIL] 无法准备 mm10/Cabernet/BISCUIT smoke 项目"
         return 1
     }
     run_logged "Route A manifest refresh" run_manifest_refresh "$SMOKE_HG38" || {
@@ -3428,13 +3433,13 @@ run_doctor_section() {
         return 1
     }
     run_logged "Route B manifest refresh" run_manifest_refresh "$SMOKE_MM10" || {
-        summary "[FAIL] mm10/SRD/BISCUIT manifest 刷新失败"
+        summary "[FAIL] mm10/Cabernet/BISCUIT manifest 刷新失败"
         return 1
     }
     doctor_step_ok
     doctor_step_start "Route A/B workflow"
     ROUTE_A_LOG="$TMP_ROOT/route_a.hg38-cabernet-bismark.log"
-    ROUTE_B_LOG="$TMP_ROOT/route_b.mm10-srd-biscuit.log"
+    ROUTE_B_LOG="$TMP_ROOT/route_b.mm10-cabernet-biscuit.log"
     HG38_START_EPOCH="$(date +%s)"
     MM10_START_EPOCH="$HG38_START_EPOCH"
     printf '+ route A: hg38/Cabernet/Bismark\n' >> "$DETAIL_LOG"
@@ -3461,8 +3466,8 @@ run_doctor_section() {
     while [[ -z "$ROUTE_A_RC" || -z "$ROUTE_B_RC" ]]; do
         if [[ -z "$ROUTE_B_PID" && -z "$ROUTE_B_RC" ]] && { (( DOCTOR_PARALLEL_ROUTES == 1 )) || [[ "$ROUTE_A_RC" == 0 ]]; }; then
             MM10_START_EPOCH="$(date +%s)"
-            printf '+ route B: mm10/SRD/BISCUIT\n' >> "$DETAIL_LOG"
-            if ! start_doctor_route mm10-srd-biscuit "$SMOKE_MM10" "$ROUTE_B_LOG" ROUTE_B_JOB_ID ROUTE_B_PID; then
+            printf '+ route B: mm10/Cabernet/BISCUIT\n' >> "$DETAIL_LOG"
+            if ! start_doctor_route mm10-cabernet-biscuit "$SMOKE_MM10" "$ROUTE_B_LOG" ROUTE_B_JOB_ID ROUTE_B_PID; then
                 if [[ -z "$ROUTE_A_RC" ]]; then
                     [[ "$ROUTE_A_JOB_ID" =~ ^[0-9]+$ ]] && scancel "$ROUTE_A_JOB_ID" >> "$DETAIL_LOG" 2>&1 || true
                     doctor_terminate_pid_bounded "$ROUTE_A_PID" "Route A after Route B launch failure"
@@ -3477,10 +3482,12 @@ run_doctor_section() {
         if [[ -z "$ROUTE_A_RC" ]] && ! kill -0 "$ROUTE_A_PID" 2>/dev/null; then
             wait "$ROUTE_A_PID"; ROUTE_A_RC=$?; ROUTE_A_FINISHED="$ROUTE_NOW"
             printf 'Route A（hg38/Cabernet/Bismark）结束，rc=%s\n' "$ROUTE_A_RC" >> "$DETAIL_LOG"
+            if (( ROUTE_A_RC == 0 )); then summary "[Alopex route] hg38-cabernet-bismark passed"; else summary "[Alopex route] hg38-cabernet-bismark failed"; fi
         fi
         if [[ -z "$ROUTE_B_RC" && -n "$ROUTE_B_PID" ]] && ! kill -0 "$ROUTE_B_PID" 2>/dev/null; then
             wait "$ROUTE_B_PID"; ROUTE_B_RC=$?; ROUTE_B_FINISHED="$ROUTE_NOW"
-            printf 'Route B（mm10/SRD/BISCUIT）结束，rc=%s\n' "$ROUTE_B_RC" >> "$DETAIL_LOG"
+            printf 'Route B（mm10/Cabernet/BISCUIT）结束，rc=%s\n' "$ROUTE_B_RC" >> "$DETAIL_LOG"
+            if (( ROUTE_B_RC == 0 )); then summary "[Alopex route] mm10-cabernet-biscuit passed"; else summary "[Alopex route] mm10-cabernet-biscuit failed"; fi
         fi
         doctor_fail_fast_routes
         [[ -n "$ROUTE_A_RC" && -n "$ROUTE_B_RC" ]] || sleep 2
@@ -3491,7 +3498,7 @@ run_doctor_section() {
     {
         printf '\n===== Route A: hg38/Cabernet/Bismark =====\n'
         cat "$ROUTE_A_LOG"
-        printf '\n===== Route B: mm10/SRD/BISCUIT =====\n'
+        printf '\n===== Route B: mm10/Cabernet/BISCUIT =====\n'
         cat "$ROUTE_B_LOG"
     } >> "$DETAIL_LOG"
     if (( ROUTE_A_RC != 0 || ROUTE_B_RC != 0 )); then
@@ -3505,7 +3512,7 @@ run_doctor_section() {
         if (( ROUTE_B_CANCELLED == 1 )); then
             summary "[CANCELLED] Route A 失败后已请求取消 Route B"
         elif (( ROUTE_B_RC != 0 )); then
-            summary "[FAIL] Route B mm10/SRD/BISCUIT workflow 失败（rc=${ROUTE_B_RC}）"
+            summary "[FAIL] Route B mm10/Cabernet/BISCUIT workflow 失败（rc=${ROUTE_B_RC}）"
         fi
         return 1
     fi
@@ -3515,7 +3522,7 @@ run_doctor_section() {
         summary "[FAIL] Route A 输出/demux 校验失败"
         return 1
     }
-    verify_route_outputs "$SMOKE_MM10" mm10-srd-biscuit >> "$DETAIL_LOG" 2>&1 || {
+    verify_route_outputs "$SMOKE_MM10" mm10-cabernet-biscuit >> "$DETAIL_LOG" 2>&1 || {
         summary "[FAIL] Route B 输出/demux 校验失败"
         return 1
     }
@@ -3542,6 +3549,22 @@ run_doctor_section() {
 # 库模式与唯一分派入口
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     return 0
+fi
+
+# 工具链尚不可用时保留原生阶段输出；source 和 --check/help 不创建日志或展示进程。
+if (( $# <= 1 )) && [[ -z "${DNA_PIPELINE_PRESENTATION_CHILD:-}" && -x "$CONTROL_PYTHON" && \
+      -f "$PIPELINE_ROOT/core/alopex/presentation.py" && "${1:-}" != --help && "${1:-}" != -h && "$*" != *--check* ]]; then
+    case "${1:-doctor}" in
+        doctor) DISPLAY_MODE=doctor ;;
+        conda|reference|demux|download) DISPLAY_MODE="doctor-$1" ;;
+        *) DISPLAY_MODE="" ;;
+    esac
+    if [[ -n "$DISPLAY_MODE" ]]; then
+        exec env PYTHONPATH="$PIPELINE_ROOT/core" "$CONTROL_PYTHON" -m alopex present-command \
+            --mode "$DISPLAY_MODE" --title "Alopex Doctor${1:+ · $1}" \
+            --log-dir "${DNA_PIPELINE_DOCTOR_LOG_DIR:-$PIPELINE_ROOT/logs/doctor}" \
+            -- bash "$DOCTOR_SELF_PATH" "$@"
+    fi
 fi
 
 SECTION="${1:-doctor}"

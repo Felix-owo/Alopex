@@ -13,6 +13,7 @@ import json
 import os
 import errno
 import shutil
+import stat
 import subprocess
 import uuid
 from collections.abc import Collection, Iterator, Mapping, Sequence
@@ -88,6 +89,21 @@ def stable_file_identity(
     return identity
 
 
+def stat_if_present(path: Path) -> os.stat_result | None:
+    """仅真正缺席返回None；悬空链接（含父目录）及访问失败必须传播。"""
+    candidate = path
+    while True:
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            if candidate == candidate.parent:
+                return None
+            candidate = candidate.parent
+        else:
+            state = candidate.stat()
+            return state if candidate == path else None
+
+
 def project_temporary_parent(destination: str | Path, *, project_dir: str | Path | None = None) -> Path:
     """项目运行的工作/提交临时项写入05_tmp；无项目上下文的安装事务保留目标父目录。"""
     destination = Path(destination)
@@ -99,19 +115,38 @@ def project_temporary_parent(destination: str | Path, *, project_dir: str | Path
             candidate = Path(os.path.abspath(configured))
             project = candidate
     if project is None:
-        project = next((parent for parent in absolute.parents
-                        if (parent / "00_config").is_dir()), None)
+        for parent in absolute.parents:
+            marker = parent / "00_config"
+            state = stat_if_present(marker)
+            if state is None:
+                continue
+            if not stat.S_ISDIR(state.st_mode):
+                raise ValueError(f"Project configuration directory is not a directory: {marker}")
+            project = parent
+            break
     if project is None:
         return destination.parent
     temporary = project / "05_tmp"
-    if temporary.is_symlink() or (temporary.exists() and not temporary.is_dir()):
-        raise ValueError(f"Project temporary directory must be a real directory: {temporary}")
+    try:
+        mode = temporary.lstat().st_mode
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISDIR(mode):
+            raise ValueError(f"Project temporary directory must be a real directory: {temporary}")
     temporary.mkdir(parents=True, exist_ok=True)
     # 先拒绝跨挂载提交；不得让后续工具退化为复制覆盖已有科学结果。
     parent = absolute.parent
-    while not parent.exists():
-        parent = parent.parent
-    if parent.stat().st_dev != temporary.stat().st_dev:
+    while True:
+        try:
+            parent_state = parent.stat()
+        except FileNotFoundError:
+            if parent == parent.parent:
+                raise
+            parent = parent.parent
+        else:
+            break
+    if parent_state.st_dev != temporary.stat().st_dev:
         raise OSError(errno.EXDEV, "05_tmp and destination must share a filesystem", str(destination))
     return temporary
 
@@ -193,9 +228,11 @@ def _safe_relative(text: object, *, label: str) -> Path:
 
 
 def _remove_path(path: Path) -> None:
-    if not path.exists() and not path.is_symlink():
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
         return
-    if path.is_dir() and not path.is_symlink():
+    if stat.S_ISDIR(mode):
         _make_writable(path)
         shutil.rmtree(path)
     else:
@@ -266,8 +303,7 @@ def publish(
 
         ordered = [destination for destination in destinations if destination != commit_last]
         if commit_last is not None:
-            if commit_last.exists() or commit_last.is_symlink():
-                commit_last.unlink()
+            commit_last.unlink(missing_ok=True)
             ordered.append(commit_last)
 
         for destination in ordered:
@@ -326,27 +362,40 @@ def write_tsv_atomic(
 
 def _make_tree_read_only(root: Path) -> None:
     # snapshot 的输入链接指向已封存的共享内容；不得修改链接外的文件或其他账号权限。
-    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        if path.is_symlink():
-            continue
-        os.chmod(path, 0o755 if path.is_dir() else 0o444)
-    os.chmod(root, 0o755)
+    # 完整枚举失败必须阻止发布，不能留下未封存manifest却批准整个快照。
+    if not stat.S_ISDIR(root.lstat().st_mode):
+        raise ValueError(f"Snapshot stage must be a real directory: {root}")
+    pending, directories = [root], []
+    while pending:
+        directory = pending.pop()
+        directories.append(directory)
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                mode = path.lstat().st_mode
+                if stat.S_ISDIR(mode):
+                    pending.append(path)
+                elif not stat.S_ISLNK(mode):
+                    os.chmod(path, 0o444)
+    for directory in reversed(directories):
+        os.chmod(directory, 0o755)
 
 
 def _make_writable(path: Path) -> None:
-    if path.is_symlink() or not path.is_dir():
-        return
-    os.chmod(path, 0o755)
-    for child in path.rglob("*"):
-        if child.is_symlink() or not child.is_dir():
-            continue
+    # 清理只修改自有真实目录；类型/扫描失败不能让链接目标被当目录chmod。
+    pending = [path]
+    while pending:
+        directory = pending.pop()
         try:
-            os.chmod(child, 0o755)
+            mode = directory.lstat().st_mode
         except FileNotFoundError:
-            pass
+            continue
+        if not stat.S_ISDIR(mode):
+            continue
+        os.chmod(directory, 0o755)
+        with os.scandir(directory) as entries:
+            pending.extend(Path(entry.path) for entry in entries)
 
 
 def _remove_stage(stage: Path) -> None:
-    if stage.exists():
-        _make_writable(stage)
-        shutil.rmtree(stage)
+    _remove_path(stage)

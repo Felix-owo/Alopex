@@ -202,9 +202,6 @@ STATIC_RESOURCE_REQUESTS: Mapping[str, _StaticRuleRequest] = MappingProxyType(
             (2, 2, 2, 2), (4, 8, 12, 16), (120, 180, 240, 360)
         ),
         "bsconv_dna": _StaticRuleRequest((2, 2, 2, 2), (4, 8, 12, 16), (120, 180, 240, 360)),
-        "high_cph_bam": _StaticRuleRequest(
-            (2, 2, 2, 2), (4, 8, 12, 16), (120, 180, 240, 360)
-        ),
 
         "pileup": _StaticRuleRequest((1, 1, 1, 1), (4, 8, 12, 16), (60, 120, 180, 240)),
         "generate_cpg_input": _StaticRuleRequest(

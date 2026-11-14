@@ -196,10 +196,8 @@ else:
     BARCODE_MAP = CONFIG_DIR / "Barcode_Map.csv" if PROTOCOL_POLICY.name != "droplet" else None
     RUN_SNAPSHOT_DEP = []
 DNA_OUT_DIR = INTERMEDIATE_DIR / "demux" / "DNA"
-RNA_OUT_DIR = INTERMEDIATE_DIR / "demux" / "RNA"
 DEMUX_STATE_DIR = INTERMEDIATE_DIR / "demux" / "state"
 DEMUX_COMPLETION_PATTERN = DEMUX_STATE_DIR / "{sample}" / "completion.json"
-RNA_COLLECT_DIR = INTERMEDIATE_DIR / "RNA" / ".collect"
 
 for required_path, label in (
     (SAMPLE_MANIFEST, "sample manifest"),
@@ -250,7 +248,6 @@ BISMARK_CONFIG = PROTOCOL_CONFIG.get("bismark", {})
 DEMUX_MIN_MATCHED_READ_PAIRS = int(DEMUX_CONFIG["min_matched_read_pairs"])
 DNA_W_SPACER_LEN = int(DEMUX_CONFIG["dna_w_spacer_len"])
 
-PUBLISH_RNA_BAM = PROTOCOL_POLICY.publishes_rna_bam
 KEEP_FINAL_BAM = bool(config["retention"]["keep_final_bam"])
 
 BISCUIT_LIBRARY_MODE = biscuit_library_mode(config) if METHYLATION_BACKEND == "biscuit" else None
@@ -583,7 +580,6 @@ ALIGN_THREADS = lambda wildcards: backend_stage_threads("biscuit", "align", wild
 BISMARK_ALIGN_THREADS = lambda wildcards: backend_stage_threads("bismark", "align", wildcards)
 HIGH_CPH_READ_NAMES_THREADS = resource_threads("high_cph_read_names")
 BSCONV_DNA_THREADS = resource_threads("bsconv_dna")
-HIGH_CPH_BAM_THREADS = resource_threads("high_cph_bam")
 PILEUP_THREADS = resource_threads("pileup")
 CPG_THREADS = resource_threads("generate_cpg_input")
 BISMARK_EXTRACT_THREADS = lambda wildcards: backend_stage_threads("bismark", "extract", wildcards)
@@ -772,7 +768,6 @@ checkpoint demux:
         route_id = lambda wc: DEMUX_RUN_ROUTES[wc.sample].route_id,
         downstream_dna = lambda wc: DEMUX_RUN_ROUTES[wc.sample].downstream_dna,
         dna_dir = lambda wc: str(DNA_OUT_DIR / wc.sample),
-        rna_dir = lambda wc: str(RNA_OUT_DIR / wc.sample),
         resource_log = lambda wc: static_resource_log("droplet_demux") if PROTOCOL_POLICY.name == "droplet" else demux_resource_log(wc.sample),
         spool_dir = lambda wc: str(INTERMEDIATE_DIR / "demux/spool" / wc.sample)
     threads: resource_threads("droplet_demux") if PROTOCOL_POLICY.name == "droplet" else DEMUX_THREADS
@@ -798,7 +793,6 @@ checkpoint demux:
             "$(dirname {output.manifest:q})" \
             "$(dirname {output.completion:q})" \
             "$(dirname {params.dna_dir:q})" \
-            "$(dirname {params.rna_dir:q})" \
             "$(dirname {log:q})"
         dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
         printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
@@ -830,15 +824,13 @@ checkpoint demux:
         }} >> {log:q} 2>&1
 
         dna_final={params.dna_dir:q}
-        rna_final={params.rna_dir:q}
         completion_final={output.completion:q}
-        dna_tmp=""; rna_tmp=""; report_tmp=""; mqc_tmp=""; manifest_tmp=""; completion_tmp=""
+        dna_tmp=""; report_tmp=""; mqc_tmp=""; manifest_tmp=""; completion_tmp=""
         recovery_dir={PROJECT_TMP_DIR:q}/demux-recovery/{wildcards.sample:q}
         mkdir -p "$recovery_dir"
         demux_backup_path() {{
             case "$1" in
                 "$dna_final") printf '%s/DNA' "$recovery_dir" ;;
-                "$rna_final") printf '%s/RNA' "$recovery_dir" ;;
                 {output.json_report:q}) printf '%s/report.json' "$recovery_dir" ;;
                 {output.json_mqc:q}) printf '%s/demux_mqc.json' "$recovery_dir" ;;
                 {output.manifest:q}) printf '%s/manifest.tsv' "$recovery_dir" ;;
@@ -866,7 +858,6 @@ checkpoint demux:
             # EXIT条件调用会关闭隐式errexit；任一成员恢复失败都须保留备份，
             # 不能继续移动目录或恢复completion来批准未完整恢复的文件组。
             restore_demux_path "$dna_final" || return $?
-            restore_demux_path "$rna_final" || return $?
             restore_demux_path {output.json_report:q} || return $?
             restore_demux_path {output.json_mqc:q} || return $?
             restore_demux_path {output.manifest:q} || return $?
@@ -884,7 +875,6 @@ checkpoint demux:
         if [[ -e "$completion_backup" || -e "$completion_backup.absent" ]]; then
             if [[ -e "$completion_final" ]]; then
                 discard_demux_backup "$dna_final"
-                discard_demux_backup "$rna_final"
                 discard_demux_backup {output.json_report:q}
                 discard_demux_backup {output.json_mqc:q}
                 discard_demux_backup {output.manifest:q}
@@ -905,14 +895,13 @@ checkpoint demux:
                     if (( exit_status == 0 )); then exit_status=$recovery_status; fi
                 fi
             fi
-            rm -rf -- "$dna_tmp" "$rna_tmp"
+            rm -rf -- "$dna_tmp"
             rm -f -- "$report_tmp" "$mqc_tmp" "$manifest_tmp" "$completion_tmp"
             if (( demux_scratch_active == 1 )); then dna_pipeline_cleanup_scratch || true; fi
             return "$exit_status"
         }}
         trap cleanup_demux_tmp EXIT
         dna_tmp="$(dna_pipeline_temporary "$dna_final" directory)"
-        rna_tmp="$(dna_pipeline_temporary "$rna_final" directory)"
         report_tmp="$(dna_pipeline_temporary {output.json_report:q})"
         mqc_tmp="$(dna_pipeline_temporary {output.json_mqc:q})"
         manifest_tmp="$(dna_pipeline_temporary {output.manifest:q})"
@@ -920,7 +909,6 @@ checkpoint demux:
 
 
         dna_write_tmp="$dna_tmp"
-        rna_write_tmp="$rna_tmp"
         if [[ {params.pipeline_mode:q} == droplet ]]; then
             scratch_mb="$({RULE_PYTHON:q} -m alopex droplet-output-disk-mb --spool {params.spool_dir:q})"
             if dna_pipeline_allocate_scratch {SCRATCH_NAMESPACE:q} demux {params.sample_name:q} "$scratch_mb" {PROJECT_DIR:q} >> {log:q} 2>&1; then
@@ -929,7 +917,6 @@ checkpoint demux:
                 project_fs="$(df -Pk {PROJECT_DIR:q} | awk 'END{{print $1}}')"
                 if [[ "$scratch_fs" != "$project_fs" && "$scratch_fs" != tmpfs && "$scratch_fs" != ramfs ]]; then
                     dna_write_tmp="$DNA_PIPELINE_SCRATCH_DIR/DNA"
-                    rna_write_tmp="$DNA_PIPELINE_SCRATCH_DIR/RNA"
                 fi
             else
                 printf 'WARNING: project scratch unavailable; keeping persistent demux staging in project\n' >> {log:q}
@@ -946,7 +933,6 @@ checkpoint demux:
               {params.r2_args} \
               --barcode-map {input.barcode_map:q} \
               --dna-out-dir "$dna_write_tmp" \
-              --rna-out-dir "$rna_write_tmp" \
               --json-report "$report_tmp" \
               --sample-name={params.sample_name:q} \
               --min-matched-read-pairs {params.min_matched_read_pairs} \
@@ -969,7 +955,7 @@ checkpoint demux:
         fi
 
         {RULE_PYTHON:q} -m alopex write-demux-metadata {params.calling_args} -- \
-            "$report_tmp" "$mqc_tmp" "$manifest_tmp" "$dna_final" "$rna_final" \
+            "$report_tmp" "$mqc_tmp" "$manifest_tmp" "$dna_final" \
             {params.pipeline_mode:q} {params.route_id:q} {params.downstream_dna:q} \
             {params.raw_sample:q} {input.cell_manifest:q} >> {log:q} 2>&1
 
@@ -989,13 +975,11 @@ checkpoint demux:
         publish_in_progress=1
         backup_demux_path "$completion_final"
         backup_demux_path "$dna_final"
-        backup_demux_path "$rna_final"
         backup_demux_path {output.json_report:q}
         backup_demux_path {output.json_mqc:q}
         backup_demux_path {output.manifest:q}
 
         mv "$dna_tmp" "$dna_final"
-        mv "$rna_tmp" "$rna_final"
         mv "$report_tmp" {output.json_report:q}
         mv "$mqc_tmp" {output.json_mqc:q}
         mv "$manifest_tmp" {output.manifest:q}
@@ -1008,14 +992,12 @@ checkpoint demux:
             --report {output.json_report:q} \
             --mqc {output.json_mqc:q} \
             --dna-dir "$dna_final" \
-            --rna-dir "$rna_final" \
             --cell-manifest {input.cell_manifest:q} >> {log:q} 2>&1
         mv "$completion_tmp" "$completion_final"
 
 
         publish_in_progress=0
         discard_demux_backup "$dna_final"
-        discard_demux_backup "$rna_final"
         discard_demux_backup {output.json_report:q}
         discard_demux_backup {output.json_mqc:q}
         discard_demux_backup {output.manifest:q}
@@ -1024,31 +1006,6 @@ checkpoint demux:
         """
 
 
-if PROTOCOL_POLICY.requires_rna_barcode:
-    localrules: rna_collect_fastq
-
-    rule rna_collect_fastq:
-        """把已提交 run 的 RNA FASTQ 硬链接收集到 02_work/RNA/FASTQ 保留区；demux scratch 回收后数据仍存续。"""
-        input:
-            manifest = current_run_demux_manifest,
-        output:
-            marker = RNA_COLLECT_DIR / "{sample}.json"
-        log:
-            LOGS_DIR / "rules/demux/{sample}_rna_collect.log"
-        params:
-            scientific_identity = scientific_code_identity(('alopex.inputs.collect_rna_fastq',), ()),
-            intermediate_dir = str(INTERMEDIATE_DIR),
-        shell:
-            r"""
-            set -euo pipefail
-            export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
-            mkdir -p "$(dirname {output.marker:q})" "$(dirname {log:q})"
-            {RULE_PYTHON:q} -m alopex collect-rna-fastq \
-                --manifest {input.manifest:q} \
-                --intermediate-dir {params.intermediate_dir:q} \
-                --marker {output.marker:q} \
-                --run-id={wildcards.sample:q} > {log:q} 2>&1
-            """
 # 科学处理：BISCUIT
 
 if METHYLATION_BACKEND == "biscuit":
@@ -1237,8 +1194,6 @@ if METHYLATION_BACKEND == "biscuit":
 
     DNA_BAM_OUTPUT = temp(CELL_PATH_PATTERN.dna_bam) if not KEEP_FINAL_BAM else CELL_PATH_PATTERN.dna_bam
     DNA_BAI_OUTPUT = temp(CELL_PATH_PATTERN.dna_bam_index) if not KEEP_FINAL_BAM else CELL_PATH_PATTERN.dna_bam_index
-    RNA_BAM_OUTPUT = CELL_PATH_PATTERN.rna_bam
-    RNA_BAI_OUTPUT = CELL_PATH_PATTERN.rna_bam_index
 
 
     def get_pileup_bam(wildcards):
@@ -1249,344 +1204,127 @@ if METHYLATION_BACKEND == "biscuit":
         return PROJECT_LAYOUT.cell(wildcards.demux_sample).dna_bam_index
 
 
-    if not PUBLISH_RNA_BAM:
-        rule bsconv_filter_dna:
-            """在同一 scratch 作业内识别 high-CpH reads 并发布过滤后的 DNA BAM。"""
-            input:
-                demux_completion = current_demux_completion,
-                bam = CELL_PATH_PATTERN.post_alignment_bam,
-                bai = CELL_PATH_PATTERN.post_alignment_bam_index,
-                ref = REFERENCE_GENOME,
+    rule bsconv_filter_dna:
+        """在同一 scratch 作业内识别 high-CpH reads 并发布过滤后的 DNA BAM。"""
+        input:
+            demux_completion = current_demux_completion,
+            bam = CELL_PATH_PATTERN.post_alignment_bam,
+            bai = CELL_PATH_PATTERN.post_alignment_bam_index,
+            ref = REFERENCE_GENOME,
 
-            output:
-                summary = CELL_PATH_PATTERN.high_cph_summary,
-                mqc = temp(CELL_PATH_PATTERN.high_cph_multiqc),
-                dna = DNA_BAM_OUTPUT,
-                dna_bai = DNA_BAI_OUTPUT
-            log:
-                classify = LOGS_DIR / "rules/biscuit/{demux_sample}_high_cph_reads.log",
-                filter = LOGS_DIR / "rules/biscuit/{demux_sample}_bsconv_dna.log"
-            threads: BSCONV_DNA_THREADS
-            resources:
-                mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
-                    "high_cph_read_names", wildcards.demux_sample, attempt
-                ),
-                runtime = lambda wildcards, attempt: combined_static_runtime_min(
-                    HIGH_CPH_FILTER_RULES, wildcards.demux_sample, attempt
-                ),
-                disk_mb = lambda wildcards: static_scratch_mb(
-                    "high_cph_filter", wildcards.demux_sample
-                ),
-                attempt_no = lambda wildcards, attempt: int(attempt)
-            params:
-                scientific_identity = scientific_code_identity(('alopex.science.run_bsconv_extraction',), ('dna_pipeline_run_bsconv_classification',)),
-                biscuit = BISCUIT,
-                samtools = SAMTOOLS,
-                threshold = BISCUIT_HIGH_CPH_RETENTION_THRESHOLD,
-                excluded_contigs_json = HIGH_CPH_EXCLUDED_CONTIGS_JSON,
-                sample_name = lambda wc: wc.demux_sample.replace(os.sep, "_"),
-                protocol = PROTOCOL_POLICY.name,
-                high_cph_role = PROTOCOL_POLICY.high_cph_role,
-                scratch_namespace = SCRATCH_NAMESPACE,
-                resource_log = lambda wc: static_resource_log(
-                    "high_cph_read_names", wc.demux_sample
-                )
-            conda: ENVIRONMENT_YAML
-            shell:
-                r"""
-                set -euo pipefail
-                source {JOB_RUNTIME:q}
-                mkdir -p "$(dirname {output.dna:q})" "$(dirname {log.classify:q})"
-                dna_pipeline_init_attempt_logs {resources.attempt_no} \
-                    {log.classify:q} {log.filter:q}
-                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s merged=bsconv_filter\n' \
-                    {params.resource_log:q} {resources.attempt_no} {threads} \
-                    {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log.classify:q}
-                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s merged=bsconv_filter\n' \
-                    {params.resource_log:q} {resources.attempt_no} {threads} \
-                    {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log.filter:q}
+        output:
+            summary = CELL_PATH_PATTERN.high_cph_summary,
+            mqc = temp(CELL_PATH_PATTERN.high_cph_multiqc),
+            dna = DNA_BAM_OUTPUT,
+            dna_bai = DNA_BAI_OUTPUT
+        log:
+            classify = LOGS_DIR / "rules/biscuit/{demux_sample}_high_cph_reads.log",
+            filter = LOGS_DIR / "rules/biscuit/{demux_sample}_bsconv_dna.log"
+        threads: BSCONV_DNA_THREADS
+        resources:
+            mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
+                "high_cph_read_names", wildcards.demux_sample, attempt
+            ),
+            runtime = lambda wildcards, attempt: combined_static_runtime_min(
+                HIGH_CPH_FILTER_RULES, wildcards.demux_sample, attempt
+            ),
+            disk_mb = lambda wildcards: static_scratch_mb(
+                "high_cph_filter", wildcards.demux_sample
+            ),
+            attempt_no = lambda wildcards, attempt: int(attempt)
+        params:
+            scientific_identity = scientific_code_identity(('alopex.science.run_bsconv_extraction',), ('dna_pipeline_run_bsconv_classification',)),
+            biscuit = BISCUIT,
+            samtools = SAMTOOLS,
+            threshold = BISCUIT_HIGH_CPH_RETENTION_THRESHOLD,
+            excluded_contigs_json = HIGH_CPH_EXCLUDED_CONTIGS_JSON,
+            sample_name = lambda wc: wc.demux_sample.replace(os.sep, "_"),
+            protocol = PROTOCOL_POLICY.name,
+            high_cph_role = PROTOCOL_POLICY.high_cph_role,
+            scratch_namespace = SCRATCH_NAMESPACE,
+            resource_log = lambda wc: static_resource_log(
+                "high_cph_read_names", wc.demux_sample
+            )
+        conda: ENVIRONMENT_YAML
+        shell:
+            r"""
+            set -euo pipefail
+            source {JOB_RUNTIME:q}
+            mkdir -p "$(dirname {output.dna:q})" "$(dirname {log.classify:q})"
+            dna_pipeline_init_attempt_logs {resources.attempt_no} \
+                {log.classify:q} {log.filter:q}
+            printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s merged=bsconv_filter\n' \
+                {params.resource_log:q} {resources.attempt_no} {threads} \
+                {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log.classify:q}
+            printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s scratch_mb=%s merged=bsconv_filter\n' \
+                {params.resource_log:q} {resources.attempt_no} {threads} \
+                {resources.mem_mb} {resources.runtime} {resources.disk_mb} >> {log.filter:q}
 
-                dna_pipeline_allocate_scratch \
-                    {params.scratch_namespace:q} \
-                    high_cph_filter \
-                    {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
-                dna_pipeline_install_scratch_cleanup
-                tmpdir="$DNA_PIPELINE_SCRATCH_DIR"
+            dna_pipeline_allocate_scratch \
+                {params.scratch_namespace:q} \
+                high_cph_filter \
+                {wildcards.demux_sample:q} {resources.disk_mb} {PROJECT_DIR:q}
+            dna_pipeline_install_scratch_cleanup
+            tmpdir="$DNA_PIPELINE_SCRATCH_DIR"
 
-                tmp_names="$tmpdir/high_cph_reads.txt"
-                tmp_summary="$tmpdir/bsconv_filter_summary.json"
-                tmp_mqc="$tmpdir/bsconv_filter_mqc.json"
-                tmp_bam="$tmpdir/dna.bam"
+            tmp_names="$tmpdir/high_cph_reads.txt"
+            tmp_summary="$tmpdir/bsconv_filter_summary.json"
+            tmp_mqc="$tmpdir/bsconv_filter_mqc.json"
+            tmp_bam="$tmpdir/dna.bam"
 
-                dna_pipeline_log_scratch >> {log.filter:q} 2>&1
+            dna_pipeline_log_scratch >> {log.filter:q} 2>&1
 
-                common_extract_args=(
-                    --bsconv-tsv -
-                    --threshold {params.threshold}
-                    --high-read-names "$tmp_names"
-                    --summary-json "$tmp_summary"
-                    --multiqc-json "$tmp_mqc"
-                    --sample-name={params.sample_name:q}
-                    --excluded-contigs-json {params.excluded_contigs_json:q}
-                    --alignment-bam {input.bam:q}
-                    --samtools {params.samtools:q}
-                    --protocol {params.protocol:q}
-                    --high-cph-role {params.high_cph_role:q}
-                )
+            common_extract_args=(
+                --bsconv-tsv -
+                --threshold {params.threshold}
+                --high-read-names "$tmp_names"
+                --summary-json "$tmp_summary"
+                --multiqc-json "$tmp_mqc"
+                --sample-name={params.sample_name:q}
+                --excluded-contigs-json {params.excluded_contigs_json:q}
+                --alignment-bam {input.bam:q}
+                --samtools {params.samtools:q}
+                --protocol {params.protocol:q}
+                --high-cph-role {params.high_cph_role:q}
+            )
 
-                dna_pipeline_run_bsconv_classification \
-                    {params.samtools:q} {params.biscuit:q} {input.ref:q} {input.bam:q} \
-                    {log.classify:q} {RULE_PYTHON:q} "${{common_extract_args[@]}}"
+            dna_pipeline_run_bsconv_classification \
+                {params.samtools:q} {params.biscuit:q} {input.ref:q} {input.bam:q} \
+                {log.classify:q} {RULE_PYTHON:q} "${{common_extract_args[@]}}"
 
-                if [ ! -s "$tmp_names" ]; then
-                    echo "INFO: no high-CpH reads detected; copying complete aligned BAM." >> {log.filter:q}
-                    if cp --reflink=auto {input.bam:q} "$tmp_bam" 2>/dev/null; then
-                        :
-                    elif cp -c {input.bam:q} "$tmp_bam" 2>/dev/null; then
-                        :
-                    else
-                        cp {input.bam:q} "$tmp_bam"
-                    fi
+            if [ ! -s "$tmp_names" ]; then
+                echo "INFO: no high-CpH reads detected; copying complete aligned BAM." >> {log.filter:q}
+                if cp --reflink=auto {input.bam:q} "$tmp_bam" 2>/dev/null; then
+                    :
+                elif cp -c {input.bam:q} "$tmp_bam" 2>/dev/null; then
+                    :
                 else
-                    sam_extra=$(({threads} > 1 ? {threads} - 1 : 0))
-                    {params.samtools:q} view -@ "$sam_extra" -b \
-                        -N "^$tmp_names" \
-                        -o "$tmp_bam" \
-                        {input.bam:q} \
-                        >> {log.filter:q} 2>&1
+                    cp {input.bam:q} "$tmp_bam"
                 fi
-                {params.samtools:q} quickcheck -v "$tmp_bam" >> {log.filter:q} 2>&1
-                {params.samtools:q} index "$tmp_bam" >> {log.filter:q} 2>&1
-
-                {RULE_PYTHON:q} -m alopex atomic-publish \
-                    --samtools {params.samtools:q} \
-                    --bam-destination {output.dna:q} \
-                    --commit-last {output.dna:q} \
-                    --file "$tmp_summary" {output.summary:q} \
-                    --file "$tmp_mqc" {output.mqc:q} \
-                    --file "$tmp_bam.bai" {output.dna_bai:q} \
-                    --file "$tmp_bam" {output.dna:q} \
-                    >> {log.filter:q} 2>&1
-                dna_pipeline_release_scratch
-                """
-
-
-    if PUBLISH_RNA_BAM:
-        rule high_cph_read_names:
-            """识别 high-CpH reads，写出 read names、守恒摘要与 MultiQC 输入。"""
-            input:
-                demux_completion = current_demux_completion,
-                bam = CELL_PATH_PATTERN.post_alignment_bam,
-                bai = CELL_PATH_PATTERN.post_alignment_bam_index,
-                ref = REFERENCE_GENOME,
-
-            output:
-                names = temp(CELL_PATH_PATTERN.high_cph_read_names),
-                summary = CELL_PATH_PATTERN.high_cph_summary,
-                mqc = temp(CELL_PATH_PATTERN.high_cph_multiqc)
-            log:
-                LOGS_DIR / "rules/biscuit/{demux_sample}_high_cph_reads.log"
-            threads: HIGH_CPH_READ_NAMES_THREADS
-            resources:
-                mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
-                    "high_cph_read_names", wildcards.demux_sample, attempt
-                ),
-                runtime = lambda wildcards, attempt: static_resource_runtime_min(
-                    "high_cph_read_names", wildcards.demux_sample, attempt
-                ),
-                attempt_no = lambda wildcards, attempt: int(attempt)
-            params:
-                scientific_identity = scientific_code_identity(('alopex.science.run_bsconv_extraction',), ('dna_pipeline_run_bsconv_classification',)),
-                biscuit = BISCUIT,
-                samtools = SAMTOOLS,
-                threshold = BISCUIT_HIGH_CPH_RETENTION_THRESHOLD,
-                excluded_contigs_json = HIGH_CPH_EXCLUDED_CONTIGS_JSON,
-                sample_name = lambda wc: wc.demux_sample.replace(os.sep, "_"),
-                protocol = PROTOCOL_POLICY.name,
-                high_cph_role = PROTOCOL_POLICY.high_cph_role,
-                resource_log = lambda wc: static_resource_log("high_cph_read_names", wc.demux_sample)
-            conda: ENVIRONMENT_YAML
-            shell:
-                r"""
-                set -euo pipefail
-                source {JOB_RUNTIME:q}
-                mkdir -p "$(dirname {output.names:q})" "$(dirname {log:q})"
-                dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
-                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
-                    {params.resource_log:q} {resources.attempt_no} {threads} \
-                    {resources.mem_mb} {resources.runtime} >> {log:q}
-
-                tmp_names="$(dna_pipeline_temporary {output.names:q})"
-                tmp_summary="$(dna_pipeline_temporary {output.summary:q})"
-                tmp_mqc="$(dna_pipeline_temporary {output.mqc:q})"
-                cleanup_bsconv_filter_tmp() {{
-                    rm -f -- "$tmp_names" "$tmp_summary" "$tmp_mqc"
-                }}
-                trap cleanup_bsconv_filter_tmp EXIT
-
-                common_extract_args=(
-                    --bsconv-tsv -
-                    --threshold {params.threshold}
-                    --high-read-names "$tmp_names"
-                    --summary-json "$tmp_summary"
-                    --multiqc-json "$tmp_mqc"
-                    --sample-name={params.sample_name:q}
-                    --excluded-contigs-json {params.excluded_contigs_json:q}
-                    --alignment-bam {input.bam:q}
-                    --samtools {params.samtools:q}
-                    --protocol {params.protocol:q}
-                    --high-cph-role {params.high_cph_role:q}
-                )
-
-                dna_pipeline_run_bsconv_classification \
-                    {params.samtools:q} {params.biscuit:q} {input.ref:q} {input.bam:q} \
-                    {log:q} {RULE_PYTHON:q} "${{common_extract_args[@]}}"
-
-
-                mv "$tmp_names" {output.names:q}
-                mv "$tmp_summary" {output.summary:q}
-                mv "$tmp_mqc" {output.mqc:q}
-                trap - EXIT
-                """
-
-
-    if PUBLISH_RNA_BAM:
-        rule bsconv_dna:
-            """按 high-CpH read names 过滤并原子发布 DNA BAM。"""
-            input:
-                demux_completion = current_demux_completion,
-                bam = CELL_PATH_PATTERN.post_alignment_bam,
-                bai = CELL_PATH_PATTERN.post_alignment_bam_index,
-                high_names = rules.high_cph_read_names.output.names
-            output:
-                dna = DNA_BAM_OUTPUT,
-                dna_bai = DNA_BAI_OUTPUT
-            log:
-                LOGS_DIR / "rules/biscuit/{demux_sample}_bsconv_dna.log"
-            threads: BSCONV_DNA_THREADS
-            resources:
-                mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
-                    "bsconv_dna", wildcards.demux_sample, attempt
-                ),
-                runtime = lambda wildcards, attempt: static_resource_runtime_min(
-                    "bsconv_dna", wildcards.demux_sample, attempt
-                ),
-                attempt_no = lambda wildcards, attempt: int(attempt)
-            params:
-                samtools = SAMTOOLS,
-                resource_log = lambda wc: static_resource_log("bsconv_dna", wc.demux_sample)
-            conda: ENVIRONMENT_YAML
-            shell:
-                r"""
-                set -euo pipefail
-                source {JOB_RUNTIME:q}
-                mkdir -p "$(dirname {output.dna:q})" "$(dirname {log:q})"
-                dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
-                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
-                    {params.resource_log:q} {resources.attempt_no} {threads} \
-                    {resources.mem_mb} {resources.runtime} >> {log:q}
-
-                tmp_bam="$(dna_pipeline_temporary {output.dna:q})"
-                tmp_bai="$tmp_bam.bai"
-                cleanup_dna_bam_tmp() {{ rm -f -- "$tmp_bam" "$tmp_bai"; }}
-                trap cleanup_dna_bam_tmp EXIT
-
-                copy_bam_independent() {{
-                    src="$1"
-                    dst="$2"
-                    if cp --reflink=auto "$src" "$dst" 2>/dev/null; then
-                        echo "INFO: BAM reused with reflink/copy-on-write when supported." >> {log:q}
-                    elif cp -c "$src" "$dst" 2>/dev/null; then
-                        echo "INFO: BAM reused with APFS clonefile." >> {log:q}
-                    else
-                        cp "$src" "$dst"
-                        echo "INFO: BAM reused with regular copy." >> {log:q}
-                    fi
-                }}
-
-                if [ ! -s {input.high_names:q} ]; then
-                    echo "INFO: no high-CpH reads detected; retaining the complete aligned BAM." >> {log:q}
-                    copy_bam_independent {input.bam:q} "$tmp_bam"
-                    cp {input.bai:q} "$tmp_bai"
-                else
-                    sam_extra=$(({threads} > 1 ? {threads} - 1 : 0))
-                    high_names={input.high_names:q}
-                    {params.samtools:q} view -@ "$sam_extra" -b \
-                        -N "^$high_names" \
-                        -o "$tmp_bam" \
-                        {input.bam:q} \
-                        >> {log:q} 2>&1
-                    {params.samtools:q} index "$tmp_bam" >> {log:q} 2>&1
-                fi
-
-                {params.samtools:q} quickcheck -v "$tmp_bam" >> {log:q} 2>&1
-                mv "$tmp_bam" {output.dna:q}
-                mv "$tmp_bai" {output.dna_bai:q}
-                trap - EXIT
-                """
-
-
-        rule bsconv_rna_bam:
-            """SRD 恒定发布被 high-CpH 筛出的 BAM，作为 RNA 部分原始数据保留在 02_work/RNA。"""
-            input:
-                demux_completion = current_demux_completion,
-                bam = CELL_PATH_PATTERN.post_alignment_bam,
-                high_names = rules.high_cph_read_names.output.names
-            output:
-                rna_bam = RNA_BAM_OUTPUT,
-                rna_bai = RNA_BAI_OUTPUT
-            log:
-                LOGS_DIR / "rules/biscuit/{demux_sample}_rna_bam.log"
-            threads: HIGH_CPH_BAM_THREADS
-            resources:
-                mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
-                    "high_cph_bam", wildcards.demux_sample, attempt
-                ),
-                runtime = lambda wildcards, attempt: static_resource_runtime_min(
-                    "high_cph_bam", wildcards.demux_sample, attempt
-                ),
-                attempt_no = lambda wildcards, attempt: int(attempt)
-            params:
-                samtools = SAMTOOLS,
-                resource_log = lambda wc: static_resource_log("high_cph_bam", wc.demux_sample)
-            conda: ENVIRONMENT_YAML
-            shell:
-                r"""
-                set -euo pipefail
-                source {JOB_RUNTIME:q}
-                mkdir -p "$(dirname {output.rna_bam:q})" "$(dirname {log:q})"
-                dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
-                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
-                    {params.resource_log:q} {resources.attempt_no} {threads} \
-                    {resources.mem_mb} {resources.runtime} >> {log:q}
-                tmp_bam="$(dna_pipeline_temporary {output.rna_bam:q})"
-                cleanup_rna_bam_tmp() {{ rm -f -- "$tmp_bam" "$tmp_bam.bai"; }}
-                trap cleanup_rna_bam_tmp EXIT
-
+            else
                 sam_extra=$(({threads} > 1 ? {threads} - 1 : 0))
-                high_names={input.high_names:q}
-                if [ -s "$high_names" ]; then
-                    {params.samtools:q} view -@ "$sam_extra" -b \
-                        -N "$high_names" \
-                        -o "$tmp_bam" {input.bam:q} \
-                        >> {log:q} 2>&1
-                else
-                    {params.samtools:q} view -H {input.bam:q} | \
-                        {params.samtools:q} view -@ "$sam_extra" -b -o "$tmp_bam" - \
-                        >> {log:q} 2>&1
-                fi
-                {params.samtools:q} quickcheck -v "$tmp_bam" >> {log:q} 2>&1
-                {params.samtools:q} index "$tmp_bam" >> {log:q} 2>&1
-                {RULE_PYTHON:q} -m alopex atomic-publish \
-                    --samtools {params.samtools:q} \
-                    --bam-destination {output.rna_bam:q} \
-                    --commit-last {output.rna_bam:q} \
-                    --file "$tmp_bam.bai" {output.rna_bai:q} \
-                    --file "$tmp_bam" {output.rna_bam:q} \
-                    >> {log:q} 2>&1
-                cleanup_rna_bam_tmp
-                trap - EXIT
-                """
+                {params.samtools:q} view -@ "$sam_extra" -b \
+                    -N "^$tmp_names" \
+                    -o "$tmp_bam" \
+                    {input.bam:q} \
+                    >> {log.filter:q} 2>&1
+            fi
+            {params.samtools:q} quickcheck -v "$tmp_bam" >> {log.filter:q} 2>&1
+            {params.samtools:q} index "$tmp_bam" >> {log.filter:q} 2>&1
+
+            {RULE_PYTHON:q} -m alopex atomic-publish \
+                --samtools {params.samtools:q} \
+                --bam-destination {output.dna:q} \
+                --commit-last {output.dna:q} \
+                --file "$tmp_summary" {output.summary:q} \
+                --file "$tmp_mqc" {output.mqc:q} \
+                --file "$tmp_bam.bai" {output.dna_bai:q} \
+                --file "$tmp_bam" {output.dna:q} \
+                >> {log.filter:q} 2>&1
+            dna_pipeline_release_scratch
+            """
+
+
     rule pileup:
         """对单个细胞的过滤后 BAM 执行 BISCUIT pileup，产出 bgzip VCF 与变体统计；零比对 cell 发布合法空 VCF。"""
         input:
@@ -2252,7 +1990,6 @@ else:
             bam = rules.bismark_align_dedup.output.bam
         output:
             bam = temp(CELL_PATH_PATTERN.processed_bam) if not KEEP_FINAL_BAM else CELL_PATH_PATTERN.processed_bam,
-            removed = temp(CELL_PATH_PATTERN.removed_bam) if PUBLISH_RNA_BAM else [],
             summary = CELL_PATH_PATTERN.high_cph_summary,
             mqc = temp(CELL_PATH_PATTERN.high_cph_multiqc),
         log:
@@ -2276,7 +2013,6 @@ else:
             excluded_contigs_json = HIGH_CPH_EXCLUDED_CONTIGS_JSON,
             percentage = BISMARK_NONCONVERSION_PERCENTAGE_CUTOFF,
             minimum = BISMARK_NONCONVERSION_MIN_COUNT,
-            publish_removed = "true" if PUBLISH_RNA_BAM else "false",
             protocol = PROTOCOL_POLICY.name,
             high_cph_role = PROTOCOL_POLICY.high_cph_role,
             python = _rule_executable("python"),
@@ -2337,8 +2073,6 @@ else:
             main_bio="$filtered"
             if (( excluded_pairs > 0 )); then
                 {params.samtools:q} cat -o "$tmp/processed.bam" "$main_bio" "$tmp/excluded.bam" >> {log:q} 2>&1
-            elif (( candidate_pairs == 0 )) && {params.publish_removed}; then
-                cp "$main_bio" "$tmp/processed.bam"
             else
                 mv "$main_bio" "$tmp/processed.bam"
             fi
@@ -2353,74 +2087,18 @@ else:
                 --protocol {params.protocol:q} --high-cph-role {params.high_cph_role:q} \
                 --summary-path "$tmp/summary.json" --multiqc-path "$tmp/mqc.json" >> {log:q} 2>&1
 
-            if {params.publish_removed}; then
-                {RULE_PYTHON:q} -m alopex atomic-publish \
-                    --samtools {params.samtools:q} \
-                    --bam-destination {output.bam:q} \
-                    --commit-last {output.bam:q} \
-                    --file "$tmp/summary.json" {output.summary:q} \
-                    --file "$tmp/mqc.json" {output.mqc:q} \
-                    --file "$removed" {output.removed:q} \
-                    --file "$tmp/processed.bam" {output.bam:q} \
-                    >> {log:q} 2>&1
-            else
-                {RULE_PYTHON:q} -m alopex atomic-publish \
-                    --samtools {params.samtools:q} \
-                    --bam-destination {output.bam:q} \
-                    --commit-last {output.bam:q} \
-                    --file "$tmp/summary.json" {output.summary:q} \
-                    --file "$tmp/mqc.json" {output.mqc:q} \
-                    --file "$tmp/processed.bam" {output.bam:q} \
-                    >> {log:q} 2>&1
-            fi
+            {RULE_PYTHON:q} -m alopex atomic-publish \
+                --samtools {params.samtools:q} \
+                --bam-destination {output.bam:q} \
+                --commit-last {output.bam:q} \
+                --file "$tmp/summary.json" {output.summary:q} \
+                --file "$tmp/mqc.json" {output.mqc:q} \
+                --file "$tmp/processed.bam" {output.bam:q} \
+                >> {log:q} 2>&1
             dna_pipeline_release_scratch
             """
 
 
-    if PUBLISH_RNA_BAM:
-        rule bismark_publish_rna_bam:
-            """SRD 恒定把被 non-CG 筛出的 BAM 排序索引后保留到 02_work/RNA/BAM。"""
-            input:
-                bam = rules.bismark_filter_nonconversion.output.removed
-            output:
-                bam = CELL_PATH_PATTERN.rna_bam,
-                bai = CELL_PATH_PATTERN.rna_bam_index
-            log:
-                LOGS_DIR / "rules/bismark/{demux_sample}_rna_bam.log"
-            threads: HIGH_CPH_BAM_THREADS
-            resources:
-                mem_mb = lambda wildcards, attempt: static_resource_mem_mb(
-                    "high_cph_bam", wildcards.demux_sample, attempt
-                ),
-                runtime = lambda wildcards, attempt: static_resource_runtime_min(
-                    "high_cph_bam", wildcards.demux_sample, attempt
-                ),
-                attempt_no = lambda wildcards, attempt: int(attempt)
-            params:
-                scientific_identity = scientific_code_identity((), ('dna_pipeline_coordinate_sort_and_stage',)),
-                samtools = SAMTOOLS,
-                resource_log = lambda wc: static_resource_log("high_cph_bam", wc.demux_sample),
-            conda: ENVIRONMENT_YAML
-            shell:
-                r"""
-                set -euo pipefail
-                source {JOB_RUNTIME:q}
-                mkdir -p "$(dirname {log:q})"
-                dna_pipeline_init_attempt_logs {resources.attempt_no} {log:q}
-                printf '%s attempt=%s threads=%s mem_mb=%s runtime_min=%s\n' \
-                    {params.resource_log:q} {resources.attempt_no} {threads} \
-                    {resources.mem_mb} {resources.runtime} >> {log:q}
-                tmp_bam="$(dna_pipeline_temporary {output.bam:q})"
-                tmp_bai="$tmp_bam.bai"
-                trap 'rm -f -- "$tmp_bam" "$tmp_bai"' EXIT
-                sam_extra=$(({threads} > 1 ? {threads} - 1 : 0))
-                dna_pipeline_coordinate_sort_and_stage \
-                    {params.samtools:q} "$sam_extra" {input.bam:q} \
-                    "$tmp_bam" "$tmp_bai" \
-                    {output.bam:q} {output.bai:q} {RULE_PYTHON:q} >> {log:q} 2>&1
-                rm -f -- "$tmp_bam" "$tmp_bai"
-                trap - EXIT
-                """
     rule bismark_extract:
         """从过滤 BAM 调用甲基化；Droplet 汇集逐胞嘧啶 UMI 共识，孔板使用原生 extraction。"""
         group: "bismark_cell" if PROTOCOL_POLICY.name in {"cabernet", "droplet"} else None
@@ -2602,22 +2280,6 @@ def current_final_manifest_qc_inputs(wildcards):
             for path in current_cell_artifacts(sample).final_qc]
 
 
-def current_rna_bam_inputs(wildcards):
-    if not PUBLISH_RNA_BAM:
-        return []
-    return [str(path) for sample in get_demuxed_samples()
-            for path in current_cell_artifacts(sample).rna_bams]
-
-
-def current_rna_fastq_inputs(wildcards):
-    if not PROTOCOL_POLICY.requires_rna_barcode:
-        return []
-    return [
-        str(RNA_COLLECT_DIR / f"{run_id}.json")
-        for run_id in DEMUX_RUN_IDS
-    ]
-
-
 rule multiqc:
     """统一抽取最多 1000 个细胞生成 MultiQC，保留全量 DAG 依赖并原子提交标明抽样范围的 HTML。"""
     input:
@@ -2712,8 +2374,6 @@ rule final_sample_manifest:
         trigger = DEMUX_COMPLETION_BARRIER,
         deliverables = current_pipeline_output_targets,
         qc_artifacts = current_final_manifest_qc_inputs,
-        rna_bams = current_rna_bam_inputs,
-        rna_fastq_markers = current_rna_fastq_inputs,
         initial_manifest = rules.initial_cell_manifest.output.manifest
     output:
         manifest = STAGED_RESULTS_DIR / "QC_Results" / "sample_manifest.tsv",
@@ -2743,7 +2403,6 @@ rule final_sample_manifest:
                 "cpg_coordinate_base": CPG_COORDINATE_BASE,
                 "generate_snp": GENERATE_SNP,
                 "keep_final_bam": KEEP_FINAL_BAM,
-                "publish_rna_bam": PUBLISH_RNA_BAM,
             },
             sort_keys=True,
             separators=(",", ":"),

@@ -55,7 +55,6 @@ from .inputs import (
     map_discovered_samples_to_manifest,
     read_cell_identity_manifest,
     read_demux_generation,
-    rna_fastq_collect_destination,
 )
 from .io import (
     project_temporary_parent,
@@ -204,7 +203,6 @@ class FinalManifestOptions:
     cpg_coordinate_base: int
     generate_snp: bool
     keep_final_bam: bool
-    publish_rna_bam: bool
 
 
 @dataclass(frozen=True)
@@ -297,7 +295,7 @@ def _parse_final_options(options: Mapping[str, object]) -> FinalManifestOptions:
     option_fields = {
         "generate_snp",
         "keep_final_bam",
-        "publish_rna_bam",
+
         "methylation_backend",
         "cpg_coordinate_base",
     }
@@ -320,7 +318,6 @@ def _parse_final_options(options: Mapping[str, object]) -> FinalManifestOptions:
     return FinalManifestOptions(
         backend=backend, cpg_coordinate_base=active_options["cpg_coordinate_base"],
         generate_snp=active_options["generate_snp"], keep_final_bam=active_options["keep_final_bam"],
-        publish_rna_bam=active_options["publish_rna_bam"],
     )
 
 
@@ -335,12 +332,9 @@ def _plan_expected_runs(
         project_id = str(record.get("project_sample_id", "") or "").strip()
         protocol = str(record.get("protocol", "") or "").strip().lower()
         dna_raw_sample = str(record.get("dna_raw_sample", "") or "").strip()
-        rna_sample = str(record.get("rna_sample", "") or "").strip()
         routes = []
         if dna_raw_sample:
             routes.append((project_id, default_dna_route(protocol), dna_raw_sample))
-        if rna_sample and "rna_sample" in get_protocol(protocol).raw_input_columns:
-            routes.append((f"{project_id}__rna", "srd_rna_enrichment_tube", rna_sample))
         for run_id, route_id, raw_sample in routes:
             expected = {
                 "project_sample_id": project_id,
@@ -373,12 +367,6 @@ def _require_declared_routes(cells: dict[str, dict[str, object]]) -> None:
                 raise ValueError(
                     f"Cell {cell_id!r} declares dna_raw_sample but has no matching committed "
                     f"demux route {expected_route!r}"
-                )
-        if "rna_sample" in get_protocol(protocol).raw_input_columns and str(record.get("rna_sample", "") or "").strip():
-            if record.get("rna_enrichment_route_id") != "srd_rna_enrichment_tube":
-                raise ValueError(
-                    f"Cell {cell_id!r} declares rna_sample but has no matching committed "
-                    "srd_rna_enrichment_tube demux route"
                 )
 
 
@@ -435,45 +423,7 @@ def _merge_committed_generations(
                     f"expected=({expected_run['project_sample_id']!r}, "
                     f"{expected_run['route_id']!r}, {expected_run['raw_sample']!r})"
                 )
-            if (
-                str(demux.get("pipeline_mode", "")).strip().lower() == "srd"
-                and str(demux.get("rna_status", "")) == "Pass"
-            ):
-                intermediate = demux_state.parent.parent
-                project_root = intermediate.parent
-                collected = [
-                    rna_fastq_collect_destination(intermediate, route, cell_id, mate)
-                    for mate in (1, 2)
-                ]
-                missing = [path for path in collected if not path.is_file()]
-                if missing:
-                    raise FileNotFoundError(
-                        "Committed SRD RNA FASTQ is missing from the collection area "
-                        "(rna_collect_fastq must run first): "
-                        + ", ".join(str(path) for path in missing)
-                    )
-                r1, r2 = (str(path.relative_to(project_root)) for path in collected)
-                if route == "srd_rna_enrichment_tube":
-                    record["rna_enrichment_rna_fastq_r1"] = r1
-                    record["rna_enrichment_rna_fastq_r2"] = r2
-                else:
-                    record["dna_tube_rna_fastq_r1"] = r1
-                    record["dna_tube_rna_fastq_r2"] = r2
-            if route == "srd_rna_enrichment_tube":
-                if record.get("rna_enrichment_route_id"):
-                    raise ValueError(f"Cell {cell_id!r} has more than one SRD RNA-enrichment demux route")
-                record.update({
-                    "rna_enrichment_route_id": route,
-                    "rna_enrichment_raw_sample": raw,
-                    "rna_enrichment_dna_reads": demux.get("dna_reads", "0"),
-                    "rna_enrichment_dna_status": demux.get("dna_status", ""),
-                    "rna_enrichment_rna_reads": demux.get("rna_reads", "0"),
-                    "rna_enrichment_rna_status": demux.get("rna_status", ""),
-                    "rna_enrichment_input_read_pairs": demux.get("input_read_pairs", "0"),
-                    "rna_enrichment_matched_read_pairs": demux.get("matched_reads", "0"),
-                    "rna_enrichment_unassigned_rate": demux.get("unassigned_rate", ""),
-                })
-            elif str(demux.get("downstream_dna", "")).strip().lower() == "true":
+            if str(demux.get("downstream_dna", "")).strip().lower() == "true":
                 if record.get("dna_route_id"):
                     raise ValueError(f"Cell {cell_id!r} has more than one downstream-DNA demux route")
                 record.update({
@@ -481,8 +431,6 @@ def _merge_committed_generations(
                     "dna_raw_sample": raw,
                     "dna_reads": demux.get("dna_reads", "0"),
                     "dna_status": demux.get("dna_status", ""),
-                    "dna_tube_rna_reads": demux.get("rna_reads", "0"),
-                    "dna_tube_rna_status": demux.get("rna_status", ""),
                     "dna_input_read_pairs": demux.get("input_read_pairs", "0"),
                     "dna_matched_read_pairs": demux.get("matched_reads", "0"),
                     "dna_unassigned_rate": demux.get("unassigned_rate", ""),
@@ -659,8 +607,7 @@ def _metrics_for_cell(job: CellMetricJob) -> tuple[str, dict[str, object]]:
                "methylation_backend": options.backend, "backend_qc_status": "PASS", "analysis_status": "PASS",
                "cpg_path": str(job.public_paths.cpg.relative_to(project)),
                "cpg_representation": cpg_representation(options.cpg_coordinate_base),
-               "snp_path": str(job.public_paths.snp.relative_to(project)) if options.generate_snp or options.backend == "rastair" else "",
-               "rna_bam_path": str(job.paths.rna_bam.relative_to(project)) if options.publish_rna_bam else ""}
+               "snp_path": str(job.public_paths.snp.relative_to(project)) if options.generate_snp or options.backend == "rastair" else ""}
     if options.backend == "rastair":
         updates.update({
             "retained_bam_path": str(job.paths.marked_bam.relative_to(project)) if options.keep_final_bam else "",
@@ -692,7 +639,6 @@ def _apply_cell_metrics(
                     "cpg_path": "",
                     "cpg_representation": "",
                     "snp_path": "",
-                    "rna_bam_path": "",
                     "analysis_status": "NOT_ANALYZED",
                 }
             )
@@ -741,17 +687,13 @@ def _emit_final_tsv(
 ) -> None:
     preferred = [
         "sample_id", "project_sample_id", "species", "protocol", "plate_id", "cell_order",
-        "dna_barcode", "rna_barcode", "dna_raw_sample", "rna_sample",
+        "dna_barcode", "dna_raw_sample", "rna_sample",
         "dna_route_id", "dna_reads", "dna_status",
-        "dna_tube_rna_reads", "dna_tube_rna_status", "dna_input_read_pairs",
+        "dna_input_read_pairs",
         "dna_matched_read_pairs", "dna_unassigned_rate",
-        "dna_tube_rna_fastq_r1", "dna_tube_rna_fastq_r2",
-        "rna_enrichment_route_id", "rna_enrichment_raw_sample",
-        "rna_enrichment_dna_reads", "rna_enrichment_dna_status",
-        "rna_enrichment_rna_reads", "rna_enrichment_rna_status",
-        "rna_enrichment_input_read_pairs", "rna_enrichment_matched_read_pairs",
-        "rna_enrichment_unassigned_rate", "rna_enrichment_rna_fastq_r1",
-        "rna_enrichment_rna_fastq_r2", "analysis_status",
+
+
+        "analysis_status",
         "cutadapt_input_pairs", "trimmed_pairs", "both_primary_mapped_pairs",
         "one_primary_mapped_pairs", "backend_accepted_pairs", "backend_rejected_pairs",
         "unmapped_pairs", "ambiguous_pairs", "no_primary_pairs", "duplicate_pairs",
@@ -763,7 +705,7 @@ def _emit_final_tsv(
         "non_cpg_metric_source", "high_cph_fraction",
         "high_cph_role", "methylation_backend", "backend_qc_status",
         "cpg_path", "cpg_representation", "snp_path",
-        "rna_bam_path", "notes",
+        "notes",
     ]
     rows = list(cells.values())
     extra = sorted({key for row in rows for key in row} - set(preferred))
@@ -1488,8 +1430,13 @@ def _output_relative_is_owned(relative: Path) -> bool:
 def _check_result_directories(root: Path, relative: Path, *, label: str) -> None:
     directory = root
     for part in (*relative.parts[:-1], None):
-        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
-            raise ValueError(f"{label} requires real result directories: {directory}")
+        try:
+            mode = directory.lstat().st_mode
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISDIR(mode):
+                raise ValueError(f"{label} requires real result directories: {directory}")
         if part is not None:
             directory /= part
 
@@ -1712,13 +1659,18 @@ def _publish_hardlink(stage: Path, public: Path, relative: Path) -> None:
 
 
 def _prune_stale_public_files(public: Path, allowed: set[str]) -> None:
-    for path in sorted(public.rglob("*"), reverse=True):
-        relative = path.relative_to(public)
-        if path.is_symlink() or path.is_file():
-            if relative.as_posix() not in allowed:
-                _remove_path(path)
-        elif path.is_dir() and not any(path.iterdir()):
-            _remove_path(path)
+    def scan_failed(error: OSError) -> None:
+        raise error
+
+    # rglob会忽略扫描错误；必须完整清退旧文件后才能提交新delivery完成标记。
+    # walk不跟随目录链接，链接在filenames中，仅unlink本身。
+    for directory, _subdirectories, filenames in public.walk(top_down=False, on_error=scan_failed):
+        for name in filenames:
+            path = directory / name
+            if path.relative_to(public).as_posix() not in allowed:
+                path.unlink()
+        if directory != public and not any(directory.iterdir()):
+            directory.rmdir()
 
 
 def _run_manifest_payload(ready: Mapping[str, object], snapshot: Mapping[str, object]) -> dict[str, object]:
@@ -1827,8 +1779,12 @@ def publish_delivery(ready_path: str | Path) -> Path:
 def _retained_bam_paths(project: Path, config: Mapping[str, object]) -> tuple[Path, ...]:
     layout = ProjectLayout(project / "02_work", project / "03_results", get_backend(config))
     for directory in (layout.intermediate_dir, layout.intermediate_dir / layout.backend):
-        if directory.is_symlink():
-            raise ValueError(f"Refusing to access retained BAMs through a symlink: {directory}")
+        try:
+            mode = directory.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(mode):
+            raise ValueError(f"Retained BAMs require real directories: {directory}")
     paths = []
     with (layout.result_root / "QC_Results/sample_manifest.tsv").open() as handle:
         reader = csv.DictReader(handle, delimiter="\t")
@@ -1849,10 +1805,15 @@ def clean_demux_scratch_after_publish(project_dir: str | Path) -> None:
     """在已完成发布后先清除 demux 提交边界；失败时保留 FASTQ，拒绝经目录符号链接清理。"""
     project = Path(project_dir).expanduser().resolve()
     scratch = project / "02_work" / "demux"
-    if not scratch.is_dir():
+    try:
+        for directory in (project / "02_work", scratch):
+            if not stat.S_ISDIR(directory.lstat().st_mode):
+                logger.warning("Refusing to reclaim demux scratch through a non-directory: %s", directory)
+                return
+    except FileNotFoundError:
         return
-    if (project / "02_work").is_symlink() or scratch.is_symlink():
-        logger.warning("Refusing to reclaim demux scratch through a symlink: %s", scratch)
+    except OSError as exc:
+        logger.warning("Demux directory could not be checked; preserving scratch: %s: %s", scratch, exc)
         return
     try:
         _remove_path(scratch / "state")

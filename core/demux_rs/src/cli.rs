@@ -280,7 +280,7 @@ fn input_entries_and_existing_aliases_are_protected_without_mutation() {
     if raw_alias.exists() {
         assert!(validate_io_paths(&[("raw", &input)], &[("DNA", &raw_alias)], &[]).is_err());
         assert!(validate_io_paths(&[("spool", &raw)], &[], &[("evidence", &raw_alias.join("new.json"))]).is_err());
-        assert!(validate_io_paths(&[("raw", &input)], &[("DNA", &output), ("RNA", &root.join("output"))], &[]).is_err());
+        assert!(validate_io_paths(&[("raw", &input)], &[("DNA", &output), ("another output", &root.join("output"))], &[]).is_err());
         assert!(validate_io_paths(&[("raw", &input)], &[("DNA", &output)], &[("report", &root.join("output/report.json"))]).is_err());
     }
     assert_eq!(std::fs::read(&input).unwrap(), b"original input");
@@ -317,7 +317,7 @@ fn io_plan_rejects_aliases_without_creating_or_changing_files() {
     assert!(validate_io_paths(&inputs, &[], &[("report", &missing.join("../shared-report.json"))]).is_err());
     let not_directory = root.join("file");
     std::fs::write(&not_directory, b"not a directory").unwrap();
-    assert!(validate_io_paths(&inputs, &[("RNA", &missing.join("../file/../RNA"))], &[]).is_err());
+    assert!(validate_io_paths(&inputs, &[("another output", &missing.join("../file/../DNA"))], &[]).is_err());
     let output = missing.join("DNA");
     assert!(validate_io_paths(&inputs, &[("DNA", &output)],
         &[("report", &output.join("report.json"))]).is_err());
@@ -333,7 +333,7 @@ fn io_plan_rejects_aliases_without_creating_or_changing_files() {
 }
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "DNA/RNA FASTQ 高通量解复用器")]
+#[command(author, version, about = "DNA FASTQ 高通量解复用器")]
 pub(crate) struct Args {
     #[arg(
         long,
@@ -359,15 +359,13 @@ pub(crate) struct Args {
 
     #[arg(
         long = "barcode-map",
-        help = "Barcode_Map.csv；必需 DNA_Barcode、PlateID、Cell_Order，dna-rna 模式还需 RNA_Barcode。"
+        help = "Barcode_Map.csv；必需 DNA_Barcode、PlateID、Cell_Order。"
     )]
     pub(crate) barcode_map: Option<PathBuf>,
 
     #[arg(long = "dna-out-dir", help = "DNA demux FASTQ 输出根目录。")]
     pub(crate) dna_out_dir: Option<PathBuf>,
 
-    #[arg(long = "rna-out-dir", help = "RNA demux FASTQ 输出根目录。")]
-    pub(crate) rna_out_dir: Option<PathBuf>,
 
     #[arg(long = "json-report", help = "JSON report 输出路径。")]
     pub(crate) json_report: Option<PathBuf>,
@@ -396,7 +394,7 @@ pub(crate) struct Args {
         long = "mode",
         value_enum,
         default_value_t = DemuxMode::DnaOnly,
-        help = "dna-only 用于 Cabernet；dna-only-taps 使用普通四碱基 ME；dna-rna 用于 SRD DNA-ME/TSO-RNA 混合布局。"
+        help = "dna-only 用于 Cabernet；dna-only-taps 使用普通四碱基 ME。"
     )]
     pub(crate) mode: DemuxMode,
 }
@@ -409,6 +407,4 @@ pub(crate) enum DemuxMode {
     DnaOnlyTaps,
     #[value(name = "dna-only-droplet")]
     DnaOnlyDroplet,
-    #[value(name = "dna-rna")]
-    DnaRna,
 }

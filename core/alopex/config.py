@@ -85,7 +85,6 @@ required:
 - retention
 - common
 - cabernet
-- srd
 - taps
 - droplet
 properties:
@@ -116,11 +115,9 @@ properties:
     - cpg_coordinate_base
     properties:
       protocol:
-        description: 建库协议（srd / cabernet / taps / droplet）；manifest 的 rna_sample 在 srd 为本地 RNA tube，在 cabernet/taps/droplet
-          为可选外部 RNA raw 关联。
+        description: 建库协议（cabernet / taps / droplet）；manifest 的 rna_sample 为可选外部 RNA raw 关联。
         type: string
         enum:
-        - srd
         - cabernet
         - taps
         - droplet
@@ -192,13 +189,11 @@ properties:
     - keep_final_bam
     properties:
       keep_final_bam:
-        description: true 保留 02_work/ 最终 BAM；false 在持锁成功发布后回收最终 BAM/索引，SRD RNA BAM 除外；null/省略按协议默认，TAPS 为 true，其余为 false。
+        description: true 保留 02_work/ 最终 BAM；false 在持锁成功发布后回收最终 BAM/索引；null/省略按协议默认，TAPS 为 true，其余为 false。
         type:
         - boolean
         - 'null'
   cabernet:
-    $ref: '#/$defs/plate_protocol'
-  srd:
     $ref: '#/$defs/plate_protocol'
   taps:
     type: object
@@ -296,7 +291,7 @@ $defs:
         minimum: 0
         maximum: 20
   high_cph:
-    description: Cabernet/SRD/Droplet 的 high-CpH / non-conversion 处理参数，固定统计并剔除；TAPS 不适用，无用户开关；省略时使用内置默认。
+    description: Cabernet/Droplet 的 high-CpH / non-conversion 处理参数，固定统计并剔除；TAPS 不适用，无用户开关；省略时使用内置默认。
     type: object
     additionalProperties: false
     properties:
@@ -364,7 +359,7 @@ references:
   mm10: resources/mm10_reference/mm10.primary.lambda.puc19.fa  # primary genome + lambda + pUC19；也接受绝对路径
 
 analysis:
-  protocol: cabernet              # cabernet / srd / taps / droplet；manifest 的 rna_sample 在 srd 为本地输入，cabernet/taps/droplet 为可选外部 RNA raw 关联
+  protocol: cabernet              # cabernet / taps / droplet；manifest 的 rna_sample 为可选外部 RNA raw 关联
   cpg_coordinate_base: 1         # CpG pos、RawAdata 与 SingleCpG 位点默认 1-based；设为 0 输出 0-based，原生 BED/VCF/BAM 不变
 
 runtime:
@@ -372,7 +367,7 @@ runtime:
   latency_wait_seconds: 120       # snakemake --latency-wait：等待输出文件在文件系统可见的秒数
 
 retention:
-  keep_final_bam: null           # null 按协议默认：TAPS=true，其余=false；显式 true/false 覆盖，SRD RNA BAM 独立保留
+  keep_final_bam: null           # null 按协议默认：TAPS=true，其余=false；显式 true/false 覆盖
 
 slurm:
   jobs: 60                        # SLURM 全局并发上限，含 Droplet 全库 calling、demux 块和后续 cell 作业
@@ -398,9 +393,6 @@ common:
     generate_snp: false             # BISCUIT-only SNP 输出开关；true 时发布 snps.bed.gz；TAPS 默认发布 VCF，不使用此开关
 
 cabernet:
-  methylation_backend: bismark  # biscuit / bismark；需要差异参数时在本模块覆盖 common 的同名叶子
-
-srd:
   methylation_backend: bismark  # biscuit / bismark；需要差异参数时在本模块覆盖 common 的同名叶子
 
 taps: {}
@@ -456,9 +448,6 @@ CONFIG_SECTION_DEFAULTS: dict[str, dict[str, object]] = {
     "cabernet": {
         "methylation_backend": "bismark",
     },
-    "srd": {
-        "methylation_backend": "bismark",
-    },
     "taps": {},
     "droplet": {},
 }
@@ -491,7 +480,7 @@ def apply_config_defaults(config: dict[str, object]) -> dict[str, object]:
     # 模板用 null 保留协议默认选择；密封/执行配置仍只消费已求解的布尔值。
     if config["retention"]["keep_final_bam"] is None:
         config["retention"]["keep_final_bam"] = config["analysis"].get("protocol") == "taps"
-    for protocol in ("cabernet", "srd", "taps", "droplet"):
+    for protocol in ("cabernet", "taps", "droplet"):
         for key, value in config[protocol].items():
             if key in ("demux", "high_cph", "bismark", "biscuit") and not isinstance(value, dict):
                 raise ValueError(f"config section {protocol}.{key!s} must be a mapping")
@@ -504,13 +493,13 @@ def get_protocol_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(analysis, Mapping):
         raise ValueError("analysis must be a mapping")
     protocol = analysis.get("protocol")
-    if protocol not in ("cabernet", "srd", "taps", "droplet"):
+    if protocol not in ("cabernet", "taps", "droplet"):
         raise ValueError(f"Unsupported protocol: {protocol!r}")
     module = config.get(protocol)
     if not isinstance(module, dict) or not isinstance(config.get("common"), dict):
         raise ValueError("common and selected protocol must be mappings")
     groups = ("demux",) if protocol == "taps" else ("demux", "high_cph", "bismark")
-    if protocol in ("cabernet", "srd"):
+    if protocol in ("cabernet",):
         groups += ("biscuit",)
     effective = {key: copy.deepcopy(value) for key, value in config["common"].items() if key in groups}
     for values in (module, _PROTOCOL_FIXED_CONFIG.get(protocol, {})):
@@ -587,7 +576,7 @@ def get_backend(config: dict[str, Any]) -> str:
             f"Unsupported methylation backend {name!r}; choose biscuit, bismark or rastair"
         )
     if (analysis.get("protocol") == "taps") != (name == "rastair"):
-        raise ValueError("protocol taps requires rastair; Cabernet/SRD require biscuit or bismark")
+        raise ValueError("protocol taps requires rastair; Cabernet requires biscuit or bismark")
     biscuit = module.get("biscuit") or {}
     if bool(biscuit.get("generate_snp")) and name != "biscuit":
         raise ValueError(
@@ -665,7 +654,7 @@ def validate_config_semantics(config: Mapping[str, object]) -> None:
     for species, path in config["references"].items():
         if "\x00" in path:
             raise ValueError(f"references.{species} must not contain NUL")
-    for section in ("common", "cabernet", "srd", "droplet"):
+    for section in ("common", "cabernet", "droplet"):
         for name in config[section].get("high_cph", {}).get("excluded_contigs", ()):
             if re.fullmatch(r"[^,\s]+", name) is None or "\x00" in name:
                 raise ValueError(f"{section}.high_cph.excluded_contigs must contain literal names without whitespace, comma or NUL: {name!r}")
@@ -677,7 +666,7 @@ def validate_config_semantics(config: Mapping[str, object]) -> None:
         if value is not None and (not value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value)):
             raise ValueError(f"slurm.{field} must be a non-blank string without control characters or null")
 
-    for section in ("common", "cabernet", "srd"):
+    for section in ("common", "cabernet",):
         biscuit = config[section].get("biscuit", {})
         if "high_cph_retention_threshold" not in biscuit:
             continue
@@ -695,16 +684,13 @@ def validate_config_semantics(config: Mapping[str, object]) -> None:
 class ProtocolPolicy:
     name: str
     demux_mode: str
-    requires_rna_barcode: bool
-    rna_output_role: str
     high_cph_role: str
 
-    publishes_rna_bam: bool
 
     @property
     def raw_input_columns(self) -> tuple[str, ...]:
         """返回本项目需要 FASTQ 的 manifest 列；外部 RNA 关联不参与拆分。"""
-        return ("dna_raw_sample", "rna_sample") if self.name == "srd" else ("dna_raw_sample",)
+        return ("dna_raw_sample",)
 
 
 @dataclass(frozen=True)
@@ -713,29 +699,21 @@ class RawRoutePolicy:
     protocol: str
     demux_mode: str
     downstream_dna: bool
-    rna_output_role: str
     high_cph_role: str
 
 
 _PROTOCOLS = {
     "droplet": ProtocolPolicy(
-        name="droplet", demux_mode="dna-only-droplet", requires_rna_barcode=False,
-        rna_output_role="not_used", high_cph_role="cdna_contamination", publishes_rna_bam=False,
+        name="droplet", demux_mode="dna-only-droplet",
+        high_cph_role="cdna_contamination",
     ),
     "taps": ProtocolPolicy(
-        name="taps", demux_mode="dna-only-taps", requires_rna_barcode=False,
-        rna_output_role="not_used", high_cph_role="not_applicable",
-        publishes_rna_bam=False,
+        name="taps", demux_mode="dna-only-taps",
+        high_cph_role="not_applicable",
     ),
     "cabernet": ProtocolPolicy(
-        name="cabernet", demux_mode="dna-only", requires_rna_barcode=False,
-        rna_output_role="not_used", high_cph_role="cdna_contamination",
-        publishes_rna_bam=False,
-    ),
-    "srd": ProtocolPolicy(
-        name="srd", demux_mode="dna-rna", requires_rna_barcode=True,
-        rna_output_role="audit_only", high_cph_role="residual_high_cph",
-        publishes_rna_bam=True,
+        name="cabernet", demux_mode="dna-only",
+        high_cph_role="cdna_contamination",
     ),
 }
 
@@ -744,9 +722,6 @@ def _raw_route(
     route_id: str,
     protocol: str,
     downstream_dna: bool,
-    *,
-    rna_output_role: str | None = None,
-    high_cph_role: str | None = None,
 ) -> RawRoutePolicy:
     policy = _PROTOCOLS[protocol]
     return RawRoutePolicy(
@@ -754,8 +729,7 @@ def _raw_route(
         protocol=protocol,
         downstream_dna=downstream_dna,
         demux_mode=policy.demux_mode,
-        rna_output_role=rna_output_role or policy.rna_output_role,
-        high_cph_role=high_cph_role or policy.high_cph_role,
+        high_cph_role=policy.high_cph_role,
     )
 
 
@@ -763,14 +737,6 @@ _RAW_ROUTES = {
     "droplet_dna": _raw_route("droplet_dna", "droplet", True),
     "taps_dna_nucleus": _raw_route("taps_dna_nucleus", "taps", True),
     "cabernet_dna_nucleus": _raw_route("cabernet_dna_nucleus", "cabernet", True),
-    "srd_dna_tube": _raw_route("srd_dna_tube", "srd", True),
-    "srd_rna_enrichment_tube": _raw_route(
-        "srd_rna_enrichment_tube",
-        "srd",
-        False,
-        rna_output_role="audit_only",
-        high_cph_role="not_applicable",
-    ),
 }
 
 
@@ -937,14 +903,6 @@ class CellOutputPaths:
             return self.dna_bam, self.dna_bam_index
         return (self.processed_bam,)
 
-    @property
-    def rna_bam(self) -> Path:
-        """SRD 协议恒定保留的被筛除 BAM（RNA 部分原始数据，位于 02_work/RNA）。"""
-        return self.intermediate_dir / "RNA" / "BAM" / f"{self.sample_id}.rna.bam"
-
-    @property
-    def rna_bam_index(self) -> Path:
-        return Path(f"{self.rna_bam}.bai")
 
     @property
     def post_alignment_bam(self) -> Path:
@@ -981,17 +939,10 @@ class CellOutputPaths:
     def dupsifter_multiqc(self) -> Path:
         return self.intermediate_dir / "biscuit" / f"{self.sample_id}.dupsifter_mqc.json"
 
-    @property
-    def high_cph_read_names(self) -> Path:
-        return self.backend_dir / f"{self.sample_id}.high_cph_reads.txt"
 
     @property
     def processed_bam(self) -> Path:
         return self.backend_dir / f"{self.sample_id}.processed.bam"
-
-    @property
-    def removed_bam(self) -> Path:
-        return self.backend_dir / f"{self.sample_id}.nonconversion_removed.bam"
 
 
     @property
@@ -1087,13 +1038,12 @@ class CellArtifacts:
     final_qc: tuple[Path, ...]
     multiqc: tuple[Path, ...]
     retained_bams: tuple[Path, ...]
-    rna_bams: tuple[Path, ...]
     high_cph_display: Path | None
 
     @property
     def final_inputs(self) -> tuple[Path, ...]:
         """列出汇总实际消费的科学结果、持久 QC 和保留 BAM，不包含临时展示文件。"""
-        return tuple(dict.fromkeys((*self.deliverables, *self.final_qc, *self.rna_bams)))
+        return tuple(dict.fromkeys((*self.deliverables, *self.final_qc)))
 
     def multiqc_sources(self) -> tuple[Path, ...]:
         """展示 JSON 已回收时只依赖保留的 summary，不回溯 BAM 规则。"""
@@ -1116,7 +1066,6 @@ def cell_artifacts(
     multiqc = [paths.cutadapt_json]
     retained = paths.retained_bam_files if keep_final_bam else ()
     final_qc.extend(retained)
-    rna = (paths.rna_bam, paths.rna_bam_index) if policy.publishes_rna_bam else ()
     if generate_snp:
         deliverables.extend(public_files["snp_path"])
     if paths.backend == "rastair":
@@ -1144,7 +1093,7 @@ def cell_artifacts(
                 final_qc.append(metrics["bismark_dedup_report"])
                 multiqc.append(metrics["bismark_dedup_report"])
     return CellArtifacts(MappingProxyType(metrics), tuple(deliverables), tuple(final_qc),
-                         tuple(multiqc), retained, rna,
+                         tuple(multiqc), retained,
                          paths.high_cph_multiqc if paths.backend != "rastair" else None)
 
 
@@ -1161,14 +1110,11 @@ class DemuxRow(TypedDict):
     demux_source_revision: str
     retention_policy: str
     retention_threshold: str
-    rna_output_role: str
     high_cph_role: str
     plate_id: str
     cell_order: str
     dna_barcode: str
-    rna_barcode: str
     dna_reads: str
-    rna_reads: str
     input_fastq_pairs: str
     input_read_pairs: str
     usable_read_pairs: str
@@ -1179,10 +1125,7 @@ class DemuxRow(TypedDict):
     unassigned_rate: str
     dna_r1: str
     dna_r2: str
-    rna_r1: str
-    rna_r2: str
     dna_status: str
-    rna_status: str
 
 
 class ProjectSampleRow(TypedDict):
@@ -1199,12 +1142,10 @@ class CellIdentityRow(ProjectSampleRow):
     plate_id: str
     cell_order: str
     dna_barcode: str
-    rna_barcode: str
 
 
 class BarcodeRow(TypedDict):
     dna_barcode: str
-    rna_barcode: str
     plate_id: str
     cell_order: str
 
@@ -1228,7 +1169,6 @@ class DemuxCompletion(TypedDict, total=False):
     multiqc: FileIdentity
     initial_cell_manifest: FileIdentity
     dna_dir: str
-    rna_dir: str
     _manifest_path: str
     _cell_manifest_path: str
     _rows: list[DemuxRow]
@@ -1709,7 +1649,7 @@ def _object(
                 "unsupported=" + ",".join(extra) if extra else "",
             ) if part
         )
-        raise ValueError(f"{label} fields do not match schema 3 ({detail}): {source}")
+        raise ValueError(f"{label} fields do not match the current contract ({detail}): {source}")
     return value
 
 

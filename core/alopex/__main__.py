@@ -33,9 +33,9 @@ from .delivery import (
 from .inputs import (
     _resolve_config,
     call_droplet_cells,
-    collect_rna_fastq,
     copy_demux_fastq,
     demux_source_revision,
+    discover_project_config,
     droplet_output_disk_mb,
     init_project_directory,
     print_refresh_result,
@@ -95,6 +95,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m alopex", description="Alopex 核心模块内部 CLI。")
     commands = parser.add_subparsers(dest="command", required=True)
 
+    present = commands.add_parser("present-command", help="观测本次用户入口；原始输出完整落日志，退出由子命令决定。")
+    present.add_argument("--mode", choices=("doctor", "doctor-conda", "doctor-reference", "doctor-demux", "doctor-download", "pipeline"), required=True)
+    present.add_argument("--title", required=True)
+    present.add_argument("--log-dir", type=Path, required=True)
+    present.add_argument("--project", type=Path)
+    present.add_argument("argv", nargs=argparse.REMAINDER)
+
     multiqc_report = commands.add_parser("multiqc-report", help="生成配置隔离的 Pipeline MultiQC 报告。")
     multiqc_report.add_argument("--file-list", type=Path, required=True, help="Pipeline 生成的 JSON 源路径清单。")
     multiqc_report.add_argument("--config", type=Path, required=True)
@@ -105,6 +112,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init-project", help="初始化项目骨架（目录/模板/launcher symlink）。")
     init.add_argument("path", nargs="?", default=".", help="项目目录；默认当前目录。")
     init.add_argument("--pipeline-root", required=True, help="Pipeline 安装根，用于模板与 symlink。")
+    discover_config = commands.add_parser("discover-project-config", help="向上定位项目配置，访问失败不回退父项目。")
+    discover_config.add_argument("start", type=Path)
     scalars = commands.add_parser("config-scalars", help="把平台路由所需的 config 标量输出为可 eval 的 shell 赋值。")
     scalars.add_argument("--config", required=True)
     progress = commands.add_parser("controller-progress", help="增量读取 controller 日志进度，不写状态文件。")
@@ -181,7 +190,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         stage_droplet.add_argument("--" + field, required=True)
     stage_droplet.add_argument("--threads", type=int, required=True)
     write_metadata = commands.add_parser("write-demux-metadata", help="demux 事务内写出 MQC 与 manifest。")
-    for arg in ("report_path", "mqc_path", "manifest_path", "dna_dir", "rna_dir",
+    for arg in ("report_path", "mqc_path", "manifest_path", "dna_dir",
                 "pipeline_mode", "route_id", "downstream_dna", "raw_sample", "cell_manifest_path"):
         write_metadata.add_argument(arg)
     write_metadata.add_argument("--calling-metrics", default="")
@@ -189,11 +198,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     write_completion = commands.add_parser("write-demux-completion", help="demux 事务内写出 completion 提交记录。")
     write_completion.add_argument("out_json")
     for field in ('--run-id', '--project-sample-id', '--manifest', '--report', '--mqc',
-                      '--dna-dir', '--rna-dir', '--cell-manifest'):
+                      '--dna-dir', '--cell-manifest'):
         write_completion.add_argument(field, required=True)
-    collect = commands.add_parser("collect-rna-fastq", help="收集 RNA FASTQ 到保留区。")
-    for field in ('--manifest', '--intermediate-dir', '--marker', '--run-id'):
-        collect.add_argument(field, required=True)
     write_final = commands.add_parser("write-sample-manifest", help="写出最终 sample manifest。")
     for arg in ("initial_manifest", "intermediate_dir", "staged_results_dir",
                 "published_results_dir", "out_tsv", "pair_qc_json", "cutadapt_qc_json"):
@@ -217,8 +223,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          help="JSON array of canonical reference contig names excluded from assessment.")
     extract.add_argument("--alignment-bam", required=True, type=Path)
     extract.add_argument("--samtools", default="samtools")
-    extract.add_argument("--protocol", choices=("cabernet", "srd", "droplet"), required=True)
-    extract.add_argument("--high-cph-role", choices=("cdna_contamination", "residual_high_cph"),
+    extract.add_argument("--protocol", choices=("cabernet", "droplet"), required=True)
+    extract.add_argument("--high-cph-role", choices=("cdna_contamination",),
                          required=True)
     split = commands.add_parser("split-bismark-pairs", help="Bismark BAM 配对路由与计数。")
     split.add_argument("--excluded-contigs-json", required=True)
@@ -322,6 +328,14 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command
     try:
 
+        if command == "present-command":
+            from .presentation import run_displayed
+            argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+            if not argv:
+                raise ValueError("present-command requires a child command")
+            return run_displayed(argv, mode=args.mode, title=args.title,
+                                 log_dir=args.log_dir, project=args.project)
+
         if command == "multiqc-report":
             return run_multiqc_report(args.file_list, args.config, args.output_dir, args.comment)
         elif command == "init-project":
@@ -336,6 +350,8 @@ def main(argv: list[str] | None = None) -> int:
             config = load_project_config(args.config)
             for var, value in export_config_scalars(config).items():
                 print(f"{var}={shlex.quote(value)}")
+        elif command == "discover-project-config":
+            print(discover_project_config(args.start))
         elif command == "controller-progress":
             offset, progress = read_controller_progress(args.log, args.offset)
             print(offset, progress)
@@ -413,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "write-demux-metadata":
             write_run_metadata(
                 args.report_path, args.mqc_path, args.manifest_path, args.dna_dir,
-                args.rna_dir, args.pipeline_mode, args.route_id, args.downstream_dna,
+                args.pipeline_mode, args.route_id, args.downstream_dna,
                 args.raw_sample, args.cell_manifest_path,
                 calling_metrics=args.calling_metrics, structure_metrics=args.structure_metrics,
             )
@@ -426,11 +442,8 @@ def main(argv: list[str] | None = None) -> int:
                 report_path=args.report,
                 mqc_path=args.mqc,
                 dna_dir=args.dna_dir,
-                rna_dir=args.rna_dir,
                 cell_manifest_path=args.cell_manifest,
             )
-        elif command == "collect-rna-fastq":
-            collect_rna_fastq(args.manifest, args.intermediate_dir, args.marker, args.run_id)
         elif command == "write-sample-manifest":
             write_final_sample_manifest(
                 args.initial_manifest, args.intermediate_dir, args.staged_results_dir,

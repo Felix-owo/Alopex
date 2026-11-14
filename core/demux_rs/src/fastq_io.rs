@@ -10,18 +10,12 @@ pub(super) fn write_fastq_record(
     trim_start: usize,
     umi: Option<&[u8]>,
     trim: bool,
-    keep_comment: bool,
 ) -> Result<()> {
     output.push(b'@');
     if let Some(umi_seq) = umi {
         output.extend_from_slice(normalize_read_id(id)?);
         output.push(b':');
         output.extend_from_slice(umi_seq);
-        if keep_comment {
-            if let Some(comment_start) = id.iter().position(u8::is_ascii_whitespace) {
-                output.extend_from_slice(&id[comment_start..]);
-            }
-        }
     } else {
         output.extend_from_slice(id);
     }

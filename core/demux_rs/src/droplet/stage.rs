@@ -406,10 +406,9 @@ fn stage_batch(id: u64, input: InputChunk, shards: usize) -> Result<Staged> {
                     layout.trim_start,
                     Some(layout.umi),
                     true,
-                    false,
                 )?;
                 let second = out.len();
-                write_fastq_record(out, id2, r2, q2, 9, Some(layout.umi), true, false)?;
+                write_fastq_record(out, id2, r2, q2, 9, Some(layout.umi), true)?;
                 let n1 = u32::try_from(second - first)?;
                 let n2 = u32::try_from(out.len() - second)?;
                 out[length_at..length_at + 4].copy_from_slice(&n1.to_le_bytes());

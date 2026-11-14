@@ -10,6 +10,8 @@ control:
   - conda-libmamba-solver>=26,<27
   - pyyaml>=6,<7
   - jsonschema>=4.26,<5
+  - rich>=15,<16
+  - psutil>=7.2,<8
   - snakemake>=9.25,<10
   - snakemake-executor-plugin-slurm>=2.7,<3
   - rust>=1.97,<1.98
@@ -90,12 +92,11 @@ notebook:
   - numba>=0.61,<0.63
   - numpy>=2,<3
   - packaging>=24,<26
+  - psutil>=7.2,<8
   - pandas>=2.2,<3
-  - polars>=1,<2
+  - h5py>=3.11,<4
   - pyyaml>=6,<7
   - scikit-learn>=1.5,<2
   - seaborn>=0.13,<0.14
   - tqdm>=4.66,<5
   - zstd>=1.5,<2
-  - pip:
-    - snapatac2==2.9.0

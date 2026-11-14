@@ -239,16 +239,28 @@ dna_pipeline_find_single_output() {
     done
     local -a patterns=("$@")
     local -a matches=()
-    local pattern path glob excluded
-    shopt -s nullglob
+    local pattern path glob excluded scan_status
+    local -a depth=()
+    (( recursive == 1 )) || depth=(-maxdepth 1)
     for pattern in "${patterns[@]}"; do
-        if (( recursive == 1 )); then
-            while IFS= read -r -d '' path; do matches+=("$path"); done < <(find "$directory" -type f -name "$pattern" -print0)
-        else
-            while IFS= read -r -d '' path; do matches+=("$path"); done < <(find "$directory" -maxdepth 1 -type f -name "$pattern" -print0)
+        scan_status=2
+        # 空路径不可能是find结果；NUL尾记录传回退出码，避免异步扫描失败被while吞掉。
+        while IFS= read -r -d '' path; do
+            if [[ -z "$path" ]]; then
+                IFS= read -r -d '' scan_status || scan_status=2
+                break
+            fi
+            matches+=("$path")
+        done < <(
+            scan_status=0
+            find "$directory" ${depth[@]+"${depth[@]}"} -type f -name "$pattern" -print0 || scan_status=$?
+            printf '\0%s\0' "$scan_status"
+        )
+        if (( scan_status != 0 )); then
+            printf 'ERROR: native output scan failed in %s (exit %s)\n' "$directory" "$scan_status" >&2
+            return "$scan_status"
         fi
     done
-    shopt -u nullglob
     if (( ${#exclude_globs[@]} > 0 )); then
         local -a kept=()
         for path in ${matches[@]+"${matches[@]}"}; do
@@ -352,21 +364,4 @@ dna_pipeline_emit_canonical_cpg() {
             }
         }'
     } | "$zstd" -q -T1 -c > "$out_tmp"
-}
-
-# 对 BAM 坐标排序，并通过 atomic-publish 以 BAM commit-last 原子提交。
-dna_pipeline_coordinate_sort_and_stage() {
-    local samtools="${1:?}" extra="${2:?}" src="${3:?}"
-    local tmp_bam="${4:?}" tmp_bai="${5:?}" final_bam="${6:?}" final_bai="${7:?}"
-    local python="${8:?}"
-    mkdir -p "$(dirname "$final_bam")" || return $?
-    "$samtools" sort -@ "$extra" -o "$tmp_bam" "$src" || return $?
-    "$samtools" index -@ "$extra" "$tmp_bam" || return $?
-    "$samtools" quickcheck -v "$tmp_bam" || return $?
-    "$python" -m alopex atomic-publish \
-        --samtools "$samtools" \
-        --bam-destination "$final_bam" \
-        --commit-last "$final_bam" \
-        --file "$tmp_bai" "$final_bai" \
-        --file "$tmp_bam" "$final_bam"
 }

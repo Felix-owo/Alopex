@@ -38,7 +38,7 @@ from ..config import (
 )
 from ..delivery import load_run_manifest, load_run_snapshot
 from ..identity import PythonSourceGraph, capture_loaded_source_codes, assert_loaded_sources_current
-from ..io import sha256_file, project_temporary_parent
+from ..io import sha256_file, project_temporary_parent, stat_if_present
 from ..paths import CORE_ROOT as _CORE_ROOT, PIPELINE_ROOT as _PIPELINE_ROOT
 from ..runtime import effective_cpu_count
 
@@ -55,7 +55,6 @@ REQUIRED_MANIFEST_FIELDS = {
     "project_sample_id",
     "plate_id",
     "dna_barcode",
-    "rna_barcode",
     "dna_raw_sample",
     "dna_reads",
     "dna_status",
@@ -268,7 +267,7 @@ def load_sealed_qc_context(
     config_backend = get_backend(config)
     if not run_species or config_species != run_species:
         raise ValueError("Sealed config species disagrees with the run manifest")
-    if run_protocol not in {"cabernet", "srd", "taps", "droplet"} or config_protocol != run_protocol:
+    if run_protocol not in {"cabernet", "taps", "droplet"} or config_protocol != run_protocol:
         raise ValueError("Sealed config protocol disagrees with the run manifest")
 
     reference_path = Path(str(run.get("reference_path", ""))).expanduser().resolve()
@@ -576,7 +575,6 @@ def build_qc_records(
             "demux_clone_id": str(cell["project_sample_id"]),
             "demux_plate_id": str(cell["plate_id"]),
             "demux_dna_barcode": str(cell["dna_barcode"]),
-            "demux_rna_barcode": str(cell["rna_barcode"]),
             "demux_raw_sample": str(cell["dna_raw_sample"]),
             "demux_dna_reads_count": int(cell["demux_dna_reads_count"]),
             "cpg_file": Path(cell["cpg_file"]),
@@ -744,12 +742,11 @@ import pandas as pd
 
 try:
     import anndata as ad
-    import polars as pl
-    import snapatac2 as snap
+    from . import matrix as matrices, diagnostics
     from numba import njit
     from tqdm import tqdm
 except ImportError as _qc_import_error:
-    ad = pl = snap = None
+    ad = matrices = diagnostics = None
     tqdm = None
     _HEAVY_IMPORT_ERROR = _qc_import_error
 
@@ -759,6 +756,9 @@ except ImportError as _qc_import_error:
         if len(args) == 1 and callable(args[0]) and not kwargs:
             return args[0]
         return _identity
+
+
+_LOADED_SOURCE_CODES = capture_loaded_source_codes()
 
 
 @dataclass(frozen=True)
@@ -1076,6 +1076,9 @@ TSS_REQUIRED_COLUMNS = (
     "meth_frac",
     "count",
     "CloneID",
+    "coverage",
+    "covered_bins",
+    "observed_sites",
 )
 
 
@@ -1106,16 +1109,15 @@ QC_INFO_COLUMNS = (
 )
 
 
-RAW_ADATA_SCHEMA_VERSION = 5
+RAW_ADATA_SCHEMA_VERSION = 6
 
 
-RAW_ADATA_SCHEMA_MODE = "strand_resolved_headered_empty_safe"
+RAW_ADATA_SCHEMA_MODE = "portable_csr_counts"
 
 
-RAW_ADATA_ALGORITHM_VERSION = "snapatac2_import_values_native_reference_v2"
+RAW_ADATA_ALGORITHM_VERSION = "alopex_portable_csr_counts_v1"
 
 
-EMPTY_CPG_SENTINEL_CONTIG = "__DNA_PIPELINE_EMPTY__"
 
 
 MAX_CPG_WORKERS = 32
@@ -1378,8 +1380,7 @@ def _raw_adata_schema_matches(
         and isinstance(schema_payload.get("sample_ids"), list)
         and schema_payload.get("cpg_header") == "chrom\tpos\tmethyl\tunmethyl"
         and schema_payload.get("source_cpg_representation") == CPG_REPRESENTATIONS[base]
-        and schema_payload.get("empty_cpg_sentinel")
-        == f"{EMPTY_CPG_SENTINEL_CONTIG}:{base}:0:1"
+        and schema_payload.get("empty_cell_representation") == "empty_csr_row"
     )
 
 
@@ -1498,13 +1499,6 @@ def _read_chrom_sizes(fai_path: Path) -> dict[str, int]:
                 ) from exc
             if not chrom or length <= 0:
                 raise ValueError(f"{fai_path}:{line_no}: invalid chromosome entry")
-            if chrom == EMPTY_CPG_SENTINEL_CONTIG:
-                raise ValueError(
-                    f"{fai_path}:{line_no}: reference uses reserved empty-CpG "
-                    f"sentinel contig {EMPTY_CPG_SENTINEL_CONTIG}"
-                )
-
-
             if chrom in chrom_sizes:
                 raise ValueError(f"{fai_path}:{line_no}: duplicate chromosome {chrom}")
             chrom_sizes[chrom] = length
@@ -1560,232 +1554,111 @@ def _raw_cpg_coordinate_base(adata) -> int:
     return int(base)
 
 
-def make_cpg_peak_matrix(adata, *, peak_file: Path, **kwargs):
-    """按 RawAdata 的实际坐标读取标准 0-based BED，保持原生计数与位点顺序。"""
-    base = _raw_cpg_coordinate_base(adata)
-    if base == 0:
-        return snap.pp.make_peak_matrix(adata, peak_file=str(peak_file), **kwargs)
-    opener = gzip.open if Path(peak_file).suffix == ".gz" else open
-    regions = []
-    with opener(peak_file, "rt") as handle:
-        for line in handle:
-            if not line.strip() or line.startswith("#"):
-                continue
-            chrom, start, end = line.rstrip("\n").split("\t")[:3]
-            regions.append(f"{chrom}:{int(start) + base}-{int(end) + base}")
-    return snap.pp.make_peak_matrix(adata, use_rep=regions, **kwargs)
 
 
-def _make_cpg_import_dir(output_parent: Path) -> Path:
-    """在项目05_tmp创建独占导入目录；链接及临时矩阵均不落节点盘。"""
-    return Path(tempfile.mkdtemp(prefix=".snapatac-cpg-input.",
-                                 dir=project_temporary_parent(output_parent / "RawAdata.h5ad")))
+
+@contextmanager
+def _managed_cpg_text(path):
+    """Raw导入与公共统计共用解码器退出、诊断和句柄关闭边界。"""
+    process, handle, diagnostics = _open_cpg_text(path)
+    error = None
+    try:
+        yield handle
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        handle.close()
+        _finish_cpg_process(process, path, error, diagnostics)
 
 
 def load_or_create_raw_adata(
-    selected_files: list[Path],
-    out_file: Path,
-    fai_path: Path | None,
-    *,
-    reuse_existing: bool,
-    expected_sample_ids: list[str],
-    zero_mapped_sample_ids: set[str],
-    sealed_context: SealedQCContext,
-    cpg_output_identities: Mapping[str, Mapping[str, object]],
-    before_rebuild=None,
+    selected_files: list[Path], out_file: Path, fai_path: Path | None, *, reuse_existing: bool,
+    expected_sample_ids: list[str], zero_mapped_sample_ids: set[str], sealed_context: SealedQCContext,
+    cpg_output_identities: Mapping[str, Mapping[str, object]], before_rebuild=None,
 ):
-    """按 sealed 坐标导入 CpG，保留原生染色体索引顺序并按名称补充真实长度。
-
-    reference_sequences 的行序决定全局稀疏列偏移，不得用 FAI 行序重建；
-    1-based 每条染色体为坐标 0 留空槽，不改变真实参考长度。
-    """
+    """严格导入整数计数为可移植backed CSR；空细胞是真实空行，不生成sentinel。"""
     assert_current = _reference_guard(fai_path, before_commit=sealed_context.assert_current)
     assert_current()
-    source_base = _source_cpg_coordinate_base(sealed_context.cpg_representation)
-    expected = [str(value) for value in expected_sample_ids]
-    zero_mapped = {str(value) for value in zero_mapped_sample_ids}
+    base = _source_cpg_coordinate_base(sealed_context.cpg_representation)
+    expected, zero_mapped = list(map(str, expected_sample_ids)), set(map(str, zero_mapped_sample_ids))
     if len(expected) != len(set(expected)):
         raise ValueError("Current manifest contains duplicate Sample_ID values")
     if zero_mapped - set(expected):
         raise ValueError("Zero-mapped Sample_ID set differs from current manifest")
     if set(cpg_output_identities) != set(expected):
         raise ValueError("Sealed CpG inventory Sample_ID set differs from current manifest")
-    for label, value in (
-        ("sealed_delivery_id", sealed_context.delivery_id),
-        ("sealed_snapshot_id", sealed_context.snapshot_id),
-    ):
+    for value in (sealed_context.delivery_id, sealed_context.snapshot_id):
         if re.fullmatch(r"[0-9a-f]{64}", str(value)) is None:
-            raise ValueError(f"{label} must be a 64-character content identity")
-    schema_file = out_file.with_name(f"{out_file.stem}.input_schema.json")
-    files = sorted(Path(path).resolve() for path in selected_files)
-    cpg_bindings = []
-    sources = {}
-    linkname2clean = {}
-    for path in files:
-        name = path.name.removesuffix(".cpg.tsv.zst") + ".tsv.zst"
-        sample_id = _clean_cpg_table_name(name)
-        if sample_id in sources:
-            raise ValueError(f"More than one active CpG file maps to {sample_id!r}")
-        if sample_id not in cpg_output_identities:
+            raise ValueError("Sealed delivery/snapshot identity must be 64-character content identity")
+    sources, bindings = {}, []
+    for path in sorted(Path(p).resolve() for p in selected_files):
+        sid = _clean_cpg_table_name(path.name.removesuffix(".cpg.tsv.zst") + ".tsv.zst")
+        if sid in sources:
+            raise ValueError(f"More than one active CpG file maps to {sid!r}")
+        if sid not in cpg_output_identities:
             raise ValueError(f"CpG input is absent from sealed inventory: {path}")
-        record = cpg_output_identities[sample_id]
+        record = cpg_output_identities[sid]
         if not path.is_file() or path.stat().st_size != record["size_bytes"] or not record["size_bytes"]:
             raise FileNotFoundError(f"Selected CpG result is missing or has a wrong size: {path}")
-        sources[sample_id] = path
-        linkname2clean[name] = sample_id
-        linkname2clean[name.removesuffix(".zst")] = sample_id
-        cpg_bindings.append({
-            "sample_id": sample_id,
-            "path": str(path),
-            "size_bytes": record["size_bytes"],
-            "sha256": record["sha256"],
-        })
+        sources[sid] = path
+        bindings.append({"sample_id": sid, "path": str(path), "size_bytes": record["size_bytes"], "sha256": record["sha256"]})
     if set(sources) != set(expected):
         raise ValueError("CpG input Sample_ID set differs from current manifest")
-    cpg_bindings.sort(key=lambda record: record["sample_id"])
-    input_signature = {
-        "schema_version": RAW_ADATA_SCHEMA_VERSION,
-        "algorithm_version": RAW_ADATA_ALGORITHM_VERSION,
-        "algorithm_sha256": _algorithm_fingerprints()["raw"],
-        "delivery_id": sealed_context.delivery_id,
-        "snapshot_id": sealed_context.snapshot_id,
-        "cpg_header": "chrom\tpos\tmethyl\tunmethyl",
-        "cpg_coordinate_base": source_base,
-        "source_cpg_representation": sealed_context.cpg_representation,
-        "empty_cpg_sentinel": f"{EMPTY_CPG_SENTINEL_CONTIG}:{source_base}:0:1",
-        "sample_ids": sorted(expected),
+    schema_file = out_file.with_name(f"{out_file.stem}.input_schema.json")
+    signature = {"schema_version": RAW_ADATA_SCHEMA_VERSION, "algorithm_version": RAW_ADATA_ALGORITHM_VERSION,
+        "algorithm_sha256": _algorithm_fingerprints()["raw"], "delivery_id": sealed_context.delivery_id,
+        "snapshot_id": sealed_context.snapshot_id, "cpg_header": "chrom\tpos\tmethyl\tunmethyl",
+        "cpg_coordinate_base": base, "source_cpg_representation": sealed_context.cpg_representation,
+        "empty_cell_representation": "empty_csr_row", "sample_ids": sorted(expected),
         "reference_fai": _content_binding(fai_path) if fai_path is not None else None,
-        "cpg_files": cpg_bindings,
-    }
-    schema_payload: object = None
+        "cpg_files": sorted(bindings, key=lambda x: x["sample_id"])}
+    payload = None
     if schema_file.is_file():
         try:
-            schema_payload = json.loads(schema_file.read_text(encoding="utf-8"))
+            payload = json.loads(schema_file.read_text())
         except (OSError, ValueError, TypeError):
-            schema_payload = None
-    cached_empty = schema_payload.get("empty_cpg_sample_ids") if isinstance(schema_payload, dict) else None
-    valid_empty = (
-        isinstance(cached_empty, list)
-        and all(isinstance(value, str) for value in cached_empty)
-        and cached_empty == sorted(set(cached_empty))
-        and set(cached_empty) <= set(expected)
-        and zero_mapped <= set(cached_empty)
-    )
-    schema_matches = valid_empty and _raw_adata_schema_matches(
-        out_file, schema_payload, {**input_signature, "empty_cpg_sample_ids": cached_empty}
-    )
-
-    if reuse_existing and out_file.exists() and out_file.is_file():
-        existing = None
+            pass
+    cached_empty = payload.get("empty_cpg_sample_ids") if isinstance(payload, dict) else None
+    valid_empty = (isinstance(cached_empty, list) and all(isinstance(x, str) for x in cached_empty)
+                   and cached_empty == sorted(set(cached_empty)) and set(cached_empty) <= set(expected)
+                   and zero_mapped <= set(cached_empty))
+    if (reuse_existing and valid_empty and _raw_adata_schema_matches(out_file, payload,
+            {**signature, "empty_cpg_sample_ids": cached_empty})):
+        existing = matrices.CSRReader(out_file, "obsm/__values__")
         try:
-            existing = snap.read(str(out_file), backed="r")
-            observed = [str(value) for value in existing.obs_names]
-            if len(observed) != len(set(observed)) or set(observed) != set(expected):
-                raise ValueError(
-                    "RawAdata Sample_ID set differs from current final manifest"
-                )
-            if schema_matches:
-                assert_current()
-                validated = existing
-                existing = None
-                return validated, set(cached_empty)
-            raise ValueError(
-                "RawAdata does not match the current configured-base four-column input schema"
-            )
-        except Exception as e:
+            _require_exact_sample_ids(pd.DataFrame({"Sample_ID": existing.obs_names}), expected, "RawAdata")
             assert_current()
-            _log(f"读取现有 h5ad 失败，尝试重建: {e}", level="WARNING")
-        finally:
-            if existing is not None:
-                existing.close()
-
+            return existing, set(cached_empty)
+        except BaseException:
+            existing.close()
+            raise
     if before_rebuild is not None:
         before_rebuild()
-    chrom_sizes = _read_chrom_sizes(fai_path) if fai_path is not None and fai_path.exists() else None
-    # sealed CpG 原文件直接交给原生导入，不再用 Python 预扫全库。
-    empty_cpg = {sample_id for sample_id, path in sources.items()
-                 if _cpg_table_is_empty(path, chrom_sizes, source_base)}
-    assert_current()
-    if zero_mapped - empty_cpg:
-        raise ValueError("Zero-mapped cells must have an empty current CpG result")
-    input_signature["empty_cpg_sample_ids"] = sorted(empty_cpg)
-    if fai_path is None or not fai_path.exists():
-        return None, empty_cpg
-
+    if fai_path is None:
+        raise ValueError("RawAdata requires the sealed reference FAI")
+    sizes = _read_chrom_sizes(fai_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    import_dir = _make_cpg_import_dir(out_file.parent)
-    _log(f"Raw CpG temporary links: {import_dir}", level="DEBUG")
-    temporary = import_dir.parent / f".{out_file.stem}.{uuid.uuid4().hex}.tmp{out_file.suffix}"
-    snap_data = None
+    temporary = project_temporary_parent(out_file) / f".{out_file.stem}.{uuid.uuid4().hex}.tmp.h5ad"
     try:
-
-
-        for sample_id, source in sources.items():
-            name = sample_id + ".tsv.zst"
-            target = import_dir / name
-            if sample_id not in empty_cpg:
-                os.symlink(source.resolve(), target)
-                continue
-
-
-            target = import_dir / name.removesuffix(".zst")
-            target.write_text(
-                "chrom\tpos\tmethyl\tunmethyl\n"
-                f"{EMPTY_CPG_SENTINEL_CONTIG}\t{source_base}\t0\t1\n",
-                encoding="utf-8",
-            )
-
-        snap_data = snap.pp.import_values(
-            str(import_dir),
-            chrom_sizes={chrom: length + source_base for chrom, length in chrom_sizes.items()},
-            file=str(temporary),
-            backend="hdf5",
-            chunk_size=200,
-        )
-        new_names = [
-            linkname2clean.get(
-                bn := Path(str(x)).name,
-                _clean_cpg_table_name(bn),
-            )
-            for x in snap_data.obs_names
-        ]
-        if len(new_names) != len(set(new_names)):
-            raise ValueError("Active CpG inputs produced duplicate Sample_ID values")
-        if len(new_names) != len(expected) or set(new_names) != set(expected):
-            raise ValueError(
-                "New RawAdata Sample_ID set differs from current final manifest"
-            )
-        snap_data.obs_names = new_names
-        snap_data.uns["cpg_coordinate_base"] = source_base
-        snap_data.uns["source_cpg_representation"] = sealed_context.cpg_representation
-        reference = snap_data.uns["reference_sequences"]
-        reference_names = reference["reference_seq_name"].to_list()
-        if (len(reference_names) != len(chrom_sizes)
-                or len(set(reference_names)) != len(reference_names)
-                or dict(zip(reference_names, reference["reference_seq_length"].to_list()))
-                != {chrom: length + source_base for chrom, length in chrom_sizes.items()}):
-            raise ValueError("Native RawAdata chromosome index differs from the reference")
-        snap_data.uns["reference_sequences"] = reference.with_columns(pl.Series(
-            "reference_bp_length", [chrom_sizes[chrom] for chrom in reference_names],
-            dtype=pl.UInt64,
-        ))
-        snap_data.close()
-        snap_data = None
+        ordered = {sid: sources[sid] for sid in sorted(sources)}
+        empty = matrices.write_raw_cpgs(ordered, sizes, base, temporary, _managed_cpg_text,
+                                       workers=min(4, effective_cpu_count()))
+        if zero_mapped - empty:
+            raise ValueError("Zero-mapped cells must have an empty current CpG result")
+        with matrices.h5py.File(temporary, "r+") as handle:
+            matrices.write_elem(handle["uns"], "source_cpg_representation", sealed_context.cpg_representation)
+        signature["empty_cpg_sample_ids"] = sorted(empty)
+        probe = matrices.CSRReader(temporary, "obsm/__values__")
+        try:
+            _require_exact_sample_ids(pd.DataFrame({"Sample_ID": probe.obs_names}), expected, "New RawAdata")
+        finally:
+            probe.close()
         assert_current()
-        _publish_raw_adata_generation(
-            temporary, out_file, schema_file, input_signature,
-            before_commit=assert_current,
-        )
+        _publish_raw_adata_generation(temporary, out_file, schema_file, signature, before_commit=assert_current)
     finally:
-        if snap_data is not None:
-            try:
-                snap_data.close()
-            except Exception as exc:
-                _log(f"关闭未完成的 h5ad 失败: {exc}", level="WARNING")
         temporary.unlink(missing_ok=True)
-        shutil.rmtree(import_dir, ignore_errors=True)
-
-    return snap.read(str(out_file), backed="r"), empty_cpg
+    return matrices.CSRReader(out_file, "obsm/__values__"), empty
 
 
 def _raw_adata_schema_mode(out_file: Path) -> str:
@@ -1808,7 +1681,7 @@ def _algorithm_fingerprints() -> dict[str, str]:
 
     sources = PythonSourceGraph((_CORE_ROOT,), loaded_sources=_LOADED_SOURCE_CODES)
     versions = {name: importlib.metadata.version(name)
-                for name in ("numpy", "pandas", "scipy", "numba", "snapatac2")}
+                for name in ("numpy", "pandas", "scipy", "numba", "anndata", "h5py")}
     roots = {
         "input": ("build_qc_records", "source_identity"),
         "raw": ("load_or_create_raw_adata",),
@@ -1816,6 +1689,7 @@ def _algorithm_fingerprints() -> dict[str, str]:
         "gini": ("compute_gini_index",),
         "tss": ("compute_tss_profile",),
         "single": ("prepare_single_cpg_adata",),
+        "chromosome": ("compute_chromosome_diagnostics",),
     }
     fingerprints = {}
     for stage, names in roots.items():
@@ -1833,6 +1707,8 @@ def _cache_identities(identity: Mapping[str, object], cfg, algorithms: Mapping[s
     common = {"input": identity["identity_sha256"], "reader": algorithms["input"]}
     payloads = {
         "cpg": {**common, "algorithm": algorithms["cpg"]},
+        "chromosome": {**common, "algorithm": algorithms["chromosome"], "raw": algorithms["raw"],
+                       "raw_generation": identity["raw_generation"]},
         "gini": {**common, "algorithm": algorithms["gini"], "raw": algorithms["raw"],
                  "raw_generation": identity["raw_generation"],
                  "bin_size": cfg.gini_bin_size},
@@ -1917,25 +1793,6 @@ def _iter_cpg_rows(handle, path: Path, chrom_sizes: Mapping[str, int] | None, co
             raise ValueError(f"{path}:{line_no}: duplicate or out-of-order CpG position: {chrom}:{pos}")
         last_positions[chrom] = pos
         yield chrom, pos, methyl, unmethyl
-
-
-def _cpg_table_is_empty(path: Path, chrom_sizes: Mapping[str, int] | None, coordinate_base: int) -> bool:
-    """只探测表头与首条记录；全表格式/解压校验由 CpG 流式统计完成。"""
-    process, handle, diagnostics = _open_cpg_text(path)
-    stream_error = None
-    found_data = False
-    try:
-        rows = _iter_cpg_rows(handle, path, chrom_sizes, coordinate_base)
-        found_data = next(rows, None) is not None
-    except BaseException as exc:
-        stream_error = exc
-        raise
-    finally:
-        handle.close()
-        # 非空流主动早停，不能把本次关闭管道产生的 SIGPIPE 当成损坏输入。
-        # 空表已读至 EOF，仍必须检查解码器退出，禁止把解压失败当成空细胞。
-        _finish_cpg_process(process, path, stream_error, diagnostics, early_stop=found_data)
-    return not found_data
 
 
 def _kahan_add(total: float, correction: float, value: float) -> tuple[float, float]:
@@ -2387,146 +2244,16 @@ def _gini_from_sorted_positive(x_sorted: np.ndarray) -> float:
     return float((n + 1 - 2 * np.sum(cumx) / cumx[-1]) / n)
 
 
-def _aggregate_tss_matrix(
-    tss_mat: ad.AnnData,
-    pos_map: pd.Series,
-    value_name: str,
-    agg_expr: str,
-    *,
-    chunk_size: int = 4,
-) -> pl.DataFrame:
-    # 原生矩阵每个唯一基因组区间只计算一次；在稀疏观测上展开完整gene/bin关联。
-    regions = pd.Index(tss_mat.var_names, dtype=str)
-    features = pd.Series(np.arange(len(regions), dtype=np.int64),
-                         index=regions).reindex(pos_map.index)
-    known = features.notna().to_numpy()
-    membership = pl.DataFrame({
-        "feature_index": features[known].to_numpy(dtype=np.int64),
-        "position_coarse": pos_map.to_numpy(dtype=np.int32)[known],
-    })
-    obs_names = np.asarray(tss_mat.obs_names, dtype=str)
-    parts = []
-    for matrix, start, end in tss_mat.chunked_X(chunk_size):
-        coo = matrix.tocoo(copy=False)
-        parts.append(
-            pl.DataFrame(
-                {
-                    "Sample_ID": obs_names[start:end][coo.row],
-                    "feature_index": coo.col.astype(np.int64, copy=False),
-                    value_name: coo.data.astype(np.float64, copy=False),
-                }
-            )
-            .join(membership, on="feature_index", how="inner", maintain_order="left")
-            .group_by(["Sample_ID", "position_coarse"])
-            .agg(getattr(pl.col(value_name), agg_expr)())
-        )
-    if not parts:
-        return pl.DataFrame(
-            schema={
-                "Sample_ID": pl.Utf8,
-                "position_coarse": pl.Int32,
-                value_name: pl.Float64,
-            }
-        )
-    return (
-        pl.concat(parts)
-        .group_by(["Sample_ID", "position_coarse"])
-        .agg(getattr(pl.col(value_name), agg_expr)())
-    )
 
 
-def _read_tss_offset_map(
-    tss_bed_path: Path, coordinate_base: int = 0, *,
-    covered_positions: np.ndarray | None = None,
-    reference_ranges: Mapping[str, tuple[int, int]] | None = None,
-) -> pd.Series:
-    try:
-        pos_df = pd.read_csv(tss_bed_path, sep="\t", header=None, comment="#", usecols=[0, 1, 2, 6, 8],
-                             converters={0: str, 6: str})
-    except (ValueError, pd.errors.ParserError) as exc:
-        raise ValueError(f"TSS BED must have at least 9 columns: {tss_bed_path}") from exc
-
-    positions = pd.to_numeric(pos_df[8], errors="coerce")
-    values = positions.to_numpy(dtype=float)
-    if (
-        not np.isfinite(values).all()
-        or not np.equal(values, np.floor(values)).all()
-        or (values < np.iinfo(np.int32).min).any()
-        or (values > np.iinfo(np.int32).max).any()
-    ):
-        raise ValueError(f"TSS BED offset must be a finite 32-bit integer: {tss_bed_path}")
-
-    starts = pos_df[1].to_numpy(dtype=float)
-    ends = pos_df[2].to_numpy(dtype=float)
-    if (not np.isfinite(starts).all() or not np.isfinite(ends).all()
-            or not np.equal(starts, np.floor(starts)).all()
-            or not np.equal(ends, np.floor(ends)).all()
-            or (ends >= float(np.iinfo(np.int64).max)).any()
-            or (starts < 0).any() or (ends <= starts).any()):
-        raise ValueError(f"TSS BED must contain nonempty nonnegative intervals: {tss_bed_path}")
-    starts, ends = starts.astype(np.int64), ends.astype(np.int64)
-    pos_df[1], pos_df[2] = starts, ends
-    if pos_df[6].str.strip().eq("").any():
-        raise ValueError(f"TSS BED contains an empty gene_id: {tss_bed_path}")
-    if pos_df.duplicated(subset=[0, 1, 2, 6]).any():
-        raise ValueError(f"TSS BED contains duplicate gene/bin membership: {tss_bed_path}")
-    if covered_positions is not None:
-        if reference_ranges is None:
-            raise ValueError("TSS covered positions require reference ranges")
-        offsets = pos_df[0].map({chrom: offset for chrom, (offset, _) in reference_ranges.items()})
-        lengths = pos_df[0].map({chrom: length for chrom, (_, length) in reference_ranges.items()})
-        known = offsets.notna().to_numpy()
-        keep = np.zeros(len(pos_df), dtype=bool)
-        if len(covered_positions) and known.any():
-            global_starts = offsets[known].to_numpy(dtype=np.int64) + starts[known] + coordinate_base
-            global_ends = offsets[known].to_numpy(dtype=np.int64) + np.minimum(
-                ends[known] + coordinate_base, lengths[known].to_numpy(dtype=np.int64))
-            indices = np.searchsorted(covered_positions, global_starts)
-            keep[known] = ((indices < len(covered_positions))
-                           & (covered_positions[np.minimum(indices, len(covered_positions) - 1)] < global_ends))
-        pos_df = pos_df.loc[keep]
-        values = values[keep]
-    region_keys = (
-        pos_df[0].astype(str)
-        + ":"
-        + (pos_df[1].astype(np.int64) + coordinate_base).astype(str)
-        + "-"
-        + (pos_df[2].astype(np.int64) + coordinate_base).astype(str)
-    )
-    return pd.Series(values.astype(np.int32), index=region_keys, name="position_coarse")
 
 
-@njit
-def _mark_tss_covered_bits(bits, indices, reference_size):
-    """只按稀疏索引标记真实观测，不读取甲基化值或改变零值含义。"""
-    for index in indices:
-        if index < 0 or index >= reference_size:
-            raise ValueError('Raw CpG index is outside the reference')
-        bits[index >> 3] |= np.uint8(1 << (index & 7))
 
 
-def _tss_covered_positions(raw_adata) -> tuple[np.ndarray, dict[str, tuple[int, int]]]:
-    """按原生全局索引构建覆盖并集，避免逐批重排已累计的位点。"""
-    ranges = {}
-    offset = 0
-    reference = raw_adata.uns['reference_sequences']
-    for chrom, length in zip(reference['reference_seq_name'], reference['reference_seq_length'], strict=True):
-        length = int(length)
-        if length < 0:
-            raise ValueError('Raw reference length must be nonnegative')
-        ranges[str(chrom)] = (offset, length)
-        offset += length
-    bits = np.zeros((offset + 7) // 8, dtype=np.uint8)
-    for matrix, _, _ in raw_adata.obsm.el('__values__').chunked(4):
-        _mark_tss_covered_bits(bits, matrix.indices, offset)
-    parts = []
-    # 分块展开，避免为整个人类基因组创建字节级稠密布尔数组。
-    for start in range(0, len(bits), 1 << 20):
-        part = np.flatnonzero(np.unpackbits(bits[start:start + (1 << 20)], bitorder='little'))
-        if part.size:
-            parts.append(part.astype(np.int64, copy=False) + start * 8)
-    covered = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
-    return covered, ranges
+
+
+
+
 
 
 def _validated_gini_cache(
@@ -2615,6 +2342,12 @@ def _validated_tss_cache(
             or np.any((counts == 0) != (fractions == 0))
         ):
             return None
+        for name in ("coverage", "covered_bins", "observed_sites"):
+            values = pd.to_numeric(prof[name], errors="raise").to_numpy(dtype=float)
+            if not np.isfinite(values).all() or (values <= 0).any() or not np.equal(values, np.floor(values)).all():
+                return None
+        if (prof["coverage"].to_numpy() < counts).any():
+            return None
         prof["Sample_ID"] = sample_values
         prof["position_coarse"] = positions.astype(np.int64)
         prof["meth_frac"] = fractions
@@ -2701,7 +2434,7 @@ def compute_gini_index(
     # 直接消费 backed CSR，避免逐位点创建区间对象及临时 tile HDF5 的往返 I/O。
     # 只保留观测分箱；不把无 coverage 的缺失分箱补成零，也不丢弃零甲基化位点。
     for matrix, start, end in tqdm(
-        raw_adata.obsm.el("__values__").chunked(4),
+        raw_adata.iter_rows(4),
         total=(raw_adata.n_obs + 3) // 4, desc="Gini Index",
     ):
         rows, _, counts = _coverage_bins_from_csr(
@@ -2784,163 +2517,41 @@ def _select_tss_cells(df_qc: pd.DataFrame, fraction: float, seed: int) -> tuple[
     }
 
 
-def _copy_tss_cells(raw_adata, indices: list[int], out: Path):
-    """只读取抽中行的原始稀疏整数记录，建立供 TSS 消费的 backed 副本。"""
-    from scipy.sparse import vstack
 
-    # 原生离散行 subset 会先解压整个 CSR；连续 slice 则只读取该行。
-    # 不解码、聚合或重编码 packed counts，保留索引、观测零值与行顺序。
-    values = raw_adata.obsm.el("__values__")
-    selected = vstack([values[index:index + 1, :] for index in indices], format="csr")
-    obs = raw_adata.obs[:].to_pandas().iloc[indices].copy()
-    names = list(raw_adata.obs_names)
-    obs.index = [names[index] for index in indices]
-    result = snap.AnnData(
-        filename=str(out), backend="hdf5", obs=obs,
-        obsm={"__values__": selected},
-        uns={name: raw_adata.uns[name] for name in raw_adata.uns.keys()},
-    )
-    result.obs_names = obs.index.to_list()
-    return result
 
 
 def compute_tss_profile(
-    raw_adata: ad.AnnData,
-    df_qc: pd.DataFrame,
-    tss_bed_path: Path,
-    out_csv: Path,
-    recompute: bool,
-    empty_cpg_sample_ids: set[str],
-    *,
-    sample_fraction: float = 1.0,
-    sample_seed: int = 0,
-    before_commit=None,
+    raw_adata, df_qc: pd.DataFrame, tss_bed_path: Path, out_csv: Path, recompute: bool,
+    empty_cpg_sample_ids: set[str], *, sample_fraction: float = 1.0, sample_seed: int = 0, before_commit=None,
 ) -> pd.DataFrame:
-    """仅计算传入 QC 子集的 TSS，先复制对应 RawAdata 行并在退出时清理临时矩阵。"""
-    assert_reference_current = _reference_guard(tss_bed_path)
-
-    def prepare_tss_commit():
-        if before_commit is not None:
-            before_commit()
-        assert_reference_current()
-
-    if set(empty_cpg_sample_ids) - set(df_qc["Sample_ID"].astype(str)):
+    """直接读取抽中CSR行计算TSS，并同步发布全部细胞的覆盖及score解释。"""
+    assert_current = _reference_guard(tss_bed_path, before_commit=before_commit)
+    if set(empty_cpg_sample_ids) - set(df_qc.Sample_ID.astype(str)):
         raise ValueError("Empty-CpG Sample_ID set differs from QC table")
-    df_qc, _ = _select_tss_cells(df_qc, sample_fraction, sample_seed)
-    expected_sample_ids = set(df_qc["Sample_ID"].astype(str))
-    empty_cpg = {str(value) for value in empty_cpg_sample_ids} & expected_sample_ids
-    if (not recompute) and out_csv.exists():
-        prof = _validated_tss_cache(out_csv, expected_sample_ids, empty_cpg)
-        if prof is not None and not prof.empty:
-            clones = df_qc.set_index("Sample_ID")["CloneID"].astype(str)
-            if not prof["CloneID"].astype(str).eq(prof["Sample_ID"].map(clones)).all():
-                prof = None
-        if prof is not None:
-            _log("命中 TSS Profile 缓存", level="DEBUG")
-            assert_reference_current()
-            return prof
-        _log("TSS Profile 缓存不符合当前键/数值契约，重新计算", level="WARNING")
-
-    _log("开始计算 TSS Profile", level="INFO")
-    if expected_sample_ids == empty_cpg:
-        _read_tss_offset_map(tss_bed_path)
-        prof = pd.DataFrame(columns=TSS_REQUIRED_COLUMNS)
-        _atomic_write_csv(prof, out_csv, before_commit=prepare_tss_commit)
-        validated = _validated_tss_cache(out_csv, expected_sample_ids, empty_cpg)
-        if validated is None:
-            out_csv.unlink(missing_ok=True)
-            raise ValueError("Computed empty TSS profile violates the output contract")
-        return validated
-
-    temporary_parent = project_temporary_parent(out_csv)
-
-    def make_and_aggregate(
-        value_type: str, summary_type: str, value_name: str, aggregate: str
-    ) -> pl.DataFrame:
-        temporary = temporary_parent / f".tss-{value_type}.{os.getpid()}.{time.time_ns()}.h5ad"
-        matrix = None
-        try:
-            matrix = snap.pp.make_peak_matrix(
-                raw_adata,
-                value_type=value_type,
-                use_rep=tss_regions,
-                summary_type=summary_type,
-                inplace=False,
-                file=str(temporary),
-                backend="hdf5",
-                chunk_size=4,
-            )
-            # 汇总批次包含完整细胞，减少小批分组与HDF5往返，不跨细胞合并科学统计。
-            return _aggregate_tss_matrix(
-                matrix, pos_series, value_name, aggregate,
-                chunk_size=4 if selected_raw is not None else 64,
-            )
-        finally:
+    selected, _ = _select_tss_cells(df_qc, sample_fraction, sample_seed)
+    selected_ids = set(selected.Sample_ID)
+    scores_path = out_csv.parent / diagnostics.TSS_SCORE_INFO
+    if not recompute:
+        profile = _validated_tss_cache(out_csv, selected_ids, set(empty_cpg_sample_ids) & selected_ids)
+        if profile is not None and scores_path.is_file():
             try:
-                if matrix is not None:
-                    matrix.close()
-            finally:
-                temporary.unlink(missing_ok=True)
-
-    subset_file = temporary_parent / f".tss-cells.{os.getpid()}.{time.time_ns()}.h5ad"
-    selected_raw = None
-    try:
-        raw_ids = [str(value) for value in raw_adata.obs_names]
-        if len(raw_ids) != len(set(raw_ids)) or expected_sample_ids - set(raw_ids):
-            raise ValueError("TSS Sample_ID set differs from RawAdata")
-        if expected_sample_ids != set(raw_ids):
-            selected_raw = _copy_tss_cells(
-                raw_adata,
-                [index for index, sid in enumerate(raw_ids) if sid in expected_sample_ids],
-                subset_file,
-            )
-            raw_adata = selected_raw
-        # 抽检时筛去未观测区间能降低两次原生矩阵开销；全库不再为此额外扫描所有记录。
-        if selected_raw is not None:
-            covered, ranges = _tss_covered_positions(raw_adata)
-            pos_series = _read_tss_offset_map(
-                tss_bed_path, _raw_cpg_coordinate_base(raw_adata),
-                covered_positions=covered, reference_ranges=ranges,
-            )
-        else:
-            pos_series = _read_tss_offset_map(tss_bed_path, _raw_cpg_coordinate_base(raw_adata))
-            reference = raw_adata.uns['reference_sequences']
-            indexed_lengths = dict(zip(reference['reference_seq_name'], reference['reference_seq_length'], strict=True))
-            # 原生矩阵仍只接收实际reference内的区间；不额外读取Raw来筛空区间。
-            pos_series = pos_series.loc[
-                [chrom in indexed_lengths and int(span.split('-')[0]) < int(indexed_lengths[chrom])
-                 for chrom, span in (region.rsplit(':', 1) for region in pos_series.index)]
-            ]
-        tss_regions = sorted(pos_series.index.unique())
-        if not tss_regions:
-            prof = pd.DataFrame(columns=TSS_REQUIRED_COLUMNS)
-            _atomic_write_csv(prof, out_csv, before_commit=prepare_tss_commit)
-            return prof
-        frac_pl = make_and_aggregate("fraction", "mean", "meth_frac", "mean")
-        count_pl = make_and_aggregate("target", "sum", "count", "sum")
-    finally:
-        try:
-            if selected_raw is not None:
-                selected_raw.close()
-        finally:
-            subset_file.unlink(missing_ok=True)
-
-    prof = frac_pl.join(
-        count_pl, on=["Sample_ID", "position_coarse"], how="full", coalesce=True
-    ).to_pandas()
-    prof = prof.merge(
-        df_qc[["Sample_ID", "CloneID"]],
-        on="Sample_ID",
-        how="left",
-        validate="many_to_one",
-    )
-    _atomic_write_csv(prof, out_csv, before_commit=prepare_tss_commit)
-    prof = _validated_tss_cache(out_csv, expected_sample_ids, empty_cpg)
-    if prof is None:
-        out_csv.unlink(missing_ok=True)
+                scores = pd.read_csv(scores_path, converters={"Sample_ID": str, "CloneID": str}, float_precision="round_trip")
+                scores = diagnostics.validate_tss_scores(scores, df_qc, selected_ids)
+            except (ValueError, pd.errors.ParserError):
+                scores = None
+            clones = df_qc.set_index("Sample_ID").CloneID
+            if scores is not None and (scores.CloneID.eq(scores.Sample_ID.map(clones)).all()
+                    and (profile.empty or profile.CloneID.eq(profile.Sample_ID.map(clones)).all())):
+                assert_current()
+                return profile
+    profile, eligible = diagnostics.tss_profiles(raw_adata, selected, tss_bed_path, _is_primary_chromosome)
+    scores = diagnostics.tss_scores(profile, df_qc, selected_ids, eligible)
+    _atomic_write_csv(profile, out_csv, before_commit=assert_current)
+    _atomic_write_csv(scores, scores_path, before_commit=assert_current)
+    validated = _validated_tss_cache(out_csv, selected_ids, set(empty_cpg_sample_ids) & selected_ids)
+    if validated is None:
         raise ValueError("Computed TSS profile violates the output contract")
-
-    return prof
+    return validated
 
 
 def _merge_pipeline_qc(
@@ -3209,6 +2820,7 @@ def _run_pipeline_impl(
         str(record["sample_id"]): record.pop("cpg_output_identity") for record in records
     }
     pipeline_qc = pd.DataFrame.from_records(records)
+    _log(f"QC 输入：{len(records)} 个细胞；物种：{cfg.genome}；CPU预算：{workers}")
     zero_mapped_sample_ids = {
         str(record["sample_id"])
         for record in records
@@ -3219,9 +2831,12 @@ def _run_pipeline_impl(
         _log(f"阶段完成；耗时：{dt:.2f}s")
 
     previous = {}
+    previous_diagnostics = {}
     if paths.input_identity.is_file():
         try:
-            previous = json.loads(paths.input_identity.read_text(encoding="utf-8"))["cache_identities"]
+            previous_payload = json.loads(paths.input_identity.read_text(encoding="utf-8"))
+            previous = previous_payload["cache_identities"]
+            previous_diagnostics = previous_payload.get("diagnostic_artifacts", {})
         except (OSError, ValueError, KeyError, TypeError):
             pass
     if not isinstance(previous, dict):
@@ -3230,6 +2845,11 @@ def _run_pipeline_impl(
     timer.start("adata")
     _log("阶段 2/6：准备 RawAdata 矩阵")
     raw_adata = None
+    # 仅为展示读取小型schema；科学复用仍由下方原有校验决定。
+    try:
+        _display_raw_before = json.loads(paths.raw_adata.with_name("RawAdata.input_schema.json").read_text()).get("generation_id")
+    except (OSError, ValueError, AttributeError):
+        _display_raw_before = None
     if recompute_raw_adata:
         _log("按 --recompute-raw-adata 重建 RawAdata")
     if not paths.cpg_dir.is_dir():
@@ -3267,12 +2887,22 @@ def _run_pipeline_impl(
     identity["raw_generation"] = json.loads(
         paths.raw_adata.with_name("RawAdata.input_schema.json").read_text(encoding="utf-8")
     )["generation_id"]
+    _log("RawAdata：" + ("已复用" if _display_raw_before == identity["raw_generation"] else "已生成／重建"))
     algorithms = _algorithm_fingerprints()
     identity["algorithms"] = {k: v for k, v in algorithms.items() if k != "single"}
     identity["cache_identities"] = _cache_identities(identity, cfg, algorithms)
     changed = {key for key, value in identity["cache_identities"].items() if previous.get(key) != value}
     if changed:
         _log("需要更新的下游缓存：" + ", ".join(sorted(changed)))
+    # 附表内容也绑定上次完整提交；格式合法的外部改写不能被再次签为本代真值。
+    diagnostic_bindings = [("chromosome", diagnostics.CHROMOSOME_INFO), ("tss", diagnostics.TSS_SCORE_INFO)]
+    if cfg.tss_bed is not None:
+        diagnostic_bindings.append(("tss", paths.tss_info.name))
+    for stage, name in diagnostic_bindings:
+        artifact = paths.qc_results_dir / name
+        if (not isinstance(previous_diagnostics, dict) or not artifact.is_file()
+                or previous_diagnostics.get(name) != _content_binding(artifact)):
+            changed.add(stage)
     recompute_cpg_stats |= "cpg" in changed
     recompute_gini |= "gini" in changed
     recompute_tss |= "tss" in changed
@@ -3404,6 +3034,23 @@ def _run_pipeline_impl(
             )
         else:
             _log("本次跳过 TSS；不生成 TSS 表和图", "WARNING")
+
+    compute_chromosome_diagnostics(raw_adata, df_qc, paths.qc_results_dir / diagnostics.CHROMOSOME_INFO,
+        recompute="chromosome" in changed, before_commit=prepare_cache_commit)
+    if cfg.tss_bed is None:
+        scores = diagnostics.tss_scores(pd.DataFrame(), df_qc, set(), {}, skipped=True)
+        score_path = paths.qc_results_dir / diagnostics.TSS_SCORE_INFO
+        cached_scores = None
+        if score_path.is_file():
+            try:
+                candidate = pd.read_csv(score_path, converters={'Sample_ID': str, 'CloneID': str}, float_precision='round_trip')
+                cached_scores = diagnostics.validate_tss_scores(candidate, df_qc, set())
+            except (ValueError, pd.errors.ParserError):
+                pass
+        if cached_scores is None or not cached_scores.TSS_score_status.eq('skipped').all():
+            _atomic_write_csv(scores, score_path, before_commit=prepare_cache_commit)
+    identity["diagnostic_artifacts"] = {name: _content_binding(paths.qc_results_dir / name)
+        for _, name in diagnostic_bindings}
 
     if cfg.tss_bed is None or (tss_profile is not None and tss_profile.empty):
         plots_dir = _project_directory(
@@ -3618,17 +3265,17 @@ def _validate_notebook_pipeline_root(candidate: Path) -> Path:
 
 def _notebook_project_root(dna_project_root: str | Path | None) -> Path:
     option = _notebook_root_option(dna_project_root, "DNA_PROJECT_ROOT")
+    start = Path(option).expanduser().resolve() if option else Path.cwd().resolve()
+    for base in ([start] if option else [start, *start.parents]):
+        candidate = base / "03_results" / "run_manifest.json"
+        state = stat_if_present(candidate)
+        if state is None:
+            continue
+        if not _qc_lock_stat.S_ISREG(state.st_mode):
+            raise ValueError(f"Delivery manifest must be a regular file: {candidate}")
+        return base
     if option:
-        candidate = Path(option).expanduser().resolve()
-        if not (candidate / "03_results" / "run_manifest.json").is_file():
-            raise FileNotFoundError(
-                f"DNA_PROJECT_ROOT 没有 sealed delivery: {candidate}"
-            )
-        return candidate
-    start = Path.cwd().resolve()
-    for base in (start, *start.parents):
-        if (base / "03_results" / "run_manifest.json").is_file():
-            return base.resolve()
+        raise FileNotFoundError(f"DNA_PROJECT_ROOT 没有 sealed delivery: {start}")
     raise FileNotFoundError(
         "Cannot find a completed Alopex delivery "
         "(03_results/run_manifest.json); set DNA_PROJECT_ROOT."
@@ -3739,20 +3386,24 @@ def run_qc_processor(
     environment["PATH"] = str(paths.pipeline_root / "conda/current/control/bin") + os.pathsep + environment.get("PATH", "")
     for variable in _THREAD_LIMIT_ENV_VARS:
         environment[variable] = worker_count
-    _log(f"启动 QC Processor 子进程: {processor}")
-    completed = subprocess.run(command, check=False, env=environment)
-    if completed.returncode:
-        raise RuntimeError(f"QC Processor failed with exit code {completed.returncode}")
+    from ..presentation import run_displayed
+    log_dir = _project_directory(paths.project_dir, Path("04_logs/downstream"), create=False)
+    exit_code = run_displayed(
+        command, mode="qc", title=f"DNA 甲基化 QC · {paths.project_dir.name}",
+        log_dir=log_dir, project=paths.project_dir, budget=int(worker_count),
+        env=environment, notebook=True,
+    )
+    if exit_code:
+        raise RuntimeError(f"QC Processor failed with exit code {exit_code}; see 04_logs/downstream/")
 
 
 def _single_obs_equal(left, right) -> bool:
-    """仅比较时统一浮点缺失表示；不把零值当缺失，也不改写原始注释。"""
-    def normalize(frame):
-        return frame.with_columns([
-            pl.col(name).fill_nan(None)
-            for name, dtype in frame.schema.items() if dtype in (pl.Float32, pl.Float64)
-        ])
-    return normalize(left).equals(normalize(right))
+    """只在比较时统一缺失，原始字符串与真实零独立保留。"""
+    try:
+        pd.testing.assert_frame_equal(left, right, check_dtype=False, check_categorical=False, check_exact=True)
+        return True
+    except AssertionError:
+        return False
 
 
 def prepare_single_cpg_adata(
@@ -3763,13 +3414,13 @@ def prepare_single_cpg_adata(
 ) -> Path:
     """从当前 RawAdata 生成 single-CpG 矩阵，按细胞身份整合 QC 并关闭全部句柄。
 
-    使用当前物种的 BED3、fraction/mean 和 chunk_size=500；保留全部细胞。
+    使用当前物种的 BED3、fraction/mean 和逐细胞有界 CSR；保留全部细胞。
     var_names 跟随 sealed CpG 坐标：0-based 半开区间或 1-based 闭区间；X 不变。
     已验证的矩阵可复用，仅 QC/HQ 改变时只更新 obs。失效矩阵从当前已核验Raw重建，
     recompute可强制重建；完成并关闭后才替换正式文件，不关闭其他Notebook的句柄。
     """
     with _qc_write_lock(paths.qc_results_dir):
-        if snap is None:
+        if ad is None:
             raise ImportError("Single-CpG generation requires the Alopex notebook environment")
         sealed = load_sealed_qc_context(
             paths.project_dir, expected_pipeline_root=paths.pipeline_root
@@ -3813,12 +3464,13 @@ def prepare_single_cpg_adata(
         signature = {
             "algorithm_sha256": algorithms["single"],
             **coordinate_metadata,
-            "snapatac2": importlib.metadata.version("snapatac2"),
+            "anndata": importlib.metadata.version("anndata"),
+            "h5py": importlib.metadata.version("h5py"),
             "delivery_id": sealed.delivery_id,
             "raw_generation": raw_schema["generation_id"],
             "raw_h5ad": raw_schema["h5ad"],
             "bed": _content_binding(bed),
-            "value_type": "fraction", "summary_type": "mean", "chunk_size": 500,
+            "value_type": "fraction", "summary_type": "mean", "row_batch_size": 1,
         }
         output = paths.qc_results_dir / "SingleCpG_Adata.h5ad"
         schema_path = output.with_name("SingleCpG_Adata.input_schema.json")
@@ -3836,44 +3488,36 @@ def prepare_single_cpg_adata(
         raw = matrix = None
         try:
             if reuse and not recompute:
-                matrix = snap.read(str(output), backed="r")
+                matrix = matrices.CSRReader(output)
             else:
-                _log("生成 single-CpG 矩阵：fraction/mean，chunk_size=500")
-                raw = snap.read(str(raw_path), backed="r")
+                _log("生成 single-CpG 矩阵：fraction/mean，逐细胞CSR")
+                raw = matrices.CSRReader(raw_path, "obsm/__values__")
                 _require_exact_sample_ids(qc, list(raw.obs_names), "RawAdata QC")
                 if _raw_cpg_coordinate_base(raw) != coordinate_base:
                     raise ValueError("RawAdata coordinates differ from the sealed CpG representation")
-                matrix = make_cpg_peak_matrix(
-                    raw, value_type="fraction", summary_type="mean",
-                    peak_file=bed, inplace=False, file=str(temporary), chunk_size=500,
-                )
-                if coordinate_base == 1:
-                    feature_names = []
-                    for name in matrix.var_names:
-                        chrom, interval = name.rsplit(":", 1)
-                        start, end = interval.split("-")
-                        feature_names.append(f"{chrom}:{start}-{int(end) - 1}")
-                    matrix.var_names = feature_names
-                for key, value in coordinate_metadata.items():
-                    matrix.uns[key] = value
+                matrices.write_single_cpg(raw, bed, temporary, qc.set_index("Sample_ID").loc[list(raw.obs_names)])
+                matrix = matrices.CSRReader(temporary)
             names = list(matrix.obs_names)
             aligned = _require_exact_sample_ids(qc, names, "SingleCpG QC")
-            current = matrix.obs[:]
-            merged = current.to_pandas()
+            current = matrix.obs
+            merged = current.copy()
             for column in aligned.columns:
                 merged[column] = aligned[column].array
-            updated = pl.from_pandas(merged)
+            updated = merged
             assert_qc_current()
-            obs_changed = not _single_obs_equal(updated, current)
+            filter_parameters = json.dumps(qc.attrs.get("qc_filter_parameters", {}), sort_keys=True)
+            obs_changed = (not _single_obs_equal(updated, current)
+                           or matrix.uns.get("qc_filter_parameters", "{}") != filter_parameters)
             if obs_changed:
+                matrix.close()
+                matrix = None
+                target = output if reuse and not recompute else temporary
                 if reuse and not recompute:
-                    matrix.close()
-                    matrix = None
-                    matrix = snap.read(str(output), backed="r+")
                     _invalidate_completion(schema_path)
-                matrix.obs = updated
-                matrix.obs_names = names
-            matrix.close()
+                updated.index = pd.Index(names)
+                matrices.update_obs(target, updated, {"qc_filter_parameters": filter_parameters})
+            if matrix is not None:
+                matrix.close()
             matrix = None
             assert_qc_current()
             if not reuse or recompute:
@@ -3947,6 +3591,90 @@ def load_notebook_tss_frame(paths: NotebookPaths) -> pd.DataFrame:
         raise ValueError("TSS cache is incomplete or invalid; rerun the QC Processor")
     completed.assert_current()
     return frame
+
+
+def compute_chromosome_diagnostics(raw, df_qc, output, *, recompute=False, before_commit=None):
+    """按同代Raw逐染色体诊断；缓存损坏补算，不再次扫描CpG文件。"""
+    frame = None
+    if not recompute and output.is_file():
+        try:
+            candidate = pd.read_csv(output, converters={'Sample_ID': str, 'CloneID': str, 'chrom': str}, float_precision='round_trip')
+            if (set(candidate.Sample_ID) == set(df_qc.Sample_ID)
+                    and not candidate.duplicated(['Sample_ID', 'chrom']).any()
+                    and candidate.CloneID.eq(candidate.Sample_ID.map(df_qc.set_index('Sample_ID').CloneID)).all()):
+                host = candidate.loc[candidate.chromosome_class.eq('host')].groupby('Sample_ID').observed_sites.sum()
+                expected = df_qc.set_index('Sample_ID').Sample_Unique_CpG_Sites
+                if host.reindex(expected.index).eq(expected).all():
+                    frame = candidate
+        except (OSError, ValueError, KeyError, AttributeError):
+            pass
+    if frame is None:
+        frame = diagnostics.chromosome_summary(raw, _is_primary_chromosome, _classify_seq_name)
+        frame['CloneID'] = frame.Sample_ID.map(df_qc.set_index('Sample_ID').CloneID)
+        _atomic_write_csv(frame, output, before_commit=before_commit)
+    return frame
+
+
+def _load_qc_diagnostic(paths, name):
+    """读取完成凭证绑定的诊断CSV；不接纳同名旧表或读取期间的替换。"""
+    sealed = load_sealed_qc_context(paths.project_dir, expected_pipeline_root=paths.pipeline_root)
+    if sealed.delivery_id != paths.delivery_id:
+        raise ValueError('Delivery changed; rerun the Notebook from its first cell')
+    run_paths = build_paths(paths.project_dir)
+    completed = _require_completed_qc(run_paths, sealed)
+    path = paths.qc_results_dir / name
+    guard = _reference_guard(path, before_commit=completed.assert_current)
+    identity = json.loads(run_paths.input_identity.read_text())
+    if identity.get('diagnostic_artifacts', {}).get(name) != _content_binding(path):
+        raise ValueError(f'Diagnostic is incomplete or stale: {name}; rerun the QC Processor')
+    frame = pd.read_csv(path, converters={'Sample_ID': str, 'CloneID': str, 'chrom': str}, float_precision='round_trip')
+    guard()
+    return frame
+
+
+def load_chromosome_qc_frame(paths):
+    """加载全部细胞的同代逐染色体计数/甲基化率。"""
+    return _load_qc_diagnostic(paths, diagnostics.CHROMOSOME_INFO)
+
+
+def load_tss_score_frame(paths):
+    """加载覆盖信息、抽样状态和可解释的TSS score；未抽中/无覆盖不伪造score。"""
+    return _load_qc_diagnostic(paths, diagnostics.TSS_SCORE_INFO)
+
+
+def annotate_notebook_qc(paths, frame, *, mapping_threshold=None, lambda_max=10.0,
+                         puc19_min=90.0, cpg_min=500000, gini_max=0.5):
+    """为矩阵准备同代完整注释，发布逐细胞筛选原因，不改变标准20列QC。"""
+    with _qc_write_lock(paths.qc_results_dir):
+        sealed = load_sealed_qc_context(paths.project_dir, expected_pipeline_root=paths.pipeline_root)
+        if sealed.delivery_id != paths.delivery_id:
+            raise ValueError('Delivery changed; rerun the Notebook from its first cell')
+        completed = _require_completed_qc(build_paths(paths.project_dir), sealed)
+        frame = _require_exact_sample_ids(frame, list(completed.sample_ids), 'Notebook annotations')
+        saved = pd.read_csv(paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str), float_precision='round_trip')
+        saved = _require_exact_sample_ids(saved, list(completed.sample_ids), 'Saved QC')
+        pd.testing.assert_frame_equal(frame[list(QC_INFO_COLUMNS)], saved[list(QC_INFO_COLUMNS)], check_dtype=False, check_exact=True)
+        parameters = dict(mapping_threshold=mapping_threshold, lambda_max=lambda_max,
+                          puc19_min=puc19_min, cpg_min=cpg_min, gini_max=gini_max)
+        reasons = diagnostics.filter_reasons(frame, **parameters)
+        result = frame.drop(columns=[c for c in reasons if c not in QC_INFO_COLUMNS], errors='ignore').merge(
+            reasons, on=list(QC_INFO_COLUMNS[:3]), how='left', validate='one_to_one')
+        scores = load_tss_score_frame(paths)
+        result = result.drop(columns=[c for c in scores if c not in ('Sample_ID', 'CloneID')], errors='ignore').merge(
+            scores, on=['Sample_ID', 'CloneID'], how='left', validate='one_to_one')
+        cells = read_active_cells(paths.project_dir, sealed_context=sealed)
+        identity = pd.DataFrame({'Sample_ID': [c['sample_id'] for c in cells],
+                                 'DNA_Barcode': [c['dna_barcode'] for c in cells],
+                                 'Cell_Order': [c['cell_order'] for c in cells]})
+        result = result.drop(columns=['DNA_Barcode', 'Cell_Order'], errors='ignore').merge(identity, on='Sample_ID', validate='one_to_one')
+        result['sample'] = result.Sample_ID
+        result['clone_id'] = result.CloneID
+        result['nCG'] = result.Sample_Unique_CpG_Sites
+        result['met_rate'] = result['Sample_Meth_CpG_Rate%'] / 100
+        result.attrs['qc_filter_parameters'] = parameters
+        _atomic_write_csv(reasons, paths.qc_results_dir / diagnostics.FILTER_INFO, before_commit=completed.assert_current)
+        completed.assert_current()
+        return result
 
 
 if __name__ == "__main__":

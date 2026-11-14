@@ -56,7 +56,7 @@ pub(super) fn spawn_writer(
     completion: Receiver<bool>,
 ) -> JoinHandle<Result<u64>> {
     std::thread::spawn(move || {
-        let buckets = paths.dna_cell_ids.len() + paths.rna_cell_ids.len();
+        let buckets = paths.dna_cell_ids.len();
         let writeback = WritebackGuard::start(
             paths.mode,
             writer_pair_budget(paths.mode, buckets, detect_soft_open_file_limit())
@@ -159,7 +159,7 @@ fn droplet_writer_budget_retains_all_or_uses_bounded_fallback() {
     assert_eq!(writer_pair_budget(mode, 40000, Some(65536)), 128);
     assert_eq!(writer_pair_budget(mode, 9000, Some(100000)), 9000);
     assert_eq!(
-        writer_pair_budget(DemuxMode::DnaRna, 6000, Some(100000)),
+        writer_pair_budget(DemuxMode::DnaOnly, 6000, Some(100000)),
         128
     );
 }
@@ -252,7 +252,7 @@ fn writer_loop(
 ) -> Result<u64> {
     let mut writers = WriterCache::new(
         paths.mode,
-        paths.dna_cell_ids.len() + paths.rna_cell_ids.len(),
+        paths.dna_cell_ids.len(),
         writeback.as_ref().map(|guard| guard.state.clone()),
     );
     let mut stats: AHashMap<BucketKey, u64> = AHashMap::new();
@@ -509,7 +509,7 @@ fn create_fastq_writers(
     let r1 = OutputFile::new(r1, writeback.clone())?;
     let r2 = OutputFile::new(r2, writeback)?;
     if paths.mode == DemuxMode::DnaOnlyDroplet {
-        let outputs = (paths.dna_cell_ids.len() + paths.rna_cell_ids.len()).max(1) * 2;
+        let outputs = (paths.dna_cell_ids.len()).max(1) * 2;
         let capacity = droplet_writer_buffer_capacity(outputs, dirty_threshold);
         Ok((
             BufWriter::with_capacity(capacity, r1),
@@ -542,15 +542,7 @@ fn write_report(
         let dna_count = *stats
             .get(&BucketKey::Dna(row.dna_barcode.clone()))
             .unwrap_or(&0);
-        let rna_count = *stats
-            .get(&BucketKey::Rna(row.rna_barcode.clone()))
-            .unwrap_or(&0);
-        let dna_status = output_status(paths, Modality::Dna, &row.dna_barcode, dna_count)?;
-        let rna_status = if paths.mode == DemuxMode::DnaRna {
-            output_status(paths, Modality::Rna, &row.rna_barcode, rna_count)?
-        } else {
-            "Not_Used".to_string()
-        };
+        let dna_status = output_status(paths, &row.dna_barcode, dna_count)?;
         let cell_sample_id = paths
             .dna_cell_ids
             .get(&row.dna_barcode)
@@ -562,11 +554,8 @@ fn write_report(
             plate_id: row.plate_id.clone(),
             cell_order: row.cell_order.clone(),
             dna_barcode: row.dna_barcode.clone(),
-            rna_barcode: row.rna_barcode.clone(),
             dna_read_count: dna_count,
-            rna_read_count: rna_count,
             dna_status,
-            rna_status,
         });
     }
 
@@ -582,14 +571,13 @@ fn write_report(
     let input_read_pairs = fate_counts.input_read_pairs();
     let matched_reads = fate_counts.matched_read_pairs();
     let report = DemuxReport {
-        schema_version: 3,
+        schema_version: 4,
         build_version: env!("CARGO_PKG_VERSION").to_string(),
         source_revision: BUILD_SOURCE_REVISION.to_string(),
         mode: match paths.mode {
             DemuxMode::DnaOnly => "dna-only".to_string(),
             DemuxMode::DnaOnlyTaps => "dna-only-taps".to_string(),
             DemuxMode::DnaOnlyDroplet => "dna-only-droplet".to_string(),
-            DemuxMode::DnaRna => "dna-rna".to_string(),
         },
         retention_policy: "matched_read_pairs".to_string(),
         retention_threshold: paths.min_matched_read_pairs,
@@ -637,21 +625,18 @@ fn report_cell_order_has_transitive_numeric_then_text_order() {
         .enumerate()
         .map(|(i, order)| CellRow {
             dna_barcode: format!("barcode{i}"),
-            rna_barcode: String::new(),
             plate_id: format!("P{i:02}"),
             cell_order: order.to_string(),
         })
         .collect();
     let paths = OutputPaths {
         dna_out_dir: root.join("dna"),
-        rna_out_dir: root.join("rna"),
         json_report: root.join("report.json"),
         sample_name: "Sort".to_string(),
         dna_cell_ids: rows
             .iter()
             .map(|row| (row.dna_barcode.clone(), format!("Sort_{}", row.plate_id)))
             .collect(),
-        rna_cell_ids: AHashMap::new(),
         min_matched_read_pairs: 1,
         mode: DemuxMode::DnaOnly,
         input_fastq_pairs: 1,
@@ -680,21 +665,14 @@ fn report_cell_order_has_transitive_numeric_then_text_order() {
 
 fn output_status(
     paths: &OutputPaths,
-    modality: Modality,
     barcode: &str,
     count: u64,
 ) -> Result<String> {
     if count == 0 {
         return Ok("Zero_Output".to_string());
     }
-    let base_dir = match modality {
-        Modality::Dna => &paths.dna_out_dir,
-        Modality::Rna => &paths.rna_out_dir,
-    };
-    let key = match modality {
-        Modality::Dna => BucketKey::Dna(barcode.to_string()),
-        Modality::Rna => BucketKey::Rna(barcode.to_string()),
-    };
+    let base_dir = &paths.dna_out_dir;
+    let key = BucketKey::Dna(barcode.to_string());
     let cell_sample_id = key.cell_sample_id(paths)?;
     let dir = base_dir.join(cell_sample_id);
     let r1_path = dir.join(format!("{}_R1.fastq.gz", cell_sample_id));
@@ -750,10 +728,8 @@ pub(super) fn prepare_output_roots(config: &Config, spool: Option<&Path>, rows: 
         .chain(std::iter::once(("--barcode-map", config.barcode_map.as_path())))
         .collect();
     if let Some(spool) = spool { inputs.push(("--droplet-spool", spool)); }
-    let mut directories = vec![("--dna-out-dir", config.dna_out_dir.as_path())];
-    if config.mode == DemuxMode::DnaRna {
-        directories.push(("--rna-out-dir", config.rna_out_dir.as_path()));
-    }
+    let directories = vec![("--dna-out-dir", config.dna_out_dir.as_path())];
+
     crate::cli::validate_io_paths(&inputs, &directories,
         &[("--json-report", config.json_report.as_path())])?;
     let names: Vec<_> = rows.iter().map(|row| format!("{}_{}", config.sample_name,

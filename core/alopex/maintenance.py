@@ -304,7 +304,7 @@ def _check_installed_environment(prefix: Path, role: str, expected_subdir: str, 
         "anndata", "ipykernel", "jupyterlab", "numba", "numpy", "packaging", "pandas", "polars",
         "pyyaml", "scikit-learn", "seaborn", "tqdm", "jsonschema", "snakemake",
         "snakemake-executor-plugin-slurm", "pip", "pysam", "cutadapt", "multiqc", "awscli",
-        "leidenalg", "cykhash", "umi_tools",
+        "leidenalg", "cykhash", "umi_tools", "rich", "psutil",
     )}
     python_distributions.update({"matplotlib-base": "matplotlib", "python-igraph": "igraph"})
     def distribution_for(name):
@@ -407,6 +407,8 @@ def _gtf_attributes(raw: str) -> dict[str, str]:
     for item in raw.split(";"):
         key, separator, value = item.strip().partition(" ")
         if separator:
+            if key in {"gene_id", "gene_type"} and key in attributes:
+                raise ValueError(f"duplicate GTF {key}")
             attributes[key] = value.strip().strip('"')
     return attributes
 
@@ -492,12 +494,19 @@ def build_downstream_references(
                 if (
                     feature != "gene"
                     or chrom not in contig_lengths
-                    or strand not in {"+", "-"}
                 ):
                     continue
-                attrs = _gtf_attributes(attrs_s)
+                try:
+                    attrs = _gtf_attributes(attrs_s)
+                except ValueError as exc:
+                    raise ValueError(f"{annotation}:{line_number}: {exc}") from exc
+                if not attrs.get("gene_type", "").strip():
+                    raise ValueError(f"{annotation}:{line_number}: GTF gene lacks gene_type")
                 if attrs.get("gene_type") != "protein_coding":
                     continue
+                # 不能把无法定义TSS的主核蛋白编码gene静默过滤后封存为完整参考。
+                if strand not in {"+", "-"}:
+                    raise ValueError(f"{annotation}:{line_number}: invalid protein-coding GTF strand {strand!r}")
                 gene_id = attrs.get("gene_id", "").strip()
                 if not gene_id:
                     raise ValueError(
@@ -507,13 +516,11 @@ def build_downstream_references(
                 if gene_id in seen_genes:
                     raise ValueError(f"duplicate protein-coding gene_id {gene_id!r}: {annotation}:{line_number}")
                 seen_genes.add(gene_id)
-                try:
-                    gene_start = int(start_s) - 1
-                    gene_end = int(end_s)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"invalid GTF coordinate on line {line_number}: {annotation}"
-                    ) from exc
+                if (re.fullmatch(r"[0-9]+", start_s) is None
+                        or re.fullmatch(r"[0-9]+", end_s) is None):
+                    raise ValueError(f"{annotation}:{line_number}: invalid GTF coordinate")
+                gene_start = int(start_s) - 1
+                gene_end = int(end_s)
                 if (
                     gene_start < 0
                     or gene_end <= gene_start
@@ -865,9 +872,9 @@ TEST_ROUTES: dict[str, dict[str, str]] = {
         "methylation_backend": "bismark",
         "reference_key": "hg38",
     },
-    "mm10-srd-biscuit": {
+    "mm10-cabernet-biscuit": {
         "species": "mm10",
-        "protocol": "srd",
+        "protocol": "cabernet",
         "methylation_backend": "biscuit",
         "reference_key": "mm10",
     },
@@ -902,7 +909,7 @@ def apply_common_route_config(cfg: dict[str, Any], route_id: str) -> None:
     module = cfg[meta["protocol"]]
     if meta["protocol"] not in _PROTOCOL_FIXED_CONFIG:
         module["methylation_backend"] = meta["methylation_backend"]
-    if meta["protocol"] in ("cabernet", "srd"):
+    if meta["protocol"] == "cabernet":
         module.setdefault("biscuit", {})["generate_snp"] = False
     if meta["methylation_backend"] == "bismark":
         module.setdefault("bismark", {})["library_type"] = "non_directional"
@@ -927,7 +934,7 @@ def synthesize_route_config(source: Path, destination: Path, route: str) -> None
 BENCHMARK_SCHEMA_VERSION = 2
 
 
-BENCHMARK_ID = "doctor_hpc_raw_v2"
+BENCHMARK_ID = "doctor_hpc_raw_v3"
 
 
 def _benchmark_fastq_pairs(r1: Path, r2: Path) -> Iterable[tuple[bytes, bytes]]:
@@ -999,7 +1006,7 @@ def _write_benchmark_fastqs(project: Path, stem: str, pairs: Sequence[tuple[str,
 
 
 def stage_benchmark_supplement(project: Path, reference: Path, label: str, route: str) -> dict[str, object]:
-    """为真实抽样补充明确命名的合成对照、重复/CpH 和 SRD 双管 RNA 布局，原始记录不改写。"""
+    """为真实抽样补充明确命名的合成对照、重复/CpH，原始记录不改写。"""
     backend = TEST_ROUTES[route]["methylation_backend"]
     samtools = PIPELINE_ROOT / "conda/current" / backend / "bin/samtools"
     fasta = subprocess.check_output([str(samtools), "faidx", str(reference), "chrM", "lambda", "pUC19"], text=True)
@@ -1034,21 +1041,10 @@ def stage_benchmark_supplement(project: Path, reference: Path, label: str, route
                           barcode["DNA_Barcode"] + "AGATGTGTATAAGAGACAG" + "G" * 9 + fragment[:100],
                           fragment[-100:].translate(complement)[::-1]))
     dna_pairs = len(pairs)
-    rna = []
-    if TEST_ROUTES[route]["protocol"] == "srd":
-        for barcode in barcodes:
-            for index in range(12):
-                payload = sequences["chrM"][300 + index:400 + index]
-                umi = "ACGT" + "ACGT"[index % 4] * 4
-                rna.append((f"synthetic_srd_{barcode['PlateID']}_{index}",
-                            "GTCTAACGCGTTAC" + barcode["RNA_Barcode"] + umi + "A" * 5 + payload,
-                            payload.translate(complement)[::-1]))
-        pairs.extend((name + "_dna_tube", left, right) for name, left, right in rna)
-        _write_benchmark_fastqs(project, label + "_RNA", rna)
     _write_benchmark_fastqs(project, label + "_L003", pairs)
-    return {"kind": "synthetic_supplement", "dna_pairs": dna_pairs, "rna_pairs_per_tube": len(rna),
+    return {"kind": "synthetic_supplement", "dna_pairs": dna_pairs,
             "controls": ["chrM", "lambda", "pUC19"], "high_cph_duplicate_pairs": 4,
-            "native_srd_library": False, "reference": str(reference)}
+            "reference": str(reference)}
 
 
 def stage_taps_truth(project: Path, reference: Path) -> None:
@@ -1196,7 +1192,7 @@ def _benchmark_cpg_metrics(path: Path) -> dict[str, dict[str, int]]:
 
 
 def verify_route_outputs(project: Path, benchmark_path: Path, route: str) -> None:
-    """核对多 cell 的拆分/过滤守恒、实际宿主和对照 CpG、SRD 保留及密封交付，保存可追溯回归报告。"""
+    """核对多 cell 的拆分/过滤守恒、实际宿主和对照 CpG及密封交付，保存可追溯回归报告。"""
     if route not in TEST_ROUTES:
         raise ValueError(f"unsupported route: {route}")
     benchmark = json.loads(benchmark_path.read_text())
@@ -1206,8 +1202,8 @@ def verify_route_outputs(project: Path, benchmark_path: Path, route: str) -> Non
     if run_manifest.get("schema_version") != 8 or run_manifest.get("status") != "complete":
         raise ValueError(f"{route}: sealed run manifest is not complete schema 8")
     if TEST_ROUTES[route]["protocol"] in {"cabernet", "taps"}:
-        expected_link = "Taps_RNA" if route == "hg38-taps-rastair" else "hg38_cabernet_RNA"
-        if any(row.get("rna_sample") != expected_link or row.get("rna_enrichment_route_id") for row in rows):
+        expected_link = "Taps_RNA" if route == "hg38-taps-rastair" else TEST_ROUTES[route]["species"] + "_cabernet_RNA"
+        if any(row.get("rna_sample") != expected_link for row in rows):
             raise ValueError(f"{route}: external RNA association was lost or became a local RNA route")
     if not (project / "03_results/QC_Results/multiqc_report.html").is_file():
         raise ValueError("Doctor MultiQC report missing")
@@ -1250,18 +1246,6 @@ def verify_route_outputs(project: Path, benchmark_path: Path, route: str) -> Non
                 raise ValueError(f"{sample}: real host genome CpG coverage missing")
             if any(counts.get(chrom, {}).get("rows", 0) == 0 for chrom in ("chrM", "lambda", "pUC19")):
                 raise ValueError(f"{sample}: synthetic control CpG coverage missing")
-            if route == "mm10-srd-biscuit":
-                for field in ("dna_tube_rna_reads", "rna_enrichment_rna_reads"):
-                    if int(row[field]) != 12:
-                        raise ValueError(f"{sample}: SRD synthetic RNA count mismatch")
-                for field in ("dna_tube_rna_fastq_r1", "dna_tube_rna_fastq_r2", "rna_enrichment_rna_fastq_r1", "rna_enrichment_rna_fastq_r2", "rna_bam_path"):
-                    if not row[field] or not (project / row[field]).is_file():
-                        raise ValueError(f"{sample}: retained SRD {field} missing")
-                for prefix in ("dna_tube_rna_fastq", "rna_enrichment_rna_fastq"):
-                    if sum(1 for _ in _benchmark_fastq_pairs(project / row[prefix + "_r1"], project / row[prefix + "_r2"])) != 12:
-                        raise ValueError(f"{sample}: collected RNA FASTQ pair count mismatch")
-                if not (project / (row["rna_bam_path"] + ".bai")).is_file():
-                    raise ValueError(f"{sample}: SRD retained BAM index missing")
         for field, minimum in (("duplicate_pairs", expected["minimum_duplicate_pairs_total"]),
                                ("high_cph_removed_pairs", expected["minimum_high_cph_pairs_total"])):
             if sum(int(row[field]) for row in active) < minimum:

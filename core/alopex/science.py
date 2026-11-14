@@ -155,14 +155,13 @@ def _read_high_cph_summary(path: Path, sample: str, backend: str) -> dict[str, o
         or payload["backend"] != backend
         or payload["sample"] != sample
         or payload["metric_unit"] != "read_pairs"
-        or payload["protocol"] not in {"cabernet", "srd", "droplet"}
+        or payload["protocol"] not in {"cabernet", "droplet"}
         or payload["high_cph_role"]
-        not in {"cdna_contamination", "residual_high_cph"}
+        not in {"cdna_contamination"}
     ):
         raise ValueError(f"High-CpH summary identity is invalid: {path}")
     expected_role = {
         "cabernet": "cdna_contamination",
-        "srd": "residual_high_cph",
     }[str(payload["protocol"])]
     if payload["high_cph_role"] != expected_role:
         raise ValueError(f"High-CpH summary protocol/role contract is invalid: {path}")
@@ -563,7 +562,8 @@ def run_bsconv_extraction(args) -> None:
             raw_candidate_path = Path(raw_candidate_handle.name)
             raw_excluded_path = Path(raw_excluded_handle.name)
             with open_text(args.bsconv_tsv) as handle:
-                reader = csv.reader(handle, delimiter="\t")
+                # 原生 bsconv 不转义 QNAME；合法双引号属于读段身份，不能按 CSV 解码。
+                reader = csv.reader(handle, delimiter="\t", quoting=csv.QUOTE_NONE)
                 for row in reader:
                     if not row or row[0].startswith("#"):
                         continue
@@ -1022,14 +1022,13 @@ def _read_filter_summary(path: Path, sample: str) -> dict[str, Any]:
         raise ValueError("Bismark non-conversion minimum_count must be >= 1")
     if not isinstance(filter_applied, bool):
         raise ValueError("Bismark non-conversion filter_applied must be boolean")
-    if payload["protocol"] not in {"cabernet", "srd", "droplet"}:
+    if payload["protocol"] not in {"cabernet", "droplet"}:
         raise ValueError("Bismark non-conversion protocol is invalid")
     if payload["high_cph_role"] not in {
         "cdna_contamination",
-        "residual_high_cph",
     }:
         raise ValueError("Bismark non-conversion high_cph_role is invalid")
-    expected_role = {"cabernet": "cdna_contamination", "droplet": "cdna_contamination", "srd": "residual_high_cph"}
+    expected_role = {"cabernet": "cdna_contamination", "droplet": "cdna_contamination"}
     if payload["high_cph_role"] != expected_role[payload["protocol"]]:
         raise ValueError("Bismark non-conversion protocol/role contract is invalid")
     if not filter_applied:

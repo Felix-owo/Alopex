@@ -94,7 +94,7 @@ while (( $# > 0 )); do
 done
 
 case "$DNA_PIPELINE_DATA_MODE" in production|test) ;; *) echo "ERROR: DNA_PIPELINE_DATA_MODE must be production or test." >&2; exit 2;; esac
-case "$DNA_PIPELINE_TEST_ROUTE" in auto|hg38-cabernet-bismark|mm10-srd-biscuit|hg38-taps-rastair) ;; *) echo "ERROR: unsupported DNA_PIPELINE_TEST_ROUTE: $DNA_PIPELINE_TEST_ROUTE" >&2; exit 2;; esac
+case "$DNA_PIPELINE_TEST_ROUTE" in auto|hg38-cabernet-bismark|mm10-cabernet-biscuit|hg38-taps-rastair) ;; *) echo "ERROR: unsupported DNA_PIPELINE_TEST_ROUTE: $DNA_PIPELINE_TEST_ROUTE" >&2; exit 2;; esac
 if [[ "$DNA_PIPELINE_DATA_MODE" == production && "$DNA_PIPELINE_TEST_ROUTE" != auto ]]; then
     echo "ERROR: DNA_PIPELINE_TEST_ROUTE is only valid when DNA_PIPELINE_DATA_MODE=test." >&2; exit 2
 fi
@@ -168,34 +168,25 @@ DNA_PIPELINE_SNAKEMAKE="$DNA_PIPELINE_CONTROL_ENV/bin/snakemake"
 DNA_PIPELINE_CONDA="$DNA_PIPELINE_CONTROL_ENV/bin/conda"
 export DNA_PIPELINE_CONTROL_ENV
 
-# 从当前目录逐级向上查找最近的 <project>/00_config/config.yaml。
-discover_project_config() {
-    local cursor="$1" candidate parent
-    cursor="$(cd -P -- "$cursor" && printf '%s.' "$PWD")" || return $?
-    cursor="${cursor%.}"
-    while :; do
-        candidate="$cursor/00_config/config.yaml"
-        if [[ -f "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-        parent="${cursor%/*}"
-        [[ -n "$parent" ]] || parent=/
-        [[ "$parent" != "$cursor" ]] || break
-        cursor="$parent"
-    done
-    return 1
-}
-
-DNA_PIPELINE_CONFIG="$(discover_project_config "$DNA_PIPELINE_LAUNCH_DIR" || true)"
-[[ -f "$DNA_PIPELINE_CONFIG" ]] || {
-    echo "ERROR: no Alopex project found in the current directory or its parents." >&2
+# 定位归输入模块；权限/I/O失败不能跨过当前项目而选中父项目。
+DNA_PIPELINE_CONFIG="$(PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" \
+    -m alopex discover-project-config "$DNA_PIPELINE_LAUNCH_DIR")" || {
+    echo "ERROR: cannot locate an accessible Alopex project in the current directory or its parents." >&2
     echo "Initialize the current directory with: /path/to/Alopex/core/run_pipeline.sh --init-project" >&2
     exit 2
 }
 DNA_PIPELINE_PROJECT_DIR="$(cd -P -- "${DNA_PIPELINE_CONFIG%/*}/.." && printf '%s.' "$PWD")"
 DNA_PIPELINE_PROJECT_DIR="${DNA_PIPELINE_PROJECT_DIR%.}"
 export DNA_PIPELINE_CONFIG DNA_PIPELINE_PROJECT_DIR
+
+# 仅用户运行入口使用父进程展示；内部 Doctor 路线、只读和维护动作不递归创建面板。
+if (( DNA_PIPELINE_READ_ONLY == 0 && DNA_PIPELINE_REFRESH_MANIFEST == 0 )) && \
+    [[ -z "${DNA_PIPELINE_PRESENTATION_CHILD:-}" && -f "$DNA_PIPELINE_ROOT/core/alopex/presentation.py" ]]; then
+    exec env PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" -m alopex present-command \
+        --mode pipeline --title "Alopex · ${DNA_PIPELINE_PROJECT_DIR##*/}" \
+        --log-dir "$DNA_PIPELINE_PROJECT_DIR/04_logs/controller" --project "$DNA_PIPELINE_PROJECT_DIR" \
+        -- bash "$DNA_PIPELINE_LAUNCHER_SOURCE"
+fi
 
 # 日志、中断与启动器临时文件
 # 清理 launcher 临时合成目录。

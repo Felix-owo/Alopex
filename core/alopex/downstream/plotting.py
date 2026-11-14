@@ -1889,3 +1889,58 @@ def plot_final_qc_dashboard_batch(
             out_path=out_path,
             figsize=figsize,
         )
+
+
+def plot_chromosome_diagnostics(frame, out_path=None):
+    """逐CloneID/主染色体显示覆盖及甲基化；缺覆盖保持空白，不以零制造甲基化。"""
+    _load_plot_dependencies()
+    with plt.rc_context({'font.size': 10, 'axes.titlesize': 12, 'axes.labelsize': 10,
+                         'xtick.labelsize': 9, 'ytick.labelsize': 9, 'legend.fontsize': 9,
+                         'legend.title_fontsize': 10}):
+        data = frame.loc[frame['chromosome_class'].eq('host')].copy()
+        if data.empty:
+            if out_path is not None:
+                Path(out_path).unlink(missing_ok=True)
+            return
+        chroms = sorted(data.chrom.unique(), key=lambda name: (int(name[3:]) if name[3:].isdigit() else 100 if name == 'chrX' else 101))
+        groups = list(dict.fromkeys(data.CloneID))
+        grouped = data.groupby(['CloneID', 'chrom'], sort=False)
+        coverage = grouped.observed_sites.median().unstack('chrom').reindex(index=groups, columns=chroms)
+        methylation = grouped.meth_frac.median().unstack('chrom').reindex(index=groups, columns=chroms)
+        valid = grouped.meth_frac.count().unstack('chrom').reindex(index=groups, columns=chroms).fillna(0)
+        fig, axes = plt.subplots(2, 1, figsize=(max(9, len(chroms) * .42), max(5, len(groups) * .55 + 3)))
+        sns.heatmap(np.log10(coverage + 1), cmap='Blues', ax=axes[0], cbar_kws={'label': 'log10(median sites + 1)'})
+        sns.heatmap(methylation, annot=valid.astype(int), fmt='d', cmap='viridis', vmin=0, vmax=1, ax=axes[1], cbar_kws={'label': 'Median site fraction'})
+        axes[0].set_title('Chromosome coverage (zero sites retained)')
+        axes[1].set_title('Chromosome methylation\nNumbers: covered cells; blank: missing')
+        for ax in axes:
+            ax.set_xlabel('Chromosome'); ax.set_ylabel('CloneID'); ax.tick_params(axis='x', rotation=45)
+        fig.tight_layout()
+        if out_path is not None:
+            fig.savefig(out_path, bbox_inches='tight')
+        plt.show()
+
+
+def plot_tss_scores(frame, out_path=None):
+    """score与实际gene/bin覆盖并列展示；未定义score不补零，抽样状态仍在表内。"""
+    _load_plot_dependencies()
+    with plt.rc_context({'font.size': 10, 'axes.titlesize': 12, 'axes.labelsize': 10,
+                         'xtick.labelsize': 9, 'ytick.labelsize': 9, 'legend.fontsize': 9,
+                         'legend.title_fontsize': 10}):
+        valid = frame.loc[np.isfinite(frame['TSS_score']) & np.isfinite(frame['TSS_coverage_fraction'])]
+        if valid.empty:
+            if out_path is not None:
+                Path(out_path).unlink(missing_ok=True)
+            print('TSS score 无可定义相关的细胞；请查看覆盖和 TSS_score_status。')
+            return
+        fig, ax = plt.subplots(figsize=(6, 4.5))
+        sns.scatterplot(data=valid, x='TSS_coverage_fraction', y='TSS_score', hue='CloneID', ax=ax)
+        ax.set_xlim(0, 1.02)
+        ax.set_ylim(-1.02, 1.02)
+        ax.set_xlabel('Covered gene/bin members / eligible members')
+        ax.set_ylabel('Pearson r(|TSS offset|, methylation fraction)')
+        ax.set_title(f'Defined TSS scores: {len(valid)} / {len(frame)} cells')
+        fig.tight_layout()
+        if out_path is not None:
+            fig.savefig(out_path, bbox_inches='tight')
+        plt.show()

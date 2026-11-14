@@ -1,31 +1,41 @@
-# Alopex v17.10
+# Alopex v18.4
 
-正式源码以 Git tag `v17.10` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+本仓为公开运行包；开发文档、测试和维护规范由相应私有开发仓提供。
 
-v17.10 修复 TSS 按基因组坐标去重而丢失重叠基因关联的问题，保留每个蛋白编码 gene/bin 的真实相对距离和权重；同时修复标准 reference 候选改为正式文件名后的绑定提交。两物种全部基因关联及原始坐标已核验，Single-CpG 文件字节不变，实际算法身份仅 TSS 改变。包含此前全部扫描完整性、Notebook 和绘图更新。默认 jobs=60，TAPS 默认保留最终 BAM；显式配置优先。更新后重启 Notebook kernel，从首格重跑。已有旧 TSS 参考的安装须按下述 reference 步骤从原 GTF 重建，不能补签旧 BED；本次受管安装同步已核验的参考，不重跑科学分析。验证范围见[发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/docs/benchmarks/config-audit.md#release-v1710)。
+## 从这里开始
+
+已有环境和项目：在项目目录先运行 `./run_pipeline.sh --dry-run`，确认配置与选样后再运行 `./run_pipeline.sh`。
+
+首次使用按下面三步走；HPC 的执行位置按第 3 节，不在登录节点直接运行完整 Doctor。
+
+1. **准备 Pipeline。** 完成[安装](#1-安装)和[标准 reference](#2-准备标准-reference)。
+2. **验证工具链。** 按[构建与检查](#3-构建与检查)运行 Doctor，看到 `FINAL STATUS: READY` 后继续。
+3. **跑一个项目。** [初始化](#4-初始化与配置) → [导入与选样](#5-导入与选样) → [dry-run 和运行](#6-运行与恢复)；最后核对[结果与完成确认](#7-结果与完成确认)。
+
+| 当前遇到的情况 | 直接进入 |
+| --- | --- |
+| 已有项目失败、锁残留或发布中断 | [运行与恢复](#6-运行与恢复) |
+| 想看资源、进度或错误日志 | [运行状态与详细输出](#运行状态与详细输出) |
+| 上游已完成，要做 QC 或导出矩阵 | [下游 README](downstream/README.md) |
+| 刚升级 v18.4，要核对修复与恢复步骤 | [v18.4 更新说明](#v184-更新说明) |
+
+正式源码以 Git tag `v18.4` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
 | 协议 / `analysis.protocol` | 后端 | 主要处理 |
 | --- | --- | --- |
 | Cabernet / `cabernet` | 默认 Bismark，可选 BISCUIT | 孔板解复用、trimming、位置去重、high-CpH/non-conversion 过滤 |
-| SRD / `srd` | 默认 Bismark，可选 BISCUIT | DNA/RNA tube 解复用、DNA 分析，保留 RNA FASTQ 与被筛除 BAM |
 | Droplet DD-MET5 / `droplet` | 固定 Bismark non-directional | DNA 独立谷底 calling、官方设计白名单、逐胞嘧啶 UMI 共识 |
 | Cabernet–TAPS+ / `taps` | 固定 BWA-MEM + Rastair | 标记重复，调用 CpG/SNP，统计 Non-CpG；不作 high-CpH 筛除 |
 
 | 查阅内容 | 文档 |
 | --- | --- |
 | Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
-| 配置参数、QC 字段与计数口径 | [ANALYSIS_PARAMETERS](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/docs/ANALYSIS_PARAMETERS.md) |
-| 流程与维护契约 | [pipeline.drawio](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/docs/pipeline.drawio)、[AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/AGENTS.md) |
-| 实测结果、验证范围与失败教训 | [BENCHMARKS](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/docs/BENCHMARKS.md) |
+| 配置参数、QC 字段与计数口径 | [ANALYSIS_PARAMETERS](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/docs/ANALYSIS_PARAMETERS.md) |
+| 流程与维护契约 | [pipeline.drawio](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/docs/pipeline.drawio)、[AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/AGENTS.md) |
+| 实测结果、验证范围与失败教训 | [BENCHMARKS](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/docs/BENCHMARKS.md) |
 
-源码按职责定位：`core/alopex/`包含配置、输入、科学处理、交付与维护，其`downstream/`子包负责QC计算与绘图；`core/`下的Shell入口与Snakefile负责运行编排；顶层`downstream/`承载Notebook与操作说明。开发测试在`tests/`，详细契约和证据在`docs/`，私有 Alopex_dev 的完整发行包包含 docs、tests 和维护规范；公开 Alopex 的运行包才排除开发内容。
-
-
-项目运行的临时工作与提交文件统一使用本项目 `05_tmp/`，包括预处理、原生工具 spill、诊断、矩阵写出和发布候选；外部 `TMPDIR` / `SLURM_TMPDIR` 不改选节点盘。临时文件关闭并校验后使用同文件系统原子替换；`05_tmp` 不得为符号链接，输出位于另一挂载时明确失败，不回退复制覆盖。仅清理本次创建的临时项，重试所需的事务备份也保留在 `05_tmp/`，运行或恢复未完成时不要手动清空该目录。
-
-`02_work/` 中有明确下游消费者的阶段产物、`.snakemake/` 恢复状态，以及没有项目上下文的环境/参考安装事务保留各自职责位置。安装事务的临时项必须与安装目标处于同一文件系统，不写入任意分析项目。共享空间和配额仍需足以容纳已有结果、新候选及并发作业；空间检查不等于容量预留。
 
 ## 1. 安装
 
@@ -33,18 +43,24 @@ v17.10 修复 TSS 按基因组坐标去重而丢失重叠基因关联的问题�
 
 demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态链接，避免宿主库探测与 Conda 链接器不一致；不要求系统另装 zlib 开发包。
 
-环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
+环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。
 
-从 [v17.10 Release](https://github.com/Felix-owo/Alopex_dev/releases/tag/v17.10) 下载 `Alopex-v17.10.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。Alopex_dev 完整发行包保留全部受版本控制的源码、固定资源、下游 Notebook、docs、tests 与维护规范。公开 Alopex 另发运行包，排除 docs、tests 和开发规范；Conda、生成参考、科学结果及未跟踪日志均不入包。
+Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
+
+从 [v18.4 Release](https://github.com/Felix-owo/Alopex/releases/tag/v18.4) 下载 `Alopex-v18.4.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。
+
+Alopex_dev 完整发行包保留全部受版本控制的源码、固定资源、下游 Notebook、docs、tests 与维护规范。公开 Alopex 另发运行包，排除 docs、tests 和开发规范；Conda、生成参考、科学结果及未跟踪日志均不入包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v17.10.tar.gz
-cd Alopex-v17.10
+tar -xzf Alopex-v18.4.tar.gz
+cd Alopex-v18.4
 conda --version
 ```
 
-跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。运行快照会记录实际源码、环境和输入身份，实验及验收范围见 [发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v17.10/docs/benchmarks/config-audit.md#release-v1710)。
+跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。
+
+运行快照会记录实际源码、环境和输入身份，实验及验收范围见 [发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/docs/benchmarks/config-audit.md#release-v18-4)。
 
 | 平台 / 部署方式 | 要求 |
 | --- | --- |
@@ -65,7 +81,9 @@ conda --version
 | `hg38.genes.gtf` | GENCODE v48 / GRCh38 | [GTF](https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_48/gencode.v48.annotation.gtf.gz) |
 | `mm10.genes.gtf` | GENCODE M25 / GRCm38 | [GTF](https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.annotation.gtf.gz) |
 
-Doctor 保留下载的原始 FASTA，只在临时目录生成分析用 FASTA：hg38 使用 GIABv3 的 no-ALT、CEN/PAR/GRC 屏蔽与定向 decoy；mm10 使用 GRCm38 主装配及其 Y PAR 屏蔽。分别加入 lambda/pUC19 后为 **220／68 条比对序列**；分析 FASTA 仍使用 `<genome>.primary.lambda.puc19.fa` 路径，其内容范围以固定清单为准。
+Doctor 保留下载的原始 FASTA，只在临时目录生成分析用 FASTA：hg38 使用 GIABv3 的 no-ALT、CEN/PAR/GRC 屏蔽与定向 decoy；mm10 使用 GRCm38 主装配及其 Y PAR 屏蔽。
+
+分别加入 lambda/pUC19 后为 **220／68 条比对序列**；分析 FASTA 仍使用 `<genome>.primary.lambda.puc19.fa` 路径，其内容范围以固定清单为准。
 
 比对包含真实辅助序列，最终 nCG、甲基化 QC、Gini、TSS 和 Single-CpG 矩阵按明确的主核染色体范围计算。RawAdata 保留全参考观测供 QC／审计，controls 单独统计。坐标、屏蔽范围、输入校验值及适用边界见源码 checkout 的 `docs/ANALYSIS_PARAMETERS.md`「标准 reference 与分析范围」。此策略自 v16.2 发布；运行包不包含开发文档。
 
@@ -82,7 +100,9 @@ PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding beg
 PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding seal --reference /path/reference.fa --kind "$index_kind" --build-input /path/build/input.json
 ```
 
-已有新构建参考可整体传输到另一台机器：先放在独立候选目录，连同所有 `.reference.json` 一起复制；用 `reference-binding import` 依次核 FASTA、各索引家族和 downstream。此动作必须已有有效 producer 回执，逐文件 SHA256 与参考代际完全一致后仅更新目标文件系统的 stat 状态；缺失回执或内容失配会失败，不对未知旧索引补签。随后运行 `reference --check` 和目标平台真实小数据比对／CpG 验收，再切换正式目录。跨平台传输的是索引数据，环境／可执行文件仍使用目标平台版本。
+已有新构建参考可整体传输到另一台机器：先放在独立候选目录，连同所有 `.reference.json` 一起复制；用 `reference-binding import` 依次核 FASTA、各索引家族和 downstream。
+
+此动作必须已有有效 producer 回执，逐文件 SHA256 与参考代际完全一致后仅更新目标文件系统的 stat 状态；缺失回执或内容失配会失败，不对未知旧索引补签。随后运行 `reference --check` 和目标平台真实小数据比对／CpG 验收，再切换正式目录。跨平台传输的是索引数据，环境／可执行文件仍使用目标平台版本。
 
 ## 3. 构建与检查
 
@@ -100,7 +120,11 @@ PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding sea
 
 HPC 的标准顺序：
 
-当前 HPC 存储根为 `/storage2/wangshouwenLab/`，部署目录为 `/storage2/wangshouwenLab/limited_shared_folder/analysis/cmy/Alopex/`。更新前核对上传目标；Jupyter 的工作目录和 `ServerApp.root_dir` 应使用新根，解释器及 kernel 也须核对实际解析路径。登录 shell 的 `cd` 不会改变已运行的服务。已有任务继续使用启动时路径，切换入口时保留运行中任务；旧 `/storage/wangshouwenLab/` 仅用于明确的历史读取，不再接收更新。
+当前 HPC 存储根为 `/storage2/wangshouwenLab/`，部署目录为 `/storage2/wangshouwenLab/limited_shared_folder/analysis/cmy/Alopex/`。
+
+更新前核对上传目标；Jupyter 的工作目录和 `ServerApp.root_dir` 应使用新根，解释器及 kernel 也须核对实际解析路径。登录 shell 的 `cd` 不会改变已运行的服务。
+
+已有任务继续使用启动时路径，切换入口时保留运行中任务；旧 `/storage/wangshouwenLab/` 仅用于明确的历史读取，不再接收更新。
 
 HPC 更新保留来源仓库的真实 `.git` 与历史，核对正式 tag、commit、工作树和逐文件 SHA256；已有本地修改须先审查保留。归档安装本身仍可不带 Git，不以新建空仓库代替来源历史。
 
@@ -115,7 +139,7 @@ HPC 更新保留来源仓库的真实 `.git` 与历史，核对正式 tag、comm
 | Doctor 路线 | 内容 |
 | --- | --- |
 | A | hg38 / Cabernet / Bismark：真实 Cabernet 抽样与合成对照 |
-| B | mm10 / SRD / BISCUIT：真实 Cabernet DNA 抽样与合成 RNA 布局/对照 |
+| B | mm10 / Cabernet / BISCUIT：真实 Cabernet DNA 抽样与合成对照 |
 | C | hg38 / TAPS / Rastair：独立合成真值 |
 
 标准 HPC 操作使用现有 Jupyter allocation；macOS 使用本机执行。成功结尾为 `FINAL STATUS: READY`，默认日志在 `logs/doctor/`；成功清理沙箱，失败保留诊断。READY 证明本次工具链与固定小样本通过，不代表真实全库科学等价或性能验证。
@@ -132,11 +156,15 @@ cd /path/to/Patient001
 
 也可用 `--init-project /path/to/Patient001`。之后使用项目根目录的 `./run_pipeline.sh`。
 
+初始化保留已有输入；输入链接悬空时会报错，请先修复链接再重试。
+
+sample manifest须保持六列，空字段也保留分隔符；manifest与Barcode Map用于引用字段的引号须正确闭合和转义。格式错误会在处理前报出文件和行号，先修复原表再重试；合法的多行备注和字段内双引号仍支持。
+
 | 项目路径 | 用途 |
 | --- | --- |
 | `00_config/` | `config.yaml`、六列 `sample_manifest.tsv`、孔板协议的 `Barcode_Map.csv` |
 | `01_raw/` | 原始 paired FASTQ |
-| `02_work/` | 可恢复中间结果、SRD RNA 数据与稳定结果 stage |
+| `02_work/` | 可恢复中间结果与稳定结果 stage |
 | `03_results/` | 当前完整交付的科学结果和 QC |
 | `04_logs/` | controller、规则、Slurm 日志与 provenance |
 | `05_tmp/` | 作业临时文件 |
@@ -161,14 +189,14 @@ cabernet:
 | 结构与覆盖 | 只接受 schema 3；内置默认 → `common` → 选定协议覆盖，列表整体替换，固定协议策略最终生效 |
 | reference 路径 | 保留 YAML 引号内的首尾空格；绝对路径直接定位，相对路径依次查 Pipeline 根和项目根，不裁剪为另一文件名 |
 | 共用 / 全局设置 | demux、high-CpH、Bismark、BISCUIT 参数放 `common`；物种/reference、`analysis`、`runtime`、`slurm`、`retention` 为全局设置 |
-| Cabernet / SRD | 可选 `methylation_backend: bismark` 或 `biscuit`；Bismark 默认 combined-index end-to-end，`bismark.local_alignment: true` 改为 CT/GA local；Bismark 各协议均固定 `--maxins 1000` |
+| Cabernet | 可选 `methylation_backend: bismark` 或 `biscuit`；Bismark 默认 combined-index end-to-end，`bismark.local_alignment: true` 改为 CT/GA local；Bismark 各协议均固定 `--maxins 1000` |
 | Droplet | backend、spacer=0、non-directional 固定，不声明 `methylation_backend`、`demux.dna_w_spacer_len` 或 `bismark.library_type`；无需 Barcode Map，`rna_sample` 可选填外部 RNA 原始 basename |
 | TAPS | backend 固定 Rastair，不声明 `methylation_backend`；输出 SNP VCF/索引与 Non-CpG QC |
 | 无差异模块 | `taps` / `droplet` 可省略或为 `{}` |
 
 | 孔板 Barcode Map | 要求 |
 | --- | --- |
-| 必需列 | `DNA_Barcode,PlateID,Cell_Order`；SRD 另需 `RNA_Barcode` |
+| 必需列 | `DNA_Barcode,PlateID,Cell_Order` |
 | Barcode | 8 或 10 bp A/C/G/T；同长度序列间 Hamming distance 必须大于 2 |
 | 身份 | PlateID、Cell_Order 各自唯一；Cell_Order 保留字符串，不丢前导零 |
 | CSV 格式 | 表头去 BOM、外围空白并忽略大小写后非空且唯一；各行列数一致 |
@@ -202,14 +230,15 @@ mate 支持 `R1/R2` 或 `1/2`，分隔符支持 `_ . -`；lane 为 1–999，chu
 | 协议 | `rna_sample` 的含义 |
 | --- | --- |
 | Cabernet / TAPS | 可选的外部 RNA_DARLIN **原始 RNA basename**，不是 RNA sample_id 或路径；不产生本地 RNA route，也不会被 refresh 自动当成本地 DNA 登记 |
-| SRD | 本地 RNA-enrichment tube，需对应本地输入 |
 | Droplet | 可选外部 RNA 原始 basename，与 Cabernet 一致；配套 RNA 独立 calling，按对应文库与完整 CB17 关联；留空保持未关联 |
 
 DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联-rna_darlin-结果)。
 
 ## 6. 运行与恢复
 
-科学阶段临时数据固定写入当前项目 `05_tmp/`，每个作业使用独占随机子目录并只清理自身目录。启动前检查预计磁盘需求及10%余量，空间不足直接失败，不自动切换到节点 `/tmp`、`/var/tmp` 或外部 `TMPDIR`。该检查不预留跨作业容量，也不保证共享存储或用户配额永不耗尽。可恢复的跨节点工件保留在 `02_work/`。升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。详见[调度参数](docs/ANALYSIS_PARAMETERS.md)。
+科学阶段临时数据固定写入当前项目 `05_tmp/`，每个作业使用独占随机子目录并只清理自身目录。启动前检查预计磁盘需求及10%余量，空间不足直接失败，不自动切换到节点 `/tmp`、`/var/tmp` 或外部 `TMPDIR`。该检查不预留跨作业容量，也不保证共享存储或用户配额永不耗尽。可恢复的跨节点工件保留在 `02_work/`。
+
+升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。详见[调度参数](docs/ANALYSIS_PARAMETERS.md)。
 
 ```bash
 ./run_pipeline.sh --dry-run
@@ -217,6 +246,7 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 ```
 
 项目从当前目录向上定位；初始化、刷新和运行分别执行。launcher 不接受额外 Snakemake flag 或 target。
+遇到悬空配置链接、非普通配置文件或不可访问路径时停止，不改选父项目；先修复当前项目的 `00_config/config.yaml` 再重试。
 
 | 情况 | 处理方式 |
 | --- | --- |
@@ -225,9 +255,20 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 | 残留锁 | 确认没有运行中的 launcher 后，才手动移除项目 `.snakemake/locks` |
 | 发布中断 | 保留 `02_work/results_stage/` 后重跑；stage 与 `03_results/` 必须同一文件系统，公开 `run_manifest.json` 最后提交 |
 | 最终 DNA BAM | 模板`retention.keep_final_bam: null`按协议默认：TAPS保留、其余回收；显式true/false覆盖。`true` 保留 BAM 及适用索引，缺失时进入 DAG 恢复；`false` 在成功发布后回收当前 backend 活跃细胞的最终 BAM/索引 |
-| SRD RNA | FASTQ 和被筛除 BAM 固定保存在 `02_work/RNA/{FASTQ,BAM}/`，不受最终 DNA BAM 开关影响 |
 | 上游重新发布 | 旧下游 context 会拒绝继续读取或提交 QC，需重新启动下游 |
 | reference 构建中断 | 重跑对应 Doctor 段，恢复未完成事务并复验；未完成不报告 READY |
+
+### 运行状态与详细输出
+
+Doctor、`run_pipeline.sh` 和 Notebook 的 `qc.run_qc_processor()` 自动展示中文状态面板：当前阶段、开始时间与耗时、进程及资源口径；无需新增参数。交互终端原位更新，Notebook详情折叠，重定向仅记录阶段变化/告警及五分钟心跳。
+
+Doctor summary/detail和controller原生日志完整保留，QC原始输出见项目`04_logs/downstream/qc.<时间>.<PID>.log`；失败从面板日志入口查首条错误。
+
+中断运行后，等待原入口完成清理和自有进程组回收，再重跑对应入口；保留项目中间件供现有恢复流程使用。
+
+BISCUIT 的原生读段名称按字面保留，包括双引号。旧实现曾把带引号的名称按CSV解码，可能在high-CpH筛除时删错分子而总数不变；只有实际输入含此类名称才涉及该问题。受影响结果从当前alignment BAM重做bsconv过滤及后续pileup/CpG/QC和交付，缺该BAM时按DAG恢复上游；不能仅重做下游QC或补签旧结果。详见[原始反证与验收](docs/benchmarks/config-audit.md#v18-2-literal-qnames-20261111)。
+
+资源申请值、本机采样和远程不可用数据分开显示，任务进度不等于剩余时间；详细约束见[运行展示标准](docs/contracts/environment.md#运行展示标准)。
 
 ## 7. 结果与完成确认
 
@@ -275,12 +316,40 @@ Alopex 以 [GPL-3.0](LICENSE) 发布。
 
 ## 开发与发行
 
-回归测试包含在 Alopex_dev 完整发行包；公开 Alopex 运行包不包含开发回归。开发时 checkout 正式 tag 后执行 `bash tests/run_regression.sh --preflight`；该入口将完整 discovery 主矩阵分成普通/工作流两组，与集成矩阵通过三个独立进程组并行执行，各自保留日志，失败回收本次 worker。全部主测试的整体执行 wall 单列于 `.workers.json` 的 `core_matrix_wall_seconds`，不以拆分后的较短组耗时替代性能验收；测试名和条件跳过原因逐项记录。完整下游回归需设置 `DNA_PIPELINE_DOWNSTREAM_PYTHON="$PWD/conda/current/notebook/bin/python"` 与 `DNA_PIPELINE_REQUIRE_DOWNSTREAM_TESTS=1`。
+回归测试包含在 Alopex_dev 完整发行包；公开 Alopex 运行包不包含开发回归。
+
+开发时 checkout 正式 tag 后执行 `bash tests/run_regression.sh --preflight`；该入口将完整 discovery 主矩阵分成普通/工作流两组，与集成矩阵通过三个独立进程组并行执行，各自保留日志，失败回收本次 worker。
+
+全部主测试的整体执行 wall 单列于 `.workers.json` 的 `core_matrix_wall_seconds`，不以拆分后的较短组耗时替代性能验收；测试名和条件跳过原因逐项记录。
+
+完整下游回归需设置 `DNA_PIPELINE_DOWNSTREAM_PYTHON="$PWD/conda/current/notebook/bin/python"` 与 `DNA_PIPELINE_REQUIRE_DOWNSTREAM_TESTS=1`。
 
 开发仓 `.gitattributes` 不排除 docs/tests；公开仓单独用 `export-ignore` 固定运行发行内容。两者都使用 [Git 原生归档](https://git-scm.com/docs/git-archive) 重建，无独立打包脚本：
 
 ```bash
-git archive --format=tar.gz --prefix=Alopex-v17.10/ -o Alopex-v17.10.tar.gz v17.10
+git archive --format=tar.gz --prefix=Alopex-v18.4/ -o Alopex-v18.4.tar.gz v18.4
 ```
 
 源码 checkout 的当前文档结构见 [docs 导航](https://github.com/Felix-owo/Alopex_dev/blob/main/docs/README.md)，修改前按 [AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/main/AGENTS.md) 的任务清单读取详细契约。上文固定 tag 链接用于对应正式发行版的历史说明。
+
+### v18.4 更新说明
+
+- QC/Raw/Single 使用标准 H5AD 磁盘 CSR，不再依赖 SnapATAC2 或 Polars；公开四列 CpG、原始计数与坐标保持不变。
+- Notebook 增加逐染色体诊断、带覆盖及抽样状态的 TSS score、逐细胞筛选原因；矩阵 obs 同时保存 QC、条码、孔序和下游注释，默认 HQ 门槛不变。
+- MethylTree 可复用同代 QC/Single 导出独立矩阵；其 Notebook 保留原分析单元，仅增加输入接入分支。同步修复两张诊断图独立调用时的依赖初始化。
+
+升级后运行标准 Doctor，重启 Notebook kernel 并从第一格运行。旧 Raw schema 按完整输入身份自动重建，随后生成同代 Single；不能只改旧矩阵 metadata。BISCUIT 原生读段名称、严格输入与中断修复也包含在本次全部仓库同步中，既有 GTF 参考升级要求见 [v18.1 发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v18.1/docs/benchmarks/config-audit.md#release-v18-1)。不自动重跑生产数据。
+
+本机原始计数/坐标/缺失真值、完整回归、隔离 Doctor 与部署边界见[本版发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/docs/benchmarks/config-audit.md#release-v18-4)。
+
+### 源码与临时文件位置
+
+源码按职责定位：`core/alopex/`包含配置、输入、科学处理、交付与维护，其`downstream/`子包负责QC计算与绘图；`core/`下的Shell入口与Snakefile负责运行编排；顶层`downstream/`承载Notebook与操作说明。
+
+开发测试在`tests/`，详细契约和证据在`docs/`，私有 Alopex_dev 的完整发行包包含 docs、tests 和维护规范；公开 Alopex 的运行包才排除开发内容。
+
+项目运行的临时工作与提交文件统一使用本项目 `05_tmp/`，包括预处理、原生工具 spill、诊断、矩阵写出和发布候选；外部 `TMPDIR` / `SLURM_TMPDIR` 不改选节点盘。临时文件关闭并校验后使用同文件系统原子替换；`05_tmp` 不得为符号链接，输出位于另一挂载时明确失败，不回退复制覆盖。
+
+仅清理本次创建的临时项，重试所需的事务备份也保留在 `05_tmp/`，运行或恢复未完成时不要手动清空该目录。
+
+`02_work/` 中有明确下游消费者的阶段产物、`.snakemake/` 恢复状态，以及没有项目上下文的环境/参考安装事务保留各自职责位置。安装事务的临时项必须与安装目标处于同一文件系统，不写入任意分析项目。共享空间和配额仍需足以容纳已有结果、新候选及并发作业；空间检查不等于容量预留。

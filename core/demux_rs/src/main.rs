@@ -29,12 +29,8 @@ use std::thread::JoinHandle;
 
 static DNA_NATIVE_TABLE: OnceLock<[u8; 256]> = OnceLock::new();
 static DNA_BISULFITE_TABLE: OnceLock<[u8; 256]> = OnceLock::new();
-static RNA_BISULFITE_TABLE: OnceLock<[u8; 256]> = OnceLock::new();
 
 const ME_SEQ: &[u8] = b"AGATGTGTATAAGAGACAG";
-const TSO_SEQ: &[u8] = b"GTCTAACGCGTTAC";
-const LEN_UMI: usize = 8;
-const LEN_SPACER: usize = 5;
 const LEN_GAP_AFTER_ME: usize = 9;
 const MIN_R1_LEN: usize = 20;
 const DEFAULT_CHUNK_SIZE: usize = 20_000;
@@ -50,7 +46,6 @@ struct Config {
     r2: Vec<PathBuf>,
     barcode_map: PathBuf,
     dna_out_dir: PathBuf,
-    rna_out_dir: PathBuf,
     json_report: PathBuf,
     sample_name: String,
     min_matched_read_pairs: u64,
@@ -102,9 +97,6 @@ impl Config {
         let dna_out_dir = args
             .dna_out_dir
             .context("--dna-out-dir is required for demux")?;
-        let rna_out_dir = args
-            .rna_out_dir
-            .context("--rna-out-dir is required for demux")?;
         let json_report = args
             .json_report
             .context("--json-report is required for demux")?;
@@ -114,7 +106,6 @@ impl Config {
             r2: args.r2,
             barcode_map,
             dna_out_dir,
-            rna_out_dir,
             json_report,
             sample_name: args.sample_name,
             min_matched_read_pairs: args.min_matched_read_pairs,
@@ -129,41 +120,25 @@ impl Config {
 #[derive(Debug, Clone)]
 struct CellRow {
     dna_barcode: String,
-    rna_barcode: String,
     plate_id: String,
     cell_order: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Modality {
-    Dna,
-    Rna,
-}
-
-impl Modality {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Dna => "DNA",
-            Self::Rna => "RNA",
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum BucketKey {
     Dna(String),
-    Rna(String),
     Unmatched,
 }
 
 impl BucketKey {
     fn is_matched(&self) -> bool {
-        matches!(self, Self::Dna(_) | Self::Rna(_))
+        matches!(self, Self::Dna(_))
     }
 
     fn label(&self) -> &str {
         match self {
-            Self::Dna(bc) | Self::Rna(bc) => bc.as_str(),
+            Self::Dna(bc) => bc.as_str(),
             Self::Unmatched => "unmatched",
         }
     }
@@ -175,11 +150,6 @@ impl BucketKey {
                 .get(barcode)
                 .map(String::as_str)
                 .with_context(|| format!("No canonical Sample ID for DNA barcode {}", barcode)),
-            Self::Rna(barcode) => paths
-                .rna_cell_ids
-                .get(barcode)
-                .map(String::as_str)
-                .with_context(|| format!("No canonical Sample ID for RNA barcode {}", barcode)),
             Self::Unmatched => Ok(paths.sample_name.as_str()),
         }
     }
@@ -187,7 +157,6 @@ impl BucketKey {
     fn output_dir(&self, paths: &OutputPaths) -> Result<PathBuf> {
         match self {
             Self::Dna(_) => Ok(paths.dna_out_dir.join(self.cell_sample_id(paths)?)),
-            Self::Rna(_) => Ok(paths.rna_out_dir.join(self.cell_sample_id(paths)?)),
             Self::Unmatched => Ok(paths
                 .dna_out_dir
                 .join(format!("{}_unmatched", paths.sample_name))),
@@ -196,7 +165,7 @@ impl BucketKey {
 
     fn file_stem(&self, paths: &OutputPaths) -> Result<String> {
         match self {
-            Self::Dna(_) | Self::Rna(_) => Ok(self.cell_sample_id(paths)?.to_string()),
+            Self::Dna(_) => Ok(self.cell_sample_id(paths)?.to_string()),
             Self::Unmatched => Ok(format!("{}_unmatched", paths.sample_name)),
         }
     }
@@ -205,11 +174,9 @@ impl BucketKey {
 #[derive(Debug, Clone)]
 struct OutputPaths {
     dna_out_dir: PathBuf,
-    rna_out_dir: PathBuf,
     json_report: PathBuf,
     sample_name: String,
     dna_cell_ids: AHashMap<String, String>,
-    rna_cell_ids: AHashMap<String, String>,
     min_matched_read_pairs: u64,
     mode: DemuxMode,
     input_fastq_pairs: usize,
@@ -218,7 +185,6 @@ struct OutputPaths {
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 struct FateCounts {
     dna_assigned: u64,
-    rna_assigned: u64,
     ambiguous: u64,
     unmatched: u64,
     short: u64,
@@ -228,7 +194,6 @@ impl FateCounts {
     fn record(&mut self, fate: TerminalFate) {
         match fate {
             TerminalFate::DnaAssigned => self.dna_assigned += 1,
-            TerminalFate::RnaAssigned => self.rna_assigned += 1,
             TerminalFate::Ambiguous => self.ambiguous += 1,
             TerminalFate::Unmatched => self.unmatched += 1,
             TerminalFate::Short => self.short += 1,
@@ -237,14 +202,13 @@ impl FateCounts {
 
     fn add_assign(&mut self, other: Self) {
         self.dna_assigned += other.dna_assigned;
-        self.rna_assigned += other.rna_assigned;
         self.ambiguous += other.ambiguous;
         self.unmatched += other.unmatched;
         self.short += other.short;
     }
 
     fn input_read_pairs(self) -> u64 {
-        self.dna_assigned + self.rna_assigned + self.ambiguous + self.unmatched + self.short
+        self.dna_assigned + self.ambiguous + self.unmatched + self.short
     }
 
     fn usable_read_pairs(self) -> u64 {
@@ -252,7 +216,7 @@ impl FateCounts {
     }
 
     fn matched_read_pairs(self) -> u64 {
-        self.dna_assigned + self.rna_assigned
+        self.dna_assigned
     }
 }
 
@@ -279,11 +243,8 @@ struct SampleStats {
     plate_id: String,
     cell_order: String,
     dna_barcode: String,
-    rna_barcode: String,
     dna_read_count: u64,
-    rna_read_count: u64,
     dna_status: String,
-    rna_status: String,
 }
 
 struct InputChunk {
@@ -452,23 +413,13 @@ struct BarcodeIndex {
     full: DistMap,
     shifted: DistMap,
     barcode_len: usize,
-    modality: Modality,
 }
 
 impl BarcodeIndex {
-    fn empty(modality: Modality) -> Self {
-        Self {
-            full: DistMap::new(),
-            shifted: DistMap::new(),
-            barcode_len: 0,
-            modality,
-        }
-    }
 
     fn from_barcodes(
         barcodes: impl IntoIterator<Item = String>,
         barcode_len: usize,
-        modality: Modality,
     ) -> Self {
         let mut full = DistMap::new();
         let mut shifted = DistMap::new();
@@ -487,7 +438,7 @@ impl BarcodeIndex {
                 Self::insert_candidate(&mut full, candidate, &id, dist);
             });
 
-            if modality == Modality::Dna && barcode_len > 1 {
+            if barcode_len > 1 {
                 let shifted_key = seq[1..barcode_len].to_vec();
                 Self::insert_candidate(&mut shifted, shifted_key, &id, 0);
             }
@@ -497,7 +448,6 @@ impl BarcodeIndex {
             full,
             shifted,
             barcode_len,
-            modality,
         }
     }
 
@@ -516,7 +466,7 @@ impl BarcodeIndex {
         if direct != BarcodeMatch::None {
             return direct;
         }
-        if self.modality == Modality::Dna && seq.len() + 1 == self.barcode_len {
+        if seq.len() + 1 == self.barcode_len {
             return Self::match_candidate(self.shifted.get(seq));
         }
         BarcodeMatch::None
@@ -600,7 +550,6 @@ impl BarcodeIndex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalFate {
     DnaAssigned,
-    RnaAssigned,
     Ambiguous,
     Unmatched,
     Short,
@@ -609,8 +558,6 @@ enum TerminalFate {
 struct ProcResult<'a> {
     trim_start: usize,
     category: &'a str,
-    modality: Option<Modality>,
-    umi: Option<&'a [u8]>,
     is_valid: bool,
     fate: TerminalFate,
 }
@@ -620,8 +567,6 @@ impl<'a> ProcResult<'a> {
         Self {
             trim_start: 0,
             category: "unmatched",
-            modality: None,
-            umi: None,
             is_valid: false,
             fate: TerminalFate::Unmatched,
         }
@@ -634,40 +579,26 @@ impl<'a> ProcResult<'a> {
         }
     }
 
-    fn rejected(fate: TerminalFate, umi: Option<&'a [u8]>) -> Self {
+    fn rejected(fate: TerminalFate) -> Self {
         Self {
             fate,
-            umi,
             ..Self::unmatched()
         }
     }
 
     fn assigned(
-        modality: Modality,
         assigned_barcode: &'a str,
         trim_start: usize,
-        umi: Option<&'a [u8]>,
     ) -> Self {
         Self {
             trim_start,
             category: assigned_barcode,
-            modality: Some(modality),
-            umi,
             is_valid: true,
-            fate: match modality {
-                Modality::Dna => TerminalFate::DnaAssigned,
-                Modality::Rna => TerminalFate::RnaAssigned,
-            },
+            fate: TerminalFate::DnaAssigned,
         }
     }
 
-    fn output_umi(&self) -> Option<&'a [u8]> {
-        if self.is_valid {
-            self.umi
-        } else {
-            None
-        }
-    }
+
 }
 
 fn main() {
@@ -729,28 +660,16 @@ fn run() -> Result<()> {
     );
 
     let cell_rows = load_barcode_map(&config.barcode_map, config.mode)?;
-    let (dna_bc_lengths, rna_bc_len) = resolve_barcode_lengths(&cell_rows, config.mode)?;
-    validate_effective_barcode_prefixes(&cell_rows, &dna_bc_lengths, rna_bc_len, config.mode)?;
+    let dna_bc_lengths = resolve_barcode_lengths(&cell_rows)?;
+    validate_effective_barcode_prefixes(&cell_rows, &dna_bc_lengths)?;
     prepare_output_roots(&config, droplet_spool.as_deref(), &cell_rows)?;
     let dna_bc_lengths_label = dna_bc_lengths
         .iter()
         .map(usize::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    if config.mode == DemuxMode::DnaRna {
-        log::info!(
-            "Using barcode lengths: DNA={}bp, RNA={}bp; DNA barcode-to-ME spacer={}bp",
-            dna_bc_lengths_label,
-            rna_bc_len,
-            config.dna_w_spacer_len
-        );
-    } else {
-        log::info!(
-            "Using barcode lengths: DNA={}bp; RNA demux disabled; DNA barcode-to-ME spacer={}bp",
-            dna_bc_lengths_label,
-            config.dna_w_spacer_len
-        );
-    }
+    log::info!("Using DNA barcode lengths: {}bp; DNA barcode-to-ME spacer={}bp",
+        dna_bc_lengths_label, config.dna_w_spacer_len);
     log::info!("Using demultiplexing mode: {:?}", config.mode);
 
     let mixed_dna_lengths = dna_bc_lengths.len() > 1;
@@ -763,7 +682,7 @@ fn run() -> Result<()> {
                     .filter(move |row| !mixed_dna_lengths || row.dna_barcode.len() == dna_bc_len)
                     .map(|row| row.dna_barcode.clone());
                 let mut index =
-                    BarcodeIndex::from_barcodes(dna_barcodes, dna_bc_len, Modality::Dna);
+                    BarcodeIndex::from_barcodes(dna_barcodes, dna_bc_len);
                 if config.mode == DemuxMode::DnaOnlyDroplet {
                     droplet::protect_design(&mut index)?;
                 }
@@ -771,17 +690,6 @@ fn run() -> Result<()> {
             })
             .collect::<Result<Vec<_>>>()?,
     );
-    let rna_idx = if config.mode == DemuxMode::DnaRna {
-        let rna_barcodes = cell_rows.iter().map(|row| row.rna_barcode.clone());
-        Arc::new(BarcodeIndex::from_barcodes(
-            rna_barcodes,
-            rna_bc_len,
-            Modality::Rna,
-        ))
-    } else {
-        Arc::new(BarcodeIndex::empty(Modality::Rna))
-    };
-
     let dna_cell_ids = cell_rows
         .iter()
         .map(|row| {
@@ -799,24 +707,11 @@ fn run() -> Result<()> {
             )
         })
         .collect::<AHashMap<_, _>>();
-    let rna_cell_ids = cell_rows
-        .iter()
-        .filter(|row| !row.rna_barcode.is_empty())
-        .map(|row| {
-            (
-                row.rna_barcode.clone(),
-                format!("{}_{}", config.sample_name, row.plate_id),
-            )
-        })
-        .collect::<AHashMap<_, _>>();
-
     let paths = OutputPaths {
         dna_out_dir: config.dna_out_dir.clone(),
-        rna_out_dir: config.rna_out_dir.clone(),
         json_report: config.json_report.clone(),
         sample_name: config.sample_name.clone(),
         dna_cell_ids,
-        rna_cell_ids,
         min_matched_read_pairs: config.min_matched_read_pairs,
         mode: config.mode,
         input_fastq_pairs: config.r1.len(),
@@ -825,14 +720,13 @@ fn run() -> Result<()> {
     if let Some(spool) = droplet_spool {
         return droplet::replay::run(&config, cell_rows, dna_indices, paths, &spool);
     }
-    run_pipeline(config, cell_rows, dna_indices, rna_idx, paths)
+    run_pipeline(config, cell_rows, dna_indices, paths)
 }
 
 fn run_pipeline(
     config: Config,
     cell_rows: Vec<CellRow>,
     dna_indices: Arc<Vec<BarcodeIndex>>,
-    rna_idx: Arc<BarcodeIndex>,
     paths: OutputPaths,
 ) -> Result<()> {
     let pool_capacity = config
@@ -861,20 +755,13 @@ fn run_pipeline(
         DNA_BISULFITE_TABLE.get()
     }
     .context("DNA table was not initialized")?;
-    let rna_lut = RNA_BISULFITE_TABLE
-        .get()
-        .context("RNA bisulfite table was not initialized")?;
-
     let worker_handle = spawn_worker(
         rx_work,
         tx_write,
         tx_input_recycle,
         dna_indices,
-        rna_idx,
         dna_lut,
-        rna_lut,
         config.dna_w_spacer_len,
-        config.mode,
     );
 
     let (tx_completion, rx_completion) = bounded(1);
@@ -934,11 +821,8 @@ fn spawn_worker(
     tx_write: Sender<CompletedChunk>,
     tx_input_recycle: Sender<InputChunk>,
     dna_indices: Arc<Vec<BarcodeIndex>>,
-    rna_idx: Arc<BarcodeIndex>,
     dna_lut: &'static [u8; 256],
-    rna_lut: &'static [u8; 256],
     dna_w_spacer_len: usize,
-    demux_mode: DemuxMode,
 ) -> JoinHandle<Result<()>> {
     std::thread::spawn(move || {
         rx_work.into_iter().par_bridge().try_for_each_with(
@@ -946,21 +830,16 @@ fn spawn_worker(
                 tx_write,
                 tx_input_recycle,
                 dna_indices,
-                rna_idx,
                 dna_w_spacer_len,
-                demux_mode,
             ),
-            |(writer, recycle_input, dna_indexes, rna_index, spacer_len, mode),
+            |(writer, recycle_input, dna_indexes, spacer_len),
              (chunk_id, mut input_chunk, mut acc_buf)| {
                 process_chunk(
                     &input_chunk,
                     &mut acc_buf,
                     dna_indexes,
-                    rna_index,
                     dna_lut,
-                    rna_lut,
                     *spacer_len,
-                    *mode,
                 )?;
                 compress_accumulation(&mut acc_buf)?;
                 input_chunk.clear();
@@ -981,11 +860,8 @@ fn process_chunk(
     input: &InputChunk,
     acc: &mut AccumulationBuffer,
     dna_indices: &[BarcodeIndex],
-    rna_idx: &BarcodeIndex,
     dna_lut: &'static [u8; 256],
-    rna_lut: &'static [u8; 256],
     dna_w_spacer_len: usize,
-    demux_mode: DemuxMode,
 ) -> Result<()> {
     for i in 0..input.count {
         let r1_start = input.r1_offsets[i];
@@ -1005,11 +881,8 @@ fn process_chunk(
         let result = process_read(
             r1_seq,
             dna_indices,
-            rna_idx,
             dna_lut,
-            rna_lut,
             dna_w_spacer_len,
-            demux_mode,
         );
         acc.fates.record(result.fate);
         if result.fate == TerminalFate::Short {
@@ -1030,9 +903,8 @@ fn process_chunk(
             r1_seq,
             &input.r1_quals[r1_start..r1_end],
             result.trim_start,
-            result.output_umi(),
+            None,
             result.is_valid,
-            true,
         )?;
         write_fastq_record(
             &mut bucket.r2_raw,
@@ -1040,9 +912,8 @@ fn process_chunk(
             &input.r2_seqs[r2_start..r2_end],
             &input.r2_quals[r2_start..r2_end],
             0,
-            result.output_umi(),
+            None,
             false,
-            true,
         )?;
     }
     Ok(())
@@ -1050,11 +921,7 @@ fn process_chunk(
 
 fn bucket_key_for_result(result: &ProcResult<'_>) -> BucketKey {
     if result.is_valid {
-        match result.modality {
-            Some(Modality::Dna) => BucketKey::Dna(result.category.to_string()),
-            Some(Modality::Rna) => BucketKey::Rna(result.category.to_string()),
-            None => BucketKey::Unmatched,
-        }
+        BucketKey::Dna(result.category.to_string())
     } else {
         BucketKey::Unmatched
     }
@@ -1077,15 +944,7 @@ fn init_tables() {
         table[b'g' as usize] = b'A';
         table
     });
-    RNA_BISULFITE_TABLE.get_or_init(|| {
-        let mut table = [0u8; 256];
-        for (idx, value) in table.iter_mut().enumerate() {
-            *value = idx as u8;
-        }
-        table[b'C' as usize] = b'T';
-        table[b'c' as usize] = b'T';
-        table
-    });
+
 }
 
 fn ensure_fastq_input(path: &Path, label: &str) -> Result<()> {
@@ -1211,7 +1070,7 @@ mod tests {
     fn droplet_correction_rejects_equal_neighbors_but_keeps_exact() {
         let a = "AAAAAAAAAAAAAAAAA".to_string();
         let b = "TGAAAAAAAAAAAAAAA".to_string();
-        let index = BarcodeIndex::from_barcodes([a.clone(), b], 17, Modality::Dna);
+        let index = BarcodeIndex::from_barcodes([a.clone(), b], 17);
         assert_eq!(
             index.match_simple(a.as_bytes()),
             BarcodeMatch::Unique { id: &a }
@@ -1235,7 +1094,7 @@ mod tests {
         assert_eq!(design.len(), 829_440);
         assert!(design.contains(a.as_bytes()) && design.contains(b.as_bytes()));
         assert!(!design.contains(b"AAAAAAAAAAAAAAAAA".as_slice()));
-        let mut index = BarcodeIndex::from_barcodes([a.clone(), b.clone()], 17, Modality::Dna);
+        let mut index = BarcodeIndex::from_barcodes([a.clone(), b.clone()], 17);
         droplet::protect_design(&mut index).unwrap();
         assert_eq!(
             index.match_simple(a.as_bytes()),
@@ -1287,8 +1146,6 @@ mod tests {
                 barcode.to_str().unwrap(),
                 "--dna-out-dir",
                 root.join("dna").to_str().unwrap(),
-                "--rna-out-dir",
-                root.join("rna").to_str().unwrap(),
                 "--json-report",
                 root.join("report.json").to_str().unwrap(),
                 "--sample-name",
@@ -1381,8 +1238,6 @@ mod tests {
                 "barcodes.csv",
                 "--dna-out-dir",
                 "dna",
-                "--rna-out-dir",
-                "rna",
                 "--json-report",
                 "report.json",
                 "--sample-name",
@@ -1398,10 +1253,9 @@ mod tests {
         }
     }
 
-    fn row(dna: &str, rna: &str, order: &str) -> CellRow {
+    fn row(dna: &str, order: &str) -> CellRow {
         CellRow {
             dna_barcode: dna.to_string(),
-            rna_barcode: rna.to_string(),
             plate_id: format!("P{order}"),
             cell_order: order.to_string(),
         }
@@ -1438,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn rna_umi_stays_in_the_shared_qname_before_comments() {
+    fn droplet_umi_stays_in_the_shared_qname_before_comments() {
         for (left, right) in [
             (&b"read/1"[..], &b"read/2"[..]),
             (&b"read 1:N:0:ATCG"[..], &b"read 2:N:0:ATCG"[..]),
@@ -1452,16 +1306,15 @@ mod tests {
                     b"ACGT",
                     b"IIII",
                     0,
-                    Some(b"ACGTACGT"),
+                    Some(b"ACGTACGTACGT"),
                     false,
-                    true,
                 )
-                .expect("valid RNA FASTQ");
+                .expect("valid UMI FASTQ");
                 assert_eq!(
                     record.split(|b| b.is_ascii_whitespace()).next().unwrap(),
-                    b"@read:ACGTACGT"
+                    b"@read:ACGTACGTACGT"
                 );
-                assert!(record.ends_with(b"\nACGT\n+\nIIII\n"));
+                assert_eq!(record, b"@read:ACGTACGTACGT\nACGT\n+\nIIII\n");
             }
         }
     }
@@ -1474,25 +1327,22 @@ mod tests {
     }
 
     #[test]
-    fn dna_mixed_lengths_are_retained_but_rna_mixed_lengths_fail() {
+    fn dna_mixed_lengths_are_retained() {
         let rows = vec![
-            row("ACGTACGT", "TGCATGCA", "1"),
-            row("ACGTACGTAA", "TGCATGCAAA", "2"),
+            row("ACGTACGT", "1"),
+            row("ACGTACGTAA", "2"),
         ];
         let dna = infer_barcode_lengths(&rows, "DNA", |item| item.dna_barcode.as_str())
             .expect("DNA layout supports registered 8/10bp barcodes");
         assert_eq!(dna, vec![10, 8]);
-        assert!(
-            infer_uniform_barcode_len(&rows, "RNA", |item| { item.rna_barcode.as_str() }).is_err()
-        );
     }
 
     #[test]
     fn dna_demux_matches_both_registered_8bp_and_10bp_barcodes() {
         init_tables();
         let rows = vec![
-            row("ACGTACGT", "TGCATGCA", "1"),
-            row("TGCATGCAAA", "ACGTACGTAA", "2"),
+            row("ACGTACGT", "1"),
+            row("TGCATGCAAA", "2"),
         ];
         let lengths = infer_barcode_lengths(&rows, "DNA", |item| item.dna_barcode.as_str())
             .expect("mixed DNA lengths should be supported");
@@ -1507,13 +1357,10 @@ mod tests {
                         .filter(move |item| !mixed || item.dna_barcode.len() == len)
                         .map(|item| item.dna_barcode.clone()),
                     len,
-                    Modality::Dna,
                 )
             })
             .collect::<Vec<_>>();
-        let rna_index = BarcodeIndex::empty(Modality::Rna);
         let dna_lut = DNA_BISULFITE_TABLE.get().expect("DNA LUT");
-        let rna_lut = RNA_BISULFITE_TABLE.get().expect("RNA LUT");
 
         for barcode in [b"ACGTACGT".as_slice(), b"TGCATGCAAA".as_slice()] {
             let mut read = Vec::new();
@@ -1524,11 +1371,8 @@ mod tests {
             let result = process_read(
                 &read,
                 &indices,
-                &rna_index,
                 dna_lut,
-                rna_lut,
-                0,
-                DemuxMode::DnaOnly,
+                        0,
             );
             assert!(result.is_valid, "barcode {:?} should match", barcode);
             assert_eq!(result.fate, TerminalFate::DnaAssigned);
@@ -1541,9 +1385,8 @@ mod tests {
         init_tables();
         let lut = DNA_NATIVE_TABLE.get().unwrap();
         assert_ne!(lut[b'G' as usize], lut[b'A' as usize]);
-        let index = BarcodeIndex::from_barcodes(vec!["ACGTACGT".to_string()], 8, Modality::Dna);
+        let index = BarcodeIndex::from_barcodes(vec!["ACGTACGT".to_string()], 8);
         let indices = vec![index];
-        let rna = BarcodeIndex::empty(Modality::Rna);
         let mut read = b"ACGTACGT".to_vec();
         read.extend_from_slice(ME_SEQ);
         read.extend_from_slice(b"CCCCCCCCC");
@@ -1551,11 +1394,8 @@ mod tests {
         let result = process_read(
             &read,
             &indices,
-            &rna,
             lut,
-            RNA_BISULFITE_TABLE.get().unwrap(),
             0,
-            DemuxMode::DnaOnlyTaps,
         );
         assert!(result.is_valid);
         assert_eq!(result.fate, TerminalFate::DnaAssigned);
@@ -1569,11 +1409,8 @@ mod tests {
         let result = process_read(
             &converted,
             &indices,
-            &rna,
             lut,
-            RNA_BISULFITE_TABLE.get().unwrap(),
             0,
-            DemuxMode::DnaOnlyTaps,
         );
         assert!(!result.is_valid);
     }
@@ -1581,7 +1418,7 @@ mod tests {
     #[test]
     fn dna_indel_fallback_trims_at_actual_anchor_end() {
         init_tables();
-        let index = BarcodeIndex::from_barcodes(["ACGTACGT".to_string()], 8, Modality::Dna);
+        let index = BarcodeIndex::from_barcodes(["ACGTACGT".to_string()], 8);
         for lut in [
             DNA_NATIVE_TABLE.get().unwrap(),
             DNA_BISULFITE_TABLE.get().unwrap(),
@@ -1614,7 +1451,6 @@ mod tests {
                 "AAAAAAAG".to_string(),
             ],
             8,
-            Modality::Dna,
         );
         match index.match_simple(b"AAAAAAAG") {
             BarcodeMatch::Unique { id } => {
@@ -1624,66 +1460,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rna_layout_requires_complete_umi_and_post_umi_spacer() {
-        init_tables();
-        let index = BarcodeIndex::from_barcodes(vec!["AACGTGAT".to_string()], 8, Modality::Rna);
-        let lut = RNA_BISULFITE_TABLE.get().expect("RNA LUT");
-
-        let mut incomplete = Vec::new();
-        incomplete.extend_from_slice(TSO_SEQ);
-        incomplete.extend_from_slice(b"AACGTGAT");
-        incomplete.extend_from_slice(b"ACGTACGT");
-        let rejected =
-            match_rna_read(&incomplete, &index, lut).expect("layout evidence should exist");
-        assert!(!rejected.is_valid);
-        assert_eq!(rejected.fate, TerminalFate::Unmatched);
-
-        let mut complete = incomplete.clone();
-        complete.extend_from_slice(b"NNNNN");
-        complete.extend_from_slice(b"GATTACA");
-        let assigned = match_rna_read(&complete, &index, lut).expect("complete RNA layout");
-        assert!(assigned.is_valid);
-        assert_eq!(assigned.fate, TerminalFate::RnaAssigned);
-        assert_eq!(
-            assigned.trim_start,
-            TSO_SEQ.len() + 8 + LEN_UMI + LEN_SPACER
-        );
-    }
 
     #[test]
     fn observed_n_is_not_imputed_by_one_substitution_matching() {
-        let index = BarcodeIndex::from_barcodes(vec!["ACGTACGT".to_string()], 8, Modality::Dna);
+        let index = BarcodeIndex::from_barcodes(vec!["ACGTACGT".to_string()], 8);
         assert_eq!(index.match_simple(b"ACGTACGN"), BarcodeMatch::None);
     }
 
-    #[test]
-    fn rna_layout_requires_at_least_one_payload_base() {
-        init_tables();
-        let index = BarcodeIndex::from_barcodes(vec!["AACGTGAT".to_string()], 8, Modality::Rna);
-        let lut = RNA_BISULFITE_TABLE.get().expect("RNA LUT");
-
-        let mut no_payload = Vec::new();
-        no_payload.extend_from_slice(TSO_SEQ);
-        no_payload.extend_from_slice(b"AACGTGAT");
-        no_payload.extend_from_slice(b"ACGTACGT");
-        no_payload.extend_from_slice(b"NNNNN");
-        let rejected =
-            match_rna_read(&no_payload, &index, lut).expect("layout evidence should exist");
-        assert!(!rejected.is_valid);
-        assert_eq!(rejected.fate, TerminalFate::Unmatched);
-
-        no_payload.push(b'G');
-        let assigned =
-            match_rna_read(&no_payload, &index, lut).expect("payload should complete layout");
-        assert!(assigned.is_valid);
-        assert_eq!(assigned.fate, TerminalFate::RnaAssigned);
-    }
 
     #[test]
     fn dna_layout_requires_at_least_one_insert_base_after_gap() {
         init_tables();
-        let index = BarcodeIndex::from_barcodes(vec!["ACGTACGT".to_string()], 8, Modality::Dna);
+        let index = BarcodeIndex::from_barcodes(vec!["ACGTACGT".to_string()], 8);
         let lut = DNA_BISULFITE_TABLE.get().expect("DNA LUT");
 
         let mut no_insert = Vec::new();

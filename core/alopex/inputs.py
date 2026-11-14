@@ -62,6 +62,7 @@ from .io import (
     render_tsv,
     sha256_bytes,
     sha256_file,
+    stat_if_present,
     write_tsv_atomic,
 )
 from .runtime import (
@@ -440,6 +441,16 @@ def _audit_one_substitution_neighborhoods(values: list[str], label: str) -> None
         )
 
 
+def _iter_delimited_rows(handle: TextIO, path: Path, *, delimiter: str) -> Iterator[tuple[int, list[str]]]:
+    """用户表格的坏引号必须带文件/物理行号失败，不能吞掉后续身份记录。"""
+    reader = csv.reader(handle, delimiter=delimiter, strict=True)
+    try:
+        for values in reader:
+            yield reader.line_num, values
+    except csv.Error as exc:
+        raise ValueError(f"input table {path} line {reader.line_num}: invalid delimited data: {exc}") from exc
+
+
 def _barcode_field(
     row: Mapping[str | None, object], headers: Mapping[str, str], key: str
 ) -> str:
@@ -453,11 +464,10 @@ def validate_barcode_map_for_protocol(
     """按当前 protocol 读取并校验带类型的 barcode 行。"""
     path = Path(path)
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        headers = _header_map(reader.fieldnames)
+        records = _iter_delimited_rows(handle, path, delimiter=",")
+        _, fields = next(records, (0, []))
+        headers = _header_map(fields)
         required = ["dna_barcode", "cell_order"] + ([] if policy.name == "droplet" else ["plateid"])
-        if policy.requires_rna_barcode:
-            required.append("rna_barcode")
         missing = [name for name in required if name not in headers]
         if missing:
             raise ValueError(
@@ -466,28 +476,28 @@ def validate_barcode_map_for_protocol(
             )
 
         seen_dna: set[str] = set()
-        seen_rna: set[str] = set()
         seen_plate: set[str] = set()
         seen_order: set[str] = set()
         dna_lengths: set[int] = set()
-        rna_lengths: set[int] = set()
         usable_rows = 0
         barcode_rows: list[BarcodeRow] = []
 
-        for row_index, raw_row in enumerate(reader, start=2):
-            if None in raw_row or any(value is None for value in raw_row.values()):
+        for row_index, values in records:
+            if not values:
+                continue
+            if len(values) != len(fields):
                 raise ValueError(f"Barcode_Map.csv row {row_index} field count differs from its header")
+            raw_row = dict(zip(fields, values))
             dna = _barcode_field(raw_row, headers, "dna_barcode")
-            rna = _barcode_field(raw_row, headers, "rna_barcode")
             plate = _barcode_field(raw_row, headers, "plateid")
             order = _barcode_field(raw_row, headers, "cell_order")
-            if not any((dna, rna, plate, order)):
+            if not any((dna, plate, order)):
                 continue
             usable_rows += 1
-            if not dna or (not plate and policy.name != "droplet") or not order or (policy.requires_rna_barcode and not rna):
+            if not dna or (not plate and policy.name != "droplet") or not order:
                 raise ValueError(
                     f"Barcode_Map.csv row {row_index} has empty required field(s) for "
-                    f"protocol={policy.name}: DNA_Barcode={dna!r}, RNA_Barcode={rna!r}, "
+                    f"protocol={policy.name}: DNA_Barcode={dna!r}, "
                     f"PlateID={plate!r}, Cell_Order={order!r}"
                 )
 
@@ -495,17 +505,11 @@ def validate_barcode_map_for_protocol(
                 cell_identity("sample", "droplet", plate, dna)
                 if dna not in droplet_design_barcodes():
                     raise ValueError("Droplet called barcode is outside the fixed DD-MET5 design")
-                if rna:
-                    raise ValueError("Droplet does not support RNA barcodes")
             else:
                 _validate_barcode(dna, column="DNA_Barcode", row_number=row_index)
             if plate and SAMPLE_ID_RE.fullmatch(plate) is None:
                 raise ValueError(f"Barcode_Map.csv row {row_index} has an unsafe PlateID: {plate!r}")
             dna_lengths.add(len(dna))
-            if rna:
-                _validate_barcode(rna, column="RNA_Barcode", row_number=row_index)
-                rna_lengths.add(len(rna))
-
             if dna in seen_dna:
                 raise ValueError(f"Duplicate DNA_Barcode {dna!r} at row {row_index}")
             if plate and plate in seen_plate:
@@ -516,14 +520,9 @@ def validate_barcode_map_for_protocol(
             seen_plate.add(plate)
             seen_order.add(order)
 
-            if policy.requires_rna_barcode:
-                if rna in seen_rna:
-                    raise ValueError(f"Duplicate RNA_Barcode {rna!r} at row {row_index}")
-                seen_rna.add(rna)
             barcode_rows.append(
                 {
                     "dna_barcode": dna,
-                    "rna_barcode": rna,
                     "plate_id": plate,
                     "cell_order": order,
                 }
@@ -533,15 +532,8 @@ def validate_barcode_map_for_protocol(
             raise ValueError(f"Barcode map contains no usable rows: {path}")
         if not dna_lengths.issubset({17} if policy.name == "droplet" else _SUPPORTED_BARCODE_LENGTHS):
             raise ValueError(f"Unsupported DNA barcode lengths: {sorted(dna_lengths)}")
-        if policy.requires_rna_barcode and len(rna_lengths) != 1:
-            raise ValueError(
-                "SRD/dna-rna mode requires one uniform RNA barcode length; "
-                f"found {sorted(rna_lengths)}"
-            )
         if policy.name != "droplet":
             _audit_one_substitution_neighborhoods(sorted(seen_dna), "DNA_Barcode")
-        if policy.requires_rna_barcode:
-            _audit_one_substitution_neighborhoods(sorted(seen_rna), "RNA_Barcode")
         return barcode_rows
 
 
@@ -563,7 +555,7 @@ INITIAL_CELL_MANIFEST_FIELDS = (
     "plate_id",
     "cell_order",
     "dna_barcode",
-    "rna_barcode",
+
     "dna_raw_sample",
     "rna_sample",
     "notes",
@@ -576,6 +568,23 @@ def _require_header(fields: list[str], expected: tuple[str, ...], *, source: Pat
             f"{label} header/order does not match the current contract: {source}; "
             f"expected={list(expected)!r}, observed={fields!r}"
         )
+
+
+def _iter_project_sample_manifest_rows(handle: TextIO, path: Path) -> Iterator[tuple[int, dict[str, str]]]:
+    """严格解析六列清单，防止截断字段被补空或坏引号吞掉下一文库。"""
+    records = _iter_delimited_rows(handle, path, delimiter="\t")
+    _, fields = next(records, (0, []))
+    _require_header(fields, PROJECT_SAMPLE_MANIFEST_FIELDS, source=path, label="sample manifest")
+    for line_no, values in records:
+        if not any(value.strip() for value in values):
+            continue
+        if len(values) != len(fields):
+            relation = "more" if len(values) > len(fields) else "fewer"
+            raise ValueError(
+                f"sample manifest {path} line {line_no} has {relation} fields than its header "
+                f"(expected {len(fields)}, observed {len(values)})"
+            )
+        yield line_no, dict(zip(fields, values))
 
 
 def read_project_sample_manifest(
@@ -593,18 +602,10 @@ def _parse_project_sample_manifest(
     handle: TextIO, *, path: Path, species: str, protocol: str
 ) -> list[ProjectSampleRow]:
     input_columns = get_protocol(protocol).raw_input_columns
-    reader = csv.DictReader(handle, delimiter="\t")
-    fields = list(reader.fieldnames or [])
-    _require_header(fields, PROJECT_SAMPLE_MANIFEST_FIELDS, source=path, label="sample manifest")
     rows: list[ProjectSampleRow] = []
     seen_ids: dict[str, int] = {}
     seen_raw: dict[tuple[str, str], tuple[str, str, int]] = {}
-    for raw in reader:
-        line_no = reader.line_num
-        if None in raw:
-            raise ValueError(
-                f"sample_manifest.tsv line {line_no} has more fields than its header"
-            )
+    for line_no, raw in _iter_project_sample_manifest_rows(handle, path):
         row = {key: str(raw.get(key, "") or "").strip() for key in PROJECT_SAMPLE_MANIFEST_FIELDS}
         if not any(row.values()):
             continue
@@ -665,22 +666,19 @@ def _parse_project_sample_manifest(
 
 
 def _read_existing_manifest_loose(path: Path) -> list[ProjectSampleRow]:
-    if not path.is_file() or path.stat().st_size == 0:
+    try:
+        state = path.lstat()
+    except FileNotFoundError:
+        return []
+    if stat.S_ISLNK(state.st_mode):
+        state = path.stat()
+    if not stat.S_ISREG(state.st_mode):
+        raise ValueError(f"Existing sample manifest must be a regular file: {path}")
+    if state.st_size == 0:
         return []
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        fields = list(reader.fieldnames or [])
-        if not fields:
-            return []
-        if fields != list(PROJECT_SAMPLE_MANIFEST_FIELDS):
-            raise ValueError(
-                f"Existing sample manifest {path} header/order does not match the current contract: "
-                f"expected={list(PROJECT_SAMPLE_MANIFEST_FIELDS)!r}, observed={fields!r}"
-            )
         rows: list[ProjectSampleRow] = []
-        for raw in reader:
-            if None in raw:
-                raise ValueError(f"Existing sample manifest {path} line {reader.line_num} has too many fields")
+        for _, raw in _iter_project_sample_manifest_rows(handle, path):
             row = {field: str(raw.get(field, "") or "").strip() for field in PROJECT_SAMPLE_MANIFEST_FIELDS}
             if any(row.values()):
                 rows.append(row)
@@ -709,14 +707,14 @@ def build_refreshed_rows(
             old.get("dna_raw_sample", "") or ""
         ).strip()
         current_rna = str(old.get("rna_sample", "") or "").strip()
-        if current_rna and "rna_sample" not in input_columns:
+        if current_rna:
             external_rna.add(current_rna)
         kept_dna = current_dna if current_dna in discovered_set else ""
-        kept_rna = current_rna if "rna_sample" not in input_columns or current_rna in discovered_set else ""
-        if not kept_dna and not ("rna_sample" in input_columns and kept_rna):
+        kept_rna = current_rna
+        if not kept_dna:
             association = (
                 f"；外部 RNA 关联 {current_rna!r} 随该行移除"
-                if current_rna and "rna_sample" not in input_columns else ""
+                if current_rna else ""
             )
             warnings.warn(
                 f"样本 {old.get('sample_id', '')!r} 已无本地 FASTQ，刷新结果将移除该行{association}。",
@@ -754,24 +752,13 @@ def build_refreshed_rows(
             raw_owners[raw_sample] = (sample_id, column)
 
     unmatched = [sample for sample in discovered if sample not in raw_owners]
-    if "rna_sample" not in input_columns:
-        misplaced = sorted(set(unmatched) & external_rna)
-        if misplaced:
-            raise ValueError(
-                "FASTQ sample(s) declared only as external RNA links are present in DNA 01_raw: "
-                + ", ".join(misplaced)
-                + ". Keep RNA FASTQs in the RNA project; DNA inputs require an explicit dna_raw_sample mapping."
-            )
-    if protocol == "srd" and unmatched:
-        warnings.warn(
-            "New SRD raw sample(s) default to independent DNA routes: "
-            + ", ".join(unmatched)
-            + ". Move a raw name to rna_sample explicitly if it is an RNA-enrichment tube.",
-            UserWarning,
-            stacklevel=2,
+    misplaced = sorted(set(unmatched) & external_rna)
+    if misplaced:
+        raise ValueError(
+            "FASTQ sample(s) declared only as external RNA links are present in DNA 01_raw: "
+            + ", ".join(misplaced)
+            + ". Keep RNA FASTQs in the RNA project; DNA inputs require an explicit dna_raw_sample mapping."
         )
-
-
     for raw_sample in unmatched:
         if raw_sample in rows_by_id:
             raise ValueError(
@@ -807,6 +794,20 @@ def _canonical_project_manifest_rows(
         row["protocol"] = row["protocol"].lower()
         normalized.append(row)
     return sorted(normalized, key=lambda row: row["sample_id"])
+
+
+def discover_project_config(start: str | Path) -> Path:
+    """向上定位项目配置；仅跳过确实缺席的候选，不把访问失败当作父项目授权。"""
+    origin = Path(start).expanduser().resolve(strict=True)
+    for base in (origin, *origin.parents):
+        candidate = base / "00_config/config.yaml"
+        state = stat_if_present(candidate)
+        if state is None:
+            continue
+        if not stat.S_ISREG(state.st_mode):
+            raise ValueError(f"Project config must be a regular file: {candidate}")
+        return candidate
+    raise FileNotFoundError(f"No Alopex project config found from {origin}")
 
 
 def _resolve_config(project_arg: str | None, config_arg: str | None) -> tuple[Path, Path]:
@@ -869,8 +870,15 @@ def refresh_manifest(
     backup_path: Path | None = None
 
     if not dry_run:
-        original_manifest = manifest_path.read_bytes() if changed and manifest_path.exists() else None
-        original_mode = stat.S_IMODE(manifest_path.stat().st_mode) if original_manifest is not None else None
+        original_manifest = original_mode = None
+        if changed:
+            try:
+                manifest_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                original_manifest = manifest_path.read_bytes()
+                original_mode = stat.S_IMODE(manifest_path.stat().st_mode)
         with _fastq_rename_transaction(raw_dir, fastq_renames):
             try:
                 if changed:
@@ -910,7 +918,18 @@ def refresh_manifest(
 
 def init_project_directory(project_dir: str | Path, pipeline_root: str | Path) -> Path:
     """初始化项目骨架：目录、config 模板、manifest 头、Barcode Map 与 launcher symlink。"""
-    if not str(project_dir).strip():
+    def create_input(path: Path, content: bytes) -> None:
+        # 独占创建不跟随悬空链接，也不会截断在检查后由其他初始化者创建的输入。
+        try:
+            handle = path.open("xb")
+        except FileExistsError:
+            if not stat.S_ISREG(path.stat().st_mode):
+                raise ValueError(f"Project input must be a regular file: {path}")
+            return
+        with handle:
+            handle.write(content)
+
+    if not str(project_dir):
         raise ValueError("empty project path")
     root = Path(pipeline_root).expanduser().resolve()
     project = Path(project_dir).expanduser()
@@ -921,20 +940,19 @@ def init_project_directory(project_dir: str | Path, pipeline_root: str | Path) -
     for name in ("00_config", "01_raw", "02_work", "03_results", "04_logs", "05_tmp"):
         (project / name).mkdir(exist_ok=True)
     config = project / "00_config" / "config.yaml"
-    if not config.exists():
-        config.write_text(CONFIG_TEMPLATE_YAML, encoding="utf-8")
+    create_input(config, CONFIG_TEMPLATE_YAML.encode("utf-8"))
     manifest = project / "00_config" / "sample_manifest.tsv"
-    if not manifest.exists():
-        manifest.write_text(
-            "sample_id\tdna_raw_sample\trna_sample\tspecies\tprotocol\tnotes\n",
-            encoding="utf-8",
-        )
+    create_input(manifest, b"sample_id\tdna_raw_sample\trna_sample\tspecies\tprotocol\tnotes\n")
     barcode = project / "00_config" / "Barcode_Map.csv"
-    if not barcode.exists() and load_project_config(config)["analysis"]["protocol"] != "droplet":
-        source = root / "resources" / "Barcode_Map.csv"
-        if not source.is_file():
-            raise FileNotFoundError(f"Barcode Map template is missing: {source}")
-        shutil.copy2(source, barcode)
+    if load_project_config(config)["analysis"]["protocol"] != "droplet":
+        try:
+            barcode_state = barcode.stat()
+        except FileNotFoundError:
+            source = root / "resources" / "Barcode_Map.csv"
+            create_input(barcode, source.read_bytes())
+        else:
+            if not stat.S_ISREG(barcode_state.st_mode):
+                raise ValueError(f"Project input must be a regular file: {barcode}")
     launcher = project / "run_pipeline.sh"
     if not launcher.exists() and not launcher.is_symlink():
         launcher.symlink_to(root / "core" / "run_pipeline.sh")
@@ -1020,7 +1038,7 @@ def verify_demux_binary_revision(binary_path: str | Path, expected_revision: str
         )
 
 
-DEMUX_REPORT_SCHEMA_VERSION = 3
+DEMUX_REPORT_SCHEMA_VERSION = 4
 
 
 _REPORT_FIELDS = {
@@ -1030,12 +1048,12 @@ _REPORT_FIELDS = {
 }
 
 
-_FATE_FIELDS = {"dna_assigned", "rna_assigned", "ambiguous", "unmatched", "short"}
+_FATE_FIELDS = {"dna_assigned", "ambiguous", "unmatched", "short"}
 
 
 _SAMPLE_FIELDS = {
     "sample_name", "cell_sample_id", "plate_id", "cell_order", "dna_barcode",
-    "rna_barcode", "dna_read_count", "rna_read_count", "dna_status", "rna_status",
+    "dna_read_count", "dna_status",
 }
 
 
@@ -1044,7 +1062,6 @@ _OUTPUT_STATUSES = {"Pass", "Zero_Output", "Low_Reads_Removed"}
 
 class DemuxReadFates(TypedDict):
     dna_assigned: int
-    rna_assigned: int
     ambiguous: int
     unmatched: int
     short: int
@@ -1056,11 +1073,8 @@ class DemuxReportSample(TypedDict):
     plate_id: str
     cell_order: str
     dna_barcode: str
-    rna_barcode: str
     dna_read_count: int
-    rna_read_count: int
     dna_status: str
-    rna_status: str
 
 
 class DemuxReport(TypedDict):
@@ -1084,7 +1098,7 @@ def cell_status(reads: int, threshold: int) -> str:
 
 
 def read_demux_report(path: str | Path) -> DemuxReport:
-    """完整加载一份 schema-3 report，不为缺失字段做任何推断。"""
+    """完整加载一份 schema-4 report，不为缺失字段做任何推断。"""
 
     source = Path(path)
     if not source.is_file():
@@ -1101,11 +1115,11 @@ def _parse_demux_report(raw: object, source: Path) -> DemuxReport:
 
     schema = _integer(report["schema_version"], "schema_version", source)
     if schema != DEMUX_REPORT_SCHEMA_VERSION:
-        raise ValueError(f"Unsupported demux report schema_version={schema}; expected 3: {source}")
+        raise ValueError(f"Unsupported demux report schema_version={schema}; expected {DEMUX_REPORT_SCHEMA_VERSION}: {source}")
     for field in ("build_version", "source_revision", "mode", "retention_policy"):
         _text(report[field], field, source)
     mode = cast(str, report["mode"])
-    if mode not in {"dna-only", "dna-only-taps", "dna-rna", "dna-only-droplet"}:
+    if mode not in {"dna-only", "dna-only-taps", "dna-only-droplet"}:
         raise ValueError(f"Demux report mode is unsupported: {mode!r}: {source}")
     if report["retention_policy"] != "matched_read_pairs":
         raise ValueError(f"Demux report retention_policy is unsupported: {source}")
@@ -1125,27 +1139,23 @@ def _parse_demux_report(raw: object, source: Path) -> DemuxReport:
         raise ValueError(f"Demux report input/read-fate accounting is inconsistent: {source}")
     if counts["usable_read_pairs"] != counts["input_read_pairs"] - fates["short"]:
         raise ValueError(f"Demux report usable/input/short accounting is inconsistent: {source}")
-    if counts["matched_reads"] != fates["dna_assigned"] + fates["rna_assigned"]:
+    if counts["matched_reads"] != fates["dna_assigned"]:
         raise ValueError(f"Demux report matched/read-fate accounting is inconsistent: {source}")
-    if mode != "dna-rna" and fates["rna_assigned"]:
-        raise ValueError(f"DNA-only demux report has RNA-assigned reads: {source}")
-
     samples = report["samples"]
     if not isinstance(samples, list) or not samples:
         raise ValueError(f"Demux report samples must be a non-empty array: {source}")
     sample_names: set[str] = set()
     cell_ids: set[str] = set()
-    dna_total = rna_total = 0
+    dna_total = 0
     threshold = counts["retention_threshold"]
     for index, value in enumerate(samples):
         label = f"samples[{index}]"
         sample = _object(value, _SAMPLE_FIELDS, label, source)
         for field in (
             "sample_name", "cell_sample_id", "plate_id", "cell_order", "dna_barcode",
-            "dna_status", "rna_status",
+            "dna_status",
         ):
             _text(sample[field], f"{label}.{field}", source, empty=(field == "plate_id" and mode == "dna-only-droplet"))
-        _text(sample["rna_barcode"], f"{label}.rna_barcode", source, empty=True)
         sample_name, cell_id, plate = (
             cast(str, sample[key]) for key in ("sample_name", "cell_sample_id", "plate_id")
         )
@@ -1159,23 +1169,14 @@ def _parse_demux_report(raw: object, source: Path) -> DemuxReport:
         sample_names.add(sample_name)
 
         dna_reads = _integer(sample["dna_read_count"], f"{label}.dna_read_count", source)
-        rna_reads = _integer(sample["rna_read_count"], f"{label}.rna_read_count", source)
-        dna_status, rna_status = cast(str, sample["dna_status"]), cast(str, sample["rna_status"])
+        dna_status = cast(str, sample["dna_status"])
         if dna_status not in _OUTPUT_STATUSES or dna_status != cell_status(dna_reads, threshold):
             raise ValueError(f"{label}.dna_status does not match dna_read_count: {source}")
-        if mode != "dna-rna":
-            if rna_reads or rna_status != "Not_Used":
-                raise ValueError(f"DNA-only {label} has active RNA output fields: {source}")
-        elif not sample["rna_barcode"]:
-            raise ValueError(f"DNA/RNA {label} has an empty rna_barcode: {source}")
-        elif rna_status not in _OUTPUT_STATUSES or rna_status != cell_status(rna_reads, threshold):
-            raise ValueError(f"{label}.rna_status does not match rna_read_count: {source}")
         dna_total += dna_reads
-        rna_total += rna_reads
 
     if len(sample_names) != 1:
         raise ValueError(f"Demux report must contain exactly one project sample identity: {source}")
-    if dna_total != fates["dna_assigned"] or rna_total != fates["rna_assigned"]:
+    if dna_total != fates["dna_assigned"]:
         raise ValueError(f"Demux report sample/read-fate accounting is inconsistent: {source}")
     return cast(DemuxReport, report)
 
@@ -1768,7 +1769,6 @@ def write_initial_cell_manifest(
                     "plate_id": barcode["plate_id"],
                     "cell_order": barcode["cell_order"],
                     "dna_barcode": barcode["dna_barcode"],
-                    "rna_barcode": barcode["rna_barcode"],
                     "dna_raw_sample": project["dna_raw_sample"],
                     "rna_sample": project["rna_sample"],
                     "notes": project["notes"],
@@ -1833,10 +1833,6 @@ def read_cell_identity_manifest(path: str | Path) -> dict[str, CellIdentityRow]:
                 raise ValueError(
                     f"Initial cell manifest line {line_no} has no raw sample route: {source}"
                 )
-            if row["protocol"] == "srd" and not row["rna_barcode"]:
-                raise ValueError(
-                    f"Initial cell manifest line {line_no} has no SRD RNA barcode: {source}"
-                )
             if cell_id in rows:
                 raise ValueError(f"Initial cell manifest repeats sample_id={cell_id!r} at line {line_no}")
             rows[cell_id] = row
@@ -1877,12 +1873,9 @@ def validate_demux_report_against_cell_manifest(
             "plate_id": plate,
             "cell_order": sample["cell_order"],
             "dna_barcode": sample["dna_barcode"],
-            "rna_barcode": sample["rna_barcode"],
         }
         for key, observed in checks.items():
             expected_value = str(row.get(key, "") or "").strip()
-            if key == "rna_barcode" and not observed:
-                continue
             if observed != expected_value:
                 raise ValueError(
                     f"Demux identity mismatch for {cell_id!r}: {key}={observed!r}, "
@@ -1903,7 +1896,7 @@ def validate_demux_report_against_cell_manifest(
 
 
 def manifest_raw_samples(manifest_rows: list[ProjectSampleRow], protocol: str) -> set[str]:
-    """提取 manifest 登记的本地物理输入；Cabernet/TAPS 的外部 RNA 关联不参与选样。"""
+    """提取 manifest 登记的本地物理输入；所有协议的外部 RNA 关联不参与选样。"""
     return {
         row[column] for row in manifest_rows
         for column in get_protocol(protocol).raw_input_columns if row.get(column)
@@ -1923,7 +1916,6 @@ def map_discovered_samples_to_manifest(
     for row in manifest_rows:
         sid = row["sample_id"]
         dna_raw = row.get("dna_raw_sample", "")
-        rna = row.get("rna_sample", "")
         if dna_raw:
             route_id = default_dna_route(protocol)
             expected_raw[dna_raw] = {
@@ -1931,13 +1923,6 @@ def map_discovered_samples_to_manifest(
                 "route_id": route_id,
                 "source_column": "dna_raw_sample",
             }
-        if rna and "rna_sample" in input_columns:
-            expected_raw[rna] = {
-                "sample_id": sid,
-                "route_id": "srd_rna_enrichment_tube",
-                "source_column": "rna_sample",
-            }
-
     discovered_set = set(discovered)
     expected_set = set(expected_raw)
     missing_fastq = sorted(expected_set - discovered_set)
@@ -1949,7 +1934,7 @@ def map_discovered_samples_to_manifest(
         identity = expected_raw[raw_sample]
         sid = identity["sample_id"]
         route_id = identity["route_id"]
-        run_id = sid if identity["source_column"] == "dna_raw_sample" else f"{sid}__rna"
+        run_id = sid
         if run_id in mapped:
             raise ValueError(f"Canonical demux run ID collision: {run_id!r}")
         mapped[run_id] = {
@@ -1966,10 +1951,10 @@ DEMUX_MANIFEST_FIELDS = (
     "demux_sample", "project_sample_id", "raw_sample", "pipeline_mode", "route_id", "demux_mode",
     "downstream_dna", "demux_report_schema_version", "demux_build_version", "demux_source_revision",
     "retention_policy", "retention_threshold",
-    "rna_output_role", "high_cph_role", "plate_id", "cell_order", "dna_barcode", "rna_barcode",
-    "dna_reads", "rna_reads", "input_fastq_pairs", "input_read_pairs", "usable_read_pairs",
+    "high_cph_role", "plate_id", "cell_order", "dna_barcode",
+    "dna_reads", "input_fastq_pairs", "input_read_pairs", "usable_read_pairs",
     "matched_reads", "unmatched_reads", "ambiguous_reads", "short_reads", "unassigned_rate",
-    "dna_r1", "dna_r2", "rna_r1", "rna_r2", "dna_status", "rna_status",
+    "dna_r1", "dna_r2", "dna_status",
 )
 
 
@@ -2001,7 +1986,6 @@ def write_demux_manifest(
     report: DemuxReport,
     out_tsv: str,
     dna_out_dir: str,
-    rna_out_dir: str,
     pipeline_mode: str,
     route_id: str,
     downstream_dna: bool,
@@ -2044,7 +2028,6 @@ def write_demux_manifest(
     short_reads = fate["short"]
     unassigned_reads = max(input_pairs - matched_reads, 0)
     unmatched_rate = (unassigned_reads / input_pairs) if input_pairs else 0.0
-    rna_enabled = demux_mode == "dna-rna"
 
     rows: list[dict[str, object]] = []
     for sample in rep["samples"]:
@@ -2052,16 +2035,7 @@ def write_demux_manifest(
         plate_id = sample["plate_id"]
         cell_sample_id = sample["cell_sample_id"]
         dna_bc = sample["dna_barcode"]
-        rna_bc = sample["rna_barcode"]
         dna_dir = Path(dna_out_dir) / cell_sample_id
-        if rna_enabled and rna_bc:
-            rna_dir = Path(rna_out_dir) / cell_sample_id
-            rna_r1 = str(rna_dir / f"{cell_sample_id}_R1.fastq.gz")
-            rna_r2 = str(rna_dir / f"{cell_sample_id}_R2.fastq.gz")
-            rna_status = sample["rna_status"]
-        else:
-            rna_r1 = rna_r2 = rna_status = ""
-
         rows.append(
             {
                 "demux_sample": cell_sample_id,
@@ -2076,14 +2050,11 @@ def write_demux_manifest(
                 "demux_source_revision": rep["source_revision"],
                 "retention_policy": rep["retention_policy"],
                 "retention_threshold": rep["retention_threshold"],
-                "rna_output_role": route.rna_output_role,
                 "high_cph_role": route.high_cph_role,
                 "plate_id": plate_id,
                 "cell_order": sample["cell_order"],
                 "dna_barcode": dna_bc,
-                "rna_barcode": rna_bc if rna_enabled else "",
                 "dna_reads": sample["dna_read_count"],
-                "rna_reads": sample["rna_read_count"] if rna_enabled else 0,
                 "input_fastq_pairs": input_fastq_pairs,
                 "input_read_pairs": input_pairs,
                 "usable_read_pairs": usable_pairs,
@@ -2094,10 +2065,7 @@ def write_demux_manifest(
                 "unassigned_rate": f"{unmatched_rate:.6f}",
                 "dna_r1": str(dna_dir / f"{cell_sample_id}_R1.fastq.gz"),
                 "dna_r2": str(dna_dir / f"{cell_sample_id}_R2.fastq.gz"),
-                "rna_r1": rna_r1,
-                "rna_r2": rna_r2,
                 "dna_status": sample["dna_status"],
-                "rna_status": rna_status,
             }
         )
 
@@ -2115,7 +2083,6 @@ def write_demux_manifest(
             "demux_source_revision": rep["source_revision"],
             "retention_policy": rep["retention_policy"],
             "retention_threshold": rep["retention_threshold"],
-            "rna_output_role": route.rna_output_role,
             "high_cph_role": route.high_cph_role,
             "input_fastq_pairs": input_fastq_pairs,
             "input_read_pairs": input_pairs,
@@ -2202,15 +2169,15 @@ def read_demux_manifest(manifest_path: str) -> list[DemuxRow]:
         return value
 
     summary_line = row_lines[-1]
-    if summary["demux_report_schema_version"] != "3":
+    if summary["demux_report_schema_version"] != str(DEMUX_REPORT_SCHEMA_VERSION):
         raise ValueError(
             f"Demux manifest {path} uses report schema "
-            f"{summary['demux_report_schema_version']!r}; Alopex requires schema 3"
+            f"{summary['demux_report_schema_version']!r}; Alopex requires schema {DEMUX_REPORT_SCHEMA_VERSION}"
         )
     for field in (
-        "project_sample_id", "plate_id", "cell_order", "dna_barcode", "rna_barcode",
-        "dna_reads", "rna_reads", "dna_r1", "dna_r2", "rna_r1", "rna_r2",
-        "dna_status", "rna_status",
+        "project_sample_id", "plate_id", "cell_order", "dna_barcode",
+        "dna_reads", "dna_r1", "dna_r2",
+        "dna_status",
     ):
         if summary[field] != "":
             raise ValueError(
@@ -2221,7 +2188,7 @@ def read_demux_manifest(manifest_path: str) -> list[DemuxRow]:
         "raw_sample", "pipeline_mode", "route_id", "demux_mode", "downstream_dna",
         "demux_report_schema_version", "demux_build_version", "demux_source_revision",
         "retention_policy", "retention_threshold",
-        "rna_output_role", "high_cph_role", "input_fastq_pairs", "input_read_pairs",
+        "high_cph_role", "input_fastq_pairs", "input_read_pairs",
         "usable_read_pairs", "matched_reads", "unmatched_reads", "ambiguous_reads",
         "short_reads", "unassigned_rate",
     )
@@ -2244,12 +2211,12 @@ def read_demux_manifest(manifest_path: str) -> list[DemuxRow]:
     except Exception as exc:
         raise ValueError(f"Invalid protocol/raw route in demux manifest {path}") from exc
     observed_route = (
-        summary["demux_mode"], summary["downstream_dna"], summary["rna_output_role"],
+        summary["demux_mode"], summary["downstream_dna"],
         summary["high_cph_role"],
     )
     expected_route = (
         route.demux_mode, "true" if route.downstream_dna else "false",
-        route.rna_output_role, route.high_cph_role,
+        route.high_cph_role,
     )
     if observed_route != expected_route:
         raise ValueError(
@@ -2303,24 +2270,13 @@ def read_demux_manifest(manifest_path: str) -> list[DemuxRow]:
         if not cell["cell_order"].strip():
             raise ValueError(f"Demux manifest line {line_no} has empty cell_order: {path}")
         dna_reads = nonnegative_int(cell, "dna_reads", line_no)
-        rna_reads = nonnegative_int(cell, "rna_reads", line_no)
-        assigned_reads += dna_reads + rna_reads
+        assigned_reads += dna_reads
         unit_float(cell, "unassigned_rate", line_no)
 
         _validate_cell_status(
             "dna", dna_reads, cell["dna_status"],
             threshold=threshold, line_no=line_no, path=path,
         )
-        if route.demux_mode == "dna-rna":
-            if not cell["rna_barcode"] or not cell["rna_r1"] or not cell["rna_r2"]:
-                raise ValueError(f"DNA/RNA demux row has incomplete RNA identity/paths at line {line_no}: {path}")
-            _validate_cell_status(
-                "rna", rna_reads, cell["rna_status"],
-                threshold=threshold, line_no=line_no, path=path,
-            )
-        elif cell["rna_barcode"] or cell["rna_r1"] or cell["rna_r2"] or cell["rna_status"] or rna_reads:
-            raise ValueError(f"DNA-only demux row contains RNA output fields at line {line_no}: {path}")
-
     if len(project_ids) != 1:
         raise ValueError(f"Demux manifest must describe exactly one project sample: {path}")
     if assigned_reads != totals["matched_reads"]:
@@ -2336,7 +2292,6 @@ def write_run_metadata(
     mqc_path: str,
     manifest_path: str,
     dna_dir: str,
-    rna_dir: str,
     pipeline_mode: str,
     route_id: str,
     downstream_dna: str,
@@ -2351,57 +2306,12 @@ def write_run_metadata(
         report,
         manifest_path,
         dna_dir,
-        rna_dir,
         pipeline_mode,
         route_id,
         str(downstream_dna).strip().lower() == "true",
         raw_sample,
         cell_manifest_path,
     )
-
-
-def collect_rna_fastq(
-    manifest_path: str, intermediate_dir: str, marker: str, run_id: str
-) -> int:
-    """把已提交 demux run 的 RNA FASTQ 硬链接收集到 02_work/RNA/FASTQ 保留区。
-
-    demux scratch（02_work/demux/）在成功发布后会被整树回收；本步骤在 DAG 内
-    先行建立同 inode 硬链接，保证 SRD 的 RNA 原始数据不受该清理影响。
-    """
-    rows = read_demux_manifest(manifest_path)
-    collected = 0
-    for row in rows:
-        if row["demux_sample"] == "__SUMMARY__":
-            continue
-        if str(row.get("rna_status", "")) != "Pass":
-            continue
-        route_id = str(row.get("route_id", "")).strip()
-        cell_id = str(row.get("demux_sample", "")).strip()
-        if not route_id or not cell_id:
-            raise ValueError(
-                f"Demux manifest row with rna_status=Pass lacks route/sample id: {run_id}"
-            )
-        for mate in (1, 2):
-            source = row.get(f"rna_r{mate}", "")
-            if not str(source).strip():
-                raise ValueError(
-                    f"Demux manifest marks {cell_id!r} RNA as Pass without rna_r{mate}: {run_id}"
-                )
-            destination = rna_fastq_collect_destination(Path(intermediate_dir), route_id, cell_id, mate)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = project_temporary_parent(destination) / (destination.name + f".tmp.{os.getpid()}.{uuid.uuid4().hex}")
-            try:
-                os.link(source, temporary)
-                os.replace(temporary, destination)
-            finally:
-                temporary.unlink(missing_ok=True)
-            collected += 1
-
-    payload = {"run_id": run_id, "collected_files": collected}
-    marker_path = Path(marker)
-    atomic_write_json(marker_path, payload)
-    print(f"INFO: run={run_id} collected_rna_files={collected}")
-    return collected
 
 
 DEMUX_COMPLETION_SCHEMA = 1
@@ -2460,26 +2370,20 @@ def validate_demux_manifest_against_cell_manifest(
                     f"Demux identity mismatch for {cell_id!r}: {field}="
                     f"{demux.get(field)!r}, initial manifest={planned.get(field)!r}"
                 )
-        if demux.get("rna_barcode") and demux["rna_barcode"] != planned.get("rna_barcode", ""):
-            raise ValueError(
-                f"Demux identity mismatch for {cell_id!r}: rna_barcode="
-                f"{demux['rna_barcode']!r}, initial manifest={planned.get('rna_barcode')!r}"
-            )
 
 
 def _validate_committed_fastqs(
-    rows: list[DemuxRow], dna_dir: Path, rna_dir: Path
+    rows: list[DemuxRow], dna_dir: Path
 ) -> None:
     dna_root = dna_dir.resolve()
-    rna_root = rna_dir.resolve()
-    if not dna_root.is_dir() or not rna_root.is_dir():
+    if not dna_root.is_dir():
         raise FileNotFoundError(
-            f"Committed demux output directory is missing: DNA={dna_root}, RNA={rna_root}"
+            f"Committed demux output directory is missing: DNA={dna_root}"
         )
     for row in rows:
         if row["demux_sample"] == "__SUMMARY__":
             continue
-        for modality, root in (("dna", dna_root), ("rna", rna_root)):
+        for modality, root in (("dna", dna_root),):
             if row[f"{modality}_status"] != "Pass":
                 continue
             for mate in (1, 2):
@@ -2528,7 +2432,7 @@ def _load_committed_completion(
         if not path.is_file():
             raise FileNotFoundError(f"Committed demux file is missing: {path}")
         identities[key] = path
-    for key in ("dna_dir", "rna_dir"):
+    for key in ("dna_dir",):
         directory = Path(str(value.get(key, ""))).resolve()
         if not directory.is_dir():
             raise FileNotFoundError(f"Committed demux output directory is missing: {directory}")
@@ -2544,7 +2448,6 @@ def write_demux_completion(
     report_path: str,
     mqc_path: str,
     dna_dir: str,
-    rna_dir: str,
     cell_manifest_path: str,
 ) -> None:
     """为一个完整发布的 demux generation 写出 commit 边界记录。"""
@@ -2552,7 +2455,7 @@ def write_demux_completion(
     validate_demux_manifest_against_cell_manifest(
         manifest_path, cell_manifest_path, project_sample_id, rows=rows
     )
-    _validate_committed_fastqs(rows, Path(dna_dir), Path(rna_dir))
+    _validate_committed_fastqs(rows, Path(dna_dir))
     cell_ids = [row["demux_sample"] for row in rows if row["demux_sample"] != "__SUMMARY__"]
     completion: DemuxCompletion = {
         "schema_version": DEMUX_COMPLETION_SCHEMA,
@@ -2567,7 +2470,6 @@ def write_demux_completion(
         "multiqc": file_identity(mqc_path),
         "initial_cell_manifest": file_identity(cell_manifest_path),
         "dna_dir": str(Path(dna_dir).resolve()),
-        "rna_dir": str(Path(rna_dir).resolve()),
     }
     output = Path(out_json)
     atomic_write_json(output, completion)
@@ -2607,7 +2509,6 @@ def validate_demux_completion(
     _validate_committed_fastqs(
         rows,
         Path(str(value.get("dna_dir", ""))).resolve(),
-        Path(str(value.get("rna_dir", ""))).resolve(),
     )
     value["_manifest_path"] = str(identities["manifest"])
     value["_cell_manifest_path"] = str(identities["initial_cell_manifest"])
@@ -2742,19 +2643,6 @@ def resolve_demux_fastq_from_manifest(
     return path
 
 
-def rna_fastq_collect_destination(
-    intermediate_dir: Path, route_id: str, demux_sample: str, mate: int
-) -> Path:
-    """SRD RNA FASTQ 在 02_work/RNA/FASTQ 保留区的规范落点（收集规则与聚合共用）。"""
-    return (
-        Path(intermediate_dir)
-        / "RNA"
-        / "FASTQ"
-        / route_id
-        / f"{demux_sample}_R{int(mate)}.fastq.gz"
-    )
-
-
 def write_demux_mqc(
     report: DemuxReport, out_json: str, pipeline_mode: str, route_id: str,
     *, calling_metrics: str = "", structure_metrics: str = "",
@@ -2781,12 +2669,6 @@ def write_demux_mqc(
             "DNA_Reads": sample["dna_read_count"],
             "DNA_Status": sample["dna_status"],
         }
-        if demux_mode == "dna-rna":
-            row.update({
-                "RNA_Barcode": sample["rna_barcode"],
-                "RNA_Reads": sample["rna_read_count"],
-                "RNA_Status": sample["rna_status"],
-            })
         data[key] = row
 
     fate = rep["read_fates"]

@@ -1,10 +1,10 @@
 {
   "schema_version": 2,
-  "benchmark_id": "doctor_hpc_raw_v2",
+  "benchmark_id": "doctor_hpc_raw_v3",
   "description": "Cabernet paired raw records (hg38 human and mm10 mouse) sampled unchanged from internal benchmark projects; source identities are sanitized in this manifest and the fixture file names are neutral; synthetic supplements are generated separately by Doctor. TAPS has no native raw FASTQ validation.",
   "barcode_map": {
     "path": "Barcode_Map.csv",
-    "sha256": "57baaae2244465be25a04dabc849ba2d8b192c2169f8c680f641b8d5311a3e39"
+    "sha256": "939fc927d2bedeb78976bb3ca56f4540d6b6367f3040bbb23c9a0e208010f519"
   },
   "datasets": {
     "hg38_cabernet": {
@@ -1126,47 +1126,46 @@
         "raw_records_modified": false
       }
     },
-    "mm10_srd": {
+    "mm10_cabernet": {
       "species": "mm10",
       "read_pairs": 1050,
       "fastq_files": [
         {
-          "path": "mm10_srd_L001_R1_001.fastq.gz",
+          "path": "mm10_cabernet_L001_R1_001.fastq.gz",
           "sha256": "1c1fa15ba30b091eefb87aea7c24d3876da361ad2b70b8c31ca92ac3483653ab",
           "pairs": 525,
           "records_sha256": "a83a90e7e1cd52c6ae658b19be3bf2b31e09cf0199bcdb76bddc69d9431945b3"
         },
         {
-          "path": "mm10_srd_L001_R2_001.fastq.gz",
+          "path": "mm10_cabernet_L001_R2_001.fastq.gz",
           "sha256": "590601588a9f8a996a9f1a4d4c8dcb64d4252832a4f4d779609a4dae0cacc591",
           "pairs": 525,
           "records_sha256": "a5941ee2432bdf11b069a65d24b47fad007b10a39e63d220a9f824e8386efd48"
         },
         {
-          "path": "mm10_srd_L002_R1_001.fastq.gz",
+          "path": "mm10_cabernet_L002_R1_001.fastq.gz",
           "sha256": "b66deda2ddca8f94133c16ac357928d133aaeeb9cb86d2834ab4d8a460689c95",
           "pairs": 525,
           "records_sha256": "f0f8649168f334410da1ff1278e5e50a3ea409eb6766eaa00878df963889a833"
         },
         {
-          "path": "mm10_srd_L002_R2_001.fastq.gz",
+          "path": "mm10_cabernet_L002_R2_001.fastq.gz",
           "sha256": "1263b4b7792823dacd999fe39b230cc209d6c2190d762d8d35082bd2f408f149",
           "pairs": 525,
           "records_sha256": "f1e4f819e29d6618289761cdfb4e562874182274994d1fd7259a1e4baa0fe0c3"
         }
       ],
       "source_provenance": {
-        "source_project": "internal-mm10_srd",
         "source_fastqs": [
           {
-            "path": "mm10_srd_R1.fastq.gz",
             "bytes": 25852038856,
-            "mtime_ns": 1776128244000000000
+            "mtime_ns": 1776128244000000000,
+            "mate": 1
           },
           {
-            "path": "mm10_srd_R2.fastq.gz",
             "bytes": 28354807075,
-            "mtime_ns": 1776128742000000000
+            "mtime_ns": 1776128742000000000,
+            "mate": 2
           }
         ],
         "source_barcode_sha256": "1b4b8223d76ed210118ab92e8cd3430104f52c9a680a93cdcd7aaef711c4a51f",
@@ -2251,7 +2250,6 @@
       "dataset": "hg38_cabernet",
       "real_pairs": 1050,
       "synthetic_dna_pairs": 40,
-      "synthetic_rna_pairs_per_tube": 0,
       "dna_input_read_pairs": 1090,
       "dna_matched_read_pairs": 1074,
       "cells": {
@@ -2278,27 +2276,30 @@
       "minimum_duplicate_pairs_total": 1,
       "minimum_high_cph_pairs_total": 1
     },
-    "mm10-srd-biscuit": {
-      "dataset": "mm10_srd",
+    "hg38-taps-rastair": {
+      "kind": "independent_synthetic_chemistry_truth",
+      "real_taps_pairs": 0
+    },
+    "mm10-cabernet-biscuit": {
+      "dataset": "mm10_cabernet",
       "real_pairs": 1050,
       "synthetic_dna_pairs": 40,
-      "synthetic_rna_pairs_per_tube": 24,
-      "dna_input_read_pairs": 1114,
-      "dna_matched_read_pairs": 1101,
+      "dna_input_read_pairs": 1090,
+      "dna_matched_read_pairs": 1077,
       "cells": {
-        "mm10_srd_A1": {
+        "mm10_cabernet_A1": {
           "dna_reads": 538,
           "dna_status": "Pass"
         },
-        "mm10_srd_B1": {
+        "mm10_cabernet_B1": {
           "dna_reads": 537,
           "dna_status": "Pass"
         },
-        "mm10_srd_C1": {
+        "mm10_cabernet_C1": {
           "dna_reads": 2,
           "dna_status": "Low_Reads_Removed"
         },
-        "mm10_srd_D1": {
+        "mm10_cabernet_D1": {
           "dna_reads": 0,
           "dna_status": "Zero_Output"
         }
@@ -2308,10 +2309,6 @@
       "minimum_host_cpg_rows_per_active_cell": 10,
       "minimum_duplicate_pairs_total": 1,
       "minimum_high_cph_pairs_total": 1
-    },
-    "hg38-taps-rastair": {
-      "kind": "independent_synthetic_chemistry_truth",
-      "real_taps_pairs": 0
     }
   }
 }
