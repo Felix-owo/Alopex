@@ -1,4 +1,4 @@
-# Alopex v18.4
+# Alopex v18.5
 
 本仓为公开运行包；开发文档、测试和维护规范由相应私有开发仓提供。
 
@@ -17,9 +17,9 @@
 | 已有项目失败、锁残留或发布中断 | [运行与恢复](#6-运行与恢复) |
 | 想看资源、进度或错误日志 | [运行状态与详细输出](#运行状态与详细输出) |
 | 上游已完成，要做 QC 或导出矩阵 | [下游 README](downstream/README.md) |
-| 刚升级 v18.4，要核对修复与恢复步骤 | [v18.4 更新说明](#v184-更新说明) |
+| 刚升级 v18.5，要核对修复与恢复步骤 | [v18.5 更新说明](#v185-更新说明) |
 
-正式源码以 Git tag `v18.4` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v18.5` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
@@ -32,9 +32,9 @@
 | 查阅内容 | 文档 |
 | --- | --- |
 | Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
-| 配置参数、QC 字段与计数口径 | [ANALYSIS_PARAMETERS](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/docs/ANALYSIS_PARAMETERS.md) |
-| 流程与维护契约 | [pipeline.drawio](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/docs/pipeline.drawio)、[AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/AGENTS.md) |
-| 实测结果、验证范围与失败教训 | [BENCHMARKS](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/docs/BENCHMARKS.md) |
+| 配置参数、QC 字段与计数口径 | [ANALYSIS_PARAMETERS](https://github.com/Felix-owo/Alopex_dev/blob/v18.5/docs/ANALYSIS_PARAMETERS.md) |
+| 流程与维护契约 | [pipeline.drawio](https://github.com/Felix-owo/Alopex_dev/blob/v18.5/docs/pipeline.drawio)、[AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/v18.5/AGENTS.md) |
+| 实测结果、验证范围与失败教训 | [BENCHMARKS](https://github.com/Felix-owo/Alopex_dev/blob/v18.5/docs/BENCHMARKS.md) |
 
 
 ## 1. 安装
@@ -47,20 +47,20 @@ demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态�
 
 Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v18.4 Release](https://github.com/Felix-owo/Alopex/releases/tag/v18.4) 下载 `Alopex-v18.4.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。
+从 [v18.5 Release](https://github.com/Felix-owo/Alopex/releases/tag/v18.5) 下载 `Alopex-v18.5.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。
 
 Alopex_dev 完整发行包保留全部受版本控制的源码、固定资源、下游 Notebook、docs、tests 与维护规范。公开 Alopex 另发运行包，排除 docs、tests 和开发规范；Conda、生成参考、科学结果及未跟踪日志均不入包。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v18.4.tar.gz
-cd Alopex-v18.4
+tar -xzf Alopex-v18.5.tar.gz
+cd Alopex-v18.5
 conda --version
 ```
 
 跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。
 
-运行快照会记录实际源码、环境和输入身份，实验及验收范围见 [发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/docs/benchmarks/config-audit.md#release-v18-4)。
+运行快照会记录实际源码、环境和输入身份，实验及验收范围见 [发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v18.5/docs/benchmarks/config-audit.md#release-v18-5)。
 
 | 平台 / 部署方式 | 要求 |
 | --- | --- |
@@ -327,12 +327,14 @@ Alopex 以 [GPL-3.0](LICENSE) 发布。
 开发仓 `.gitattributes` 不排除 docs/tests；公开仓单独用 `export-ignore` 固定运行发行内容。两者都使用 [Git 原生归档](https://git-scm.com/docs/git-archive) 重建，无独立打包脚本：
 
 ```bash
-git archive --format=tar.gz --prefix=Alopex-v18.4/ -o Alopex-v18.4.tar.gz v18.4
+git archive --format=tar.gz --prefix=Alopex-v18.5/ -o Alopex-v18.5.tar.gz v18.5
 ```
 
 源码 checkout 的当前文档结构见 [docs 导航](https://github.com/Felix-owo/Alopex_dev/blob/main/docs/README.md)，修改前按 [AGENTS](https://github.com/Felix-owo/Alopex_dev/blob/main/AGENTS.md) 的任务清单读取详细契约。上文固定 tag 链接用于对应正式发行版的历史说明。
 
-### v18.4 更新说明
+### v18.5 更新说明
+
+Notebook 环境限定 NumPy `>=2,<2.3`，匹配 AnnData 0.10 所用 SciPy 1.14 的运行支持范围；升级后由 Doctor 正常重建该角色，已验收的 NumPy 2.2.6 数值组合保持有效。
 
 - QC/Raw/Single 使用标准 H5AD 磁盘 CSR，不再依赖 SnapATAC2 或 Polars；公开四列 CpG、原始计数与坐标保持不变。
 - Notebook 增加逐染色体诊断、带覆盖及抽样状态的 TSS score、逐细胞筛选原因；矩阵 obs 同时保存 QC、条码、孔序和下游注释，默认 HQ 门槛不变。
@@ -340,7 +342,7 @@ git archive --format=tar.gz --prefix=Alopex-v18.4/ -o Alopex-v18.4.tar.gz v18.4
 
 升级后运行标准 Doctor，重启 Notebook kernel 并从第一格运行。旧 Raw schema 按完整输入身份自动重建，随后生成同代 Single；不能只改旧矩阵 metadata。BISCUIT 原生读段名称、严格输入与中断修复也包含在本次全部仓库同步中，既有 GTF 参考升级要求见 [v18.1 发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v18.1/docs/benchmarks/config-audit.md#release-v18-1)。不自动重跑生产数据。
 
-本机原始计数/坐标/缺失真值、完整回归、隔离 Doctor 与部署边界见[本版发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v18.4/docs/benchmarks/config-audit.md#release-v18-4)。
+本机原始计数/坐标/缺失真值、完整回归、隔离 Doctor 与部署边界见[本版发行验收](https://github.com/Felix-owo/Alopex_dev/blob/v18.5/docs/benchmarks/config-audit.md#release-v18-5)。
 
 ### 源码与临时文件位置
 

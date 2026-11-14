@@ -90,7 +90,7 @@ notebook:
   - jupyterlab
   - matplotlib-base>=3.9,<4
   - numba>=0.61,<0.63
-  - numpy>=2,<3
+  - numpy>=2,<2.3
   - packaging>=24,<26
   - psutil>=7.2,<8
   - pandas>=2.2,<3
