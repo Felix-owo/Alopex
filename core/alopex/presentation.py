@@ -13,6 +13,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 
 _LOADED_MODULE_CODE = sys._getframe().f_code
 
@@ -22,6 +23,28 @@ from typing import TextIO
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CHILD_ENV = "DNA_PIPELINE_PRESENTATION_CHILD"
+SNAKEMAKE_JOB_ID = r"(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|\d+)"
+
+
+def observe_slurm_group_completion(workflow) -> None:
+    """补记已完成 Slurm 分组的 UUID，和插件的分组提交日志对应。"""
+    if getattr(getattr(workflow, 'executor_plugin', None), 'cli_prefix', None) != 'slurm':
+        return
+    executor = getattr(workflow.scheduler, '_executor', None)
+    completed = getattr(executor, 'handle_job_success', None)
+    if completed is None:
+        return
+
+    def report(job):
+        result = completed(job)
+        try:
+            if job.is_group():
+                print(f'[Alopex group finished] {job.jobid}', flush=True)
+        except Exception:
+            pass  # 展示事件缺席不改变调度器处理结果。
+        return result
+
+    executor.handle_job_success = report
 
 
 def duration(seconds: float) -> str:
@@ -146,8 +169,10 @@ class RunView:
             self.worker_success = True  # 仍须等待子进程退出（含 finally 关闭句柄）。
         if message.startswith("QC 输入："):
             self.cells = message
-        if message.startswith("RawAdata："):
-            self.caches['RawAdata'] = message.partition('：')[2]
+        if message.startswith("已复用当前完整 QC"):
+            self.caches["CpG"] = "已复用"
+        if "单次解码，汇总" in message:
+            self.caches["CpG"] = "本次计算"
         if "复用已核验缓存" in message:
             self.caches['CpG'] = '已复用'
         elif '正在从 CpG 表流式提取统计信息' in message:
@@ -215,19 +240,28 @@ class RunView:
         if native_progress:
             self.progress = f"当前 DAG 已完成 {native_progress[1]}/{native_progress[2]} 个任务"
             significant = True
-        job = re.search(r"Job (\d+) has been submitted with SLURM jobid (\d+(?:_\d+)?)", message)
+        job = re.search(rf"Job ({SNAKEMAKE_JOB_ID}) has been submitted with SLURM jobid (\d+(?:_\d+)?)", message)
         if job:
             self.jobs[job[2]] = job[1]
         # Slurm arrays 由官方插件逐元素输出 external_jobid，不能扩成用户全部作业。
-        array_job = re.search(r"external_jobid=(\d+_\d+),\s*snakemake_jobid=(\d+)", message)
+        array_job = re.search(rf"external_jobid=(\d+_\d+),\s*snakemake_jobid=({SNAKEMAKE_JOB_ID})(?=\W|$)", message)
         if array_job:
             self.jobs[array_job[1]] = array_job[2]
+        finished_job = re.match(rf"(?:Finished jobid:|\[Alopex group finished\]) ({SNAKEMAKE_JOB_ID})(?=\s|$)", message)
+        if finished_job:
+            task = finished_job[1]
+            self.job_context.pop(task, None)
+            if self.pending_job == task:
+                self.pending_job = ''
+            # 采用 controller 的完成事件。squeue 中缺席的任务仍保留给后续观测。
+            self.jobs = {job: local for job, local in self.jobs.items() if local != task}
+            self.queue_rows = [row for row in self.queue_rows if row['id'] in self.jobs]
         doctor_job = re.match(r"\[Alopex job\] (\d+) (.*)", message)
         if doctor_job:
             self.jobs[doctor_job[1]] = doctor_job[2]
         if "TSS 按 CloneID" in message or message.startswith("CloneID="):
             self.sampling.append(message)
-        elif any(word in message for word in ("缓存", "RawAdata", "开始计算", "跳过 TSS")):
+        elif any(word in message for word in ("缓存", "SingleCpG", "开始计算", "跳过 TSS")):
             self.detail.append(message)
         if "WARNING" in line or message.startswith("WARNING:"):
             if message in self.warnings or len(self.warnings) < 100:
@@ -556,16 +590,32 @@ def run_displayed(command: list[str], *, mode: str, title: str, log_dir: Path,
     renderer=Renderer(view,notebook=notebook) if view is not None else None
     process=None
     saved={}
+    interrupted_by=None
+
+    def interrupt(signum, _frame):
+        nonlocal interrupted_by
+        if interrupted_by is None:
+            interrupted_by=signum
+            # 启动期间先记录信号。子进程句柄归属明确后才能转发和回收。
+            if process is not None:
+                raise _Interrupted(signum)
+
     try:
         with log_stream if log_stream is not None else nullcontext() as log:
+            if threading.current_thread() is threading.main_thread():
+                signals=(signal.SIGINT,) if notebook else (signal.SIGINT,signal.SIGTERM,signal.SIGHUP)
+                for signum in signals:
+                    saved[signum]=signal.signal(signum,interrupt)
+            if interrupted_by is not None:
+                raise _Interrupted(interrupted_by)
             process=subprocess.Popen(command,env=environment,stdout=log,
                                      stderr=subprocess.STDOUT if log is not None else None,
                                      start_new_session=True)
-            if not notebook:
-                def interrupt(signum, frame):
-                    raise _Interrupted(signum)
-                for signum in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP):
-                    saved[signum]=signal.signal(signum,interrupt)
+            if interrupted_by is not None:
+                raise _Interrupted(interrupted_by)
+            if notebook and saved:
+                signal.signal(signal.SIGINT,saved[signal.SIGINT])
+                saved.clear()
             # 日志不可用时保留原生流，执行与中断仍走同一进程组所有权边界。
             if log is None:
                 code=process.wait()

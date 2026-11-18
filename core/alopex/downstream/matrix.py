@@ -4,7 +4,10 @@ from __future__ import annotations
 import sys
 _LOADED_MODULE_CODE = sys._getframe().f_code
 
-from concurrent.futures import ThreadPoolExecutor
+import csv
+from contextlib import closing, ExitStack
+from decimal import Decimal, InvalidOperation
+from itertools import islice
 from pathlib import Path
 
 import anndata as ad
@@ -119,7 +122,9 @@ class CSRWriter:
             target = self.group[name]
             target.resize((stop,))
             target[self.nnz:stop] = values
-        self.group["indptr"][self.rows + 1:self.rows + value.shape[0] + 1] = self.nnz + value.indptr[1:]
+        # SciPy 可用 int32 表示单块，磁盘行指针累计的是所有细胞的观测项。
+        pointers = np.add(value.indptr[1:], self.nnz, dtype=np.int64)
+        self.group["indptr"][self.rows + 1:self.rows + value.shape[0] + 1] = pointers
         self.nnz, self.rows = stop, self.rows + value.shape[0]
 
     def close(self):
@@ -231,31 +236,12 @@ def read_cpg_counts(handle, path, reference, base):
                              shape=(1, int(chromosome_offsets[-1])))
 
 
-def write_raw_cpgs(sources, chrom_sizes, base, output, open_text, *, workers=4, obs=None):
-    """最多workers个细胞在途；原始计数写入标准obsm CSR，不建立输入链接或empty sentinel。"""
+def cpg_reference(chrom_sizes, base):
+    """Canonical 全参考列布局，保留所有 contig 和实际坐标基准。"""
     names = sorted(chrom_sizes)
-    reference = pd.DataFrame({"reference_seq_name": names,
-        "reference_seq_length": np.asarray([chrom_sizes[n] + base for n in names], dtype=np.uint64),
-        "reference_bp_length": np.asarray([chrom_sizes[n] for n in names], dtype=np.uint64)})
-    ids = list(sources)
-    obs = pd.DataFrame(index=pd.Index(ids)) if obs is None else obs.loc[ids]
-    writer = CSRWriter(output, obs, group="obsm/__values__", n_vars=int(reference.reference_seq_length.sum()),
-                       dtype=np.uint32, uns={"reference_sequences": reference, "cpg_coordinate_base": base})
-    empty = set()
-    def read(sid):
-        with open_text(sources[sid]) as handle:
-            return read_cpg_counts(handle, sources[sid], reference, base)
-    try:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            for start in range(0, len(ids), workers):
-                batch = ids[start:start + workers]
-                for sid, row in zip(batch, executor.map(read, batch), strict=True):
-                    if not row.nnz:
-                        empty.add(sid)
-                    writer.append(row)
-    finally:
-        writer.close()
-    return empty
+    lengths = np.asarray([chrom_sizes[name] for name in names], dtype=np.uint64)
+    return pd.DataFrame({"reference_seq_name": names, "reference_seq_length": lengths + base,
+                         "reference_bp_length": lengths})
 
 
 class IntervalIndex:
@@ -328,6 +314,62 @@ def aggregate_row(reader, row, index):
             np.add.reduceat(methyl, starts), np.add.reduceat(coverage, starts), counts)
 
 
+def exact_integers(values, dtype):
+    """从原文或已精确解析的整数列读取，保留有符号边界和整值十进制写法。"""
+    bounds = np.iinfo(dtype)
+    if values.dtype.kind not in "iu":
+        if values.dtype.kind == "f":
+            raise ValueError(f"{values.name} requires original integer text")
+
+        def parse(text):
+            if not isinstance(text, str) or not text.isascii() or "_" in text:
+                raise ValueError(f"{values.name} must contain finite integers")
+            try:
+                number = Decimal(text)
+            except InvalidOperation as exc:
+                raise ValueError(f"{values.name} must contain finite integers") from exc
+            if (not number.is_finite() or not bounds.min <= number <= bounds.max
+                    or number != number.to_integral_value()):
+                raise ValueError(f"{values.name} must contain finite integers in the {np.dtype(dtype)} range")
+            return int(number)
+
+        return values.map(parse).astype(np.int64)
+    if len(values) and (int(values.min()) < bounds.min or int(values.max()) > bounds.max):
+        raise ValueError(f"{values.name} is outside the {np.dtype(dtype)} range")
+    return values.astype(np.int64, copy=False)
+
+
+def bed_blocks(path, columns, integer_types):
+    """按字面制表符读 BED。只有遇到非整数推断时才重读原文，避免浮点舍入。"""
+    options = dict(sep="\t", header=None, names=range(max(columns) + 1), usecols=list(columns),
+                   index_col=False, quoting=csv.QUOTE_NONE, keep_default_na=False, chunksize=100000)
+
+    text_types = {i: str for i, name in columns.items() if name not in integer_types}
+    with ExitStack() as handles:
+        blocks = handles.enter_context(pd.read_csv(path, dtype=text_types, **options))
+        raw_blocks, previous_raw = None, -1
+        for index, block in enumerate(blocks):
+            if any(block[i].dtype.kind not in "iu" for i, name in columns.items() if name in integer_types):
+                # 第二个 reader 只取有歧义的块。两边使用相同的空行与分块规则。
+                if raw_blocks is None:
+                    raw_blocks = handles.enter_context(pd.read_csv(path, dtype=str, **options))
+                block = next(islice(raw_blocks, index - previous_raw - 1, None))
+                previous_raw = index
+            block = block.rename(columns=columns, copy=False)
+            chromosomes = block.chrom.unique()
+            if any(not name.strip() for name in chromosomes):
+                raise ValueError(f"BED chromosome name is empty: {path}")
+            comments = [name for name in chromosomes if name.startswith("#")]
+            if comments:
+                block = block.loc[~block.chrom.isin(comments)].copy()
+            for name, dtype in integer_types.items():
+                try:
+                    block[name] = exact_integers(block[name], dtype)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid BED {name} in {path}: {exc}") from exc
+            yield block
+
+
 def write_single_cpg(reader, bed, output, obs):
     """逐块写参考标签、逐细胞写fraction CSR；不物化全库X或全参考字符串列表。"""
     base = int(reader.uns["cpg_coordinate_base"])
@@ -336,9 +378,8 @@ def write_single_cpg(reader, bed, output, obs):
         "source_cpg_representation": reader.uns.get("source_cpg_representation", "")})
     pieces, offset = {}, 0
     try:
-        with pd.read_csv(bed, sep="\t", header=None, usecols=[0, 1, 2], names=["chrom", "start", "end"],
-                         dtype={"chrom": str, "start": np.int64, "end": np.int64}, keep_default_na=False,
-                         chunksize=100000) as chunks:
+        with closing(bed_blocks(bed, {0: "chrom", 1: "start", 2: "end"},
+                                {"start": np.int64, "end": np.int64})) as chunks:
             for block in chunks:
                 if (block.start < 0).any() or (block.end <= block.start).any():
                     raise ValueError("Invalid single-CpG BED interval")

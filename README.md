@@ -1,4 +1,4 @@
-# Alopex v18.8
+# Alopex v18.9
 
 ## 从这里开始
 
@@ -15,9 +15,9 @@
 | 已有项目失败、锁残留或发布中断 | [运行与恢复](#6-运行与恢复) |
 | 想看资源、进度或错误日志 | [运行状态与详细输出](#运行状态与详细输出) |
 | 上游已完成，要做 QC 或导出矩阵 | [下游 README](downstream/README.md) |
-| 刚升级 v18.8，要核对修复与恢复步骤 | [v18.8 更新说明](#v188-更新说明) |
+| 刚升级 v18.9，要核对修复与恢复步骤 | [v18.9 更新说明](#v189-更新说明) |
 
-正式源码以 Git tag `v18.8` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+正式源码以 Git tag `v18.9` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
@@ -44,20 +44,20 @@ demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态�
 
 Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
 
-从 [v18.8 Release](https://github.com/Felix-owo/Alopex/releases/tag/v18.8) 下载 `Alopex-v18.8.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。
+从 [v18.9 Release](https://github.com/Felix-owo/Alopex/releases/tag/v18.9) 下载 `Alopex-v18.9.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。
 
-运行包包含源码、固定资源与下游 Notebook；Conda、生成参考、科学结果及未跟踪日志不入包。
+运行包包含源码、固定资源与下游 Notebook。Conda、生成参考、科学结果和运行日志在安装后生成。
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v18.8.tar.gz
-cd Alopex-v18.8
+tar -xzf Alopex-v18.9.tar.gz
+cd Alopex-v18.9
 conda --version
 ```
 
 跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。
 
-运行快照记录实际源码、环境和输入身份；成功 Doctor 仅证明工具链和固定小样本通过。
+运行快照记录实际源码、环境和输入身份。
 
 | 平台 / 部署方式 | 要求 |
 | --- | --- |
@@ -82,7 +82,7 @@ Doctor 保留下载的原始 FASTA，只在临时目录生成分析用 FASTA：h
 
 分别加入 lambda/pUC19 后为 **220／68 条比对序列**；分析 FASTA 仍使用 `<genome>.primary.lambda.puc19.fa` 路径，其内容范围以固定清单为准。
 
-比对包含真实辅助序列，最终 nCG、甲基化 QC、Gini、TSS 和 Single-CpG 矩阵按明确的主核染色体范围计算。RawAdata 保留全参考观测供 QC／审计，controls 单独统计。参考身份与坐标范围以实际封存回执和 `core/reference/` 固定清单为准。
+比对包含真实辅助序列，最终 nCG、甲基化 QC、Gini、TSS 和 Single-CpG 矩阵按明确的主核染色体范围计算。公开四列 CpG 保留全参考观测供 QC／审计，controls 单独统计。参考身份与坐标范围以实际封存回执和 `core/reference/` 固定清单为准。
 
 FASTA/FAI、各 backend 索引、TSS／single-CpG 通过各自的 `.reference.json` 内容回执绑定同一参考。`reference --check` 只读检查；未绑定或失配的旧组件不再报告 READY。修复时 Doctor 通过既有构建事务生成、验证、提交并重建相关派生。请在没有任务使用该受管 reference 时运行修复；旧交付及其矩阵不会被自动重算或转换。
 
@@ -214,8 +214,11 @@ mate 支持 `R1/R2` 或 `1/2`，分隔符支持 `_ . -`；lane 为 1–999，chu
 
 | 操作 / 清单 | 行为 |
 | --- | --- |
-| 刷新 | 全量发现输入，生成或更新 `00_config/sample_manifest.tsv`；多个目录中的同样本 plain 配对按目录顺序改为 chunk 命名 |
-| 冲突与备份 | 相同副本、缺 mate、混合命名等冲突拒绝；刷新失败或可捕获中断时回滚已应用改名，并恢复原清单（原不存在则移除新清单）。清单内容未变不改写，有效旧清单变更时原子更新滚动 `.bak`；备份写入失败保留上一完整备份。刷新、备份及回滚保留原清单权限 |
+| 刷新 | 扫描输入并更新 `00_config/sample_manifest.tsv`。同文库的普通 R1/R2 按目录名排序，后续批次的压缩字节追加到第一批两端。已有合并文件时继续追加到该文件。lane 或 chunk 命名的输入按分块读取 |
+| 合并结果 | 合并文件以 `.merged.fastq.gz` 或 `.merged.fq.gz` 结尾，例如 `SampleA.R1.raw.merged.fastq.gz`。Alopex 按原文库名识别这对文件。补测原件以 `.archived` 后缀留在各自目录 |
+| 重复交付 | 已合并文件中若已收录新批次任一端的完整压缩字节，刷新会在写入前报告两个路径。移出重复交付后，再次刷新 |
+| 冲突与恢复 | 相同副本、缺 mate、混合命名、链接输入或归档名冲突会阻止原位合并。保留第一批的独立原件。刷新与正式运行互斥。中断后再次刷新可恢复未提交的合并。若文件访问失败，解决报错中的问题后从同一入口重试 |
+| 清单备份 | 清单内容未变不改写，有效旧清单变更时原子更新滚动 `.bak`。备份写入失败保留上一完整备份。刷新、备份及回滚保留原清单权限 |
 | 清单六列 | `sample_id / dna_raw_sample / rna_sample / species / protocol / notes` |
 | 选样 | 删除不需要的行后直接 dry-run / 运行；未登记 FASTQ 可留在原地，会提示并跳过 |
 | 再次刷新 | **会补登记有效输入，可能重新加入手动删行的样本** |
@@ -231,7 +234,7 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 
 科学阶段临时数据固定写入当前项目 `05_tmp/`，每个作业使用独占随机子目录并只清理自身目录。启动前检查预计磁盘需求及10%余量，空间不足直接失败，不自动切换到节点 `/tmp`、`/var/tmp` 或外部 `TMPDIR`。该检查不预留跨作业容量，也不保证共享存储或用户配额永不耗尽。可恢复的跨节点工件保留在 `02_work/`。
 
-升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。新项目请使用初始化生成的当前配置模板。
+升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。使用初始化生成的当前配置模板查询调度参数。
 
 ```bash
 ./run_pipeline.sh --dry-run
@@ -241,14 +244,16 @@ DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联
 项目从当前目录向上定位；初始化、刷新和运行分别执行。launcher 不接受额外 Snakemake flag 或 target。
 遇到悬空配置链接、非普通配置文件或不可访问路径时停止，不改选父项目；先修复当前项目的 `00_config/config.yaml` 再重试。
 
+正式运行从同一份封存配置选择后端、调度参数和 DAG 输入。快照完成后再编辑项目配置，改动由下一次正式启动读取。`--dry-run` 的规划工作区随调用退出清理，项目内保持原有状态。
+
 | 情况 | 处理方式 |
 | --- | --- |
 | 查看进度 / 失败 | 完整日志在 `04_logs/controller/<run_id>.log`，规则与 Slurm 日志在 `04_logs/{rules,slurm}/`；`.attempt1/.attempt2/.attempt3` 保留本轮重试证据 |
 | 规则失败 | 先查对应日志并修正原因，再运行同一 launcher；保留 `02_work/` 和 `.snakemake/`，由 Snakemake 决定重算范围 |
 | 残留锁 | 确认没有运行中的 launcher 后，才手动移除项目 `.snakemake/locks` |
-| 发布中断 | 保留 `02_work/results_stage/` 后重跑；stage 与 `03_results/` 必须同一文件系统，公开 `run_manifest.json` 最后提交 |
+| 发布中断 | 保留 `02_work/results_stage/` 后重跑。暂存文件身份变化时，重试会重新生成交付凭证。暂存与 `03_results/` 必须同一文件系统，公开 `run_manifest.json` 最后提交 |
 | 最终 DNA BAM | 模板`retention.keep_final_bam: null`按协议默认：TAPS保留、其余回收；显式true/false覆盖。`true` 保留 BAM 及适用索引，缺失时进入 DAG 恢复；`false` 在成功发布后回收当前 backend 活跃细胞的最终 BAM/索引 |
-| 上游重新发布 | 旧下游 context 会拒绝继续读取或提交 QC，需重新启动下游 |
+| 上游重新发布 | 旧下游 context 会拒绝继续读取或提交 QC，需重新启动下游。若公开最终清单与交付哈希不符，从保留的暂存结果重新发布后再运行 QC |
 | reference 构建中断 | 重跑对应 Doctor 段，恢复未完成事务并复验；未完成不报告 READY |
 
 ### 运行状态与详细输出
@@ -259,7 +264,7 @@ Doctor summary/detail和controller原生日志完整保留，QC原始输出见�
 
 中断运行后，等待原入口完成清理和自有进程组回收，再重跑对应入口；保留项目中间件供现有恢复流程使用。
 
-BISCUIT 的原生读段名称按字面保留，包括双引号。旧实现曾把带引号的名称按CSV解码，可能在high-CpH筛除时删错分子而总数不变；只有实际输入含此类名称才涉及该问题。受影响结果从当前alignment BAM重做bsconv过滤及后续pileup/CpG/QC和交付，缺该BAM时按DAG恢复上游；不能仅重做下游QC或补签旧结果。该修复自 v18.2 起提供。
+BISCUIT 的原生读段名称按字面保留，包括双引号。旧实现曾把带引号的名称按CSV解码，可能在high-CpH筛除时删错分子而总数不变；只有实际输入含此类名称才涉及该问题。受影响结果从当前alignment BAM重做bsconv过滤及后续pileup/CpG/QC和交付，缺该BAM时按DAG恢复上游；不能仅重做下游QC或补签旧结果。
 
 资源申请值、本机采样和远程不可用数据分开显示，任务进度不等于剩余时间。
 
@@ -276,7 +281,7 @@ BISCUIT 的原生读段名称按字面保留，包括双引号。旧实现曾把
 | 科学结果解读 | 边界 |
 | --- | --- |
 | CpG 坐标与计数 | `analysis.cpg_coordinate_base` 仅接受整数 0/1，默认 1；methyl/unmethyl 为非负整数，有效位点 coverage>0，合法空文件保留表头 |
-| 坐标传递 | RawAdata / SingleCpG 沿用 sealed 交付的 base；BED、VCF、BAM 仍按各自格式解释 |
+| 坐标传递 | SingleCpG 沿用 sealed 交付的 base；BED、VCF、BAM 仍按各自格式解释 |
 | Droplet 计数 | BAM 保留 PCR copies，CpG 按胞嘧啶/UMI 共识计独立分子；MAPQ≥10、baseQ≥20，未解决平票不调用；`Duplicate_Pair_Rate%` 为 NaN |
 | TAPS 解读 | Non-CpG 为可判链宿主 CHG/CHH 原始转换率，零观测为缺失，不直接等同真实 mCH 或 cDNA 污染率；未调用 SNP 不等于纯合参考，PASS 仍需结合深度、质量与链支持 |
 | MultiQC | backend 原生 mapping 分母不同；活跃 DNA>1000 时固定展示同一组1000细胞，文库概要仍为全库，全部细胞科学结果与 BAM 策略不变 |
@@ -295,9 +300,9 @@ BISCUIT 的原生读段名称按字面保留，包括双引号。旧实现曾把
 | --- | --- |
 | 启动 | 用 `conda/current/notebook` 环境打开 `downstream/DNA_QC_Visualization.ipynb`，填写 `DNA_PROJECT_ROOT`、`DNA_PIPELINE_ROOT`；按需设置 `TSS_BED` / `SKIP_TSS` |
 | 下游输出 | 固定写入 `06_downstream/`；完整身份匹配才复用缓存，新结果覆盖对应旧文件，不扫描历史目录，不写回公开结果 |
-| TSS 抽检 | 默认按 CloneID 抽10%，不足10个全检、超过1000个取100；`TSS_SAMPLE_SEED=0` 可复现，`TSS_SAMPLE_FRACTION=1.0` 全检；抽样只影响 TSS，Raw/QC/Gini/Single 仍处理全部细胞 |
+| TSS 抽检 | 默认按 CloneID 抽10%，不足10个全检、超过1000个取100；`TSS_SAMPLE_SEED=0` 可复现，`TSS_SAMPLE_FRACTION=1.0` 全检；抽样只影响 TSS，QC、Gini 和 SingleCpG 仍处理全部细胞 |
 | 矩阵与零值 | 位点坐标跟随交付；有覆盖全 unmethyl 保留显式0，缺覆盖不补0；QC 位点均值、SingleCpG 区间均值与合并 reads 的比率不同 |
-| 缓存重建 | CpG统计统一用`RECOMPUTE_CPG_STATS`/`--recompute-cpg-stats`同时重建位点统计与信号组成；过期缓存按 Processor 提示重算；Raw 过期时先完成 QC Processor 的必要重建；SingleCpG 身份失配时从已核验 Raw 自动重建 |
+| 缓存重建 | 使用 `RECOMPUTE_CPG_STATS` / `--recompute-cpg-stats` 强制单次解码重建 QC、SingleCpG 和适用的 1 Mb 计数。输入或完成身份失配时由 Processor 自动重建 |
 | 绘图 | Final QC 按 CloneID 展示计数直方图，CpG sites 用 log 横轴；CpG density 展示 input pairs / unique CpG sites 散点及拟合，支持 PDF |
 | RNA 关联 | 使用当前完整交付的 sealed manifest 与同代 DNA QC；更新关联后先重发布 DNA 和当前代际 downstream，再整合 RNA |
 
@@ -307,18 +312,15 @@ BISCUIT 的原生读段名称按字面保留，包括双引号。旧实现曾把
 
 Alopex 以 [GPL-3.0](LICENSE) 发布。
 
-### v18.8 更新说明
+### v18.9 更新说明
 
-新增可选的 [MethylTree QC Notebook](downstream/only_quality_checking_alopex.ipynb)。从 Alopex 项目目录或其子目录启动后，按 sealed 交付定位 Pipeline，并通过其受管 Python 执行 Alopex QC 与矩阵导出；MethylTree 保持独立 kernel，不向 Alopex 环境添加其依赖。
+QC 单次读取封存 CpG，生成 SingleCpG、统计表及 Droplet 的常染色体 1 Mb 整数计数。与 Lemmus 联用时，先用本版完成 Alopex QC，再启动 Lemmus v6.18 的 Droplet Notebook。
 
-生产代码、科学参数和缓存身份沿用 v18.7；保留原五列 TSS profile、染色体诊断与观测零/缺失语义。新 Notebook 已完成默认和可选原始 TSS 流程验证，可选谱系推断未在该验收中运行。
-
-本版提供运行源码与可选 Notebook，科学参数和计算实现沿用 v18.7。
+多批独立 FASTQ 可按清单刷新规则合并并保留归档。配置快照、发布恢复及最终清单校验沿同一交付身份执行。终端和 Notebook 在启动期间收到中断时会回收本次子进程，Slurm 面板按实际完成事件移除普通及分组作业。
 
 ### 源码与临时文件位置
 
 源码按职责定位：`core/alopex/`包含配置、输入、科学处理、交付与维护，其`downstream/`子包负责QC计算与绘图；`core/`下的Shell入口与Snakefile负责运行编排；顶层`downstream/`承载Notebook与操作说明。
-
 
 项目运行的临时工作与提交文件统一使用本项目 `05_tmp/`，包括预处理、原生工具 spill、诊断、矩阵写出和发布候选；外部 `TMPDIR` / `SLURM_TMPDIR` 不改选节点盘。临时文件关闭并校验后使用同文件系统原子替换；`05_tmp` 不得为符号链接，输出位于另一挂载时明确失败，不回退复制覆盖。
 

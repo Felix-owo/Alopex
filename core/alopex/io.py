@@ -239,10 +239,12 @@ def _remove_path(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def _fsync_directory(path: Path) -> None:
+def _fsync_directory(path: Path, *, strict: bool = False) -> None:
     try:
         descriptor = os.open(path, os.O_RDONLY)
     except OSError:
+        if strict:
+            raise
         return
     try:
         os.fsync(descriptor)

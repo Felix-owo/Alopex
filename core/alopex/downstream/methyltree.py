@@ -90,13 +90,12 @@ def prepare_methyltree_inputs(
     *,
     nCG_cutoff: int = 100000,
     import_nCG_cutoff: int = 500000,
-    recompute_single: bool = False,
 ):
     """从已完成 QC 导出全部细胞注释及所选细胞的独立、标准 backed H5AD。
 
-    先运行 qc.run_qc_processor。公开输出只读；复用标准 Raw/Single 的科学校验，
+    先运行 qc.run_qc_processor。公开输出只读；复用标准 SingleCpG 的科学校验，
     导出始终覆盖 06_downstream/methyltree/allCpGs.h5ad，不复用用户分析后的文件。
-    双链按已覆盖胞嘧啶 fraction 的均值合并，不改成合并计数之比；Raw 保留整数。
+    双链按已覆盖胞嘧啶 fraction 的均值合并，不改成合并计数之比；原始整数保存在已发布的四列 CpG。
     """
     import pandas as pd
 
@@ -120,17 +119,12 @@ def prepare_methyltree_inputs(
         selected = samples.loc[samples["nCG"] >= import_nCG_cutoff].copy()
         if selected.empty:
             raise ValueError("No cells meet import_nCG_cutoff; no MethylTree outputs were replaced")
-        single = qc.prepare_single_cpg_adata(paths, frame, recompute=recompute_single)
-        schema_path = single.with_name("SingleCpG_Adata.input_schema.json")
-        assert_source_current = qc._reference_guard(single, schema_path, before_commit=completed.assert_current)
-        source_state = qc._raw_adata_stat_binding(single)
-        schema = json.loads(schema_path.read_text())
-        if schema["h5ad"] != source_state:
-            raise ValueError("SingleCpG completion identity differs from its H5AD")
+        single = run_paths.single_cpg
+        schema = qc._require_current_single(run_paths, completed.identity)
 
         def assert_current():
             assert_loaded_sources_current(_LOADED_SOURCE_CODES)
-            assert_source_current()
+            completed.assert_current()
 
         code = PythonSourceGraph((CORE_ROOT,), loaded_sources=_LOADED_SOURCE_CODES).dependencies(
             ("alopex.downstream.methyltree._sample_info", "alopex.downstream.methyltree._write_csr_subset"))
@@ -158,8 +152,8 @@ def prepare_methyltree_inputs(
             os.replace(temporary, output)
             qc._fsync_directory(output_dir)
             qc._atomic_write_csv(samples, sample_sheet, before_commit=assert_current)
-            qc._atomic_write_json({"input": provenance, "h5ad": qc._raw_adata_stat_binding(output),
-                                   "sample_sheet": qc._raw_adata_stat_binding(sample_sheet)},
+            qc._atomic_write_json({"input": provenance, "h5ad": qc._published_file_binding(output),
+                                   "sample_sheet": qc._published_file_binding(sample_sheet)},
                                   completion, before_commit=assert_current)
             assert_current()
             return samples, output

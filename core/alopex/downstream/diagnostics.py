@@ -14,29 +14,27 @@ FILTER_INFO = "QC_Filter_Reasons.csv"
 
 
 def tss_intervals(path, reference, is_primary, covered=None, base=0):
-    """一次读取gene/bin成员，先完整校验，再按实际主核参考构建数字索引。"""
+    """完整校验原始 gene/bin 成员，再按实际主核参考构建数字索引。"""
+    columns = {0: "chrom", 1: "start", 2: "end", 6: "gene", 8: "offset"}
     try:
-        frame = pd.read_csv(path, sep="\t", header=None, comment="#", usecols=[0, 1, 2, 6, 8],
-                            converters={0: str, 6: str}, keep_default_na=False)
-    except (ValueError, pd.errors.ParserError) as exc:
+        frame = pd.concat(matrix.bed_blocks(path, columns, {"start": np.int64, "end": np.int64,
+                                                            "offset": np.int32}), ignore_index=True)
+    except pd.errors.ParserError as exc:
         raise ValueError(f"TSS BED must have at least 9 columns: {path}") from exc
-    frame.columns = ["chrom", "start", "end", "gene", "offset"]
-    for col in ("start", "end", "offset"):
-        values = pd.to_numeric(frame[col], errors="coerce").to_numpy(dtype=float)
-        if (not np.isfinite(values).all() or not np.equal(values, np.floor(values)).all()
-                or (np.abs(values) >= (np.iinfo(np.int32).max if col == "offset" else np.iinfo(np.int64).max)).any()):
-            raise ValueError(f"TSS BED {col} must contain finite integers: {path}")
-        frame[col] = values.astype(np.int64)
+    if frame.empty:
+        raise ValueError(f"TSS BED contains no intervals: {path}")
     if (frame.start < 0).any() or (frame.end <= frame.start).any():
         raise ValueError(f"TSS BED must contain nonempty nonnegative intervals: {path}")
     if frame.gene.str.strip().eq("").any():
         raise ValueError(f"TSS BED contains an empty gene_id: {path}")
+    lengths = pd.Series(reference.reference_bp_length.to_numpy(), index=reference.reference_seq_name,
+                        dtype="Int64")
+    limits = frame.chrom.map(lengths)
+    clipped = (frame.start < limits) & (frame.end > limits)
+    frame.loc[clipped, "end"] = limits[clipped].to_numpy(dtype=np.int64)
     if frame.duplicated(["chrom", "start", "end", "gene"]).any():
         raise ValueError(f"TSS BED contains duplicate gene/bin membership: {path}")
-    lengths = dict(zip(reference.reference_seq_name, reference.reference_bp_length))
-    frame = frame.loc[frame.chrom.map(is_primary) & frame.chrom.isin(lengths)].copy()
-    frame = frame.loc[frame.start < frame.chrom.map(lengths)].copy()
-    frame["end"] = np.minimum(frame.end, frame.chrom.map(lengths))
+    frame = frame.loc[frame.chrom.map(is_primary) & (frame.start < limits)].copy()
     if covered is not None:
         offset = np.r_[0, np.cumsum(reference.reference_seq_length.to_numpy(dtype=np.int64))]
         reference_offsets = dict(zip(reference.reference_seq_name, offset[:-1]))
@@ -58,54 +56,42 @@ def tss_intervals(path, reference, is_primary, covered=None, base=0):
     return matrix.IntervalIndex(regions), membership, np.asarray(offsets, dtype=np.int64)
 
 
-def tss_profiles(reader, selected, bed, is_primary):
-    """直接对抽中行聚合，重叠gene/bin权重保留；不复制Raw或生成临时TSS矩阵。"""
-    rows, parts = reader.obs_names.get_indexer(selected.Sample_ID), []
-    if (rows < 0).any():
-        raise ValueError("TSS Sample_ID set differs from RawAdata")
-    covered = matrix.covered_positions(reader, rows) if len(rows) < reader.n_obs else None
-    index, membership, offsets = tss_intervals(bed, reader.reference, is_primary, covered,
-                                                        int(reader.uns["cpg_coordinate_base"]))
-    for row, (sid, clone) in zip(rows, selected[["Sample_ID", "CloneID"]].itertuples(index=False, name=None)):
-        cols, frac, methyl, _, _ = matrix.aggregate_row(reader, reader.read_rows(int(row), int(row) + 1), index)
-        if not len(cols):
-            continue
-        weights = membership[cols]
-        count = np.asarray(weights.sum(axis=0)).ravel()
-        present = count > 0
-        means = np.asarray(frac.astype(np.float64) @ weights).ravel()[present] / count[present]
-        methyl_sum = np.asarray(methyl @ weights).ravel()[present]
-        parts.append(pd.DataFrame({"Sample_ID": sid, "position_coarse": offsets[present], "meth_frac": means,
-            "count": methyl_sum, "CloneID": clone}))
+def tss_profile_row(reader, row, sid, clone, tss_index):
+    index, membership, offsets = tss_index
+    cols, frac, methyl, _, _ = matrix.aggregate_row(reader, row, index)
+    if not len(cols):
+        return None
+    weights = membership[cols]
+    count = np.asarray(weights.sum(axis=0)).ravel()
+    present = count > 0
+    means = np.asarray(frac.astype(np.float64) @ weights).ravel()[present] / count[present]
+    methyl_sum = np.asarray(methyl @ weights).ravel()[present]
+    return pd.DataFrame({"Sample_ID": sid, "position_coarse": offsets[present], "meth_frac": means,
+                         "count": methyl_sum, "CloneID": clone})
+
+
+def tss_profile_frame(parts):
     columns = ["Sample_ID", "position_coarse", "meth_frac", "count", "CloneID"]
-    profile = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=columns)
-    return profile
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=columns)
 
 
-
-def chromosome_summary(reader, is_primary, classify):
-    """每个细胞的主染色体/controls均保留；未观测为零计数、NaN甲基化率。"""
-    reference = reader.reference
-    offsets = np.r_[0, np.cumsum(reference.reference_seq_length.to_numpy(dtype=np.int64))]
-    parts = []
-    for block, start, stop in reader.iter_rows(4):
-        for row in range(stop - start):
-            lo, hi = block.indptr[row:row + 2]
-            indices, values = block.indices[lo:hi], block.data[lo:hi]
-            for j, chrom in enumerate(reference.reference_seq_name):
-                left, right = np.searchsorted(indices, offsets[j:j + 2])
-                covered = values[left:right]
-                labels = classify(str(chrom))
-                if not len(covered) and not (is_primary(str(chrom)) or any(labels[:3])):
-                    continue
-                methyl = (covered >> 16).astype(np.uint64)
-                coverage = (covered & 65535).astype(np.uint64)
-                parts.append({"Sample_ID": str(reader.obs_names[start + row]), "chrom": str(chrom),
-                    "chromosome_class": "host" if is_primary(str(chrom)) else "lambda" if labels[0] else "pUC19" if labels[1] else "mtDNA" if labels[2] else "auxiliary",
-                    "observed_sites": len(covered), "methyl": int(methyl.sum()),
-                    "unmethyl": int(coverage.sum() - methyl.sum()), "coverage": int(coverage.sum()),
-                    "meth_frac": float(np.mean(methyl / coverage)) if len(covered) else np.nan})
-    return pd.DataFrame(parts)
+def chromosome_row(reference, offsets, row, sid, is_primary, classify):
+    """按实际 contig 核计数，未覆盖主染色体及 controls 保留 NaN 率。"""
+    for j, chrom in enumerate(reference.reference_seq_name):
+        lo, hi = np.searchsorted(row.indices, offsets[j:j + 2])
+        covered = row.data[lo:hi]
+        is_lambda, is_puc, is_mt, _ = classify(str(chrom))
+        primary = is_primary(str(chrom))
+        if not len(covered) and not (primary or is_lambda or is_puc or is_mt):
+            continue
+        methyl = (covered >> 16).astype(np.uint64)
+        coverage = (covered & 65535).astype(np.uint64)
+        methyl_total, depth = int(methyl.sum()), int(coverage.sum())
+        yield {"Sample_ID": sid, "chrom": str(chrom),
+               "chromosome_class": ("host" if primary else "lambda" if is_lambda else
+                                    "pUC19" if is_puc else "mtDNA" if is_mt else "auxiliary"),
+               "observed_sites": len(covered), "methyl": methyl_total, "unmethyl": depth - methyl_total,
+               "coverage": depth, "meth_frac": float(np.mean(methyl / coverage)) if len(covered) else np.nan}
 
 
 def filter_reasons(frame, *, mapping_threshold=None, lambda_max=10.0, puc19_min=90.0,

@@ -188,6 +188,13 @@ if (( DNA_PIPELINE_READ_ONLY == 0 && DNA_PIPELINE_REFRESH_MANIFEST == 0 )) && \
         -- bash "$DNA_PIPELINE_LAUNCHER_SOURCE"
 fi
 
+# FASTQ 刷新会原位追加。正式运行从 snapshot 到作业结束持共享输入锁。
+if (( DNA_PIPELINE_READ_ONLY == 0 && DNA_PIPELINE_REFRESH_MANIFEST == 0 )) && \
+    [[ "${DNA_PIPELINE_RAW_LOCK_PID:-}" != "$$" ]]; then
+    exec env PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" -m alopex with-raw-input-lock \
+        "$DNA_PIPELINE_PROJECT_DIR" "$DNA_PIPELINE_LAUNCHER_SOURCE"
+fi
+
 # 日志、中断与启动器临时文件
 # 清理 launcher 临时合成目录。
 cleanup_launcher_tmp() {
@@ -332,58 +339,36 @@ done
 
 DNA_PIPELINE_WORKFLOW_CONFIG="$DNA_PIPELINE_CONFIG"
 DNA_PIPELINE_RUNTIME_TMP=""
-if (( DNA_PIPELINE_READ_ONLY == 1 )) || [[ "$DNA_PIPELINE_DATA_MODE" == test ]]; then
-    [[ ! -L "$DNA_PIPELINE_PROJECT_DIR/05_tmp" ]] || { echo "ERROR: 05_tmp must be a real directory" >&2; exit 2; }
+[[ ! -L "$DNA_PIPELINE_PROJECT_DIR/05_tmp" ]] || { echo "ERROR: 05_tmp must be a real directory" >&2; exit 2; }
+if (( DNA_PIPELINE_READ_ONLY == 1 )); then
+    system_tmp="$(cd -P -- "${TMPDIR:-/tmp}" && printf '%s.' "$PWD")"
+    DNA_PIPELINE_RUNTIME_TMP="$(mktemp -d "${system_tmp%.}/dna-pipeline-launch.XXXXXX")"
+elif [[ "$DNA_PIPELINE_DATA_MODE" == test ]]; then
     mkdir -p "$DNA_PIPELINE_PROJECT_DIR/05_tmp"
     DNA_PIPELINE_RUNTIME_TMP="$(mktemp -d "$DNA_PIPELINE_PROJECT_DIR/05_tmp/dna-pipeline-launch.XXXXXX")"
 fi
 trap cleanup_launcher_tmp_on_exit EXIT
 install_launcher_signal_traps
 
-if [[ "$DNA_PIPELINE_DATA_MODE" == test ]]; then
-    [[ "$DNA_PIPELINE_TEST_ROUTE" != auto ]] || DNA_PIPELINE_TEST_ROUTE="hg38-cabernet-bismark"
-    DNA_PIPELINE_WORKFLOW_CONFIG="$DNA_PIPELINE_RUNTIME_TMP/effective-config.yaml"
-    PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" -m alopex synthesize-config \
-        --source "$DNA_PIPELINE_CONFIG" \
-        --destination "$DNA_PIPELINE_WORKFLOW_CONFIG" \
-        --route "$DNA_PIPELINE_TEST_ROUTE"
-fi
-
-DNA_PIPELINE_CONFIG_SCALARS="$(PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" \
-    -m alopex config-scalars --config "$DNA_PIPELINE_WORKFLOW_CONFIG")"
-eval "$DNA_PIPELINE_CONFIG_SCALARS"
-DNA_PIPELINE_METHYLATION_BACKEND="$CFG_METHYLATION_BACKEND"
-case "$DNA_PIPELINE_METHYLATION_BACKEND" in
-    rastair)
-        require_environment_tools "$DNA_PIPELINE_RASTAIR_ENV" rastair "${RASTAIR_REQUIRED[@]}"
-        DNA_PIPELINE_RASTAIR_ENV="$(cd "$DNA_PIPELINE_RASTAIR_ENV" && pwd -P)"
-        DNA_PIPELINE_RULE_ENV="$DNA_PIPELINE_RASTAIR_ENV"
-        ;;
-    biscuit)
-        require_environment_tools "$DNA_PIPELINE_BISCUIT_ENV" biscuit "${BISCUIT_REQUIRED[@]}"
-        DNA_PIPELINE_BISCUIT_ENV="$(cd "$DNA_PIPELINE_BISCUIT_ENV" && pwd -P)"
-        DNA_PIPELINE_RULE_ENV="$DNA_PIPELINE_BISCUIT_ENV"
-        ;;
-    bismark)
-        require_environment_tools "$DNA_PIPELINE_BISMARK_ENV" bismark "${BISMARK_RUNTIME_REQUIRED[@]}"
-        DNA_PIPELINE_BISMARK_ENV="$(cd "$DNA_PIPELINE_BISMARK_ENV" && pwd -P)"
-        DNA_PIPELINE_RULE_ENV="$DNA_PIPELINE_BISMARK_ENV"
-        ;;
-    *)
-        echo "ERROR: 当前协议的 methylation_backend 必须为 biscuit、bismark 或 rastair。" >&2
-        exit 2
-        ;;
-esac
-[[ -d "$DNA_PIPELINE_BISCUIT_ENV" ]] && DNA_PIPELINE_BISCUIT_ENV="$(cd "$DNA_PIPELINE_BISCUIT_ENV" && pwd -P)"
-[[ -d "$DNA_PIPELINE_BISMARK_ENV" ]] && DNA_PIPELINE_BISMARK_ENV="$(cd "$DNA_PIPELINE_BISMARK_ENV" && pwd -P)"
-[[ -d "$DNA_PIPELINE_RASTAIR_ENV" ]] && DNA_PIPELINE_RASTAIR_ENV="$(cd "$DNA_PIPELINE_RASTAIR_ENV" && pwd -P)"
-export DNA_PIPELINE_BISCUIT_ENV DNA_PIPELINE_BISMARK_ENV DNA_PIPELINE_RASTAIR_ENV DNA_PIPELINE_RULE_ENV
-
 export PATH="$DNA_PIPELINE_CONTROL_ENV/bin:$PATH"
 export CONDA_EXE="$DNA_PIPELINE_CONDA"
 unset PYTHONHOME
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="$DNA_PIPELINE_ROOT/core"
+
+if [[ "$DNA_PIPELINE_DATA_MODE" == test ]]; then
+    [[ "$DNA_PIPELINE_TEST_ROUTE" != auto ]] || DNA_PIPELINE_TEST_ROUTE="hg38-cabernet-bismark"
+    DNA_PIPELINE_WORKFLOW_CONFIG="$DNA_PIPELINE_RUNTIME_TMP/effective-config.yaml"
+    DNA_PIPELINE_PROJECT_DIR= "$DNA_PIPELINE_PYTHON" -m alopex synthesize-config \
+        --source "$DNA_PIPELINE_CONFIG" \
+        --destination "$DNA_PIPELINE_WORKFLOW_CONFIG" \
+        --route "$DNA_PIPELINE_TEST_ROUTE"
+fi
+
+[[ -d "$DNA_PIPELINE_BISCUIT_ENV" ]] && DNA_PIPELINE_BISCUIT_ENV="$(cd "$DNA_PIPELINE_BISCUIT_ENV" && pwd -P)"
+[[ -d "$DNA_PIPELINE_BISMARK_ENV" ]] && DNA_PIPELINE_BISMARK_ENV="$(cd "$DNA_PIPELINE_BISMARK_ENV" && pwd -P)"
+[[ -d "$DNA_PIPELINE_RASTAIR_ENV" ]] && DNA_PIPELINE_RASTAIR_ENV="$(cd "$DNA_PIPELINE_RASTAIR_ENV" && pwd -P)"
+export DNA_PIPELINE_BISCUIT_ENV DNA_PIPELINE_BISMARK_ENV DNA_PIPELINE_RASTAIR_ENV
 
 # 一次解析 status JSON 的 status 与 reason 两个字段，避免逐字段 spawn Python。
 pipeline_status_fields() {
@@ -392,13 +377,13 @@ pipeline_status_fields() {
 
 if (( DNA_PIPELINE_READ_ONLY == 1 )); then
     XDG_CACHE_HOME="$DNA_PIPELINE_RUNTIME_TMP/xdg_cache"
+    TMPDIR="$DNA_PIPELINE_RUNTIME_TMP"
 else
     XDG_CACHE_HOME="$DNA_PIPELINE_PROJECT_DIR/05_tmp/xdg_cache"
+    TMPDIR="$DNA_PIPELINE_PROJECT_DIR/05_tmp"
 fi
-[[ ! -L "$DNA_PIPELINE_PROJECT_DIR/05_tmp" ]] || { echo "ERROR: 05_tmp must be a real directory" >&2; exit 2; }
-mkdir -p "$XDG_CACHE_HOME" "$DNA_PIPELINE_PROJECT_DIR/05_tmp"
-export XDG_CACHE_HOME
-export TMPDIR="$DNA_PIPELINE_PROJECT_DIR/05_tmp" TMP="$DNA_PIPELINE_PROJECT_DIR/05_tmp" TEMP="$DNA_PIPELINE_PROJECT_DIR/05_tmp" TEMPDIR="$DNA_PIPELINE_PROJECT_DIR/05_tmp"
+mkdir -p "$XDG_CACHE_HOME"
+export XDG_CACHE_HOME TMPDIR TMP="$TMPDIR" TEMP="$TMPDIR" TEMPDIR="$TMPDIR"
 DNA_PIPELINE_TMP_LITERAL="$("$DNA_PIPELINE_PYTHON" -c 'import sys; print(repr(sys.argv[1]))' "$TMPDIR")"
 
 DNA_PIPELINE_SNAKEMAKE_VERSION="$("$DNA_PIPELINE_SNAKEMAKE" --version 2>/dev/null | head -n1)"
@@ -456,16 +441,38 @@ dna_pipeline_prepare_run_snapshot() {
     export DNA_PIPELINE_RUN_SNAPSHOT
 }
 
-dna_pipeline_prepare_read_only_inputs() {
+if (( DNA_PIPELINE_READ_ONLY == 1 )); then
     SNAPSHOT_CONFIG="$DNA_PIPELINE_WORKFLOW_CONFIG"
-    DNA_PIPELINE_DELIVERY_ID="dryrun-$$"
-    export DNA_PIPELINE_DELIVERY_ID
-}
-
-if (( DNA_PIPELINE_READ_ONLY == 0 )); then
+    export DNA_PIPELINE_DELIVERY_ID="dryrun-$$"
+else
     dna_pipeline_prepare_run_snapshot
     cleanup_launcher_tmp
 fi
+
+# 正式运行的执行器参数与规则环境必须来自 Snakemake 使用的同一封存配置。
+DNA_PIPELINE_CONFIG_SCALARS="$("$DNA_PIPELINE_PYTHON" -m alopex config-scalars --config "$SNAPSHOT_CONFIG")"
+eval "$DNA_PIPELINE_CONFIG_SCALARS"
+DNA_PIPELINE_METHYLATION_BACKEND="$CFG_METHYLATION_BACKEND"
+case "$DNA_PIPELINE_METHYLATION_BACKEND" in
+    rastair)
+        require_environment_tools "$DNA_PIPELINE_RASTAIR_ENV" rastair "${RASTAIR_REQUIRED[@]}"
+        DNA_PIPELINE_RULE_ENV="$DNA_PIPELINE_RASTAIR_ENV"
+        ;;
+    biscuit)
+        require_environment_tools "$DNA_PIPELINE_BISCUIT_ENV" biscuit "${BISCUIT_REQUIRED[@]}"
+        DNA_PIPELINE_RULE_ENV="$DNA_PIPELINE_BISCUIT_ENV"
+        ;;
+    bismark)
+        require_environment_tools "$DNA_PIPELINE_BISMARK_ENV" bismark "${BISMARK_RUNTIME_REQUIRED[@]}"
+        DNA_PIPELINE_RULE_ENV="$DNA_PIPELINE_BISMARK_ENV"
+        ;;
+    *)
+        echo "ERROR: 当前协议的 methylation_backend 必须为 biscuit、bismark 或 rastair。" >&2
+        exit 2
+        ;;
+esac
+export DNA_PIPELINE_RULE_ENV
+
 DNA_PIPELINE_STATUS_ARGS=(--project "$DNA_PIPELINE_PROJECT_DIR")
 if [[ -n "${DNA_PIPELINE_RUN_SNAPSHOT:-}" ]]; then
     DNA_PIPELINE_STATUS_ARGS+=(--current-snapshot "$DNA_PIPELINE_RUN_SNAPSHOT")
@@ -595,9 +602,6 @@ run_workflow() {
         slurm) prepare_slurm_executor ;;
     esac
     dna_pipeline_prepare_common_args "$CFG_LATENCY_WAIT"
-    if (( DNA_PIPELINE_READ_ONLY == 1 )); then
-        dna_pipeline_prepare_read_only_inputs
-    fi
     echo "INFO: Alopex 开始；执行器：$DNA_PIPELINE_EXECUTOR_LABEL"
     echo "Config: $DNA_PIPELINE_WORKFLOW_CONFIG"
     echo "Project: $DNA_PIPELINE_PROJECT_DIR"

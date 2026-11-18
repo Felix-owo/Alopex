@@ -49,6 +49,7 @@ from .config import (
 from .inputs import (
     INITIAL_CELL_MANIFEST_FIELDS,
     _cell_order_key,
+    _iter_delimited_rows,
     _parse_project_sample_manifest,
     discover_samples,
     manifest_raw_samples,
@@ -868,7 +869,7 @@ def run_multiqc_report(file_list: Path, config_file: Path, output_dir: Path, com
             cfg=ClConfig(
                 config_files=[config_file.resolve(strict=True)],
                 output_dir=output_dir, filename="multiqc_report.html",
-                force=True, report_comment=comment,
+                force=True, report_comment=comment, no_version_check=True,
             ),
             interactive=False,
         )
@@ -968,7 +969,7 @@ def prepare_sampled_multiqc_sources(
 
 
 def prepare_high_cph_multiqc_sources(
-    inputs: Iterable[str | Path], out_json: Path,
+    inputs: Iterable[str | Path], out_json: Path, *, backend: str, protocol: str,
 ) -> list[str]:
     """从保留的过滤摘要重建已清理的展示 JSON，避免报告重建回溯科学规则。"""
     sources: list[str] = []
@@ -981,9 +982,16 @@ def prepare_high_cph_multiqc_sources(
         if not path.name.endswith("_filter_summary.json"):
             sources.append(str(path))
             continue
-        summary = json.loads(path.read_text(encoding="utf-8"))
+        sample, _, kind = path.name.removesuffix("_filter_summary.json").rpartition(".")
+        if not sample or {"bsconv": "biscuit", "nonconversion": "bismark"}.get(kind) != backend:
+            raise ValueError(f"Unexpected high-CpH summary for {backend}: {path}")
+        summary = _read_high_cph_summary(path, sample, backend)
+        if summary["protocol"] != protocol or not summary["filter_applied"]:
+            raise ValueError(f"High-CpH summary disagrees with the current protocol or filter action: {path}")
+        if sample in aggregate["data"]:
+            raise ValueError(f"Duplicate high-CpH summary for {sample!r}: {path}")
         payload = _high_cph_multiqc_payload(
-            summary["sample"], summary, summary["protocol"], summary["high_cph_role"]
+            sample, summary, protocol, summary["high_cph_role"]
         )
         if not aggregate["data"]:
             aggregate = payload
@@ -1441,13 +1449,12 @@ def _check_result_directories(root: Path, relative: Path, *, label: str) -> None
             directory /= part
 
 
-def _staged_file_state(path: Path, *, include_ctime: bool = False) -> dict[str, int]:
+def _staged_file_state(observed: os.stat_result, *, include_ctime: bool = False) -> dict[str, int]:
     """ctime 仅用于本次读取/哈希期间的检查；硬链接改变它，不写入恢复身份。"""
-    stat = path.stat()
-    state = {"device": stat.st_dev, "inode": stat.st_ino,
-             "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    state = {"device": observed.st_dev, "inode": observed.st_ino,
+             "size_bytes": observed.st_size, "mtime_ns": observed.st_mtime_ns}
     if include_ctime:
-        state["ctime_ns"] = stat.st_ctime_ns
+        state["ctime_ns"] = observed.st_ctime_ns
     return state
 
 
@@ -1457,25 +1464,41 @@ def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
     _check_result_directories(results, manifest, label="staged delivery")
     if (results / manifest).is_symlink():
         raise ValueError(f"staged result may not be a symlink: {results / manifest}")
-    manifest_state = _staged_file_state(results / manifest, include_ctime=True)
-    with (results / manifest).open(encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        required = {"sample_id", "cpg_path", "snp_path"}
-        if not required.issubset(reader.fieldnames or []):
-            raise ValueError("final sample manifest is missing current delivery path fields")
-        for row in reader:
-            sample_id = str(row.get("sample_id") or "").strip()
+    manifest_state = _staged_file_state((results / manifest).stat(), include_ctime=True)
+    manifest_path = results / manifest
+    with manifest_path.open(encoding="utf-8", newline="") as handle:
+        rows = _iter_delimited_rows(handle, manifest_path, delimiter="\t")
+        line, fields = next(rows, (1, []))
+        required = {"sample_id", "cpg_path", "snp_path", "analysis_status"}
+        if len(fields) != len(set(fields)) or not required.issubset(fields):
+            raise ValueError(f"{manifest_path} line {line}: invalid final manifest header")
+        seen: set[str] = set()
+        for line, values in rows:
+            if not values:
+                continue
+            location = f"{manifest_path} line {line}"
+            if len(values) != len(fields):
+                raise ValueError(f"{location}: final manifest row differs from its header width")
+            row = dict(zip(fields, values))
+            sample_id = row["sample_id"].strip()
+            if SAMPLE_ID_RE.fullmatch(sample_id) is None or sample_id in seen:
+                raise ValueError(f"{location}: invalid or duplicate sample_id: {sample_id!r}")
+            seen.add(sample_id)
+            status = row["analysis_status"]
+            if status == "PASS":
+                if not row["cpg_path"].strip():
+                    raise ValueError(f"{location}: analyzed sample is missing its CpG path")
+            elif status != "NOT_ANALYZED" or row["cpg_path"].strip() or row["snp_path"].strip():
+                raise ValueError(f"{location}: analysis status and result paths disagree")
             paths = CellOutputPaths(results.parent, results, sample_id,
                                     str(row.get("methylation_backend") or ""))
             for field, files in paths.public_result_files.items():
                 value = str(row.get(field) or "").strip()
                 if not value:
                     continue
-                if SAMPLE_ID_RE.fullmatch(sample_id) is None:
-                    raise ValueError(f"invalid delivery sample_id: {sample_id!r}")
                 relative = files[0].relative_to(results)
                 if value != f"03_results/{relative.as_posix()}":
-                    raise ValueError(f"final sample manifest has an invalid {field}: {value!r}")
+                    raise ValueError(f"{location}: invalid {field}: {value!r}")
                 declared.update(path.relative_to(results) for path in files)
 
     records: list[dict[str, object]] = []
@@ -1486,11 +1509,11 @@ def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
             raise ValueError(f"staged result may not be a symlink: {path}")
         if not path.is_file():
             raise FileNotFoundError(f"declared staged result is missing: {path}")
-        state = _staged_file_state(path, include_ctime=True)
+        state = _staged_file_state(path.stat(), include_ctime=True)
         if relative == manifest and state != manifest_state:
             raise ValueError(f"staged manifest changed during inventory: {path}")
         digest = sha256_file(path)
-        if _staged_file_state(path, include_ctime=True) != state:
+        if _staged_file_state(path.stat(), include_ctime=True) != state:
             raise ValueError(f"staged output changed while hashing: {path}")
         del state["ctime_ns"]
         records.append(
@@ -1502,6 +1525,10 @@ def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
             }
         )
     return records
+
+
+class _StagedOutputChanged(ValueError):
+    """当前暂存文件与已记录的 ready 身份不符。"""
 
 
 def _validate_inventory(
@@ -1533,16 +1560,17 @@ def _validate_inventory(
         seen.add(key)
         _check_result_directories(root, relative, label=label)
         path = root / relative
-        if not path.is_file() or path.is_symlink():
-            raise FileNotFoundError(f"{label} output is missing: {path}")
-        stat = path.stat()
-        if stat.st_size != raw.get("size_bytes"):
-            raise ValueError(f"{label} output size changed: {path}")
+        observed = path.lstat()
+        if not stat.S_ISREG(observed.st_mode):
+            raise ValueError(f"{label} output must be a regular file: {path}")
+        size_changed = observed.st_size != raw["size_bytes"]
         if staged:
             state = raw.get("stage_identity")
-            if (not isinstance(state, dict) or any(type(value) is not int for value in state.values())
-                    or state != _staged_file_state(path)):
-                raise ValueError(f"staged output identity changed: {path}; regenerate delivery-ready")
+            if (size_changed or not isinstance(state, dict) or any(type(value) is not int for value in state.values())
+                    or state != _staged_file_state(observed)):
+                raise _StagedOutputChanged(f"staged output identity changed: {path}; rerun to regenerate delivery-ready")
+        elif size_changed:
+            raise ValueError(f"{label} output size changed: {path}")
         validated.append(dict(raw))
     return validated
 
@@ -1647,6 +1675,14 @@ def load_run_manifest(
 _PUBLIC_DIRNAME = "03_results"
 
 
+def read_sealed_final_manifest(path: Path, record: Mapping[str, object]) -> csv.DictReader:
+    """解析实际核过交付哈希的字节，避免对同一路径的第二次读取混入其他代际。"""
+    content = path.read_bytes()
+    if sha256_bytes(content) != record["sha256"]:
+        raise ValueError(f"Published final sample manifest SHA-256 disagrees with the sealed delivery: {path}")
+    return csv.DictReader(io.TextIOWrapper(io.BytesIO(content), encoding="utf-8-sig", newline=""), delimiter="\t")
+
+
 def _publish_hardlink(stage: Path, public: Path, relative: Path) -> None:
     destination = public / relative
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1731,7 +1767,15 @@ def publish_delivery(ready_path: str | Path) -> Path:
     public = project / _PUBLIC_DIRNAME
     stage = project / "02_work" / "results_stage"
 
-    outputs = _validate_inventory(stage, ready.get("outputs"), label="staged delivery", staged=True)
+    def validate_staged(records):
+        try:
+            return _validate_inventory(stage, records, label="staged delivery", staged=True)
+        except _StagedOutputChanged:
+            # onsuccess 失败不会将已完成的 ready 规则标为未完成。只撤销已失效的凭证。
+            ready_manifest.unlink(missing_ok=True)
+            raise
+
+    outputs = validate_staged(ready.get("outputs"))
     snapshot_path = Path(str(ready["run_snapshot_path"])).resolve()
     snapshot = load_run_snapshot(snapshot_path)
     payload = _run_manifest_payload(ready, snapshot)
@@ -1753,7 +1797,7 @@ def publish_delivery(ready_path: str | Path) -> Path:
         _publish_hardlink(stage, public, relative)
 
     _prune_stale_public_files(public, allowed)
-    _validate_inventory(stage, outputs, label="staged delivery", staged=True)
+    validate_staged(outputs)
     _validate_inventory(public, outputs, label="published delivery")
     for record in outputs:
         relative = Path(record["path"])
@@ -1764,7 +1808,7 @@ def publish_delivery(ready_path: str | Path) -> Path:
 
     if not config["retention"]["keep_final_bam"]:
         try:
-            for path in _retained_bam_paths(project, config):
+            for path in _retained_bam_paths(project, config, payload["outputs"]):
                 path.unlink(missing_ok=True)
         except (OSError, ValueError) as exc:
             logger.warning("Could not fully reclaim unretained BAMs: %s", exc)
@@ -1776,7 +1820,9 @@ def publish_delivery(ready_path: str | Path) -> Path:
     return marker
 
 
-def _retained_bam_paths(project: Path, config: Mapping[str, object]) -> tuple[Path, ...]:
+def _retained_bam_paths(
+    project: Path, config: Mapping[str, object], inventory: Iterable[Mapping[str, object]],
+) -> tuple[Path, ...]:
     layout = ProjectLayout(project / "02_work", project / "03_results", get_backend(config))
     for directory in (layout.intermediate_dir, layout.intermediate_dir / layout.backend):
         try:
@@ -1785,19 +1831,22 @@ def _retained_bam_paths(project: Path, config: Mapping[str, object]) -> tuple[Pa
             continue
         if not stat.S_ISDIR(mode):
             raise ValueError(f"Retained BAMs require real directories: {directory}")
+    relative = "QC_Results/sample_manifest.tsv"
+    record = next((entry for entry in inventory if entry["path"] == relative), None)
+    if record is None:
+        raise ValueError(f"Published delivery inventory omits {relative}")
+    reader = read_sealed_final_manifest(layout.result_root / relative, record)
+    if not {"sample_id", "analysis_status"}.issubset(reader.fieldnames or ()):
+        raise ValueError("Final manifest is missing BAM retention identity/status")
     paths = []
-    with (layout.result_root / "QC_Results/sample_manifest.tsv").open() as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        if not {"sample_id", "analysis_status"} <= set(reader.fieldnames or ()):
-            raise ValueError("Final manifest is missing BAM retention identity/status")
-        for row in reader:
-            if row["analysis_status"] != "PASS":
-                continue
-            if SAMPLE_ID_RE.fullmatch(row["sample_id"]) is None:
-                raise ValueError(f"Invalid retained BAM sample_id: {row['sample_id']!r}")
-            artifacts = cell_artifacts(layout.cell(row["sample_id"]), config["analysis"]["protocol"],
-                                       generate_snp=False, keep_final_bam=True)
-            paths.extend(artifacts.retained_bams)
+    for row in reader:
+        if row["analysis_status"] != "PASS":
+            continue
+        if SAMPLE_ID_RE.fullmatch(row["sample_id"]) is None:
+            raise ValueError(f"Invalid retained BAM sample_id: {row['sample_id']!r}")
+        artifacts = cell_artifacts(layout.cell(row["sample_id"]), config["analysis"]["protocol"],
+                                   generate_snp=False, keep_final_bam=True)
+        paths.extend(artifacts.retained_bams)
     return tuple(paths)
 
 
@@ -1874,13 +1923,17 @@ def project_status(
                         )
                         config = load_project_config(config_path)
                         keep_bam = config["retention"]["keep_final_bam"]
-                        for path in _retained_bam_paths(project, config):
-                            if keep_bam and not path.is_file():
+                        for path in _retained_bam_paths(project, config, manifest["outputs"]):
+                            try:
+                                state = path.stat() if keep_bam else path.lstat()
+                            except FileNotFoundError:
+                                state = None
+                            if keep_bam and (state is None or not stat.S_ISREG(state.st_mode)):
                                 return {
                                     "status": "resumable",
                                     "reason": f"requested retained BAM/index is missing: {path}",
                                 }
-                            if not keep_bam and (path.exists() or path.is_symlink()):
+                            if not keep_bam and state is not None:
                                 return {
                                     "status": "resumable",
                                     "reason": f"unretained BAM/index awaits cleanup under the Snakemake lock: {path}",
@@ -1890,8 +1943,10 @@ def project_status(
                             "manifest": str(public_manifest),
                             "delivery_id": manifest.get("delivery", {}).get("id", ""),
                         }
-                except (FileNotFoundError, ValueError, RuntimeError, OSError, KeyError, TypeError):
+                except (FileNotFoundError, RuntimeError, KeyError, TypeError):
                     pass
+                except (OSError, ValueError) as exc:
+                    return {"status": "resumable", "reason": f"could not verify current delivery: {exc}"}
             return {
                 "status": "resumable",
                 "reason": "completed delivery differs from current inputs/code/environment; reusing compatible Snakemake outputs",

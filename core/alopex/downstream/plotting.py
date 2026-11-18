@@ -923,8 +923,16 @@ def plot_plate_metric_map(
     clone_color_map: dict = None,
     out_path: Path = None,
 ):
-    """按 CloneID 分面绘制一个 QC 指标的孔板位置热图。"""
+    """按 CloneID 分面，用同一数值范围绘制各孔实际观测到的 QC 指标。"""
+    def skip_plot(message):
+        if out_path is not None:
+            Path(out_path).unlink(missing_ok=True)
+        print(message)
+
+    if not df.empty and metric not in df.columns:
+        raise ValueError(f"QC 表中找不到孔板指标 {metric!r}")
     if df.empty or 'PlateID' not in df.columns or 'CloneID' not in df.columns:
+        skip_plot('当前没有可定位到孔板的细胞，跳过孔板图。')
         return
     _load_plot_dependencies()
 
@@ -932,11 +940,9 @@ def plot_plate_metric_map(
     row_map = {letter: index for index, letter in enumerate(row_order)}
     plot_df = df.copy()
     plot_df['CloneID'] = plot_df['CloneID'].map(normalize_clone_id_value)
-    unique_for_labels = sorted(plot_df['CloneID'].dropna().unique().tolist())
-    clone_display_map, omitted = make_cloneid_diff_labels(unique_for_labels)
     plate_id = plot_df['PlateID'].astype('string').str.strip().str.upper()
     if plate_id.fillna('').eq('').all():
-        print('当前细胞无 PlateID，跳过孔板图。')
+        skip_plot('当前细胞无 PlateID，跳过孔板图。')
         return
     valid_plate = plate_id.str.fullmatch(r'[A-H](?:[1-9]|1[0-2])', na=False)
     if (~valid_plate).any():
@@ -953,29 +959,36 @@ def plot_plate_metric_map(
             f"⚠️ 忽略 {len(invalid)} 行无效 PlateID（应为 A1-H12）："
             f"{'; '.join(examples)}{suffix}"
         )
-    plot_df = plot_df.loc[valid_plate].copy()
+    plot_df['PlateID'] = plate_id
+    plot_df = plot_df.loc[valid_plate & plot_df['CloneID'].notna()].copy()
     if plot_df.empty:
-        print('⚠️ 没有可用于 Plate View 的有效 PlateID')
+        skip_plot('没有同时具备有效 PlateID 和 CloneID 的细胞，跳过孔板图。')
         return
-    plot_df['PlateID'] = plate_id.loc[valid_plate]
+    try:
+        values = pd.to_numeric(plot_df[metric], errors='raise')
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"孔板指标 {metric!r} 含非数值记录") from exc
+    plot_df['_plate_metric'] = values
+    plot_df = plot_df.loc[np.isfinite(values)].copy()
+    if plot_df.empty:
+        skip_plot(f'孔板指标 {metric!r} 没有有限观测值，跳过孔板图。')
+        return
     plot_df['row_idx'] = plot_df['PlateID'].str[0].map(row_map)
     plot_df['col_idx'] = plot_df['PlateID'].str[1:].astype(int)
     unique_clones = sorted(plot_df['CloneID'].dropna().unique().tolist())
-    if not unique_clones:
-        print('⚠️ 没有同时包含有效 PlateID 和 CloneID 的记录；请重新生成 DNAme QC 表')
-        return
+    clone_display_map, omitted = make_cloneid_diff_labels(unique_clones)
+    norm = mcolors.Normalize(plot_df['_plate_metric'].min(), plot_df['_plate_metric'].max())
 
     num_clones = len(unique_clones)
-    n_cols = 2
+    n_cols = min(2, num_clones)
     n_rows = math.ceil(num_clones / n_cols)
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
         figsize=(n_cols * 9, n_rows * 6),
         dpi=PlotParams.DPI,
+        squeeze=False,
     )
-    if num_clones == 1:
-        axes = np.array([axes])
     axes_flat = axes.flatten()
 
     for index, clone in enumerate(unique_clones):
@@ -998,39 +1011,34 @@ def plot_plate_metric_map(
             )
         else:
             cmap = 'YlOrBr'
-        ax.scatter(
+        points = ax.scatter(
             subset['col_idx'],
             subset['row_idx'],
             s=850,
-            c=subset[metric] if metric in subset.columns else np.zeros(len(subset)),
+            c=subset['_plate_metric'],
             cmap=cmap,
+            norm=norm,
             edgecolors='white',
             linewidth=0.8,
             alpha=0.85,
             zorder=2,
         )
-        if metric in subset.columns:
-            for _, row in subset.iterrows():
-                val = row[metric]
-                if pd.isna(val):
-                    continue
-                if val >= 1000000.0:
-                    label = f'{int(val / 1000000.0)}M'
-                elif val >= 1000.0:
-                    label = f'{int(val / 1000.0)}K'
-                else:
-                    label = f'{int(val)}'
-                ax.text(
-                    row['col_idx'],
-                    row['row_idx'],
-                    label,
-                    ha='center',
-                    va='center',
-                    fontsize=9,
-                    color=Colors.TITLE,
-                    fontweight='normal',
-                    zorder=3,
-                )
+        for col, row, value in subset[['col_idx', 'row_idx', '_plate_metric']].itertuples(index=False, name=None):
+            if value >= 1_000_000:
+                label = f'{value / 1_000_000:.4g}M'
+            elif value >= 10_000:
+                label = f'{value / 1_000:.4g}K'
+            else:
+                label = f'{value:.4g}'
+            # Choose the higher-contrast label against the marker composited on white.
+            alpha = points.get_alpha()
+            rgb = alpha * np.asarray(points.to_rgba(value)[:3]) + (1 - alpha)
+            linear_rgb = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+            luminance = linear_rgb @ [0.2126, 0.7152, 0.0722]
+            ax.text(
+                col, row, label, ha='center', va='center', fontsize=9,
+                color='white' if luminance < 0.179 else 'black', fontweight='normal', zorder=3,
+            )
         ax.set_xticks(range(1, 13))
         ax.set_yticks(range(8))
         ax.set_yticklabels(row_order)

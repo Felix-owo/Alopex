@@ -6,17 +6,17 @@
 
 1. **选对 kernel。** 打开 [DNA_QC_Visualization.ipynb](DNA_QC_Visualization.ipynb)，使用 `Alopex QC`；更新源码或更换 Pipeline 后先重启 kernel。
 2. **确认第一格的两条路径。** `DNA_PROJECT_ROOT` 指向数据项目，`DNA_PIPELINE_ROOT` 指向 Pipeline；按[运行前检查](#运行)确认 complete 交付可读。
-3. **按顺序运行。** 等 `qc.run_qc_processor()` 状态卡变为“已完成”后再加载 QC、绘图；需要矩阵时运行[最后一格](#保存供下游复用的-single-cpg-矩阵)。
+3. **按顺序运行。** 等 `qc.run_qc_processor()` 状态卡变为“已完成”后再加载 QC、绘图；矩阵与细胞注释可直接使用，见[SingleCpG 读取方式](#保存供下游复用的-single-cpg-矩阵)。
 
 | 现在要做什么 | 直接进入 |
 | --- | --- |
 | 第一次注册 kernel，或只用终端计算 | [kernel 注册](#jupyter--vs-code-kernel) / [CLI](#cli) |
-| 找 QC 表、Raw 或 SingleCpG | [输出](#输出) |
+| 找 QC 表、SingleCpG | [输出](#输出) |
 | 恢复失败计算、调整重算范围 | [缓存与强制重算](#缓存与强制重算) |
 | 调整图、筛选或 TSS 抽检 | [指标与筛选](#指标与筛选) / [TSS](#tss-profile) |
 | 连接 MethylTree 或 RNA_DARLIN | [MethylTree](#连接-methyltree) / [RNA 关联](#关联-rna_darlin-结果) |
 
-**完成判据：** Processor 成功退出后才显示“已完成”；结果在项目 `06_downstream/`。CLI 只计算 QC，SingleCpG 由 Notebook 最后一格生成。
+**完成判据：** Processor 成功退出后才显示“已完成”；结果在项目 `06_downstream/`。Processor 同时生成 QC 与带细胞注释的 SingleCpG。
 
 ## 运行
 
@@ -54,11 +54,13 @@ Notebook 调用独立 Processor 完成计算，再加载 QC 绘图；Processor �
 
 确实无需 TSS 时设为 `True`；不能同时指定外部 `TSS_BED`
 
-首格只负责参数、源码导入和路径确认；后续计算与绘图分别调用 `qc`、`plotting` 模块。显式项目缺少 manifest 时立即报错，不借用当前目录的其他项目定位 Pipeline。自动向上定位遇到权限、I/O 错误、悬空链接或非普通 manifest 时停止，不选择父项目；先修复当前项目的 `03_results/run_manifest.json` 及其父目录链接，再重试。更换 Pipeline 或更新源码后须重启 kernel，从首格重跑。
+首格只负责参数、源码导入和路径确认；后续计算与绘图分别调用 `qc`、`plotting` 模块。显式项目缺少 manifest 时立即报错，不借用当前目录的其他项目定位 Pipeline。自动定位时，发现当前项目的 `00_config/config.yaml` 但缺少交付记录，会在该项目停止。先完成它的上游发布，再运行 Notebook。权限错误、I/O 错误、悬空链接或非普通 manifest 也会指出出错位置。更换 Pipeline 或更新源码后须重启 kernel，从首格重跑。
 
 ### QC 运行面板与详细日志
 
 `qc.run_qc_processor()` 自动显示一个持续更新的中文状态卡，包含当前阶段、开始时间/耗时、实际worker预算、子进程及本机进程树CPU/RSS采样。阶段与缓存明细、TSS逐CloneID抽样和诊断默认折叠；完整原始输出在项目`04_logs/downstream/qc.<时间>.<PID>.log`。已有调用参数不变，无需设置输出模式。
+
+如果运行 QC 前上游发布了新的交付 ID，Processor 会在写结果前停止。遇到交付变更提示时，从 Notebook 第一格重新运行以读取新交付。
 
 终端运行时自动选择原位动态面板，非交互输出仅保留阶段变化、告警和五分钟心跳。资源缺失显示不可用，RSS合计和采样峰值不代表独占物理内存或精确峰值；界面显示“最终提交”时仍须等待完成，只有子进程（含句柄关闭）成功退出才显示“已完成”。
 
@@ -69,7 +71,7 @@ Notebook 调用独立 Processor 完成计算，再加载 QC 绘图；Processor �
 
 ### CLI
 
-仅计算 QC 可直接运行 Processor，之后再打开 Notebook 绘图。CLI 不生成 `SingleCpG_Adata.h5ad`。
+可在终端运行 Processor，之后打开 Notebook 绘图。CLI 同时生成 `SingleCpG_Adata.h5ad`。
 
 ```bash
 PIPELINE=/path/to/Alopex
@@ -112,28 +114,30 @@ PY_KERNEL
 | 文件 / 目录 | 用途 |
 | --- | --- |
 | `DNAme_QC_Information.csv` | 下游与 adata 合并的唯一 QC 表，固定20列；[字段、顺序与单位][qc-fields] |
-| `RawAdata.h5ad` / `RawAdata.input_schema.json` | 全细胞、全参考 canonical CpG 导入矩阵与复用记录，保留辅助序列供 QC／审计 |
-| `SingleCpG_Adata.h5ad` / `SingleCpG_Adata.input_schema.json` | Notebook 最后一格生成的全细胞、主核染色体 single-CpG 矩阵与完成记录 |
+| `DNA_Doublet_1Mb_Counts.npz` | Droplet 同代 chr1–chr22 窗口整数 mc/cov，供 Lemmus 读取 |
+| `SingleCpG_Adata.h5ad` / `SingleCpG_Adata.input_schema.json` | Processor 单次解码生成的全细胞、主核染色体 single-CpG 矩阵与完成记录 |
 | `Chromosome_QC_Information.csv` | 全细胞逐染色体整数计数、位点数与甲基化率 |
-| `QC_Filter_Reasons.csv` | Notebook筛选后逐条件结果及失败原因 |
+| `QC_Filter_Reasons.csv` | Processor 生成的逐细胞筛选结果与失败原因 |
 | `TSS_Profile_Information.csv` | 原有 TSS profile：抽中细胞有覆盖 offset 的甲基化率与甲基化信号整数计数 |
 | `plots/` | QC、Final QC、孔板、信号组成、TSS、CpG density 与 PCA 等 PDF |
-| `.cache/` | CpG 统计、信号组成、Gini 与 QC 完成身份等内部缓存，不手动改写 |
+| `.cache/` | 信号组成及 QC 完成身份等内部缓存，不手动改写 |
 | `methyltree/allCpGs.h5ad` / `methyltree/sample_sheet.csv` | 显式运行 MethylTree 衔接入口时生成；独立的所选细胞矩阵及全部细胞注释 |
 
 同一项目只能有一个下游写入者。遇到 `Downstream QC is busy`，等当前 Processor 或 SingleCpG 更新结束后重试。项目和 QC 目录内的 `.qc-write.lock` 是持久锁文件，**不要删除或替换**；进程退出后系统会释放锁，文件仍存在不代表任务在运行。
 
 ## 连接 MethylTree
 
-1. 使用独立 MethylTree kernel（模板标记为 `MethylTree_3_10_lab`，按本机实际注册项选择）打开 [only_quality_checking_alopex.ipynb](only_quality_checking_alopex.ipynb)。从 Alopex 项目或子目录启动，默认向上发现项目，再从 sealed 交付定位 Pipeline；也可显式填写 `DNA_PROJECT_ROOT` / `DNA_PIPELINE_ROOT`。Alopex 计算通过该 Pipeline 的受管 Python 子进程执行，无需向 MethylTree kernel 安装 Alopex 的整套依赖；无需先执行 Alopex 可视化 Notebook。
-2. Processor 从当前 complete 交付构建或复用标准 QC/Raw；`alopex.downstream.methyltree.prepare_methyltree_inputs` 复用同一 SingleCpG builder，导出至固定 `06_downstream/methyltree/`。
+1. 使用独立 MethylTree kernel（模板标记为 `MethylTree_3_10_lab`，按本机实际注册项选择）打开 [only_quality_checking_alopex.ipynb](only_quality_checking_alopex.ipynb)。从目标 Alopex 项目或子目录启动 kernel。此模板按工作目录发现最近的项目，从其完整交付读取 Pipeline 路径。Alopex 计算通过该 Pipeline 的受管 Python 子进程执行，无需向 MethylTree kernel 安装 Alopex 的整套依赖；无需先执行 Alopex 可视化 Notebook。
+2. Processor 从当前 complete 交付构建或复用标准 QC/SingleCpG；`alopex.downstream.methyltree.prepare_methyltree_inputs` 复用同一 SingleCpG builder，导出至固定 `06_downstream/methyltree/`。
 3. 默认不运行可选谱系推断；该可选分析需在自己的 MethylTree 环境单独验收。完成后确认全部细胞在 `sample_sheet.csv`，按导入门槛选中的细胞在 `allCpGs.h5ad`。H5AD 为标准 AnnData，X 保持 backed。Notebook 保留 MethylTree 原有绘图、筛选、注释、可选谱系和诊断流程，需安装 MethylTree；仅直接调用下方 Alopex 导出 API 时不要求该包。
 
 不修改公开 CpG、文件名、表头、坐标或整数计数，也不修改 MethylTree 包源码。sample/clone/plate/barcode/cell order 来自 sealed manifest；原20列QC保留，别名和单位见[指标与分母](#指标与分母)。无观测保持NaN；signal比例是coverage比例，不是FASTQ reads比例。不要把原生mapping跨backend当成同一指标。
 
-矩阵沿用 SingleCpG 的坐标和双链 fraction/mean，原始逐链整数计数仍在 Raw；导出按连续单行读取并直接复制 CSR 的 data/indices，保留显式零和缺失掩码。**稀疏未存储项代表缺失**，不能将 `toarray()` 后的零当成真实零甲基化。
+读图时，nCG 是有覆盖的宿主主核胞嘧啶位点数。分组图和汇总图均计入 nCG 为 0 的细胞，有零值时使用线性横轴。染色体散点图和分布图共用同一组 Pearson 系数。每对细胞仅使用共同有覆盖的常染色体，少于两条或任一侧在共同集合上无变异时，相关性记为缺失。分布图标题注明可计算配对数与总配对数。
 
-每次导出重建并原子覆盖独立 H5AD，不复用用户已写入的谱系结果；重跑前关闭同一 Notebook 打开的 backing file。标准 Raw/Single/QC 仍按原有身份复用。临时H5AD验证和关闭前不替换旧目标；替换前撤销旧`allCpGs.input_schema.json`，两份输出成功后最后提交新完成身份。失败只清本次临时项；缺少完成身份时重跑入口，不接纳部分导出。后续MethylTree分析修改导出文件后不再符合该初始交付身份，衔接入口仍会重建。完整代码调用为：
+矩阵沿用 SingleCpG 的坐标和双链 fraction/mean，原始逐位点整数计数保存在公开四列 CpG；导出按连续单行读取并直接复制 CSR 的 data/indices，保留显式零和缺失掩码。**稀疏未存储项代表缺失**，不能将 `toarray()` 后的零当成真实零甲基化。
+
+每次导出重建并原子覆盖独立 H5AD，不复用用户已写入的谱系结果；重跑前关闭同一 Notebook 打开的 backing file。标准 SingleCpG/QC 仍按原有身份复用。临时H5AD验证和关闭前不替换旧目标；替换前撤销旧`allCpGs.input_schema.json`，两份输出成功后最后提交新完成身份。失败只清本次临时项；缺少完成身份时重跑入口，不接纳部分导出。后续MethylTree分析修改导出文件后不再符合该初始交付身份，衔接入口仍会重建。完整代码调用为：
 
 ```python
 from alopex.downstream import qc, methyltree
@@ -151,7 +155,7 @@ samples, h5ad = methyltree.prepare_methyltree_inputs(
 
 标准分析范围为 hg38 的 chr1–22/X/Y、mm10 的 chr1–19/X/Y；辅助／decoy 参与比对，不进入宿主 nCG、甲基化率、Gini、TSS 和最终 Single-CpG 矩阵。TSS／single-CpG BED 必须携带与当前参考匹配的 `.reference.json`，不得把旧目录套到新交付。
 
-来源与绑定以当前封存 reference 回执和固定清单为准。
+参考身份以当前封存回执为准。
 
 读图时先区分位点均值、coverage 比例和 read-pair 指标。身份列按字符串保留前导零及合法 `NA/nan/None`，数值缺失保持 NaN；观测零值不能当作缺失。完整定义见[QC 字段][qc-fields]和[生物学分母][denominators]。
 
@@ -169,7 +173,7 @@ samples, h5ad = methyltree.prepare_methyltree_inputs(
 
 Notebook 默认同时要求 lambda methylation `<10%`、pUC19 methylation `>90%`、宿主 unique CpG sites `>500000`、Gini `<0.5`。mapping 默认不参与；对应数据完成验证后才设置 `MAPPING_THRESHOLD`。pair 去重率默认不参与。
 
-`HQ` 是细胞注释；Raw 与 SingleCpG 仍保留全部细胞，SingleCpG 同时保存 QC、`HQ` 和自定义注释。
+`HQ` 是细胞注释；SingleCpG 保留全部细胞，并保存标准 QC 与 `HQ`。在 Processor 单元设置筛选门槛。
 
 ### 图与展示控制
 
@@ -178,6 +182,12 @@ Notebook 默认同时要求 lambda methylation `<10%`、pUC19 methylation `>90%`
 染色体图支持独立调用：从当前完成 QC 读取数据后，可运行 `plotting.plot_chromosome_diagnostics(..., clone_color_map=clone_color_map)` 并导出图片；不传颜色表时使用现有默认配色规则。
 
 #### 图 / Notebook 控制：解读与输出
+
+**孔板图**
+
+在绘图单元用 `PLATE_VIEW_METRIC` 选择数值列，默认是 `Native_Mapping%`。每个 CloneID 单独成图面，所有图面共用数值范围。孔内标签最多保留四位有效数字，较大的数值以 K、M 缩写。精确值在 `DNAme_QC_Information.csv`。
+
+有观测的零显示为 `0`，缺失和无穷值的孔留空。当前指标没有可绘制的孔时，重新运行该单元会清理对应的旧 PDF。指标名拼错或列中含有非数值记录时，单元报错。
 
 **Final QC**
 
@@ -222,7 +232,7 @@ QC 身份/sites、sealed final manifest pairs、composition cache host signals �
 
 ## 保存供下游复用的 single-CpG 矩阵
 
-运行 Notebook 最后一格的 `prepare_single_cpg_adata(PATHS, df_qc)`，按 `Sample_ID` 严格对齐全细胞 QC 与注释。完成后使用打印出的 `SINGLECPG_ADATA_PATH` 读取：
+Processor 按 `Sample_ID` 对齐全细胞 QC 和筛选结果并保存到矩阵。Processor 成功结束后，使用该单元打印的 `SINGLECPG_ADATA_PATH` 读取。
 
 ```python
 import anndata as ad
@@ -234,7 +244,7 @@ adata.file.close()
 
 | 使用边界 | 要求 |
 | --- | --- |
-| 完成记录 | 矩阵与 `SingleCpG_Adata.input_schema.json` 配套使用；输入身份失配时从当前已核验 Raw 自动重建，见[缓存与强制重算](#缓存与强制重算) |
+| 完成记录 | 矩阵与 `SingleCpG_Adata.input_schema.json` 配套使用；输入身份失配时由 Processor 从当前 sealed CpG 自动重建，见[缓存与强制重算](#缓存与强制重算) |
 | 坐标 | 跟随 sealed `analysis.cpg_coordinate_base`：0-based `chr1:0-2` 为半开区间，1-based `chr1:1-2` 为闭区间，表示同一 CpG；传给 BED/0-based 工具前须按实际 metadata 转换 |
 | reference 顺序 | 保留原生 `reference_sequences` 与索引顺序，不按 FAI 重排；坐标与原生索引约束见[矩阵契约][single-contract] |
 | 后续注释 | 只读对象不能回填标签；使用独立可写副本或合适大小的内存子集。MethylTree 分箱后仍按细胞 ID 对齐 `obs` |
@@ -247,30 +257,32 @@ adata.file.close()
 
 外部 BED 须匹配 sealed genome build，并通过完整坐标、重复区间和 offset 校验。reference 由 Doctor 根据已准备的 FASTA/GTF 构建，准备步骤见[主 README](../README.md)。
 
+自备 TSS BED 时，用制表符分列。第 7 列是原样读取的基因 ID，第 9 列是有符号 32 位整数 offset。坐标或 offset 带小数时，只有恰好等于整数才有效。同一基因的两个区间若在染色体末端裁成同一区间，需要修正源 BED 后重新封存。
+
 Notebook 第二格的 `TSS_SAMPLE_FRACTION`、`TSS_SAMPLE_SEED` 控制抽检，对应 CLI `--tss-sample-fraction` / `--tss-sample-seed`。默认每个原始 CloneID 抽10%：不足10个全检，其余向上取整且最多100个；比例设为1.0时全检。
 
 选样按种子与 Sample_ID 确定，不受行序影响，也不按 coverage 选样。完整范围与记录位置见[TSS 抽检控制][recompute]。
 
 抽检只影响 TSS，其他 QC 和矩阵仍保留全部细胞。CSV 仅记录选中且有覆盖的 bins，实际出现的细胞数可小于抽检数；有 coverage 的零甲基化仍保留，无覆盖不补0。全体无覆盖时仅表头 CSV 合法，旧 PDF 会清理。显式 `--skip-tss` / `SKIP_TSS=True` 会清理该交付旧 TSS CSV/PDF。
 
+重新启用 TSS 时，先设 `SKIP_TSS=False` 并运行 QC Processor，再运行绘图单元。若本次应有的 CSV 丢失，也从 Processor 恢复。单独重跑绘图只使用本次完成记录绑定的曲线。
+
 ## 缓存与强制重算
 
-默认按 sealed 输入、参数与算法身份复用缓存，无需先删除输出目录。新 Raw generation 会使 Gini/TSS 重算；canonical CpG 统计可独立复用。重算开关默认均为 `False`，只影响下游。
+默认按 sealed 输入、参数与算法身份复用缓存，无需先删除输出目录。输入身份失配或强制重算时，逐细胞解码一次，重新生成全部同代产物。重算开关默认均为 `False`，只影响下游。
 
 | Notebook 开关 | CLI 对应项 | 重建对象 |
 | --- | --- | --- |
-| `RECOMPUTE_RAW_ADATA` | `--recompute-raw-adata` | 从 sealed CpG 重建 Raw |
-| `RECOMPUTE_CPG_STATS` | `--recompute-cpg-stats` | 联合重建 CpG 位点/甲基化统计与信号组成；任一缓存缺失或损坏也会自动联合重建 |
-| `RECOMPUTE_GINI` | `--recompute-gini` | Gini |
-| `RECOMPUTE_TSS` | `--recompute-tss` | TSS profile |
-| `RECOMPUTE_SINGLECPG` | 无，仅 Notebook 最后一格 | 重建 SingleCpG；完成后恢复 `False` |
+| `RECOMPUTE_CPG_STATS` | `--recompute-cpg-stats` | 同代 QC、SingleCpG 和适用的 1 Mb 计数 |
+| `RECOMPUTE_GINI` | `--recompute-gini` | 同上 |
+| `RECOMPUTE_TSS` | `--recompute-tss` | 同上，按当前 TSS 设置生成诊断 |
 
 | 遇到的情况 | 处理方式 |
 | --- | --- |
-| 调整 TSS BED、比例或种子 | 仅 TSS 自动失效，无需强制重建其他 QC 或矩阵 |
-| QC 完成身份缺失、过期或重算中断 | 重新运行 Processor，成功后再加载 QC 或生成 SingleCpG；有效 Raw 仍可复用 |
-| Raw 输入或算法身份过期 | 先运行 Processor 完成必要重建，再处理 SingleCpG；不能仅修改 metadata 或用 Single 强制开关绕过 |
-| SingleCpG 来源未知或变化 | 从已核验 Raw 自动重建；`RECOMPUTE_SINGLECPG=True` 可强制重建。仅注释变化时复用矩阵并更新 `obs`，原 QC 列须与当前磁盘 QC 一致 |
+| 调整 TSS BED、比例或种子 | Processor 自动重建整代产物，无需打开强制重算开关 |
+| 只调整 HQ 门槛 | 重新运行 Processor；已完成矩阵复用，只更新 `obs`、筛选参数和筛选表 |
+| QC 完成身份缺失、过期或重算中断 | 重新运行 Processor，完成后再加载 QC 或读取 SingleCpG |
+| SingleCpG 来源未知或变化 | 重新运行 Processor，从 sealed CpG 自动恢复 |
 | 输入或参考在计算期间变化 | 确认文件稳定后重跑；失败时不提交完成身份，未完成矩阵不能作为有效缓存使用 |
 | CpG 格式错误或缓存计数矛盾 | 按错误定位 canonical CpG 输入并重算；不把格式失败当作合法空细胞，也不手改缓存绕过校验；输入格式与守恒见[下游契约][qc-contract] |
 

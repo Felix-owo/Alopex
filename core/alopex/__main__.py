@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -39,6 +40,7 @@ from .inputs import (
     droplet_output_disk_mb,
     init_project_directory,
     print_refresh_result,
+    raw_input_lock,
     refresh_manifest,
     stage_droplet_reads,
     verify_demux_binary_revision,
@@ -126,6 +128,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     refresh.add_argument("--project", help="项目根目录；默认使用当前目录。")
     refresh.add_argument("--configfile", help="显式指定项目 config；仅接受 <project>/00_config/config.yaml。")
     refresh.add_argument("--dry-run", action="store_true", help="只预览候选 manifest，不写入文件。")
+    read_lock = commands.add_parser("with-raw-input-lock", help="持共享原始输入锁执行正式 launcher。")
+    read_lock.add_argument("project", type=Path)
+    read_lock.add_argument("launcher")
 
 
     create = commands.add_parser("snapshot-create", help="创建/复用内容寻址 run snapshot。")
@@ -223,7 +228,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          help="JSON array of canonical reference contig names excluded from assessment.")
     extract.add_argument("--alignment-bam", required=True, type=Path)
     extract.add_argument("--samtools", default="samtools")
-    extract.add_argument("--protocol", choices=("cabernet", "droplet"), required=True)
+    extract.add_argument("--protocol", choices=("cabernet",), required=True)
     extract.add_argument("--high-cph-role", choices=("cdna_contamination",),
                          required=True)
     split = commands.add_parser("split-bismark-pairs", help="Bismark BAM 配对路由与计数。")
@@ -248,8 +253,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     summary.add_argument("--samtools", required=True)
     summary.add_argument("--percentage", type=float, required=True)
     summary.add_argument("--minimum-count", type=int, required=True)
-    summary.add_argument("--protocol", required=True)
-    summary.add_argument("--high-cph-role", required=True)
+    summary.add_argument("--protocol", choices=("cabernet", "droplet"), required=True)
+    summary.add_argument("--high-cph-role", choices=("cdna_contamination",), required=True)
     summary.add_argument("--summary-path", type=Path, required=True)
     summary.add_argument("--multiqc-path", type=Path, required=True)
 
@@ -370,6 +375,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             return print_refresh_result(args, result)
 
+        elif command == "with-raw-input-lock":
+            with raw_input_lock(args.project, exclusive=False) as descriptor:
+                os.set_inheritable(descriptor, True)
+                os.environ["DNA_PIPELINE_RAW_LOCK_PID"] = str(os.getpid())
+                os.execvp("bash", ["bash", args.launcher])
         elif command == "snapshot-create":
             print(create_run_snapshot(
                 pipeline_root=args.pipeline_root,

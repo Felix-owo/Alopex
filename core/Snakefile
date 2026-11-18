@@ -614,6 +614,9 @@ rule all:
 onstart:
     # executor_settings 在解析 Snakefile 后才绑定，须在提交首个作业前应用。
     honor_slurm_no_account(workflow)
+    if os.environ.get("DNA_PIPELINE_PRESENTATION_CHILD"):
+        from alopex.presentation import observe_slurm_group_completion
+        observe_slurm_group_completion(workflow)
 
 onsuccess:
     if PROVENANCE_SNAPSHOT_PATH is not None and DELIVERY_READY.is_file():
@@ -2313,6 +2316,7 @@ rule multiqc:
             prepare_high_cph_multiqc_sources(
                 current_multiqc_source_inputs(wildcards, selected_samples) + [str(input.pair_qc), str(input.cutadapt_qc)],
                 Path(output.high_cph),
+                backend=METHYLATION_BACKEND, protocol=PROTOCOL_POLICY.name,
             ),
             selected_samples, len(active_samples), Path(output.sampled_sources),
         )

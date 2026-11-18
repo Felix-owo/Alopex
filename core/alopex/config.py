@@ -122,7 +122,7 @@ properties:
         - taps
         - droplet
       cpg_coordinate_base:
-        description: 四列 CpG、RawAdata 和下游 SingleCpG 位点的坐标起点；默认 1，设为 0 输出 0-based；不改变 BED、VCF 或 BAM 的原生坐标。
+        description: 四列 CpG 和下游 SingleCpG 位点的坐标起点；默认 1，设为 0 输出 0-based；不改变 BED、VCF 或 BAM 的原生坐标。
         type: integer
         enum:
         - 0
@@ -360,7 +360,7 @@ references:
 
 analysis:
   protocol: cabernet              # cabernet / taps / droplet；manifest 的 rna_sample 为可选外部 RNA raw 关联
-  cpg_coordinate_base: 1         # CpG pos、RawAdata 与 SingleCpG 位点默认 1-based；设为 0 输出 0-based，原生 BED/VCF/BAM 不变
+  cpg_coordinate_base: 1         # CpG pos 与 SingleCpG 位点默认 1-based；设为 0 输出 0-based，原生 BED/VCF/BAM 不变
 
 runtime:
   local_executor_cores: 32        # local executor 的总 CPU 数（snakemake --cores）；影响吞吐不改变结果

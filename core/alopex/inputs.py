@@ -6,6 +6,7 @@ import sys
 _LOADED_MODULE_CODE = sys._getframe().f_code
 
 import stat
+import fcntl
 import csv
 import gzip
 import hashlib
@@ -20,8 +21,10 @@ import tempfile
 import time
 import uuid
 import warnings
+import zlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -57,6 +60,7 @@ from .io import (
     project_temporary_parent,
     atomic_write_bytes,
     _read_json,
+    _fsync_directory,
     atomic_write_json,
     iter_tree_files,
     render_tsv,
@@ -74,11 +78,12 @@ from .paths import PIPELINE_ROOT
 # 输入与解复用：项目和原始输入
 
 FASTQ_SUFFIXES = (".fastq.gz", ".fq.gz")
+_MERGED_FASTQ_SUFFIXES = tuple(".merged" + suffix for suffix in FASTQ_SUFFIXES)
 
 
 _FASTQ_PATTERNS = (
     (
-        re.compile(r"^(?P<sample>.+)\.R(?P<read>[12])\.raw\.f(?:ast)?q\.gz$", re.IGNORECASE),
+        re.compile(r"^(?P<sample>.+)\.R(?P<read>[12])\.raw(?:\.merged)?\.f(?:ast)?q\.gz$", re.IGNORECASE),
         lambda m: "single",
     ),
     (
@@ -93,7 +98,7 @@ _FASTQ_PATTERNS = (
         lambda m: f"part_{m.group('chunk')}",
     ),
     (
-        re.compile(r"^(?P<sample>.+)[_.-]R?(?P<read>[12])\.f(?:ast)?q\.gz$", re.IGNORECASE),
+        re.compile(r"^(?P<sample>.+)[_.-]R?(?P<read>[12])(?:\.merged)?\.f(?:ast)?q\.gz$", re.IGNORECASE),
         lambda m: "single",
     ),
 )
@@ -107,8 +112,12 @@ def _parse_fastq_inventory_name(path: Path) -> tuple[str, str, str] | None:
     return None
 
 
+def _is_merged_fastq(path: Path) -> bool:
+    return path.name.lower().endswith(_MERGED_FASTQ_SUFFIXES)
+
+
 def _iter_fastq_inventory(
-    dir_raw: Path, planned_renames: Mapping[Path, Path] | None = None,
+    dir_raw: Path, archived_paths: frozenset[Path] = frozenset(),
     selected_samples: set[str] | None = None,
 ) -> Iterable[tuple[Path, str, str, str]]:
     unsupported: list[Path] = []
@@ -116,12 +125,10 @@ def _iter_fastq_inventory(
     ignored_count = 0
     ignored_preview: list[str] = []
     for path in sorted(iter_tree_files(dir_raw)):
-        if not path.name.lower().endswith(FASTQ_SUFFIXES):
+        if path in archived_paths or not path.name.lower().endswith(FASTQ_SUFFIXES):
             continue
         if not stat.S_ISREG(path.stat().st_mode):
             continue
-        if planned_renames:
-            path = planned_renames.get(path, path)
         parsed = _parse_fastq_inventory_name(path)
         if selected_samples is not None and (
             parsed is None or parsed[0].removeprefix("样本_") not in selected_samples
@@ -166,21 +173,22 @@ def _iter_fastq_inventory(
 
 
 def discover_samples(
-    dir_raw: Path, *, planned_renames: Mapping[Path, Path] | None = None,
+    dir_raw: Path, *, archived_paths: frozenset[Path] = frozenset(),
     selected_samples: set[str] | None = None,
 ) -> dict[str, dict[str, list[str]]]:
     """按确定性的 lane/chunk 顺序发现配对 FASTQ。
 
     支持 R1/R2 或末尾 1/2、1-999 的 lane；仅去掉样本名前缀“样本_”，不改文件名或批次信息。
-    lane 按数值配对排序；归一化身份冲突、重复 mate 与缺配对均拒绝；维护预览可校验虚拟改名清单。
+    lane 按数值配对排序；归一化身份冲突、重复 mate 与缺配对均拒绝；维护预览可排除将归档的源文件。
     指定样本集合时仅校验该集合的输入，其余 FASTQ 提示后跳过；未指定时完整扫描供 refresh 使用。
     """
+    _require_no_raw_append(dir_raw.parent)
     logger.info("Starting sample discovery in: %s", dir_raw)
     if not dir_raw.is_dir():
         raise FileNotFoundError(f"Raw data directory not found: {dir_raw}")
     inventory: dict[str, dict[str, dict[str, Path]]] = {}
     duplicates: list[str] = []
-    for path, sample, mate, segment in _iter_fastq_inventory(dir_raw, planned_renames, selected_samples):
+    for path, sample, mate, segment in _iter_fastq_inventory(dir_raw, archived_paths, selected_samples):
         segment_map = inventory.setdefault(sample, {}).setdefault(segment, {})
         if mate in segment_map and segment_map[mate] != path:
             duplicates.append(
@@ -216,8 +224,12 @@ def discover_samples(
                     + ", ".join(str(mates[m]) for m in sorted(mates))
                 )
                 continue
-            r1_files.append(str(mates["R1"].resolve()))
-            r2_files.append(str(mates["R2"].resolve()))
+            left, right = mates["R1"], mates["R2"]
+            if _is_merged_fastq(left) or _is_merged_fastq(right):
+                if left.parent != right.parent or not all(map(_is_merged_fastq, (left, right))):
+                    raise ValueError(f"Merged FASTQs must be a pair in one directory: {left}, {right}")
+            r1_files.append(str(left.resolve()))
+            r2_files.append(str(right.resolve()))
         if r1_files and len(r1_files) == len(r2_files):
             samples[sample] = {"r1": r1_files, "r2": r2_files}
 
@@ -258,133 +270,377 @@ def _scan_fastq_layout(
     return families, layouts
 
 
-def resolve_single_pair_fastq_collisions(
-    dir_raw: Path,
-    *,
-    apply: bool = True,
-) -> list[tuple[Path, Path]]:
-    """把散落多个文件夹的同名单式 FASTQ 对改名为 chunk 式 ``{sample}_R{mate}_NNN.fastq.gz``
-    （文件夹按字典序），使下一次 ``discover_samples`` 将其合并为同一多 chunk 样本。
-
-    lane/chunk 命名混布、R1/R2 不成对、同 mate 字节级重复副本、目标名已存在均拒绝且不改动文件树；
-    ``apply=False`` 只返回计划，正式应用后必须通过全新 ``discover_samples`` 验证，
-    失败则按反向顺序回滚全部改名。
-    """
-    dir_raw = Path(dir_raw)
-    sample_families, sample_layouts = _scan_fastq_layout(dir_raw)
-
-    plans: list[tuple[Path, Path]] = []
-
-    def _refuse(reason: str) -> None:
-        raise ValueError(
-            f"FASTQ collision normalization refused ({reason}); nothing was renamed"
-        )
-
-    for sample in sorted(sample_families):
-        layout = sample_layouts[sample]
-
-        plain: dict[Path, dict[str, list[Path]]] = {}
-        for parent, mates in layout.items():
-            for mate, records in mates.items():
-                for family, path in records:
-                    if family == "single":
-                        plain.setdefault(parent, {}).setdefault(mate, []).append(path)
-        if not plain:
-            continue
-        duplicated_mate = any(
-            len({parent for parent, mm in plain.items() if mate in mm}) >= 2
-            for mate in ("R1", "R2")
-        )
-        if not duplicated_mate:
-            continue
-
-        if sample_families[sample] != {"single"}:
-            _refuse(
-                f"sample {sample!r} owns files outside the plain single-pair naming "
-                "(lane or chunk style); rename the batches manually instead"
-            )
+@dataclass(frozen=True)
+class FastqAppend:
+    target: Path
+    source: Path
+    archive: Path
+    output: Path
 
 
-        ordered_parents = sorted(plain, key=str)
-        for parent in ordered_parents:
-            broken = [
-                f"{mate}x{len(paths)}"
-                for mate, paths in sorted(plain[parent].items())
-                if len(paths) != 1
-            ] + [
-                f"{mate}x0" for mate in ("R1", "R2") if mate not in plain[parent]
-            ]
-            if broken:
-                _refuse(
-                    f"folder {parent} holds raw sample {sample!r} with "
-                    f"{', '.join(broken)} instead of exactly one R1/R2 pair"
-                )
+_RAW_APPEND_JOURNAL = "05_tmp/.raw-fastq-append.json"
+_RAW_INPUT_LOCK = "05_tmp/.raw-fastq.lock"
+_FASTQ_NEWLINE_MEMBER = gzip.compress(b"\n", mtime=0)
 
-        digests: dict[str, dict[str, str]] = {"R1": {}, "R2": {}}
-        for mate in ("R1", "R2"):
-            for parent in ordered_parents:
-                path = plain[parent][mate][0]
-                digests[mate][str(path)] = sha256_file(path, chunk_size=1024 * 1024)
-            seen: dict[str, str] = {}
-            for owner in sorted(digests[mate], key=str):
-                fingerprint = digests[mate][owner]
-                if fingerprint in seen:
-                    _refuse(
-                        f"two {mate} files of sample {sample!r} are byte-identical and look "
-                        f"like duplicate copies instead of independent data: {seen[fingerprint]} "
-                        f"and {owner}; delete the redundant copy manually"
-                    )
-                seen[fingerprint] = owner
 
-        for seq, parent in enumerate(ordered_parents, start=1):
-            for mate in ("R1", "R2"):
-                source = plain[parent][mate][0]
-                target = parent / f"{sample}_{mate}_{seq:03d}.fastq.gz"
-                if target.exists() or target.is_symlink():
-                    _refuse(f"planned target already exists: {target}")
-                plans.append((source, target))
-
-    if not plans or not apply:
-        return plans
-
-    with _fastq_rename_transaction(dir_raw, plans):
-        pass
-    return plans
+def _require_no_raw_append(project: Path) -> None:
+    journal = project / _RAW_APPEND_JOURNAL
+    try:
+        journal.lstat()
+    except FileNotFoundError:
+        return
+    raise RuntimeError(f"FASTQ merge recovery is pending at {journal}. Run ./run_pipeline.sh --refresh-manifest.")
 
 
 @contextmanager
-def _fastq_rename_transaction(
-    dir_raw: Path, plans: Sequence[tuple[Path, Path]],
-) -> Iterator[None]:
-    """改名、重新发现及调用方提交共用回滚边界；保留中断前真实完成的文件操作。"""
-    attempted: list[tuple[Path, Path]] = []
+def raw_input_lock(project: Path, *, exclusive: bool) -> Iterator[int]:
+    """互斥保护原位追加与上游运行；锁文件保留，避免并发者切换 inode。"""
+    path = project / _RAW_INPUT_LOCK
+    project_temporary_parent(path, project_dir=project)
+    access = os.O_RDWR if exclusive else os.O_RDONLY
+    fd = os.open(path, access | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o666)
     try:
-        for source, target in plans:
-            if target.exists() or target.is_symlink():
-                raise FileExistsError(f"FASTQ rename target already exists: {target}")
-            # rename 已成功但尚未返回 Python 时也可能收到 Ctrl-C，须先登记操作。
-            attempted.append((source, target))
-            source.rename(target)
-        if plans:
-            try:
-                discover_samples(dir_raw)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Collision renames were rolled back because the merged inventory under "
-                    f"{dir_raw} still does not validate: {exc}"
-                ) from exc
+        state = os.fstat(fd)
+        if not stat.S_ISREG(state.st_mode) or state.st_nlink != 1:
+            raise ValueError(f"Unsafe FASTQ lock: {path}")
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("FASTQ inputs are busy. Wait for the active Alopex run or manifest refresh.") from exc
+        if not exclusive:
+            _require_no_raw_append(project)
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _merge_file_state(path: Path) -> os.stat_result:
+    state = path.lstat()
+    if not stat.S_ISREG(state.st_mode) or state.st_nlink != 1:
+        raise ValueError(f"FASTQ in-place merge requires a regular file without aliases: {path}")
+    return state
+
+
+def _require_unused_fastq_archive(path: Path) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise FileExistsError(f"FASTQ merge archive already exists: {path}")
+
+
+def _plan_fastq_appends(dir_raw: Path) -> list[FastqAppend]:
+    sample_families, sample_layouts = _scan_fastq_layout(dir_raw)
+    plan: list[FastqAppend] = []
+    for sample, layout in sorted(sample_layouts.items()):
+        plain = {
+            parent: {mate: [path for family, path in records if family == "single"]
+                     for mate, records in mates.items()}
+            for parent, mates in sorted(layout.items())
+        }
+        if all(sum(bool(mates.get(mate)) for mates in plain.values()) < 2 for mate in ("R1", "R2")):
+            continue
+        if sample_families[sample] != {"single"}:
+            raise ValueError(f"Sample {sample!r} has FASTQs outside the plain single-pair naming")
+        if dir_raw.is_symlink():
+            raise ValueError(f"FASTQ in-place merge requires a real raw directory: {dir_raw}")
+        batches: list[list[Path]] = []
+        for parent, mates in plain.items():
+            if any(len(mates.get(mate, [])) != 1 for mate in ("R1", "R2")):
+                raise ValueError(f"{parent} must contain exactly one R1/R2 pair for {sample!r}")
+            batches.append([mates[mate][0] for mate in ("R1", "R2")])
+
+        existing = [pair for pair in batches if any(map(_is_merged_fastq, pair))]
+        if existing:
+            if len(existing) != 1 or not all(map(_is_merged_fastq, existing[0])):
+                raise ValueError(f"Expected one complete merged FASTQ pair for {sample!r}")
+            # 已合并的文件继续作为追加目标，即使新批次的目录名排在前面。
+            batches.remove(existing[0])
+            batches.insert(0, existing[0])
+
+        for target, *sources in zip(*batches, strict=True):
+            output = target
+            if not _is_merged_fastq(target):
+                stem, extension, gzip_extension = target.name.rsplit(".", 2)
+                output = target.with_name(f"{stem}.merged.{extension}.{gzip_extension}")
+                if stat_if_present(output) is not None:
+                    raise FileExistsError(f"Merged FASTQ output already exists: {output}")
+            by_size: dict[int, list[Path]] = {}
+            for path in (target, *sources):
+                by_size.setdefault(_merge_file_state(path).st_size, []).append(path)
+            for equal_size in by_size.values():
+                if len(equal_size) < 2:
+                    continue
+                digests = {sha256_file(path) for path in equal_size}
+                if len(digests) != len(equal_size):
+                    raise ValueError(f"Byte-identical FASTQ duplicate copies for {sample!r}: {equal_size}")
+            for source in sources:
+                archive = source.with_name(source.name + ".archived")
+                _require_unused_fastq_archive(archive)
+                plan.append(FastqAppend(target, source, archive, output))
+    return plan
+
+
+def _reject_repeated_gzip_batch(target: Path, candidates: Sequence[Path]) -> None:
+    """同一首条 header 只提示可能重复。逐个真实 gzip 成员起点比对完整压缩批次。"""
+    with target.open("rb") as stream, target.open("rb") as compare:
+        block = b""
+        while True:
+            if not block:
+                block = stream.read(64 * 1024)
+                if not block:
+                    return
+            block = block.lstrip(b"\0")  # gzip 成员间允许零填充。
+            if not block:
+                continue
+            offset = stream.tell() - len(block)
+            for path in candidates:
+                compare.seek(offset)
+                with path.open("rb") as batch:
+                    while chunk := batch.read(64 * 1024):
+                        if compare.read(len(chunk)) != chunk:
+                            break
+                    else:
+                        raise ValueError(f"Byte-identical FASTQ batch already in {target}: {path}")
+            member = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            while not member.eof:
+                if not block:
+                    block = stream.read(64 * 1024)
+                    if not block:
+                        raise EOFError(f"Truncated gzip member in {target}")
+                member.decompress(block, 1024 * 1024)
+                block = member.unused_data if member.eof else member.unconsumed_tail
+
+
+def _check_merge_pair(
+    r1: Path, r2: Path, incoming_headers: Mapping[Path, dict[bytes, list[Path]]],
+) -> tuple[bool, bool]:
+    """核对每批边界，返回每个 mate 的末条质量行是否已有换行。"""
+    possible_repeats: dict[Path, list[Path]] = {}
+
+    def read_record(handle, path, headers):
+        header = handle.readline()
+        if not header:
+            return None
+        if headers and header in headers:
+            possible_repeats.setdefault(path, []).extend(headers.pop(header))
+        sequence, plus, quality = (handle.readline() for _ in range(3))
+        if (
+            not header.startswith(b"@") or not plus.startswith(b"+")
+            or not quality
+            or len(sequence.removesuffix(b"\n").removesuffix(b"\r"))
+            != len(quality.removesuffix(b"\n").removesuffix(b"\r"))
+        ):
+            raise ValueError(f"Malformed FASTQ: {path}")
+        token = re.match(rb"[^\t\n\r\v\f ]+", header[1:])
+        if token is None:
+            raise ValueError(f"Missing FASTQ read ID: {path}")
+        name = token.group()
+        if name.endswith((b"/1", b"/2")):
+            name = name[:-2]
+        return name, quality.endswith(b"\n")
+
+    with gzip.open(r1, "rb") as left, gzip.open(r2, "rb") as right:
+        left_headers, right_headers = incoming_headers.get(r1), incoming_headers.get(r2)
+        terminal_newlines = None
+        while True:
+            left_record = read_record(left, r1, left_headers)
+            right_record = read_record(right, r2, right_headers)
+            if left_record is None and right_record is None:
+                if terminal_newlines is None:
+                    raise ValueError(f"Empty FASTQ batch: {r1} and {r2}")
+                break
+            if left_record is None or right_record is None or not left_record[0] or left_record[0] != right_record[0]:
+                raise ValueError(f"FASTQ mate IDs or record counts differ: {r1} and {r2}")
+            terminal_newlines = (left_record[1], right_record[1])
+    for target, candidates in possible_repeats.items():
+        _reject_repeated_gzip_batch(target, candidates)
+    return terminal_newlines
+
+
+def _state_for_append(path: Path) -> dict[str, Any]:
+    st = _merge_file_state(path)
+    return dict(path=str(path.resolve()), dev=st.st_dev, ino=st.st_ino, size=st.st_size, mtime=st.st_mtime_ns)
+
+
+def _append_identity(state: Mapping[str, Any]) -> tuple[int, int]:
+    return state["dev"], state["ino"]
+
+
+@contextmanager
+def _open_merge_file(state: Mapping[str, Any], *, append: bool = False):
+    path = Path(state["path"])
+    flags = os.O_RDWR | os.O_APPEND if append else os.O_RDONLY
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "ab" if append else "rb", buffering=0) as handle:
+        current = os.fstat(handle.fileno())
+        if (
+            not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+            or (current.st_dev, current.st_ino) != _append_identity(state)
+        ):
+            raise ValueError(f"FASTQ changed identity during merge: {path}")
+        yield handle
+
+
+def _append_fastq(source: Mapping[str, Any], target: Mapping[str, Any], expected_size: int, separator: bytes) -> None:
+    with _open_merge_file(source) as incoming, _open_merge_file(target, append=True) as output:
+        initial = os.fstat(incoming.fileno())
+        if (initial.st_size, initial.st_mtime_ns) != (source["size"], source["mtime"]):
+            raise ValueError(f"FASTQ changed before append: {source['path']}")
+        existing = os.fstat(output.fileno())
+        if existing.st_size != expected_size or (
+            expected_size == target["size"] and existing.st_mtime_ns != target["mtime"]
+        ):
+            raise ValueError(f"FASTQ target changed before append: {target['path']}")
+        data = separator or incoming.read(4 * 1024 * 1024)
+        while data:
+            pending = memoryview(data)
+            while pending:
+                written = output.write(pending)
+                if not written:
+                    raise OSError(f"Short FASTQ append: {target['path']}")
+                pending = pending[written:]
+            data = incoming.read(4 * 1024 * 1024)
+        final = os.fstat(incoming.fileno())
+        if (final.st_size, final.st_mtime_ns) != (initial.st_size, initial.st_mtime_ns):
+            raise ValueError(f"FASTQ changed during append: {source['path']}")
+        if os.fstat(output.fileno()).st_size != expected_size + source["size"] + len(separator):
+            raise OSError(f"Incomplete FASTQ append: {target['path']}")
+        os.fsync(output.fileno())
+
+
+def _recover_fastq_append(project: Path, journal: Path) -> None:
+    record = _read_json(journal, "FASTQ merge journal")
+    raw = (project / "01_raw").resolve()
+    operations = record["appends"]
+    for op in operations:
+        for key in ("source", "target", "archive", "output"):
+            path = Path(op[key]["path"] if key in ("source", "target") else op[key])
+            if not path.is_relative_to(raw) or path.resolve() != path:
+                raise ValueError(f"Unsafe path in FASTQ merge journal: {path}")
+
+    targets: dict[str, tuple[Mapping[str, Any], int, Path]] = {}
+    sources: list[tuple[Path, Path | None]] = []
+    for op in operations:
+        target = op["target"]
+        output = Path(op["output"])
+        _, total, _ = targets.get(target["path"], (target, target["size"], output))
+        targets[target["path"]] = (target, total + op["source"]["size"] + op["separator_bytes"], output)
+        source, archive = Path(op["source"]["path"]), Path(op["archive"])
+        active = stat_if_present(source) is not None
+        if active == (stat_if_present(archive) is not None):
+            raise ValueError(f"Expected exactly one FASTQ source or archive: {source}, {archive}")
+        current = _merge_file_state(source if active else archive)
+        if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
+            op["source"]["dev"], op["source"]["ino"], op["source"]["size"], op["source"]["mtime"]
+        ):
+            raise ValueError(f"FASTQ source changed before recovery: {source}")
+        sources.append((source, None if active else archive))
+
+    for target, maximum, output in targets.values():
+        original = Path(target["path"])
+        current_path = original
+        if output != original and stat_if_present(original) is None:
+            current_path = output
+        state = {**target, "path": str(current_path)}
+        with _open_merge_file(state) as handle:
+            current = os.fstat(handle.fileno())
+            if not target["size"] <= current.st_size <= maximum:
+                raise ValueError(f"Unexpected FASTQ size during recovery: {current_path}")
+        if current.st_size != target["size"]:
+            with _open_merge_file(state, append=True) as handle:
+                handle.truncate(target["size"])
+                os.fsync(handle.fileno())
+        if current_path != original:
+            current_path.rename(original)
+        _fsync_directory(original.parent, strict=True)
+    # 归档已核验。恢复改名失败必须保留日志，不能将归档当成缺席而跳过。
+    for source, archive in reversed(sources):
+        if archive is not None:
+            archive.rename(source)
+        _fsync_directory(source.parent, strict=True)
+    if record["manifest_changed"]:
+        manifest = project / "00_config/sample_manifest.tsv"
+        original = record["manifest_text"]
+        if original is None:
+            manifest.unlink(missing_ok=True)
+        elif stat_if_present(manifest) is None or manifest.read_bytes() != original.encode("utf-8"):
+            atomic_write_bytes(manifest, original.encode("utf-8"), mode=record["manifest_mode"])
+        _fsync_directory(manifest.parent, strict=True)
+    journal.unlink()
+    _fsync_directory(journal.parent, strict=True)
+
+
+@contextmanager
+def _fastq_append_transaction(
+    project: Path, plan: Sequence[FastqAppend], *, manifest_changed: bool,
+    manifest_text: bytes | None, manifest_mode: int | None,
+) -> Iterator[None]:
+    if not plan:
         yield
+        return
+    # 每个批次独立验证一次。只追加其 gzip 原始字节，不改写第一批前缀。
+    states = {p: _state_for_append(p) for op in plan for p in (op.target, op.source)}
+    paths_by_pair: dict[tuple[Path, str], dict[str, Path]] = {}
+    for path in states:
+        sample, mate, _ = _parse_fastq_inventory_name(path)
+        paths_by_pair.setdefault((path.parent, sample), {})[mate] = path
+    terminal_newlines: dict[Path, bool] = {}
+    incoming_headers: dict[Path, dict[bytes, list[Path]]] = {}
+    for op in plan:
+        if _is_merged_fastq(op.target):
+            with gzip.open(op.source, "rb") as batch:
+                incoming_headers.setdefault(op.target, {}).setdefault(batch.readline(), []).append(op.source)
+    for pair in paths_by_pair.values():
+        left, right = pair["R1"], pair["R2"]
+        terminal_newlines[left], terminal_newlines[right] = _check_merge_pair(left, right, incoming_headers)
+    if any(_state_for_append(path) != state for path, state in states.items()):
+        raise ValueError("FASTQ inputs changed during merge validation")
+    previous_batch: dict[Path, Path] = {}
+    operations = []
+    for op in plan:
+        previous = previous_batch.get(op.target, op.target)
+        operations.append(dict(
+            source=states[op.source], target=states[op.target], archive=str(op.archive.resolve()),
+            output=str(op.output.resolve()),
+            separator_bytes=0 if terminal_newlines[previous] else len(_FASTQ_NEWLINE_MEMBER),
+        ))
+        previous_batch[op.target] = op.source
+    journal = project / _RAW_APPEND_JOURNAL
+    atomic_write_json(journal, dict(
+        appends=operations, manifest_changed=manifest_changed,
+        manifest_text=None if manifest_text is None else manifest_text.decode("utf-8"),
+        manifest_mode=manifest_mode,
+    ), mode=0o600)
+    _fsync_directory(journal.parent, strict=True)
+
+    try:
+        sizes: dict[str, int] = {}
+        for op in operations:
+            target, source = op["target"], op["source"]
+            size = sizes.get(target["path"], target["size"])
+            separator = _FASTQ_NEWLINE_MEMBER if op["separator_bytes"] else b""
+            _append_fastq(source, target, size, separator)
+            sizes[target["path"]] = size + source["size"] + len(separator)
+        for op in plan:
+            _require_unused_fastq_archive(op.archive)
+            if _state_for_append(op.source) != states[op.source]:
+                raise ValueError(f"FASTQ changed before archive: {op.source}")
+            op.source.rename(op.archive)
+            _fsync_directory(op.source.parent, strict=True)
+        for target, output in dict.fromkeys((op.target, op.output) for op in plan):
+            if target != output:
+                if stat_if_present(output) is not None:
+                    raise FileExistsError(f"Merged FASTQ output already exists: {output}")
+                target.rename(output)
+                _fsync_directory(output.parent, strict=True)
+        yield
+        _fsync_directory(project / "00_config", strict=True)
     except BaseException:
-        for source, target in reversed(attempted):
-            if target.exists() or target.is_symlink():
-                if source.exists() or source.is_symlink():
-                    raise FileExistsError(f"FASTQ rollback source already exists: {source}")
-                target.rename(source)
+        _recover_fastq_append(project, journal)
         raise
-    if plans:
-        logger.info(
-            "Normalized %d colliding FASTQ file(s) into chunk-style segments", len(plans)
-        )
+    journal.unlink()
+    _fsync_directory(journal.parent, strict=True)
 
 
 _BARCODE_RE = re.compile(r"^[ACGT]+$")
@@ -442,7 +698,7 @@ def _audit_one_substitution_neighborhoods(values: list[str], label: str) -> None
 
 
 def _iter_delimited_rows(handle: TextIO, path: Path, *, delimiter: str) -> Iterator[tuple[int, list[str]]]:
-    """用户表格的坏引号必须带文件/物理行号失败，不能吞掉后续身份记录。"""
+    """表格的坏引号必须带文件/物理行号失败，不能吞掉后续身份记录。"""
     reader = csv.reader(handle, delimiter=delimiter, strict=True)
     try:
         for values in reader:
@@ -837,83 +1093,92 @@ def refresh_manifest(
     config_path: Path,
     dry_run: bool = False,
 ) -> dict[str, object]:
-    """先在内存中校验完整改名与 manifest 计划；预览不写文件，正式写出失败时回滚改名。"""
-    config = load_project_config(config_path)
-
+    """在管线读取锁之外合并原始 FASTQ，失败时按日志恢复整组输入。"""
+    project_dir = project_dir.absolute()
     if not project_dir.is_dir():
         raise FileNotFoundError(f"Project directory does not exist: {project_dir}")
-
-    species = str(config["species"])
-    protocol = get_protocol_policy(config).name
-    raw_dir = project_dir / "01_raw"
-    manifest_path = project_dir / "00_config" / "sample_manifest.tsv"
-
-
-    fastq_renames = resolve_single_pair_fastq_collisions(raw_dir, apply=False)
-    discovered = discover_samples(raw_dir, planned_renames=dict(fastq_renames))
-    if not discovered:
-        raise ValueError(f"No paired FASTQ samples found under: {raw_dir}")
-    existing_rows = _read_existing_manifest_loose(manifest_path)
-    rows = build_refreshed_rows(
-        discovered.keys(), existing_rows, species=species, protocol=protocol
-    )
-    if not rows:
-        raise ValueError("Manifest refresh produced no rows")
+    config = load_project_config(config_path)
+    with nullcontext() if dry_run else raw_input_lock(project_dir, exclusive=True):
+        species = str(config["species"])
+        protocol = get_protocol_policy(config).name
+        raw_dir = project_dir / "01_raw"
+        manifest_path = project_dir / "00_config" / "sample_manifest.tsv"
 
 
-    new_text = render_tsv(rows, PROJECT_SAMPLE_MANIFEST_FIELDS)
-    validated = _parse_project_sample_manifest(
-        io.StringIO(new_text), path=manifest_path, species=species, protocol=protocol
-    )
-    map_discovered_samples_to_manifest(discovered, validated, protocol=protocol)
-    changed = _canonical_project_manifest_rows(existing_rows) != rows
-    backup_path: Path | None = None
+        journal = project_dir / _RAW_APPEND_JOURNAL
+        if journal.is_symlink():
+            raise ValueError(f"Unsafe FASTQ merge journal: {journal}")
+        if stat_if_present(journal) is not None and not dry_run:
+            _recover_fastq_append(project_dir, journal)
+        _require_no_raw_append(project_dir)
+        fastq_appends = _plan_fastq_appends(raw_dir)
+        discovered = discover_samples(raw_dir, archived_paths=frozenset(op.source for op in fastq_appends))
+        if not discovered:
+            raise ValueError(f"No paired FASTQ samples found under: {raw_dir}")
+        existing_rows = _read_existing_manifest_loose(manifest_path)
+        rows = build_refreshed_rows(
+            discovered.keys(), existing_rows, species=species, protocol=protocol
+        )
+        if not rows:
+            raise ValueError("Manifest refresh produced no rows")
 
-    if not dry_run:
-        original_manifest = original_mode = None
-        if changed:
-            try:
-                manifest_path.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                original_manifest = manifest_path.read_bytes()
-                original_mode = stat.S_IMODE(manifest_path.stat().st_mode)
-        with _fastq_rename_transaction(raw_dir, fastq_renames):
-            try:
-                if changed:
-                    if original_manifest is not None and existing_rows:
-                        backup_path = manifest_path.with_name(f"{manifest_path.name}.bak")
-                        # 不原地截断旧备份，也不沿既有链接写入其他文件。
-                        atomic_write_bytes(
-                            backup_path, original_manifest,
-                            mode=original_mode,
-                        )
-                    write_tsv_atomic(manifest_path, rows, PROJECT_SAMPLE_MANIFEST_FIELDS, mode=original_mode)
-            except BaseException:
-                # 替换已经完成后仍可能收到中断；先恢复清单，再由外层逆序恢复文件名。
-                if changed:
-                    if original_manifest is None:
-                        manifest_path.unlink(missing_ok=True)
-                    elif not manifest_path.exists() or manifest_path.read_bytes() != original_manifest:
-                        atomic_write_bytes(manifest_path, original_manifest, mode=original_mode)
-                raise
 
-    return {
-        "project_dir": project_dir,
-        "config_path": config_path,
-        "raw_dir": raw_dir,
-        "manifest_path": manifest_path,
-        "species": species,
-        "protocol": protocol,
-        "discovered_count": len(discovered),
-        "row_count": len(rows),
-        "changed": changed,
-        "backup_path": backup_path,
-        "fastq_renames": fastq_renames,
-        "rows": rows,
-        "text": new_text,
-    }
+        new_text = render_tsv(rows, PROJECT_SAMPLE_MANIFEST_FIELDS)
+        validated = _parse_project_sample_manifest(
+            io.StringIO(new_text), path=manifest_path, species=species, protocol=protocol
+        )
+        map_discovered_samples_to_manifest(discovered, validated, protocol=protocol)
+        changed = _canonical_project_manifest_rows(existing_rows) != rows
+        backup_path: Path | None = None
+
+        if not dry_run:
+            original_manifest = original_mode = None
+            if changed:
+                try:
+                    manifest_path.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    original_manifest = manifest_path.read_bytes()
+                    original_mode = stat.S_IMODE(manifest_path.stat().st_mode)
+            with _fastq_append_transaction(
+                project_dir, fastq_appends, manifest_changed=changed,
+                manifest_text=original_manifest, manifest_mode=original_mode,
+            ):
+                try:
+                    if changed:
+                        if original_manifest is not None and existing_rows:
+                            backup_path = manifest_path.with_name(f"{manifest_path.name}.bak")
+                            # 不原地截断旧备份，也不沿既有链接写入其他文件。
+                            atomic_write_bytes(
+                                backup_path, original_manifest,
+                                mode=original_mode,
+                            )
+                        write_tsv_atomic(manifest_path, rows, PROJECT_SAMPLE_MANIFEST_FIELDS, mode=original_mode)
+                except BaseException:
+                    # 合并事务由恢复日志还原清单及 FASTQ，普通刷新仅还原清单。
+                    if changed and not fastq_appends:
+                        if original_manifest is None:
+                            manifest_path.unlink(missing_ok=True)
+                        elif not manifest_path.exists() or manifest_path.read_bytes() != original_manifest:
+                            atomic_write_bytes(manifest_path, original_manifest, mode=original_mode)
+                    raise
+
+        return {
+            "project_dir": project_dir,
+            "config_path": config_path,
+            "raw_dir": raw_dir,
+            "manifest_path": manifest_path,
+            "species": species,
+            "protocol": protocol,
+            "discovered_count": len(discovered),
+            "row_count": len(rows),
+            "changed": changed,
+            "backup_path": backup_path,
+            "fastq_appends": fastq_appends,
+            "rows": rows,
+            "text": new_text,
+        }
 
 
 def init_project_directory(project_dir: str | Path, pipeline_root: str | Path) -> Path:
@@ -962,7 +1227,7 @@ def init_project_directory(project_dir: str | Path, pipeline_root: str | Path) -
 
 
 def print_refresh_result(args, result) -> int:
-    """refresh-manifest 的用户可见输出（预览/更新/未变化 + 改名计划）。"""
+    """refresh-manifest 的用户可见输出（预览/更新/未变化 + 追加计划）。"""
     action = "Previewed" if args.dry_run else ("Updated" if result["changed"] else "Unchanged")
     print(f"{action} sample manifest")
     print(f"  Project:  {result['project_dir']}")
@@ -973,12 +1238,13 @@ def print_refresh_result(args, result) -> int:
     print(f"  Species:  {result['species']}")
     print(f"  FASTQ samples: {result['discovered_count']}")
     print(f"  Manifest rows: {result['row_count']}")
-    if result["fastq_renames"]:
-        state = "Planned renames" if args.dry_run else "Normalized FASTQ pairs"
-        print(f"  {state}: {len(result['fastq_renames'])} file(s)")
-        for source, target in result["fastq_renames"]:
-            rel_source = Path(source).relative_to(result["raw_dir"])
-            print(f"    {rel_source} -> {target.name}")
+    if result["fastq_appends"]:
+        state = "Planned FASTQ appends" if args.dry_run else "Appended FASTQ files"
+        print(f"  {state}: {len(result['fastq_appends'])}")
+        for op in result["fastq_appends"]:
+            root = result["raw_dir"]
+            print(f"    {op.source.relative_to(root)} -> {op.output.relative_to(root)}")
+            print(f"      Archive: {op.archive.relative_to(root)}")
     if result["backup_path"]:
         print(f"  Backup:   {result['backup_path']}")
     if args.dry_run:

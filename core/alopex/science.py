@@ -23,6 +23,7 @@ from .config import (
     FILTER_SUMMARY_FIELDS,
     FILTER_SUMMARY_SCHEMA_VERSION,
     SAMPLE_ID_RE,
+    get_protocol,
     _integer,
 )
 from .io import (
@@ -35,43 +36,41 @@ from .io import (
 
 # 科学处理：共用统计
 
-_COUNT = r"([0-9][0-9,]*)"
+def _native_count(token: str, *, grouped: bool = False) -> int:
+    """Parse an unsigned ASCII count, optionally accepting grouped thousands."""
+    if grouped and "," in token and re.fullmatch(r"[0-9]{1,3}(?:,[0-9]{3})+", token):
+        token = token.replace(",", "")
+    if not token.isascii() or not token.isdecimal():
+        raise ValueError(f"Invalid native count: {token!r}")
+    return int(token)
 
 
-def _required_count(text: str, label: str, patterns: Sequence[str]) -> int:
-    matches: list[int] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
-            matches.append(int(match.group(1).replace(",", "")))
-    if not matches:
-        raise ValueError(f"Bismark report is missing required field: {label}")
-    if len(set(matches)) != 1:
-        raise ValueError(f"Bismark report has conflicting values for {label}: {matches}")
-    return matches[0]
+def _bismark_field_values(text: str, field: str) -> list[str]:
+    # Capture every occurrence, including empty or malformed values on that physical line.
+    return [raw.strip() for raw in re.findall(
+        rf"^(?:{field}):([^\r\n]*)", text, re.IGNORECASE | re.MULTILINE
+    )]
 
 
-def _optional_count(text: str, label: str, patterns: Sequence[str], *, default: int = 0) -> int:
-    matches: list[int] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
-            matches.append(int(match.group(1).replace(",", "")))
-    if not matches:
-        return default
-    if len(set(matches)) != 1:
-        raise ValueError(f"Bismark report has conflicting values for {label}: {matches}")
-    return matches[0]
-
-
-def _required_float(text: str, label: str, pattern: str) -> float:
-    matches = [
-        float(match.group(1))
-        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
-    ]
-    if not matches:
-        raise ValueError(f"Bismark report is missing required field: {label}")
-    if any(not math.isclose(matches[0], value, abs_tol=1e-9) for value in matches[1:]):
-        raise ValueError(f"Bismark report has conflicting values for {label}: {matches}")
-    return matches[0]
+def _bismark_report_count(
+    text: str, field: str, path: Path, *, optional: bool = False, annotated: bool = False
+) -> int:
+    values = _bismark_field_values(text, field)
+    if not values:
+        if optional:
+            return 0
+        raise ValueError(f"Bismark report lacks {field} count: {path}")
+    counts = set()
+    for value in values:
+        # Deduplication appends a parenthesized percentage to the integer.
+        token = re.sub(r"[ \t]+\([^()]*\)$", "", value) if annotated else value
+        try:
+            counts.add(_native_count(token, grouped=True))
+        except ValueError as exc:
+            raise ValueError(f"Invalid Bismark count for {field} in {path}: {value!r}") from exc
+    if len(counts) != 1:
+        raise ValueError(f"Bismark report has conflicting {field} counts: {path}")
+    return counts.pop()
 
 
 def _count_bam_pairs(bam: Path, samtools: str) -> int:
@@ -122,6 +121,12 @@ def _read_json_if_present(path: Path) -> dict[str, object]:
     return value
 
 
+def _validate_high_cph_route(backend: str, protocol: str, role: str) -> None:
+    protocols = {"biscuit": ("cabernet",), "bismark": ("cabernet", "droplet")}
+    if protocol not in protocols.get(backend, ()) or role != get_protocol(protocol).high_cph_role:
+        raise ValueError(f"Invalid high-CpH protocol/role identity: {backend=}, {protocol=}, {role=}")
+
+
 def _read_high_cph_summary(path: Path, sample: str, backend: str) -> dict[str, object]:
     if backend == "bismark":
         return _read_filter_summary(path, sample)
@@ -155,16 +160,9 @@ def _read_high_cph_summary(path: Path, sample: str, backend: str) -> dict[str, o
         or payload["backend"] != backend
         or payload["sample"] != sample
         or payload["metric_unit"] != "read_pairs"
-        or payload["protocol"] not in {"cabernet", "droplet"}
-        or payload["high_cph_role"]
-        not in {"cdna_contamination"}
     ):
         raise ValueError(f"High-CpH summary identity is invalid: {path}")
-    expected_role = {
-        "cabernet": "cdna_contamination",
-    }[str(payload["protocol"])]
-    if payload["high_cph_role"] != expected_role:
-        raise ValueError(f"High-CpH summary protocol/role contract is invalid: {path}")
+    _validate_high_cph_route(backend, payload["protocol"], payload["high_cph_role"])
     counts: dict[str, int] = {}
     for field in (
         "candidate_read_pairs",
@@ -520,7 +518,8 @@ def split_pairs(
 def run_bsconv_extraction(args) -> None:
     """主流程：流式解析 bsconv TSV、排除指定 contig、按阈值划分高 retention QNAME，
     外部 sort -u 按 read-pair 去重后写出 high-read-names、summary 与 MultiQC JSON。"""
-    if not 0 <= args.threshold <= 1:
+    _validate_high_cph_route("biscuit", args.protocol, args.high_cph_role)
+    if isinstance(args.threshold, bool) or not isinstance(args.threshold, (int, float)) or not 0 <= args.threshold <= 1:
         raise ValueError("--threshold must be between 0 and 1")
 
     excluded = _parse_excluded_contigs_json(args.excluded_contigs_json)
@@ -717,14 +716,17 @@ def write_dupsifter_mqc(
                 if ":" in content:
                     key, value = content.split(":", 1)
                     key = key.strip()
-                    value = value.strip().replace(",", "")
+                    value = value.strip()
                     if key in mapping:
                         try:
-                            metrics[mapping[key]] = int(value)
+                            count = _native_count(value, grouped=True)
                         except ValueError as exc:
                             raise ValueError(
                                 f"Invalid Dupsifter count at {stat}:{line_no}: {key}={value!r}"
                             ) from exc
+                        if mapping[key] in metrics and metrics[mapping[key]] != count:
+                            raise ValueError(f"Conflicting Dupsifter count at {stat}:{line_no}: {key}={value!r}")
+                        metrics[mapping[key]] = count
     row_key = demux_sample
     output_row = {
         "Protocol": pipeline_mode,
@@ -751,24 +753,25 @@ def _parse_cph_methylation_pct(path: Path) -> float:
         raise ValueError(f"Malformed BISCUIT CpH retention title: {path}")
     if len(lines) < 2:
         raise ValueError(f"BISCUIT CpH retention table lacks a header: {path}")
-    reader = csv.DictReader(lines[1:], delimiter="\t")
+    reader = csv.DictReader(lines[1:], delimiter="\t", quoting=csv.QUOTE_NONE)
     required = {"ReadInPair", "Position", "Conversion/Retention", "Count"}
-    if not required.issubset(set(reader.fieldnames or [])):
+    fields = reader.fieldnames or []
+    if len(fields) != len(set(fields)) or not required.issubset(fields):
         raise ValueError(f"Malformed BISCUIT CpH retention header: {path}")
     seen: set[tuple[str, int, str]] = set()
     retained = total = 0
     for row in reader:
-        read = str(row["ReadInPair"]).strip()
-        state = str(row["Conversion/Retention"]).strip()
+        if None in row or None in row.values():
+            raise ValueError(f"Malformed BISCUIT CpH retention row width at {path}:{reader.line_num + 1}")
+        read = row["ReadInPair"].strip()
+        state = row["Conversion/Retention"].strip()
         if read not in {"1", "2"} or state not in {"C", "R"}:
             raise ValueError(f"Malformed BISCUIT CpH retention row: {path}: {row}")
         try:
-            position = int(str(row["Position"]).strip())
-            count = int(str(row["Count"]).strip())
+            position = _native_count(row["Position"].strip())
+            count = _native_count(row["Count"].strip())
         except ValueError as exc:
             raise ValueError(f"Invalid BISCUIT CpH count/position: {path}: {row}") from exc
-        if position < 0 or count < 0:
-            raise ValueError(f"Negative BISCUIT CpH count/position: {path}: {row}")
         identity = (read, position, state)
         if identity in seen:
             raise ValueError(f"Duplicate BISCUIT CpH state: {path}: {row}")
@@ -841,17 +844,15 @@ def _read_biscuit_native_mapping(path: Path) -> dict[str, object]:
         fields = line.split()
         if len(fields) != 2:
             raise ValueError(f"Malformed BISCUIT MAPQ row in {path}: {line!r}")
-        label, raw_count = fields[0], fields[1].replace(",", "")
+        label, raw_count = fields
         try:
-            count = int(raw_count)
+            count = _native_count(raw_count, grouped=True)
         except ValueError as exc:
             raise ValueError(f"Invalid BISCUIT MAPQ count in {path}: {line!r}") from exc
-        if count < 0:
-            raise ValueError(f"Negative BISCUIT MAPQ count in {path}: {line!r}")
         label_key: str | int = label
         if label != "unmapped":
             try:
-                label_key = int(label)
+                label_key = _native_count(label)
             except ValueError as exc:
                 raise ValueError(f"Invalid BISCUIT MAPQ label in {path}: {label!r}") from exc
             if not 0 <= label_key <= 255:
@@ -881,36 +882,20 @@ def _read_biscuit_native_mapping(path: Path) -> dict[str, object]:
 
 def parse_alignment_report(path: Path) -> dict[str, int | float]:
     text = path.read_text(encoding="utf-8", errors="strict")
-    total = _required_count(
-        text,
-        "sequence_pairs_total",
-        [rf"^Sequence pairs analysed in total:\s*{_COUNT}\s*$"],
+    total = _bismark_report_count(text, "Sequence pairs analysed in total", path)
+    unique = _bismark_report_count(text, "Number of paired-end alignments with a unique best hit", path)
+    no_alignment = _bismark_report_count(text, "Sequence pairs with no alignments under any condition", path)
+    non_unique = _bismark_report_count(text, "Sequence pairs did not map uniquely", path)
+    discarded = _bismark_report_count(
+        text, "Sequence pairs which were discarded because genomic sequence could not be extracted",
+        path, optional=True,
     )
-    unique = _required_count(
-        text,
-        "unique_best_pairs",
-        [rf"^Number of paired-end alignments with a unique best hit:\s*{_COUNT}\s*$"],
-    )
-    no_alignment = _required_count(
-        text,
-        "pairs_without_alignment",
-        [rf"^Sequence pairs with no alignments under any condition:\s*{_COUNT}\s*$"],
-    )
-    non_unique = _required_count(
-        text,
-        "pairs_not_unique",
-        [rf"^Sequence pairs did not map uniquely:\s*{_COUNT}\s*$"],
-    )
-    discarded = _optional_count(
-        text,
-        "pairs_discarded_no_genomic_sequence",
-        [
-            rf"^Sequence pairs which were discarded because genomic sequence could not be extracted:\s*{_COUNT}\s*$"
-        ],
-    )
-    mapping_efficiency = _required_float(
-        text, "mapping_efficiency", r"^Mapping efficiency:\s*([0-9]+(?:\.[0-9]+)?)%\s*$"
-    )
+    efficiencies = _bismark_field_values(text, "Mapping efficiency")
+    if not efficiencies or any(not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?%", v) for v in efficiencies):
+        raise ValueError(f"Missing or invalid Bismark mapping efficiency in {path}: {efficiencies!r}")
+    mapping_efficiency = float(efficiencies[0][:-1])
+    if any(not math.isclose(mapping_efficiency, float(v[:-1]), abs_tol=1e-9) for v in efficiencies[1:]):
+        raise ValueError(f"Bismark report has conflicting mapping efficiency values: {path}")
     if unique + no_alignment + non_unique != total:
         raise ValueError(
             "Bismark alignment counts are inconsistent: "
@@ -940,21 +925,9 @@ def parse_alignment_report(path: Path) -> dict[str, int | float]:
 
 def parse_dedup_report(path: Path) -> dict[str, int]:
     text = path.read_text(encoding="utf-8", errors="strict")
-    total = _required_count(
-        text,
-        "dedup_pairs_analysed",
-        [rf"^Total number of alignments analysed in .+?:\s*{_COUNT}(?:\s|$)"],
-    )
-    removed = _required_count(
-        text,
-        "duplicate_pairs_removed",
-        [rf"^Total number duplicated alignments removed:\s*{_COUNT}(?:\s|$)"],
-    )
-    leftover = _required_count(
-        text,
-        "deduplicated_pairs_left",
-        [rf"^Total count of deduplicated leftover sequences:\s*{_COUNT}(?:\s|$)"],
-    )
+    total = _bismark_report_count(text, r"Total number of alignments analysed in .+", path, annotated=True)
+    removed = _bismark_report_count(text, "Total number duplicated alignments removed", path, annotated=True)
+    leftover = _bismark_report_count(text, "Total count of deduplicated leftover sequences", path, annotated=True)
     if removed > total or leftover != total - removed:
         raise ValueError(
             "Bismark deduplication counts are inconsistent: "
@@ -1022,15 +995,7 @@ def _read_filter_summary(path: Path, sample: str) -> dict[str, Any]:
         raise ValueError("Bismark non-conversion minimum_count must be >= 1")
     if not isinstance(filter_applied, bool):
         raise ValueError("Bismark non-conversion filter_applied must be boolean")
-    if payload["protocol"] not in {"cabernet", "droplet"}:
-        raise ValueError("Bismark non-conversion protocol is invalid")
-    if payload["high_cph_role"] not in {
-        "cdna_contamination",
-    }:
-        raise ValueError("Bismark non-conversion high_cph_role is invalid")
-    expected_role = {"cabernet": "cdna_contamination", "droplet": "cdna_contamination"}
-    if payload["high_cph_role"] != expected_role[payload["protocol"]]:
-        raise ValueError("Bismark non-conversion protocol/role contract is invalid")
+    _validate_high_cph_route("bismark", payload["protocol"], payload["high_cph_role"])
     if not filter_applied:
         raise ValueError("Bismark non-conversion summary must record the fixed filter action")
     return payload
@@ -1382,7 +1347,9 @@ def write_filter_summary(
         or not 0 <= percentage <= 100
     ):
         raise SystemExit("filter summary percentage must be within [0, 100]")
-    if min(candidate_pairs, removed_pairs, excluded_pairs, retained_pairs) < 0:
+    _validate_high_cph_route("bismark", protocol, high_cph_role)
+    pairs = (candidate_pairs, removed_pairs, excluded_pairs, retained_pairs)
+    if any(isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in pairs):
         raise SystemExit("filter summary counts must be non-negative integers")
     if removed_pairs > candidate_pairs:
         raise SystemExit("flagged pairs exceed candidate pairs")
@@ -1439,31 +1406,10 @@ def _parse_bismark_non_cpg_methylation_pct(path: Path) -> float:
     counts: dict[tuple[str, str], int] = {}
     for state in ("Methylated", "Unmethylated"):
         for context in ("CHG", "CHH"):
-            if state == "Methylated":
-                patterns = (
-                    rf"^(?:Total )?methylated C(?:'|’)?s in {context} context:\s*([0-9][0-9,]*)\s*$",
-                    rf"^(?:Total )?methylated cytosines in {context} context:\s*([0-9][0-9,]*)\s*$",
-                )
-            else:
-                patterns = (
-                    rf"^(?:Total )?unmethylated C(?:'|’)?s in {context} context:\s*([0-9][0-9,]*)\s*$",
-                    rf"^(?:Total )?unmethylated cytosines in {context} context:\s*([0-9][0-9,]*)\s*$",
-                    rf"^Total C to T conversions in {context} context:\s*([0-9][0-9,]*)\s*$",
-                )
-            observed = [
-                int(match.group(1).replace(",", ""))
-                for pattern in patterns
-                for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
-            ]
-            if not observed:
-                raise ValueError(
-                    f"Bismark extraction report lacks {state} {context} count: {path}"
-                )
-            if len(set(observed)) != 1:
-                raise ValueError(
-                    f"Bismark extraction report has conflicting {state} {context} counts: {path}"
-                )
-            counts[(state, context)] = observed[0]
+            field = rf"(?:Total )?{state} (?:C(?:'|’)?s|cytosines) in {context} context"
+            if state == "Unmethylated":
+                field += rf"|Total C to T conversions in {context} context"
+            counts[(state, context)] = _bismark_report_count(text, field, path)
     methylated = sum(counts[("Methylated", context)] for context in ("CHG", "CHH"))
     total = methylated + sum(
         counts[("Unmethylated", context)] for context in ("CHG", "CHH")

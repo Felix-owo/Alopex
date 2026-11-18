@@ -1,8 +1,7 @@
-"""从sealed交付生成甲基化QC、缓存、Raw/Single矩阵与Notebook接入。"""
+"""从sealed交付生成甲基化QC、SingleCpG 矩阵和 1 Mb 整数计数与Notebook接入。"""
 from __future__ import annotations
 
 import argparse
-import csv
 import fcntl
 import gzip
 import hashlib
@@ -22,8 +21,9 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextlib
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -36,7 +36,7 @@ from ..config import (
     validate_downstream_reference,
     validate_tss_reference,
 )
-from ..delivery import load_run_manifest, load_run_snapshot
+from ..delivery import load_run_manifest, load_run_snapshot, read_sealed_final_manifest
 from ..identity import PythonSourceGraph, capture_loaded_source_codes, assert_loaded_sources_current
 from ..io import sha256_file, project_temporary_parent, stat_if_present
 from ..paths import CORE_ROOT as _CORE_ROOT, PIPELINE_ROOT as _PIPELINE_ROOT
@@ -48,6 +48,13 @@ _LOADED_SOURCE_CODES = capture_loaded_source_codes()
 
 FINAL_MANIFEST = Path("03_results/QC_Results/sample_manifest.tsv")
 
+QC_FILTER_DEFAULTS = {
+    "mapping_threshold": None,
+    "lambda_max": 10.0,
+    "puc19_min": 90.0,
+    "cpg_min": 500000.0,
+    "gini_max": 0.5,
+}
 
 REQUIRED_MANIFEST_FIELDS = {
     "protocol",
@@ -55,6 +62,7 @@ REQUIRED_MANIFEST_FIELDS = {
     "project_sample_id",
     "plate_id",
     "dna_barcode",
+    "cell_order",
     "dna_raw_sample",
     "dna_reads",
     "dna_status",
@@ -128,30 +136,23 @@ class SealedQCContext:
     methylation_backend: str
     output_inventory: Mapping[str, Mapping[str, object]]
     marker_state: tuple[int, ...]
+    final_manifest_state: tuple[int, ...]
 
     def assert_current(self) -> None:
-        """确认公开输入仍属加载时的交付；发布失效或替换 marker 后必须重新加载。"""
-        try:
-            current = _delivery_marker_state(self.run_manifest_path)
-        except OSError as exc:
-            raise ValueError("Sealed delivery changed; rerun downstream from the current delivery") from exc
-        if current != self.marker_state:
-            raise ValueError("Sealed delivery changed; rerun downstream from the current delivery")
+        """确认公开完成凭证与最终样本清单仍属加载时的同一次交付。"""
+        for path, observed in ((self.run_manifest_path, self.marker_state),
+                               (self.project_dir / FINAL_MANIFEST, self.final_manifest_state)):
+            try:
+                current = _delivery_file_state(path)
+            except OSError as exc:
+                raise ValueError(f"Sealed delivery changed: {path}; rerun downstream from the current delivery") from exc
+            if current != observed:
+                raise ValueError(f"Sealed delivery changed: {path}; rerun downstream from the current delivery")
 
 
-def _delivery_marker_state(path: Path) -> tuple[int, ...]:
+def _delivery_file_state(path: Path) -> tuple[int, ...]:
     stat = path.lstat()
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
-
-
-def _read_tsv(path: Path) -> tuple[list[dict[str, str]], list[str]]:
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        rows = [
-            {str(key): str(value or "").strip() for key, value in row.items()}
-            for row in reader
-        ]
-        return rows, list(reader.fieldnames or [])
 
 
 def _mapping(value: object, label: str) -> Mapping[str, object]:
@@ -218,7 +219,7 @@ def load_sealed_qc_context(
     """加载完整交付及其不可变的 config/reference 契约。"""
     project = Path(project_dir).expanduser().resolve()
     manifest_path = project / "03_results" / "run_manifest.json"
-    marker_state = _delivery_marker_state(manifest_path)
+    marker_state = _delivery_file_state(manifest_path)
     manifest = load_run_manifest(
         manifest_path,
         validate_outputs=True,
@@ -313,6 +314,7 @@ def load_sealed_qc_context(
         methylation_backend=methylation_backend,
         output_inventory=output_inventory,
         marker_state=marker_state,
+        final_manifest_state=_delivery_file_state(project / FINAL_MANIFEST),
     )
     context.assert_current()
     return context
@@ -379,12 +381,11 @@ def read_active_cells(
     if project != context.project_dir:
         raise ValueError("project_dir and sealed_context refer to different projects")
     context.assert_current()
-    manifest = project / FINAL_MANIFEST
-    _inventory_record_for_project_file(
+    manifest, record = _inventory_record_for_project_file(
         context, FINAL_MANIFEST, label="final sample manifest"
     )
-    rows, fields = _read_tsv(manifest)
-    missing = sorted(REQUIRED_MANIFEST_FIELDS - set(fields))
+    reader = read_sealed_final_manifest(manifest, record)
+    missing = sorted(REQUIRED_MANIFEST_FIELDS - set(reader.fieldnames or ()))
     if missing:
         raise ValueError(
             "Current sample_manifest.tsv is missing required field(s): "
@@ -393,7 +394,8 @@ def read_active_cells(
 
     active: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for row in rows:
+    for raw_row in reader:
+        row = {str(key): str(value or "").strip() for key, value in raw_row.items()}
         if not (
             row["dna_status"] == "Pass"
             and row["analysis_status"] == "PASS"
@@ -575,6 +577,7 @@ def build_qc_records(
             "demux_clone_id": str(cell["project_sample_id"]),
             "demux_plate_id": str(cell["plate_id"]),
             "demux_dna_barcode": str(cell["dna_barcode"]),
+            "cell_order": cell["cell_order"],
             "demux_raw_sample": str(cell["dna_raw_sample"]),
             "demux_dna_reads_count": int(cell["demux_dna_reads_count"]),
             "cpg_file": Path(cell["cpg_file"]),
@@ -673,6 +676,7 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         required=True,
         help="Alopex project root containing 00_config and 03_results.",
     )
+    parser.add_argument("--expected-delivery-id", help=argparse.SUPPRESS)
     parser.add_argument(
         "--workers",
         type=int,
@@ -680,24 +684,19 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Parallel workers; 0 chooses a conservative default.",
     )
     parser.add_argument(
-        "--recompute-raw-adata",
-        action="store_true",
-        help="Rebuild RawAdata.h5ad from sealed CpG inputs.",
-    )
-    parser.add_argument(
         "--recompute-cpg-stats",
         action="store_true",
-        help="Rebuild both methylation and signal-composition statistics from sealed CpG inputs.",
+        help="Rebuild the single-pass downstream products from sealed CpG inputs.",
     )
     parser.add_argument(
         "--recompute-gini",
         action="store_true",
-        help="Ignore cached Gini statistics.",
+        help="Recompute the downstream products, including Gini.",
     )
     parser.add_argument(
         "--recompute-tss",
         action="store_true",
-        help="Ignore cached TSS profile statistics.",
+        help="Recompute the downstream products, including TSS.",
     )
     parser.add_argument(
         "--tss-bed",
@@ -722,6 +721,9 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         help="Generate all non-TSS outputs when TSS resources are intentionally unavailable.",
     )
+    for name, default in QC_FILTER_DEFAULTS.items():
+        parser.add_argument("--" + name.replace("_", "-"), type=float, default=default,
+                            help=f"SingleCpG HQ filter threshold (default: {default}).")
     return parser
 
 
@@ -767,12 +769,12 @@ class RunPaths:
     cpg_dir: Path
     qc_results_dir: Path
     cache_dir: Path
-    raw_adata: Path
-    methyl_stats_cache: Path
+    single_cpg: Path
+    single_schema: Path
+    doublet_counts: Path
     qc_info: Path
     tss_info: Path
     composition_cache: Path
-    gini_cache: Path
     input_identity: Path
 
 
@@ -784,6 +786,7 @@ class RunConfig:
     gini_bin_size: int = 500000
     tss_sample_fraction: float = 0.1
     tss_sample_seed: int = 0
+    qc_filter_parameters: Mapping[str, float | None] = field(default_factory=QC_FILTER_DEFAULTS.copy)
 
 
 class Timer:
@@ -944,12 +947,12 @@ def build_paths(
         cpg_dir=cpg_dir,
         qc_results_dir=qc_results_dir,
         cache_dir=cache_dir,
-        raw_adata=qc_results_dir / "RawAdata.h5ad",
-        methyl_stats_cache=cache_dir / "Mapping_Stats.csv",
+        single_cpg=qc_results_dir / "SingleCpG_Adata.h5ad",
+        single_schema=qc_results_dir / "SingleCpG_Adata.input_schema.json",
+        doublet_counts=qc_results_dir / "DNA_Doublet_1Mb_Counts.npz",
         qc_info=qc_results_dir / "DNAme_QC_Information.csv",
         tss_info=qc_results_dir / "TSS_Profile_Information.csv",
         composition_cache=cache_dir / "CpG_Signal_Composition.csv",
-        gini_cache=cache_dir / "Gini_Index.csv",
         input_identity=cache_dir / "DNAme_QC_Input_Identity.json",
     )
 
@@ -985,6 +988,7 @@ def build_config(
     skip_tss: bool = False,
     tss_sample_fraction: float = 0.1,
     tss_sample_seed: int = 0,
+    qc_filter_parameters: Mapping[str, float | None] | None = None,
 ) -> RunConfig:
     """解析 reference FAI，并在需要时强制检查共享 TSS 输入。"""
     config = sealed.config
@@ -1010,6 +1014,7 @@ def build_config(
         tss_bed=tss_bed,
         tss_sample_fraction=tss_sample_fraction,
         tss_sample_seed=tss_sample_seed,
+        qc_filter_parameters={**QC_FILTER_DEFAULTS, **(qc_filter_parameters or {})},
     )
     required_paths: list[tuple[str, Path | None]] = [("reference .fai", cfg.ref_fai)]
     if not skip_tss:
@@ -1104,17 +1109,6 @@ QC_INFO_COLUMNS = (
     "Trim_Retention%",
     "Final_Pair_Yield%",
 )
-
-
-RAW_ADATA_SCHEMA_VERSION = 6
-
-
-RAW_ADATA_SCHEMA_MODE = "portable_csr_counts"
-
-
-RAW_ADATA_ALGORITHM_VERSION = "alopex_portable_csr_counts_v1"
-
-
 
 
 MAX_CPG_WORKERS = 32
@@ -1283,7 +1277,7 @@ def _fsync_file(path: Path) -> None:
         os.close(file_fd)
 
 
-def _raw_adata_stat_binding(path: Path) -> dict:
+def _published_file_binding(path: Path) -> dict:
 
     path = Path(path)
     stat = path.stat()
@@ -1332,149 +1326,94 @@ def _content_binding(path: Path) -> dict:
     }
 
 
-def _raw_adata_schema_matches(
-    out_file: Path, schema_payload: object, input_signature: dict | None = None
-) -> bool:
-
-    if not isinstance(schema_payload, dict) or not Path(out_file).is_file():
-        return False
-    generation_id = schema_payload.get("generation_id")
-    if re.fullmatch(r"[0-9a-f]{32}", str(generation_id or "")) is None:
-        return False
-    if schema_payload.get("h5ad") != _raw_adata_stat_binding(out_file):
-        return False
-    if input_signature is not None:
-        observed_input = {
-            key: value
-            for key, value in schema_payload.items()
-            if key not in {"generation_id", "h5ad"}
-        }
-        if observed_input != input_signature:
-            return False
-    reference_fai = schema_payload.get("reference_fai")
-    cpg_files = schema_payload.get("cpg_files")
-    base = schema_payload.get("cpg_coordinate_base")
-    if type(base) is not int or base not in CPG_REPRESENTATIONS:
-        return False
-    if (
-        not isinstance(reference_fai, dict)
-        or re.fullmatch(r"[0-9a-f]{64}", str(reference_fai.get("sha256", ""))) is None
-        or not isinstance(cpg_files, list)
-        or any(
-            not isinstance(record, dict)
-            or re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", ""))) is None
-            for record in cpg_files
-        )
-    ):
-        return False
-    return (
-        schema_payload.get("schema_version") == RAW_ADATA_SCHEMA_VERSION
-        and schema_payload.get("algorithm_version") == RAW_ADATA_ALGORITHM_VERSION
-        and re.fullmatch(r"[0-9a-f]{64}", str(schema_payload.get("delivery_id", "")))
-        is not None
-        and re.fullmatch(r"[0-9a-f]{64}", str(schema_payload.get("snapshot_id", "")))
-        is not None
-        and isinstance(schema_payload.get("sample_ids"), list)
-        and schema_payload.get("cpg_header") == "chrom\tpos\tmethyl\tunmethyl"
-        and schema_payload.get("source_cpg_representation") == CPG_REPRESENTATIONS[base]
-        and schema_payload.get("empty_cell_representation") == "empty_csr_row"
-    )
-
-
 def _invalidate_completion(path: Path) -> None:
     """替换任一缓存之前撤销旧完成身份；失败由下一次 Processor 恢复。"""
-    if path.exists():
+    try:
         path.unlink()
-        _fsync_directory(path.parent)
+    except FileNotFoundError:
+        return
+    _fsync_directory(path.parent)
+
+
+def _remove_skipped_tss(paths: RunPaths) -> None:
+    paths.tss_info.unlink(missing_ok=True)
+    (paths.qc_results_dir / "plots/TSS_Profile.pdf").unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
 class CompletedQCContext:
-    """一次加载的完整 QC 身份；消费者复用元数据，只在边界复验文件状态。"""
+    """当前 QC、SingleCpG 和适用的 1 Mb 计数的共同完成身份。"""
 
-    raw_schema: Mapping[str, Any]
-    algorithms: Mapping[str, str]
+    identity: Mapping[str, Any]
     sample_ids: tuple[str, ...]
     assert_current: Callable[[], None]
 
 
-def _require_completed_qc(paths: RunPaths, sealed: SealedQCContext) -> CompletedQCContext:
-    """统一核对 QC 与 Raw 的交付、算法及细胞集合，保留提交前复验边界。"""
+def _single_bed(sealed: SealedQCContext) -> Path:
+    genome = str(sealed.config["species"])
+    return sealed.pipeline_root / "resources" / f"{genome}_reference" / "cpg" / f"{genome}.single_cpg.bed.gz"
+
+
+def _require_completed_qc(
+    paths: RunPaths, sealed: SealedQCContext, *, algorithms=None, verify_diagnostics=(),
+) -> CompletedQCContext:
     assert_loaded_sources_current(_LOADED_SOURCE_CODES)
     try:
-        marker_state = _delivery_marker_state(paths.input_identity)
+        qc_guard = _reference_guard(paths.input_identity, paths.qc_info)
+        def assert_current():
+            assert_loaded_sources_current(_LOADED_SOURCE_CODES)
+            sealed.assert_current()
+            try:
+                qc_guard()
+            except ValueError as exc:
+                raise ValueError("QC completion changed; rerun the QC Processor") from exc
+
         identity = json.loads(paths.input_identity.read_text())
-        schema_path = paths.raw_adata.with_name("RawAdata.input_schema.json")
-        schema_state = _delivery_marker_state(schema_path)
-        raw_schema = json.loads(schema_path.read_text())
-        sample_ids = tuple(cell["sample_id"] for cell in read_active_cells(
-            paths.project_dir, sealed_context=sealed))
-        algorithms = _algorithm_fingerprints()
-        if (not paths.qc_info.is_file()
+        sample_ids = tuple(cell["sample_id"] for cell in read_active_cells(paths.project_dir, sealed_context=sealed))
+        algorithms = _algorithm_fingerprints() if algorithms is None else algorithms
+        generation = identity["cpg_generation"]
+        expected_artifacts = {paths.composition_cache.name, diagnostics.CHROMOSOME_INFO, diagnostics.FILTER_INFO}
+        if identity["tss_sampling"] is not None:
+            expected_artifacts.add(paths.tss_info.name)
+        if set(identity["diagnostic_artifacts"]) != expected_artifacts:
+            raise ValueError("incomplete QC artifacts")
+        if (not isinstance(generation, str) or re.fullmatch(r"[0-9a-f]{32}", generation) is None
                 or any(identity.get(key) != getattr(sealed, key) for key in
-                ("delivery_id", "snapshot_id", "run_manifest_sha256", "snapshot_config_sha256"))
-                or identity.get("raw_generation") != raw_schema.get("generation_id")
-                or identity.get("algorithms") != {k: v for k, v in algorithms.items() if k != "single"}
-                or not _raw_adata_schema_matches(paths.raw_adata, raw_schema)
-                or raw_schema.get("algorithm_sha256") != algorithms["raw"]
-                or raw_schema.get("delivery_id") != sealed.delivery_id
-                or raw_schema.get("snapshot_id") != sealed.snapshot_id
-                or raw_schema.get("source_cpg_representation") != sealed.cpg_representation
-                or len(raw_schema["sample_ids"]) != len(sample_ids)
-                or set(raw_schema["sample_ids"]) != set(sample_ids)):
-            raise ValueError("stale completion identity")
-        raw_state = dict(raw_schema["h5ad"])
+                       ("delivery_id", "snapshot_id", "run_manifest_sha256", "snapshot_config_sha256"))
+                or identity["algorithms"] != algorithms
+                or identity["qc_table"] != _content_binding(paths.qc_info)):
+            raise ValueError("stale QC completion identity")
+        assert_current = _reference_guard(paths.single_schema, paths.single_cpg, before_commit=assert_current)
+        _require_current_single(paths, identity)
+        artifacts = [paths.composition_cache if name == paths.composition_cache.name
+                     else paths.qc_results_dir / name for name in sorted(expected_artifacts)]
+        assert_current = _reference_guard(*artifacts, before_commit=assert_current)
+        for artifact in artifacts:
+            if verify_diagnostics is None or artifact.name in verify_diagnostics:
+                if _content_binding(artifact) != identity["diagnostic_artifacts"][artifact.name]:
+                    raise ValueError(f"stale QC artifact: {artifact.name}")
+        if sealed.config["analysis"]["protocol"] == "droplet":
+            assert_current = _reference_guard(paths.doublet_counts, before_commit=assert_current)
+            if identity["doublet_counts"] != _published_file_binding(paths.doublet_counts):
+                raise ValueError("stale 1 Mb integer counts")
+        assert_current()
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise ValueError("QC is incomplete or stale; rerun the QC Processor") from exc
-
-    def assert_current():
-        assert_loaded_sources_current(_LOADED_SOURCE_CODES)
-        sealed.assert_current()
-        try:
-            if (_delivery_marker_state(paths.input_identity) != marker_state
-                    or _delivery_marker_state(schema_path) != schema_state
-                    or _raw_adata_stat_binding(paths.raw_adata) != raw_state):
-                raise ValueError("QC completion changed; rerun the QC Processor")
-        except OSError as exc:
-            raise ValueError("QC completion changed; rerun the QC Processor") from exc
-    assert_current()
-    return CompletedQCContext(raw_schema, algorithms, sample_ids, assert_current)
+    return CompletedQCContext(identity, sample_ids, assert_current)
 
 
-def _publish_raw_adata_generation(
-    temporary: Path,
-    out_file: Path,
-    schema_file: Path,
-    input_signature: dict,
-    *,
-    generation_id: str | None = None,
-    before_commit=None,
-) -> dict:
-
-
-    temporary = Path(temporary)
-    out_file = Path(out_file)
-    schema_file = Path(schema_file)
-    if temporary.parent != project_temporary_parent(out_file) or schema_file.parent != out_file.parent:
-        raise ValueError("RawAdata temporary must use the project temporary directory; output and schema must share a directory")
-    generation_id = generation_id or uuid.uuid4().hex
-    if re.fullmatch(r"[0-9a-f]{32}", generation_id) is None:
-        raise ValueError("RawAdata generation_id must be 32 lowercase hex characters")
-
-    _fsync_file(temporary)
-    if before_commit is not None:
-        before_commit()
-    _invalidate_completion(schema_file)
-    os.replace(temporary, out_file)
-    _fsync_directory(out_file.parent)
-
-    schema_payload = {
-        **input_signature,
-        "generation_id": generation_id,
-        "h5ad": _raw_adata_stat_binding(out_file),
-    }
-    _atomic_write_json(schema_payload, schema_file, before_commit=before_commit)
-    return schema_payload
+def _require_current_single(paths, identity):
+    schema = json.loads(paths.single_schema.read_text())
+    source = schema["input"]
+    if (source["cpg_generation"] != identity["cpg_generation"]
+            or source["delivery_id"] != identity["delivery_id"]
+            or source["source_cpg_representation"] != identity["cpg_representation"]
+            or source["cpg_coordinate_base"] != _source_cpg_coordinate_base(identity["cpg_representation"])
+            or source["bed_sha256"] != identity["context"]["bed"]
+            or source["qc_filter_parameters"] != identity["qc_filter_parameters"]
+            or schema["h5ad"] != _published_file_binding(paths.single_cpg)):
+        raise ValueError("SingleCpG is stale; rerun the QC Processor")
+    return schema
 
 
 def _read_chrom_sizes(fai_path: Path) -> dict[str, int]:
@@ -1544,19 +1483,9 @@ def _source_cpg_coordinate_base(representation: str) -> int:
     raise ValueError(f"Unsupported sealed CpG representation: {representation!r}")
 
 
-def _raw_cpg_coordinate_base(adata) -> int:
-    base = adata.uns["cpg_coordinate_base"]
-    if isinstance(base, (bool, np.bool_)) or not isinstance(base, (int, np.integer)) or base not in (0, 1):
-        raise ValueError("RawAdata cpg_coordinate_base must be integer 0 or 1")
-    return int(base)
-
-
-
-
-
 @contextmanager
 def _managed_cpg_text(path):
-    """Raw导入与公共统计共用解码器退出、诊断和句柄关闭边界。"""
+    """统一 CpG 解码器的退出、诊断和句柄关闭边界。"""
     process, handle, diagnostics = _open_cpg_text(path)
     error = None
     try:
@@ -1569,111 +1498,6 @@ def _managed_cpg_text(path):
         _finish_cpg_process(process, path, error, diagnostics)
 
 
-def load_or_create_raw_adata(
-    selected_files: list[Path], out_file: Path, fai_path: Path | None, *, reuse_existing: bool,
-    expected_sample_ids: list[str], zero_mapped_sample_ids: set[str], sealed_context: SealedQCContext,
-    cpg_output_identities: Mapping[str, Mapping[str, object]], before_rebuild=None,
-):
-    """严格导入整数计数为可移植backed CSR；空细胞是真实空行，不生成sentinel。"""
-    assert_current = _reference_guard(fai_path, before_commit=sealed_context.assert_current)
-    assert_current()
-    base = _source_cpg_coordinate_base(sealed_context.cpg_representation)
-    expected, zero_mapped = list(map(str, expected_sample_ids)), set(map(str, zero_mapped_sample_ids))
-    if len(expected) != len(set(expected)):
-        raise ValueError("Current manifest contains duplicate Sample_ID values")
-    if zero_mapped - set(expected):
-        raise ValueError("Zero-mapped Sample_ID set differs from current manifest")
-    if set(cpg_output_identities) != set(expected):
-        raise ValueError("Sealed CpG inventory Sample_ID set differs from current manifest")
-    for value in (sealed_context.delivery_id, sealed_context.snapshot_id):
-        if re.fullmatch(r"[0-9a-f]{64}", str(value)) is None:
-            raise ValueError("Sealed delivery/snapshot identity must be 64-character content identity")
-    sources, bindings = {}, []
-    for path in sorted(Path(p).resolve() for p in selected_files):
-        sid = _clean_cpg_table_name(path.name.removesuffix(".cpg.tsv.zst") + ".tsv.zst")
-        if sid in sources:
-            raise ValueError(f"More than one active CpG file maps to {sid!r}")
-        if sid not in cpg_output_identities:
-            raise ValueError(f"CpG input is absent from sealed inventory: {path}")
-        record = cpg_output_identities[sid]
-        if not path.is_file() or path.stat().st_size != record["size_bytes"] or not record["size_bytes"]:
-            raise FileNotFoundError(f"Selected CpG result is missing or has a wrong size: {path}")
-        sources[sid] = path
-        bindings.append({"sample_id": sid, "path": str(path), "size_bytes": record["size_bytes"], "sha256": record["sha256"]})
-    if set(sources) != set(expected):
-        raise ValueError("CpG input Sample_ID set differs from current manifest")
-    schema_file = out_file.with_name(f"{out_file.stem}.input_schema.json")
-    signature = {"schema_version": RAW_ADATA_SCHEMA_VERSION, "algorithm_version": RAW_ADATA_ALGORITHM_VERSION,
-        "algorithm_sha256": _algorithm_fingerprints()["raw"], "delivery_id": sealed_context.delivery_id,
-        "snapshot_id": sealed_context.snapshot_id, "cpg_header": "chrom\tpos\tmethyl\tunmethyl",
-        "cpg_coordinate_base": base, "source_cpg_representation": sealed_context.cpg_representation,
-        "empty_cell_representation": "empty_csr_row", "sample_ids": sorted(expected),
-        "reference_fai": _content_binding(fai_path) if fai_path is not None else None,
-        "cpg_files": sorted(bindings, key=lambda x: x["sample_id"])}
-    payload = None
-    if schema_file.is_file():
-        try:
-            payload = json.loads(schema_file.read_text())
-        except (OSError, ValueError, TypeError):
-            pass
-    cached_empty = payload.get("empty_cpg_sample_ids") if isinstance(payload, dict) else None
-    valid_empty = (isinstance(cached_empty, list) and all(isinstance(x, str) for x in cached_empty)
-                   and cached_empty == sorted(set(cached_empty)) and set(cached_empty) <= set(expected)
-                   and zero_mapped <= set(cached_empty))
-    if (reuse_existing and valid_empty and _raw_adata_schema_matches(out_file, payload,
-            {**signature, "empty_cpg_sample_ids": cached_empty})):
-        existing = matrices.CSRReader(out_file, "obsm/__values__")
-        try:
-            _require_exact_sample_ids(pd.DataFrame({"Sample_ID": existing.obs_names}), expected, "RawAdata")
-            assert_current()
-            return existing, set(cached_empty)
-        except BaseException:
-            existing.close()
-            raise
-    if before_rebuild is not None:
-        before_rebuild()
-    if fai_path is None:
-        raise ValueError("RawAdata requires the sealed reference FAI")
-    sizes = _read_chrom_sizes(fai_path)
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    temporary = project_temporary_parent(out_file) / f".{out_file.stem}.{uuid.uuid4().hex}.tmp.h5ad"
-    try:
-        ordered = {sid: sources[sid] for sid in sorted(sources)}
-        empty = matrices.write_raw_cpgs(ordered, sizes, base, temporary, _managed_cpg_text,
-                                       workers=min(4, effective_cpu_count()))
-        if zero_mapped - empty:
-            raise ValueError("Zero-mapped cells must have an empty current CpG result")
-        with matrices.h5py.File(temporary, "r+") as handle:
-            matrices.write_elem(handle["uns"], "source_cpg_representation", sealed_context.cpg_representation)
-        signature["empty_cpg_sample_ids"] = sorted(empty)
-        probe = matrices.CSRReader(temporary, "obsm/__values__")
-        try:
-            _require_exact_sample_ids(pd.DataFrame({"Sample_ID": probe.obs_names}), expected, "New RawAdata")
-        finally:
-            probe.close()
-        assert_current()
-        _publish_raw_adata_generation(temporary, out_file, schema_file, signature, before_commit=assert_current)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return matrices.CSRReader(out_file, "obsm/__values__"), empty
-
-
-def _raw_adata_schema_mode(out_file: Path) -> str:
-
-    schema_file = Path(out_file).with_name(f"{Path(out_file).stem}.input_schema.json")
-    if not Path(out_file).is_file():
-        return "missing"
-    if not schema_file.is_file():
-        return "invalid_schema"
-    try:
-        payload = json.loads(schema_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return "invalid_schema"
-    if _raw_adata_schema_matches(out_file, payload):
-        return RAW_ADATA_SCHEMA_MODE
-    return "invalid_schema"
-
-
 def _algorithm_fingerprints() -> dict[str, str]:
 
     sources = PythonSourceGraph((_CORE_ROOT,), loaded_sources=_LOADED_SOURCE_CODES)
@@ -1681,41 +1505,21 @@ def _algorithm_fingerprints() -> dict[str, str]:
                 for name in ("numpy", "pandas", "scipy", "numba", "anndata", "h5py")}
     roots = {
         "input": ("build_qc_records", "source_identity"),
-        "raw": ("load_or_create_raw_adata",),
-        "cpg": ("compute_methylation_statistics", "compute_cpg_signal_composition", "_read_chrom_sizes"),
-        "gini": ("compute_gini_index",),
-        "tss": ("compute_tss_profile",),
-        "single": ("prepare_single_cpg_adata",),
-        "chromosome": ("compute_chromosome_diagnostics",),
+        "products": ("_calculate_cpg_products", "_SinglePassCells", "_merge_pipeline_qc", "_single_cpg_obs",
+                     "compute_cpg_signal_composition", "_read_chrom_sizes", "_export_qc"),
     }
     fingerprints = {}
     for stage, names in roots.items():
+        selected_roots = tuple("alopex.downstream.qc." + name for name in names)
+        if stage == "products":
+            selected_roots += ("alopex.downstream.diagnostics.filter_reasons",)
         selected = sources.dependencies(
-            tuple("alopex.downstream.qc." + name for name in names),
+            selected_roots,
             exclude=("alopex.downstream.qc._algorithm_fingerprints",),
         )
         payload = json.dumps({"code": selected, "libraries": versions}, sort_keys=True)
         fingerprints[stage] = hashlib.sha256(payload.encode()).hexdigest()
     return fingerprints
-
-
-def _cache_identities(identity: Mapping[str, object], cfg, algorithms: Mapping[str, str]) -> dict[str, str]:
-
-    common = {"input": identity["identity_sha256"], "reader": algorithms["input"]}
-    payloads = {
-        "cpg": {**common, "algorithm": algorithms["cpg"]},
-        "chromosome": {**common, "algorithm": algorithms["chromosome"], "raw": algorithms["raw"],
-                       "raw_generation": identity["raw_generation"]},
-        "gini": {**common, "algorithm": algorithms["gini"], "raw": algorithms["raw"],
-                 "raw_generation": identity["raw_generation"],
-                 "bin_size": cfg.gini_bin_size},
-        "tss": {**common, "algorithm": algorithms["tss"], "raw": algorithms["raw"],
-                "raw_generation": identity["raw_generation"],
-                "sample_fraction": cfg.tss_sample_fraction, "sample_seed": cfg.tss_sample_seed,
-                "tss_bed": _content_binding(cfg.tss_bed) if cfg.tss_bed is not None else None},
-    }
-    return {key: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
-            for key, value in payloads.items()}
 
 
 def _open_cpg_text(path: Path):
@@ -2295,7 +2099,7 @@ def _validated_tss_cache(
     try:
         prof = pd.read_csv(
             out_csv, converters=dict.fromkeys(("Sample_ID", "CloneID"), str),
-            float_precision="round_trip",
+            dtype={"position_coarse": str, "count": str}, keep_default_na=False, float_precision="round_trip",
         )
         if tuple(prof.columns) != TSS_REQUIRED_COLUMNS:
             return None
@@ -2312,14 +2116,7 @@ def _validated_tss_cache(
         clone_values = prof["CloneID"].astype("string").str.strip()
         if clone_values.isna().any() or clone_values.eq("").any():
             return None
-        positions = pd.to_numeric(
-            prof["position_coarse"], errors="raise"
-        ).to_numpy(dtype=float)
-        if (
-            not np.isfinite(positions).all()
-            or not np.equal(positions, np.floor(positions)).all()
-        ):
-            return None
+        positions = matrices.exact_integers(prof["position_coarse"], np.int32)
         key_frame = pd.DataFrame(
             {"Sample_ID": sample_values, "position_coarse": positions}
         )
@@ -2328,19 +2125,17 @@ def _validated_tss_cache(
         fractions = pd.to_numeric(prof["meth_frac"], errors="raise").to_numpy(
             dtype=float
         )
-        counts = pd.to_numeric(prof["count"], errors="raise").to_numpy(dtype=float)
+        counts = matrices.exact_integers(prof["count"], np.int64)
         if (
             not np.isfinite(fractions).all()
             or (fractions < 0).any()
             or (fractions > 1).any()
-            or not np.isfinite(counts).all()
             or (counts < 0).any()
-            or not np.equal(counts, np.floor(counts)).all()
             or np.any((counts == 0) != (fractions == 0))
         ):
             return None
         prof["Sample_ID"] = sample_values
-        prof["position_coarse"] = positions.astype(np.int64)
+        prof["position_coarse"] = positions
         prof["meth_frac"] = fractions
         prof["count"] = counts
         prof["CloneID"] = clone_values
@@ -2387,87 +2182,6 @@ def _coverage_bins_from_csr(indptr, indices, data, chrom_offsets, bin_offsets, b
     return rows, bins[:used], values[:used]
 
 
-def compute_gini_index(
-    raw_adata: ad.AnnData,
-    bin_size: int,
-    cache_path: Path,
-    recompute: bool,
-    empty_cpg_sample_ids: set[str],
-    *,
-    before_commit=None,
-) -> pd.Series:
-    """按真实染色体长度分箱，以同一 base 的 coverage 计算 Gini；空细胞保留缺失值。"""
-    expected_sample_ids = [str(value) for value in raw_adata.obs_names]
-    if (not recompute) and cache_path.exists():
-        cached = _validated_gini_cache(
-            cache_path, expected_sample_ids, empty_cpg_sample_ids
-        )
-        if cached is not None:
-            _log("命中 Gini Index 缓存", level="DEBUG")
-            return pd.Series(
-                cached["Gini_Index"].to_numpy(dtype=float),
-                index=cached["Sample_ID"].astype(str),
-                name="Gini_Index",
-            )
-        _log("Gini Index 缓存不符合当前样本/数值契约，重新计算", level="WARNING")
-
-    _log(f"开始计算 Gini Index (Bin Size: {bin_size})", level="INFO")
-    base = _raw_cpg_coordinate_base(raw_adata)
-    reference = raw_adata.uns["reference_sequences"]
-    lengths = np.asarray(reference["reference_bp_length"].to_list(), dtype=np.int64)
-    chrom_offsets = np.concatenate((np.array([0], dtype=np.int64),
-                                    np.cumsum(lengths + base)))
-    bin_offsets = np.concatenate((np.array([0], dtype=np.int64),
-                                  np.cumsum((lengths + bin_size - 1) // bin_size)))
-    primary = np.array([_is_primary_chromosome(str(chrom))
-                        for chrom in reference["reference_seq_name"]], dtype=np.bool_)
-    out = np.full(raw_adata.n_obs, np.nan, dtype=np.float64)
-    # 直接消费 backed CSR，避免逐位点创建区间对象及临时 tile HDF5 的往返 I/O。
-    # 只保留观测分箱；不把无 coverage 的缺失分箱补成零，也不丢弃零甲基化位点。
-    for matrix, start, end in tqdm(
-        raw_adata.iter_rows(4),
-        total=(raw_adata.n_obs + 3) // 4, desc="Gini Index",
-    ):
-        rows, _, counts = _coverage_bins_from_csr(
-            matrix.indptr, matrix.indices, matrix.data,
-            chrom_offsets, bin_offsets, bin_size, base, primary,
-        )
-        for local_index in range(end - start):
-            values = counts[rows[local_index]:rows[local_index + 1]]
-            if values.size:
-                out[start + local_index] = _gini_from_sorted_positive(
-                    np.sort(values.astype(np.float64, copy=False))
-                )
-    s = pd.Series(out, index=np.asarray(raw_adata.obs_names, dtype=str), name="Gini_Index")
-    result = _require_exact_sample_ids(
-        pd.DataFrame({"Sample_ID": s.index, "Gini_Index": s.values}),
-        expected_sample_ids,
-        "Computed Gini statistics",
-    )
-    values = pd.to_numeric(result["Gini_Index"], errors="raise").to_numpy(
-        dtype=float
-    )
-    if (
-        np.isinf(values).any()
-        or (values[np.isfinite(values)] < 0).any()
-        or (values[np.isfinite(values)] > 1).any()
-    ):
-        raise ValueError(
-            "Computed Gini values must be within [0, 1] when defined"
-        )
-    empty_mask = result["Sample_ID"].astype(str).isin(empty_cpg_sample_ids)
-    if not np.isnan(values[empty_mask]).all() or not np.isfinite(
-        values[~empty_mask]
-    ).all():
-        raise ValueError("Computed Gini missingness differs from empty-CpG cells")
-    _atomic_write_csv(result, cache_path, before_commit=before_commit)
-    return pd.Series(
-        values,
-        index=result["Sample_ID"].astype(str),
-        name="Gini_Index",
-    )
-
-
 def _validate_tss_sampling(fraction: float, seed: int) -> None:
     if (isinstance(fraction, (bool, np.bool_))
             or not isinstance(fraction, (int, float, np.integer, np.floating))
@@ -2509,30 +2223,6 @@ def _select_tss_cells(df_qc: pd.DataFrame, fraction: float, seed: int) -> tuple[
 
 
 
-
-
-def compute_tss_profile(
-    raw_adata, df_qc: pd.DataFrame, tss_bed_path: Path, out_csv: Path, recompute: bool,
-    empty_cpg_sample_ids: set[str], *, sample_fraction: float = 1.0, sample_seed: int = 0, before_commit=None,
-) -> pd.DataFrame:
-    """直接读取抽中CSR行计算并缓存原有TSS profile。"""
-    assert_current = _reference_guard(tss_bed_path, before_commit=before_commit)
-    if set(empty_cpg_sample_ids) - set(df_qc.Sample_ID.astype(str)):
-        raise ValueError("Empty-CpG Sample_ID set differs from QC table")
-    selected, _ = _select_tss_cells(df_qc, sample_fraction, sample_seed)
-    selected_ids = set(selected.Sample_ID)
-    if not recompute:
-        profile = _validated_tss_cache(out_csv, selected_ids, set(empty_cpg_sample_ids) & selected_ids)
-        clones = df_qc.set_index("Sample_ID").CloneID
-        if profile is not None and (profile.empty or profile.CloneID.eq(profile.Sample_ID.map(clones)).all()):
-            assert_current()
-            return profile
-    profile = diagnostics.tss_profiles(raw_adata, selected, tss_bed_path, _is_primary_chromosome)
-    _atomic_write_csv(profile, out_csv, before_commit=assert_current)
-    validated = _validated_tss_cache(out_csv, selected_ids, set(empty_cpg_sample_ids) & selected_ids)
-    if validated is None:
-        raise ValueError("Computed TSS profile violates the output contract")
-    return validated
 
 
 def _merge_pipeline_qc(
@@ -2737,352 +2427,322 @@ def _export_qc(
             def before_csv_commit():
                 assert_current()
                 _invalidate_completion(paths.input_identity)
-                single = paths.qc_results_dir / "SingleCpG_Adata.h5ad"
-                single_schema = single.with_name("SingleCpG_Adata.input_schema.json")
-                if single_schema.is_file():
-                    try:
-                        saved = json.loads(single_schema.read_text())
-                        saved = saved.get("input", {}) if isinstance(saved, dict) else {}
-                    except ValueError:
-                        saved = {}
-                    if not isinstance(saved, dict):
-                        saved = {}
-                    if (saved.get("raw_generation") != identity.get("raw_generation")
-                            or saved.get("delivery_id") != sealed.delivery_id):
-                        _invalidate_completion(single_schema)
-                        single.unlink(missing_ok=True)
 
             _atomic_write_csv(df_qc, paths.qc_info, before_commit=before_csv_commit)
+            identity["qc_table"] = _content_binding(paths.qc_info)
             _atomic_write_json(identity, paths.input_identity, before_commit=assert_current)
 
 
-def _run_pipeline_impl(
-    paths: RunPaths,
-    cfg: RunConfig,
-    workers: int,
-    recompute_raw_adata: bool,
-    recompute_cpg_stats: bool,
-    recompute_gini: bool,
-    recompute_tss: bool,
-    *,
-    sealed_context: SealedQCContext | None = None,
-    _raw_adata_owner: list,
-) -> None:
+@njit(cache=True, nogil=True)
+def _summarize_cpg_row(indices, packed, offsets, categories, window_offsets, base):
+    observed = np.zeros(5, np.int64)
+    coverage = np.zeros(5, np.int64)
+    fractions = np.zeros(5, np.float64)
+    corrections = np.zeros(5, np.float64)
+    mc = np.zeros(window_offsets[-1], np.int64)
+    cov = np.zeros_like(mc)
+    chrom = 0
+    for i in range(len(packed)):
+        pos = indices[i]
+        while pos >= offsets[chrom+1]:
+            chrom += 1
+        depth = packed[i] & 65535
+        methyl = packed[i] >> 16
+        group = categories[chrom]
+        observed[group] += 1
+        coverage[group] += depth
+        y = methyl / depth - corrections[group]
+        total = fractions[group] + y
+        corrections[group] = (total - fractions[group]) - y
+        fractions[group] = total
+        if window_offsets[chrom+1] != window_offsets[chrom]:
+            window = window_offsets[chrom] + (pos - offsets[chrom] - base) // 1_000_000
+            mc[window] += methyl
+            cov[window] += depth
+    return observed, coverage, fractions, mc, cov
 
-    timer = Timer()
-    overall_t0 = time.perf_counter()
 
-    timer.start("current_outputs")
-    _log("阶段 1/6：核对当前完整交付和 QC 输入")
-    sealed = sealed_context or load_sealed_qc_context(
-        paths.project_dir, expected_pipeline_root=_pipeline_dir()
-    )
+class _SinglePassCells:
+    """有界解码窗口。每个细胞的同一 CSR 行供全部下游统计使用。"""
 
-    if cfg.tss_bed is not None:
-        validate_tss_reference(sealed.reference_path, cfg.tss_bed)
-    def assert_runtime_current():
-        assert_loaded_sources_current(_LOADED_SOURCE_CODES)
-        sealed.assert_current()
+    def __init__(self, sources, sizes, base, representation, workers):
+        self.obs_names = pd.Index(sorted(sources))
+        self.n_obs = len(self.obs_names)
+        self.reference = matrices.cpg_reference(sizes, base)
+        self.uns = {"cpg_coordinate_base": base, "source_cpg_representation": representation}
+        self.sources = sources
+        self.workers = min(4, _bounded_cpg_workers(workers, self.n_obs))
+        self.rows = self._decode()
+        self.position = 0
+        self.consume = None
 
-    assert_current = _reference_guard(sealed.reference_path, cfg.ref_fai, cfg.tss_bed,
-        Path(str(cfg.tss_bed) + ".reference.json") if cfg.tss_bed else None,
-        before_commit=assert_runtime_current)
+    def _decode(self):
+        def read(path):
+            with _managed_cpg_text(path) as handle:
+                return matrices.read_cpg_counts(handle, path, self.reference, self.uns["cpg_coordinate_base"])
 
-    def prepare_cache_commit():
-        # 自动修复缓存也须撤旧身份；交付换代后不得提交本次计算结果。
-        assert_current()
-        _invalidate_completion(paths.input_identity)
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            for start in range(0, self.n_obs, self.workers):
+                paths = [self.sources[sid] for sid in self.obs_names[start:start+self.workers]]
+                yield from executor.map(read, paths)
 
-    records = build_qc_records(paths.project_dir, sealed_context=sealed)
-    extra_identity_files = {"reference_fai": cfg.ref_fai}
-    manifest_sample_ids = [str(record["sample_id"]) for record in records]
-    cpg_files = [Path(record.pop("cpg_file")) for record in records]
-    cpg_output_identities = {
-        str(record["sample_id"]): record.pop("cpg_output_identity") for record in records
-    }
-    pipeline_qc = pd.DataFrame.from_records(records)
-    _log(f"QC 输入：{len(records)} 个细胞；物种：{cfg.genome}；CPU预算：{workers}")
-    zero_mapped_sample_ids = {
-        str(record["sample_id"])
-        for record in records
-        if int(record["backend_accepted_pairs"]) == 0
-    }
-    dt = timer.stop("current_outputs")
-    if dt is not None:
-        _log(f"阶段完成；耗时：{dt:.2f}s")
+    def read_rows(self, start, stop):
+        if start != self.position or stop != start + 1:
+            raise ValueError("CpG rows must be consumed once in cell order")
+        row = next(self.rows)
+        self.position = stop
+        self.consume(start, row)
+        return row
 
-    previous = {}
-    previous_diagnostics = {}
-    if paths.input_identity.is_file():
-        try:
-            previous_payload = json.loads(paths.input_identity.read_text(encoding="utf-8"))
-            previous = previous_payload["cache_identities"]
-            previous_diagnostics = previous_payload.get("diagnostic_artifacts", {})
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
-    if not isinstance(previous, dict):
-        previous = {}
 
-    timer.start("adata")
-    _log("阶段 2/6：准备 RawAdata 矩阵")
-    raw_adata = None
-    # 仅为展示读取小型schema；科学复用仍由下方原有校验决定。
+def _calculate_cpg_products(reader, cfg, selected, zero_mapped, bed, single_tmp, counts_tmp):
+    base = reader.uns["cpg_coordinate_base"]
+    reference = reader.reference
+    names = reference.reference_seq_name.tolist()
+    lengths = reference.reference_bp_length.to_numpy(dtype=np.int64)
+    offsets = np.r_[0, np.cumsum(lengths+base)]
+    primary = np.asarray([_is_primary_chromosome(name) for name in names])
+    categories = np.asarray([1 if l else 2 if p else 3 if m else 0 if h else 4
+                             for l,p,m,h in map(_classify_seq_name, names)])
+    is_auto = [counts_tmp is not None and bool(re.fullmatch(r"chr(?:[1-9]|1[0-9]|2[0-2])", name))
+               for name in names]
+    windows = np.r_[0, np.cumsum(np.where(is_auto, (lengths+999999)//1000000, 0))]
+    bins = np.r_[0, np.cumsum((lengths + cfg.gini_bin_size - 1)//cfg.gini_bin_size)]
+    tss_index = diagnostics.tss_intervals(cfg.tss_bed, reference, _is_primary_chromosome) if cfg.tss_bed else None
+    tss_clones = dict(selected[["Sample_ID", "CloneID"]].itertuples(index=False, name=None))
+    profiles, chromosome, statistics, gini = [], [], [], []
+    mc = np.zeros((reader.n_obs, windows[-1]), dtype=np.int64)
+    cov = np.zeros_like(mc)
+    empty = set()
+
+    def consume(start, row):
+        sid = reader.obs_names[start]
+        if not row.nnz:
+            empty.add(sid)
+        elif sid in zero_mapped:
+            raise ValueError(f"Zero-mapped cells must have an empty current CpG result: {sid}")
+        sites, depth, fractions, mc[start], cov[start] = _summarize_cpg_row(
+            row.indices, row.data, offsets, categories, windows, base)
+        means = [fractions[i]/sites[i]*100 if sites[i] else np.nan for i in range(3)]
+        statistics.append((sid, sites[0], means[0], sites[1], means[1], sites[2], means[2],
+                           depth[1], depth[2], depth[3], depth[0], depth.sum(), depth[0]))
+        _, _, counts = _coverage_bins_from_csr(row.indptr, row.indices, row.data,
+                                               offsets, bins, cfg.gini_bin_size, base, primary)
+        gini.append(_gini_from_sorted_positive(np.sort(counts.astype(np.float64))))
+        chromosome.extend(diagnostics.chromosome_row(
+            reference, offsets, row, sid, _is_primary_chromosome, _classify_seq_name))
+        if tss_index is not None and sid in tss_clones:
+            profile = diagnostics.tss_profile_row(reader, row, sid, tss_clones[sid], tss_index)
+            if profile is not None:
+                profiles.append(profile)
+
+    reader.consume = consume
     try:
-        _display_raw_before = json.loads(paths.raw_adata.with_name("RawAdata.input_schema.json").read_text()).get("generation_id")
-    except (OSError, ValueError, AttributeError):
-        _display_raw_before = None
-    if recompute_raw_adata:
-        _log("按 --recompute-raw-adata 重建 RawAdata")
-    if not paths.cpg_dir.is_dir():
-        raise FileNotFoundError(f"Sealed CpG directory is missing: {paths.cpg_dir}")
-    raw_adata, empty_cpg_sample_ids = load_or_create_raw_adata(
-        cpg_files,
-        paths.raw_adata,
-        cfg.ref_fai,
-        reuse_existing=not recompute_raw_adata,
-        expected_sample_ids=manifest_sample_ids,
-        zero_mapped_sample_ids=zero_mapped_sample_ids,
-        sealed_context=sealed,
-        cpg_output_identities=cpg_output_identities,
-        before_rebuild=prepare_cache_commit,
-    )
-    if raw_adata is not None:
-        _raw_adata_owner.append(raw_adata)
+        matrices.write_single_cpg(reader, bed, single_tmp, pd.DataFrame(index=reader.obs_names))
+    finally:
+        reader.rows.close()
+    if len(statistics) != reader.n_obs:
+        raise RuntimeError("Incomplete single-pass CpG products")
+    if counts_tmp is not None:
+        regions = [f"{chrom}:{start+base}-{min(start+1000000,int(length))+base}"
+                   for chrom, length, enabled in zip(names, lengths, is_auto, strict=True) if enabled
+                   for start in range(0, length, 1000000)]
+        with counts_tmp.open("xb") as handle:
+            np.savez(handle, mc=mc, cov=cov, ids=np.asarray(reader.obs_names, dtype=str),
+                     regions=np.asarray(regions, dtype=str))
+    stats = pd.DataFrame(statistics, columns=[*MAPPING_STAT_COLUMNS,*COMPOSITION_COV_COLS])
+    return stats, pd.Series(gini,index=reader.obs_names), pd.DataFrame(chromosome), diagnostics.tss_profile_frame(profiles), empty
 
-    raw_adata_mode = _raw_adata_schema_mode(paths.raw_adata)
-    identity = source_identity(
-        paths.project_dir,
-        [
-            {**record, "cpg_file": path}
-            for record, path in zip(records, cpg_files, strict=True)
-        ],
-        sealed_context=sealed,
-        extra_files=extra_identity_files,
-        context={"raw_adata_mode": raw_adata_mode},
-    )
-    if raw_adata is None or raw_adata_mode != RAW_ADATA_SCHEMA_MODE:
-        raise RuntimeError(
-            "RawAdata is unavailable or does not use the current configured-base four-column CpG "
-            f"schema (observed: {raw_adata_mode})"
-        )
-    identity["raw_generation"] = json.loads(
-        paths.raw_adata.with_name("RawAdata.input_schema.json").read_text(encoding="utf-8")
-    )["generation_id"]
-    _log("RawAdata：" + ("已复用" if _display_raw_before == identity["raw_generation"] else "已生成／重建"))
-    algorithms = _algorithm_fingerprints()
-    identity["algorithms"] = {k: v for k, v in algorithms.items() if k != "single"}
-    identity["cache_identities"] = _cache_identities(identity, cfg, algorithms)
-    changed = {key for key, value in identity["cache_identities"].items() if previous.get(key) != value}
-    if changed:
-        _log("需要更新的下游缓存：" + ", ".join(sorted(changed)))
-    # 附表内容也绑定上次完整提交；格式合法的外部改写不能被再次签为本代真值。
-    diagnostic_bindings = [("chromosome", diagnostics.CHROMOSOME_INFO)]
-    if cfg.tss_bed is not None:
-        diagnostic_bindings.append(("tss", paths.tss_info.name))
-    for stage, name in diagnostic_bindings:
-        artifact = paths.qc_results_dir / name
-        if (not isinstance(previous_diagnostics, dict) or not artifact.is_file()
-                or previous_diagnostics.get(name) != _content_binding(artifact)):
-            changed.add(stage)
-    recompute_cpg_stats |= "cpg" in changed
-    recompute_gini |= "gini" in changed
-    recompute_tss |= "tss" in changed
-    if any((recompute_cpg_stats, recompute_gini, recompute_tss)):
-        prepare_cache_commit()
-    dt = timer.stop("adata")
-    if dt is not None:
-        _log(f"阶段完成；耗时：{dt:.2f}s")
 
-    timer.start("methyl_stats")
-    _log("阶段 3/6：计算 CpG 位点、覆盖和信号组成")
-    df_qc = pd.DataFrame()
-    composition_stats: pd.DataFrame | None = None
-    sample_ids = manifest_sample_ids
-    cached_mapping = (
-        None
-        if recompute_cpg_stats
-        else _load_methyl_stats_cache(
-            paths.methyl_stats_cache, sample_ids, empty_cpg_sample_ids
-        )
-    )
-    cached_composition = (
-        None
-        if recompute_cpg_stats
-        else _validated_composition_cache(
-            paths.composition_cache,
-            sample_ids,
-            empty_cpg_sample_ids,
-        )
-    )
-    cached_cpg_results = _select_cpg_cache_state(
-        cached_mapping, cached_composition
-    )
-    if cached_cpg_results is not None:
-        df_qc = cached_cpg_results
-        _log(f"复用已核验缓存：{paths.methyl_stats_cache.name}, {paths.composition_cache.name}")
-    else:
-        if len(records) != len(cpg_files):
-            raise ValueError("Active manifest and CpG input count differ")
-        cpg_by_sample: dict[str, Path] = {}
-        for record, path in zip(records, cpg_files, strict=True):
-            sample_id = str(record["sample_id"])
-            if sample_id in cpg_by_sample:
-                raise ValueError(f"Duplicate active Sample_ID: {sample_id}")
-            if not path.is_file():
-                raise FileNotFoundError(f"CpG input does not exist: {path}")
-            cpg_by_sample[sample_id] = path
-        if set(cpg_by_sample) != set(sample_ids):
-            raise ValueError("Active manifest Sample_ID set differs from CpG inputs")
-        df_qc, composition_stats = compute_methylation_statistics(
-            [cpg_by_sample[sid] for sid in sample_ids],
-            sample_ids,
-            chrom_sizes=_read_chrom_sizes(cfg.ref_fai),
-            coordinate_base=_source_cpg_coordinate_base(sealed.cpg_representation),
-            workers=workers,
-            empty_cpg_sample_ids=empty_cpg_sample_ids,
-        )
-        _atomic_write_csv(df_qc, paths.methyl_stats_cache, before_commit=prepare_cache_commit)
-
-    dt = timer.stop("methyl_stats")
-    if dt is not None:
-        _log(f"阶段完成；耗时：{dt:.2f}s")
-
-    timer.start("merge")
-    _log("阶段 4/6：按细胞身份合并 Pipeline QC")
-    if not pipeline_qc.empty:
-        df_qc = _merge_pipeline_qc(pipeline_qc, df_qc)
-
-    dt = timer.stop("merge")
-    if dt is not None:
-        _log(f"阶段完成；耗时：{dt:.2f}s")
-
-    timer.start("composition")
-    _log("阶段 5/6：整理信号组成，复用阶段 3 的统计")
-    if not df_qc.empty and composition_stats is not None:
-        df_qc = compute_cpg_signal_composition(
-            df_qc=df_qc,
-            cache_path=paths.composition_cache,
-            composition_stats=composition_stats,
-            empty_cpg_sample_ids=empty_cpg_sample_ids,
-            before_commit=prepare_cache_commit,
-        )
-    dt = timer.stop("composition")
-    if dt is not None:
-        _log(f"阶段完成；耗时：{dt:.2f}s")
-
-    timer.start("gini_tss_density")
-    _log("阶段 6/6：计算 Gini 和 TSS 指标")
-    tss_profile = None
-    if cfg.tss_bed is None:
-        if paths.tss_info.exists():
-            paths.tss_info.unlink()
-            _log(f"已移除本次跳过的 TSS 输出：{paths.tss_info.name}")
-
-    if raw_adata is not None and not df_qc.empty:
-        primary_empty = set(df_qc.loc[df_qc["Sample_Unique_CpG_Sites"].eq(0), "Sample_ID"].astype(str))
-        gini = compute_gini_index(
-            raw_adata,
-            bin_size=cfg.gini_bin_size,
-            cache_path=paths.gini_cache,
-            recompute=recompute_gini,
-            empty_cpg_sample_ids=primary_empty,
-            before_commit=prepare_cache_commit,
-        )
-        df_qc["Gini_Index"] = df_qc["Sample_ID"].astype(str).map(gini)
-        gini_missing = set(
-            df_qc.loc[df_qc["Gini_Index"].isna(), "Sample_ID"].astype(str)
-        )
-        if gini_missing != primary_empty:
-            raise ValueError("Gini missingness differs from empty-CpG cells")
-
-        if cfg.tss_bed is not None:
-            _, sampling = _select_tss_cells(df_qc, cfg.tss_sample_fraction, cfg.tss_sample_seed)
-            identity["tss_sampling"] = sampling
-            _log(f"TSS 按 CloneID 抽检: {sampling['selected_cells']}/{sampling['total_cells']} cells; "
-                 f"fraction={sampling['fraction']}, seed={sampling['seed']}")
-            for clone in sampling["clones"]:
-                _log(f"  CloneID={clone['clone_id']}: {clone['selected_cells']}/{clone['total_cells']} cells")
-            tss_profile = compute_tss_profile(
-                raw_adata=raw_adata,
-                df_qc=df_qc,
-                tss_bed_path=cfg.tss_bed,
-                out_csv=paths.tss_info,
-                recompute=recompute_tss,
-                empty_cpg_sample_ids=empty_cpg_sample_ids,
-                sample_fraction=cfg.tss_sample_fraction,
-                sample_seed=cfg.tss_sample_seed,
-                before_commit=prepare_cache_commit,
-            )
-        else:
-            _log("本次跳过 TSS；不生成 TSS 表和图", "WARNING")
-
-    compute_chromosome_diagnostics(raw_adata, df_qc, paths.qc_results_dir / diagnostics.CHROMOSOME_INFO,
-        recompute="chromosome" in changed, before_commit=prepare_cache_commit)
-    identity["diagnostic_artifacts"] = {name: _content_binding(paths.qc_results_dir / name)
-        for _, name in diagnostic_bindings}
-
-    if cfg.tss_bed is None or (tss_profile is not None and tss_profile.empty):
-        plots_dir = _project_directory(
-            paths.project_dir,
-            paths.qc_results_dir.relative_to(paths.project_dir) / "plots",
-            create=False,
-        )
-        (plots_dir / "TSS_Profile.pdf").unlink(missing_ok=True)
-
-    dt = timer.stop("gini_tss_density")
-    if dt is not None:
-        _log(f"阶段完成；耗时：{dt:.2f}s")
-
-    timer.start("export")
-    _log("提交 QC 表和完成身份")
-    _export_qc(
-        paths, df_qc, pipeline_qc, manifest_sample_ids,
-        identity, sealed, before_commit=assert_current,
-    )
-    dt = timer.stop("export")
-    if dt is not None:
-        _log(f"阶段完成；耗时：{dt:.2f}s")
-
-    _log(f"QC 已完成；总耗时：{time.perf_counter() - overall_t0:.2f}s")
+def _single_cpg_obs(frame, pipeline_qc, reasons):
+    """将同一次 QC 的筛选结果和 sealed 细胞身份保存到 SingleCpG。"""
+    obs = frame[list(QC_INFO_COLUMNS)].merge(reasons, on=list(QC_INFO_COLUMNS[:3]),
+                                            validate="one_to_one", sort=False)
+    obs = obs.set_index("Sample_ID", drop=False)
+    cells = pipeline_qc.set_index("sample_id").loc[obs.index]
+    obs["DNA_Barcode"] = cells["demux_dna_barcode"].to_numpy()
+    obs["Cell_Order"] = cells["cell_order"].to_numpy()
+    obs["sample"] = obs["Sample_ID"]
+    obs["clone_id"] = obs["CloneID"]
+    obs["nCG"] = obs["Sample_Unique_CpG_Sites"]
+    obs["met_rate"] = obs["Sample_Meth_CpG_Rate%"] / 100
+    obs.index.name = None
+    for name in obs.select_dtypes(include=["string"]):
+        obs[name] = obs[name].astype(object)
+    return obs
 
 
 def run_pipeline(
-    paths: RunPaths,
-    cfg: RunConfig,
-    workers: int,
-    recompute_raw_adata: bool,
-    recompute_cpg_stats: bool,
-    recompute_gini: bool,
-    recompute_tss: bool,
-    *,
-    sealed_context: SealedQCContext | None = None,
+    paths: RunPaths, cfg: RunConfig, workers: int, recompute_cpg_stats: bool,
+    recompute_gini: bool, recompute_tss: bool, *, sealed_context: SealedQCContext | None = None,
 ) -> None:
-    """运行 QC 流程，并保证所有退出路径都关闭自有的 RawAdata 句柄。"""
+    """由同一次 CpG 解码生成完整下游，完成身份在所有文件提交后写出。"""
     with _qc_write_lock(paths.qc_results_dir):
-        assert_loaded_sources_current(_LOADED_SOURCE_CODES)
-        raw_adata_owner: list = []
+        _run_pipeline_impl(paths, cfg, workers, recompute_cpg_stats or recompute_gini or recompute_tss,
+                           sealed_context=sealed_context)
+
+
+def _run_pipeline_impl(paths, cfg, workers, recompute, *, sealed_context=None):
+    overall_t0 = time.perf_counter()
+    stage_start = overall_t0
+
+    def stage(number, title):
+        nonlocal stage_start
+        if number != 1:
+            _log(f"阶段完成；耗时：{time.perf_counter()-stage_start:.2f}s")
+        stage_start = time.perf_counter()
+        _log(f"阶段 {number}/6：{title}")
+
+    stage(1, "核对当前完整交付和 QC 输入")
+    assert_loaded_sources_current(_LOADED_SOURCE_CODES)
+    sealed = sealed_context or load_sealed_qc_context(paths.project_dir, expected_pipeline_root=_pipeline_dir())
+    bed = _single_bed(sealed)
+    assert_current = _reference_guard(sealed.reference_path, cfg.ref_fai, bed, cfg.tss_bed,
+        Path(str(bed)+".reference.json"), Path(str(cfg.tss_bed)+".reference.json") if cfg.tss_bed else None,
+        before_commit=sealed.assert_current)
+    single_reference = validate_downstream_reference(sealed.reference_path, bed, "single-cpg")
+    tss_reference = validate_tss_reference(sealed.reference_path, cfg.tss_bed) if cfg.tss_bed else None
+    records = build_qc_records(paths.project_dir, sealed_context=sealed)
+    if not records:
+        raise ValueError("QC requires at least one cell")
+    pipeline_qc = pd.DataFrame.from_records(records)
+    _log(f"QC 输入：{len(records)} 个细胞；物种：{cfg.genome}；CPU预算：{workers}")
+    sources = {record["sample_id"]: record["cpg_file"] for record in records}
+    for record in records:
+        path = record["cpg_file"]
+        if path.stat().st_size != record["cpg_output_identity"]["size_bytes"]:
+            raise ValueError(f"Sealed CpG result has the wrong size: {path}")
+    assert_current = _reference_guard(*sources.values(), before_commit=assert_current)
+    if len(sources)!=len(records):
+        raise ValueError("Sealed CpG samples must be unique")
+    ids = sorted(sources)
+    selected, sampling = _select_tss_cells(
+        pipeline_qc[["sample_id","demux_clone_id"]].set_axis(["Sample_ID","CloneID"],axis=1),
+        cfg.tss_sample_fraction, cfg.tss_sample_seed)
+    if cfg.tss_bed is None:
+        selected = selected.iloc[:0]
+    filter_parameters = dict(cfg.qc_filter_parameters)
+    filter_uns = {"qc_filter_parameters": json.dumps(filter_parameters, sort_keys=True)}
+    filter_output = paths.qc_results_dir / diagnostics.FILTER_INFO
+    algorithms = _algorithm_fingerprints()
+    identity = source_identity(paths.project_dir, records, sealed_context=sealed,
+        extra_files={"reference_fai": cfg.ref_fai},
+        context={"bed": single_reference["files"][bed.name]["sha256"],
+                 "tss": tss_reference["files"][cfg.tss_bed.name]["sha256"] if tss_reference else None,
+                 "gini_bin_size": cfg.gini_bin_size, "tss_sampling": sampling if cfg.tss_bed else None})
+    identity["algorithms"] = algorithms
+    identity["tss_sampling"] = sampling if cfg.tss_bed else None
+    identity["qc_filter_parameters"] = filter_parameters
+    if not recompute:
         try:
-            _run_pipeline_impl(
-                paths,
-                cfg,
-                workers,
-                recompute_raw_adata,
-                recompute_cpg_stats,
-                recompute_gini,
-                recompute_tss,
-                sealed_context=sealed_context,
-                _raw_adata_owner=raw_adata_owner,
-            )
-        finally:
-            close_error: BaseException | None = None
-            for raw_adata in reversed(raw_adata_owner):
-                try:
-                    raw_adata.close()
-                except BaseException as exc:
-                    if close_error is None:
-                        close_error = exc
-            if close_error is not None and sys.exc_info()[0] is None:
-                raise close_error
+            completed = _require_completed_qc(paths, sealed, algorithms=algorithms, verify_diagnostics=None)
+        except ValueError:
+            pass
+        else:
+            if completed.identity["identity_sha256"] == identity["identity_sha256"]:
+                if cfg.tss_bed is None:
+                    completed.assert_current()
+                    assert_current()
+                    _remove_skipped_tss(paths)
+                if completed.identity["qc_filter_parameters"] != filter_parameters:
+                    frame = pd.read_csv(paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
+                                        float_precision="round_trip")
+                    frame = _require_exact_sample_ids(frame, ids, "Filter QC")
+                    reasons = diagnostics.filter_reasons(frame, **filter_parameters)
+                    obs = _single_cpg_obs(frame, pipeline_qc, reasons)
+                    schema = _require_current_single(paths, completed.identity)
+                    current = dict(completed.identity, qc_filter_parameters=filter_parameters)
+                    completed.assert_current()
+                    assert_current()
+                    _invalidate_completion(paths.input_identity)
+                    _invalidate_completion(paths.single_schema)
+                    matrices.update_obs(paths.single_cpg, obs, filter_uns)
+                    _fsync_file(paths.single_cpg)
+                    _atomic_write_csv(reasons, filter_output, before_commit=assert_current)
+                    current["diagnostic_artifacts"][filter_output.name] = _content_binding(filter_output)
+                    schema["h5ad"] = _published_file_binding(paths.single_cpg)
+                    schema["input"]["qc_filter_parameters"] = filter_parameters
+                    _atomic_write_json(schema, paths.single_schema, before_commit=assert_current)
+                    _atomic_write_json(current, paths.input_identity, before_commit=assert_current)
+                    _log("复用已核验缓存中的 CpG 结果，已更新 HQ 筛选注释")
+                    _log(f"QC 已完成；总耗时：{time.perf_counter()-overall_t0:.2f}s")
+                    return
+                completed.assert_current()
+                assert_current()
+                _log("已复用当前完整 QC、SingleCpG 和适用的 1 Mb 计数")
+                _log(f"QC 已完成；总耗时：{time.perf_counter()-overall_t0:.2f}s")
+                return
+
+    stage(2, "准备同一交付的 CpG 和参考")
+    base = _source_cpg_coordinate_base(sealed.cpg_representation)
+    sizes = _read_chrom_sizes(cfg.ref_fai)
+    reader = _SinglePassCells(sources, sizes, base, sealed.cpg_representation, workers)
+    droplet = sealed.config["analysis"]["protocol"] == "droplet"
+    zero_mapped = {r["sample_id"] for r in records if r["backend_accepted_pairs"] == 0}
+    temp_dir = project_temporary_parent(paths.single_cpg)
+    with tempfile.TemporaryDirectory(prefix="cpg-products.", dir=temp_dir) as folder:
+        work = Path(folder)
+        single_tmp = work/paths.single_cpg.name
+        counts_tmp = work/paths.doublet_counts.name if droplet else None
+        stage(3, "单次解码，汇总并写出 SingleCpG")
+        stats, gini, chromosome, tss, empty = _calculate_cpg_products(
+            reader, cfg, selected, zero_mapped, bed, single_tmp, counts_tmp)
+        stage(4, "按细胞身份合并 Pipeline QC")
+        frame = _merge_pipeline_qc(pipeline_qc, stats[list(MAPPING_STAT_COLUMNS)])
+        composition = stats[["Sample_ID",*COMPOSITION_COV_COLS]]
+        stage(5, "整理 QC、信号组成及诊断表")
+        frame = compute_cpg_signal_composition(frame, work/paths.composition_cache.name, composition, empty)
+        frame["Gini_Index"] = frame.Sample_ID.map(gini)
+        frame = _require_exact_sample_ids(frame, ids, "Single-pass QC")
+        chromosome["CloneID"] = chromosome.Sample_ID.map(frame.set_index("Sample_ID").CloneID)
+        chrom_output = paths.qc_results_dir/diagnostics.CHROMOSOME_INFO
+        _atomic_write_csv(chromosome, work/chrom_output.name)
+        if cfg.tss_bed is not None:
+            _atomic_write_csv(tss, work/paths.tss_info.name)
+        reasons = diagnostics.filter_reasons(frame, **filter_parameters)
+        _atomic_write_csv(reasons, work / filter_output.name)
+        matrices.update_obs(single_tmp, _single_cpg_obs(frame, pipeline_qc, reasons), filter_uns)
+        with contextlib.closing(matrices.CSRReader(single_tmp)) as single:
+            if list(single.obs_names) != ids:
+                raise ValueError("SingleCpG row order differs from the sealed CpG input")
+        stage(6, "提交 SingleCpG、整数计数与 QC 完成身份")
+        assert_loaded_sources_current(_LOADED_SOURCE_CODES)
+        assert_current()
+        _invalidate_completion(paths.input_identity)
+        _invalidate_completion(paths.single_schema)
+        _fsync_file(single_tmp)
+        assert_current()
+        os.replace(single_tmp, paths.single_cpg)
+        _fsync_directory(paths.single_cpg.parent)
+        generation = uuid.uuid4().hex
+        identity["cpg_generation"] = generation
+        identity["empty_cpg_sample_ids"] = sorted(empty)
+        if counts_tmp is not None:
+            _fsync_file(counts_tmp)
+            os.replace(counts_tmp, paths.doublet_counts)
+            _fsync_directory(paths.doublet_counts.parent)
+            identity["doublet_counts"] = _published_file_binding(paths.doublet_counts)
+        destinations = [paths.composition_cache, chrom_output, filter_output]
+        if cfg.tss_bed is not None:
+            destinations.append(paths.tss_info)
+            if tss.empty:
+                (paths.qc_results_dir / "plots/TSS_Profile.pdf").unlink(missing_ok=True)
+        else:
+            _remove_skipped_tss(paths)
+        for destination in destinations:
+            os.replace(work/destination.name, destination)
+            _fsync_directory(destination.parent)
+        identity["diagnostic_artifacts"] = {path.name: _content_binding(path) for path in destinations}
+        _atomic_write_json({"input": {"cpg_generation": generation, "delivery_id": sealed.delivery_id,
+                                      "cpg_coordinate_base": base,
+                                      "bed_sha256": identity["context"]["bed"],
+                                      "qc_filter_parameters": filter_parameters,
+                                      "source_cpg_representation": sealed.cpg_representation},
+                            "h5ad": _published_file_binding(paths.single_cpg)},
+                           paths.single_schema, before_commit=assert_current)
+        _export_qc(paths, frame, pipeline_qc, ids, identity, sealed, before_commit=assert_current)
+    _log(f"阶段完成；耗时：{time.perf_counter()-stage_start:.2f}s")
+    _log(f"QC 已完成；总耗时：{time.perf_counter()-overall_t0:.2f}s")
 
 
 def parse_args() -> argparse.Namespace:
@@ -3101,6 +2761,8 @@ def main() -> None:
     sealed = load_sealed_qc_context(
         project_dir, expected_pipeline_root=_pipeline_dir()
     )
+    if args.expected_delivery_id is not None and sealed.delivery_id != args.expected_delivery_id:
+        raise ValueError("Delivery changed; rerun the Notebook from its first cell")
     paths = build_paths(project_dir)
     cfg = build_config(
         sealed,
@@ -3108,6 +2770,7 @@ def main() -> None:
         skip_tss=bool(args.skip_tss),
         tss_sample_fraction=args.tss_sample_fraction,
         tss_sample_seed=args.tss_sample_seed,
+        qc_filter_parameters={name: getattr(args, name) for name in QC_FILTER_DEFAULTS},
     )
 
     _log_config_summary(paths, cfg)
@@ -3115,7 +2778,6 @@ def main() -> None:
         paths=paths,
         cfg=cfg,
         workers=args.workers,
-        recompute_raw_adata=bool(args.recompute_raw_adata),
         recompute_cpg_stats=bool(args.recompute_cpg_stats),
         recompute_gini=bool(args.recompute_gini),
         recompute_tss=bool(args.recompute_tss),
@@ -3138,7 +2800,9 @@ def load_cpg_density_frame(
     run_paths = build_paths(paths.project_dir)
     if run_paths.qc_results_dir != paths.qc_results_dir:
         raise ValueError("Notebook QC directory differs from the current delivery")
-    assert_qc_current = _require_completed_qc(run_paths, sealed).assert_current
+    assert_qc_current = _require_completed_qc(
+        run_paths, sealed, verify_diagnostics=(run_paths.composition_cache.name,),
+    ).assert_current
     qc = pd.read_csv(
         run_paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
         float_precision="round_trip",
@@ -3239,6 +2903,8 @@ def _notebook_project_root(dna_project_root: str | Path | None) -> Path:
         candidate = base / "03_results" / "run_manifest.json"
         state = stat_if_present(candidate)
         if state is None:
+            if stat_if_present(base / "00_config/config.yaml") is not None:
+                raise FileNotFoundError(f"Alopex project has no sealed delivery: {candidate}")
             continue
         if not _qc_lock_stat.S_ISREG(state.st_mode):
             raise ValueError(f"Delivery manifest must be a regular file: {candidate}")
@@ -3304,18 +2970,17 @@ def run_qc_processor(
     skip_tss: bool = False,
     tss_sample_fraction: float = 0.1,
     tss_sample_seed: int = 0,
-    recompute_raw_adata: bool = False,
     recompute_cpg_stats: bool = False,
     recompute_gini: bool = False,
     recompute_tss: bool = False,
+    qc_filter_parameters: Mapping[str, float | None] | None = None,
 ) -> None:
     """以独立子进程运行 alopex.downstream.qc 计算 main 并在失败时终止 Notebook。
 
     worker 与 native 线程共同受进程 affinity 和 Slurm allocation 的 CPU 预算约束；
-    recompute 开关透传 CLI 的 --recompute-* 重算参数，其中 raw_adata 强制
-    从 sealed CpG 重建 RawAdata.h5ad，其余默认按缓存身份自动判定复用。
-    TSS 默认每个 CloneID 抽检 10%（不足 10 个全检，最多 100 个）；
-    比例设为 1.0 时全量检查，比例与种子只影响 TSS 缓存。
+    重算开关透传 CLI，强制重新解码 sealed CpG；默认复用同代完整结果。
+    TSS 默认每个 CloneID 抽检 10%（不足 10 个全检，最多 100 个）。
+    比例设为 1.0 时全量检查，修改参数触发整代重算。
     """
     assert_loaded_sources_current(_LOADED_SOURCE_CODES)
     _validate_tss_sampling(tss_sample_fraction, tss_sample_seed)
@@ -3330,6 +2995,8 @@ def run_qc_processor(
         "-m", "alopex.downstream.qc",
         "--project-dir",
         str(paths.project_dir),
+        "--expected-delivery-id",
+        paths.delivery_id,
         "--workers",
         worker_count,
         "--tss-sample-fraction",
@@ -3341,8 +3008,12 @@ def run_qc_processor(
         command.extend(["--tss-bed", str(tss_bed)])
     elif skip_tss:
         command.append("--skip-tss")
+    for name, value in (qc_filter_parameters or {}).items():
+        if name not in QC_FILTER_DEFAULTS:
+            raise ValueError(f"Unknown HQ filter parameter: {name}")
+        if value is not None or name != "mapping_threshold":
+            command.extend(("--" + name.replace("_", "-"), str(value)))
     for flag, enabled in (
-        ("--recompute-raw-adata", recompute_raw_adata),
         ("--recompute-cpg-stats", recompute_cpg_stats),
         ("--recompute-gini", recompute_gini),
         ("--recompute-tss", recompute_tss),
@@ -3366,164 +3037,19 @@ def run_qc_processor(
         raise RuntimeError(f"QC Processor failed with exit code {exit_code}; see 04_logs/downstream/")
 
 
-def _single_obs_equal(left, right) -> bool:
-    """只在比较时统一缺失，原始字符串与真实零独立保留。"""
-    try:
-        pd.testing.assert_frame_equal(left, right, check_dtype=False, check_categorical=False, check_exact=True)
-        return True
-    except AssertionError:
-        return False
-
-
-def prepare_single_cpg_adata(
-    paths: NotebookPaths,
-    df_qc: pd.DataFrame,
-    *,
-    recompute: bool = False,
-) -> Path:
-    """从当前 RawAdata 生成 single-CpG 矩阵，按细胞身份整合 QC 并关闭全部句柄。
-
-    使用当前物种的 BED3、fraction/mean 和逐细胞有界 CSR；保留全部细胞。
-    var_names 跟随 sealed CpG 坐标：0-based 半开区间或 1-based 闭区间；X 不变。
-    已验证的矩阵可复用，仅 QC/HQ 改变时只更新 obs。失效矩阵从当前已核验Raw重建，
-    recompute可强制重建；完成并关闭后才替换正式文件，不关闭其他Notebook的句柄。
-    """
-    with _qc_write_lock(paths.qc_results_dir):
-        if ad is None:
-            raise ImportError("Single-CpG generation requires the Alopex notebook environment")
-        sealed = load_sealed_qc_context(
-            paths.project_dir, expected_pipeline_root=paths.pipeline_root
-        )
-        if sealed.delivery_id != paths.delivery_id:
-            raise ValueError("Delivery changed; rerun the Notebook from its first cell")
-        coordinate_base = _source_cpg_coordinate_base(sealed.cpg_representation)
-        coordinate_metadata = {
-            "cpg_coordinate_base": coordinate_base,
-            "cpg_interval_convention": "half-open" if coordinate_base == 0 else "closed",
-            "source_cpg_representation": sealed.cpg_representation,
-        }
-        run_paths = build_paths(paths.project_dir)
-        if run_paths.qc_results_dir != paths.qc_results_dir:
-            raise ValueError("Notebook QC directory differs from the current delivery")
-        completed_qc = _require_completed_qc(run_paths, sealed)
-        assert_qc_current = completed_qc.assert_current
-        sample_ids = list(completed_qc.sample_ids)
-        if not sample_ids:
-            raise ValueError("Single-CpG generation requires at least one cell")
-        if not df_qc.columns.is_unique or not set(QC_INFO_COLUMNS).issubset(df_qc.columns):
-            raise ValueError("df_qc must contain the complete QC table with unique column names")
-        qc = _require_exact_sample_ids(df_qc, sample_ids, "Notebook QC")
-        saved_qc = pd.read_csv(
-            paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
-            float_precision="round_trip",
-        )
-        saved_qc = _require_exact_sample_ids(saved_qc, sample_ids, "Saved QC")
-        pd.testing.assert_frame_equal(
-            qc[list(QC_INFO_COLUMNS)], saved_qc[list(QC_INFO_COLUMNS)],
-            check_dtype=False, check_exact=True,
-        )
-        raw_path = run_paths.raw_adata
-        raw_schema = completed_qc.raw_schema
-        algorithms = completed_qc.algorithms
-        genome = str(sealed.config["species"])
-        bed = paths.pipeline_root / "resources" / f"{genome}_reference" / "cpg" / f"{genome}.single_cpg.bed.gz"
-        validate_downstream_reference(sealed.reference_path, bed, "single-cpg")
-        assert_qc_current = _reference_guard(sealed.reference_path, sealed.reference_fai, bed,
-            Path(str(bed) + ".reference.json"), before_commit=assert_qc_current)
-        signature = {
-            "algorithm_sha256": algorithms["single"],
-            **coordinate_metadata,
-            "anndata": importlib.metadata.version("anndata"),
-            "h5py": importlib.metadata.version("h5py"),
-            "delivery_id": sealed.delivery_id,
-            "raw_generation": raw_schema["generation_id"],
-            "raw_h5ad": raw_schema["h5ad"],
-            "bed": _content_binding(bed),
-            "value_type": "fraction", "summary_type": "mean", "row_batch_size": 1,
-        }
-        output = paths.qc_results_dir / "SingleCpG_Adata.h5ad"
-        schema_path = output.with_name("SingleCpG_Adata.input_schema.json")
-        cached = None
-        if schema_path.is_file():
-            try:
-                cached = json.loads(schema_path.read_text())
-            except (OSError, ValueError):
-                pass
-        reuse = (output.is_file() and isinstance(cached, dict)
-                 and cached.get("input") == signature
-                 and cached.get("h5ad") == _raw_adata_stat_binding(output))
-        # 固定输出路径下，身份不匹配的旧矩阵从当前已核验Raw重建，绝不复用旧值。
-        temporary = project_temporary_parent(output) / f".{output.stem}.{uuid.uuid4().hex}.tmp.h5ad"
-        raw = matrix = None
-        try:
-            if reuse and not recompute:
-                matrix = matrices.CSRReader(output)
-            else:
-                _log("生成 single-CpG 矩阵：fraction/mean，逐细胞CSR")
-                raw = matrices.CSRReader(raw_path, "obsm/__values__")
-                _require_exact_sample_ids(qc, list(raw.obs_names), "RawAdata QC")
-                if _raw_cpg_coordinate_base(raw) != coordinate_base:
-                    raise ValueError("RawAdata coordinates differ from the sealed CpG representation")
-                matrices.write_single_cpg(raw, bed, temporary, qc.set_index("Sample_ID").loc[list(raw.obs_names)])
-                matrix = matrices.CSRReader(temporary)
-            names = list(matrix.obs_names)
-            aligned = _require_exact_sample_ids(qc, names, "SingleCpG QC")
-            current = matrix.obs
-            merged = current.copy()
-            for column in aligned.columns:
-                merged[column] = aligned[column].array
-            updated = merged
-            assert_qc_current()
-            filter_parameters = json.dumps(qc.attrs.get("qc_filter_parameters", {}), sort_keys=True)
-            obs_changed = (not _single_obs_equal(updated, current)
-                           or matrix.uns.get("qc_filter_parameters", "{}") != filter_parameters)
-            if obs_changed:
-                matrix.close()
-                matrix = None
-                target = output if reuse and not recompute else temporary
-                if reuse and not recompute:
-                    _invalidate_completion(schema_path)
-                updated.index = pd.Index(names)
-                matrices.update_obs(target, updated, {"qc_filter_parameters": filter_parameters})
-            if matrix is not None:
-                matrix.close()
-            matrix = None
-            assert_qc_current()
-            if not reuse or recompute:
-                _fsync_file(temporary)
-                assert_qc_current()
-                _invalidate_completion(schema_path)
-                os.replace(temporary, output)
-            if not reuse or recompute or obs_changed:
-                _atomic_write_json(
-                    {"input": signature, "h5ad": _raw_adata_stat_binding(output)}, schema_path,
-                    before_commit=assert_qc_current,
-                )
-            _log(f"SingleCpG 已就绪，{len(names)} 个细胞，{coordinate_base}-based，文件已关闭: {output}")
-            return output
-        finally:
-            try:
-                if matrix is not None:
-                    matrix.close()
-            finally:
-                try:
-                    if raw is not None:
-                        raw.close()
-                finally:
-                    temporary.unlink(missing_ok=True)
-
-
 def load_notebook_qc_frame(
     paths: NotebookPaths,
 ) -> tuple[pd.DataFrame, dict[str, str] | None]:
-    """加载 QC Processor 产出的 DNAme QC 表并初始化绘图主题与 CloneID 配色。"""
+    """加载 Processor 同代 QC 与筛选结果并初始化绘图主题与 CloneID 配色。"""
     sealed = load_sealed_qc_context(paths.project_dir, expected_pipeline_root=paths.pipeline_root)
     if sealed.delivery_id != paths.delivery_id:
         raise ValueError("Delivery changed; rerun the Notebook from its first cell")
     run_paths = build_paths(paths.project_dir)
     if run_paths.qc_results_dir != paths.qc_results_dir:
         raise ValueError("Notebook QC directory differs from the current delivery")
-    assert_qc_current = _require_completed_qc(run_paths, sealed).assert_current
+    assert_qc_current = _require_completed_qc(
+        run_paths, sealed, verify_diagnostics=(diagnostics.FILTER_INFO,),
+    ).assert_current
     paths.qc_results_dir.mkdir(parents=True, exist_ok=True)
     paths.plots_dir.mkdir(parents=True, exist_ok=True)
     from .plotting import setup_nature_style, normalize_clone_id_value, generate_clone_color_map
@@ -3533,6 +3059,9 @@ def load_notebook_qc_frame(
         paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
         float_precision="round_trip",
     )
+    reasons = pd.read_csv(run_paths.qc_results_dir / diagnostics.FILTER_INFO,
+                          converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str))
+    df_qc = df_qc.merge(reasons, on=list(QC_INFO_COLUMNS[:3]), how="left", validate="one_to_one")
     print(f"✅ 已加载 QC 数据: {len(df_qc)} 个样本")
     clone_color_map: dict[str, str] | None = None
     if not df_qc.empty and "CloneID" in df_qc.columns:
@@ -3551,36 +3080,16 @@ def load_notebook_tss_frame(paths: NotebookPaths) -> pd.DataFrame:
     run_paths = build_paths(paths.project_dir)
     if run_paths.qc_results_dir != paths.qc_results_dir:
         raise ValueError("Notebook QC directory differs from the current delivery")
-    completed = _require_completed_qc(run_paths, sealed)
+    completed = _require_completed_qc(run_paths, sealed, verify_diagnostics=(run_paths.tss_info.name,))
+    if completed.identity["tss_sampling"] is None:
+        raise ValueError("TSS was skipped in the completed QC run; set SKIP_TSS=False and rerun the QC Processor")
     frame = _validated_tss_cache(
         run_paths.tss_info, set(completed.sample_ids),
-        set(completed.raw_schema["empty_cpg_sample_ids"]),
+        set(completed.identity["empty_cpg_sample_ids"]),
     )
     if frame is None:
         raise ValueError("TSS cache is incomplete or invalid; rerun the QC Processor")
     completed.assert_current()
-    return frame
-
-
-def compute_chromosome_diagnostics(raw, df_qc, output, *, recompute=False, before_commit=None):
-    """按同代Raw逐染色体诊断；缓存损坏补算，不再次扫描CpG文件。"""
-    frame = None
-    if not recompute and output.is_file():
-        try:
-            candidate = pd.read_csv(output, converters={'Sample_ID': str, 'CloneID': str, 'chrom': str}, float_precision='round_trip')
-            if (set(candidate.Sample_ID) == set(df_qc.Sample_ID)
-                    and not candidate.duplicated(['Sample_ID', 'chrom']).any()
-                    and candidate.CloneID.eq(candidate.Sample_ID.map(df_qc.set_index('Sample_ID').CloneID)).all()):
-                host = candidate.loc[candidate.chromosome_class.eq('host')].groupby('Sample_ID').observed_sites.sum()
-                expected = df_qc.set_index('Sample_ID').Sample_Unique_CpG_Sites
-                if host.reindex(expected.index).eq(expected).all():
-                    frame = candidate
-        except (OSError, ValueError, KeyError, AttributeError):
-            pass
-    if frame is None:
-        frame = diagnostics.chromosome_summary(raw, _is_primary_chromosome, _classify_seq_name)
-        frame['CloneID'] = frame.Sample_ID.map(df_qc.set_index('Sample_ID').CloneID)
-        _atomic_write_csv(frame, output, before_commit=before_commit)
     return frame
 
 
@@ -3590,53 +3099,18 @@ def _load_qc_diagnostic(paths, name):
     if sealed.delivery_id != paths.delivery_id:
         raise ValueError('Delivery changed; rerun the Notebook from its first cell')
     run_paths = build_paths(paths.project_dir)
-    completed = _require_completed_qc(run_paths, sealed)
-    path = paths.qc_results_dir / name
-    guard = _reference_guard(path, before_commit=completed.assert_current)
-    identity = json.loads(run_paths.input_identity.read_text())
-    if identity.get('diagnostic_artifacts', {}).get(name) != _content_binding(path):
-        raise ValueError(f'Diagnostic is incomplete or stale: {name}; rerun the QC Processor')
+    if run_paths.qc_results_dir != paths.qc_results_dir:
+        raise ValueError("Notebook QC directory differs from the current delivery")
+    completed = _require_completed_qc(run_paths, sealed, verify_diagnostics=(name,))
+    path = run_paths.qc_results_dir / name
     frame = pd.read_csv(path, converters={'Sample_ID': str, 'CloneID': str, 'chrom': str}, float_precision='round_trip')
-    guard()
+    completed.assert_current()
     return frame
 
 
 def load_chromosome_qc_frame(paths):
     """加载全部细胞的同代逐染色体计数/甲基化率。"""
     return _load_qc_diagnostic(paths, diagnostics.CHROMOSOME_INFO)
-
-
-
-def annotate_notebook_qc(paths, frame, *, mapping_threshold=None, lambda_max=10.0,
-                         puc19_min=90.0, cpg_min=500000, gini_max=0.5):
-    """为矩阵准备同代完整注释，发布逐细胞筛选原因，不改变标准20列QC。"""
-    with _qc_write_lock(paths.qc_results_dir):
-        sealed = load_sealed_qc_context(paths.project_dir, expected_pipeline_root=paths.pipeline_root)
-        if sealed.delivery_id != paths.delivery_id:
-            raise ValueError('Delivery changed; rerun the Notebook from its first cell')
-        completed = _require_completed_qc(build_paths(paths.project_dir), sealed)
-        frame = _require_exact_sample_ids(frame, list(completed.sample_ids), 'Notebook annotations')
-        saved = pd.read_csv(paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str), float_precision='round_trip')
-        saved = _require_exact_sample_ids(saved, list(completed.sample_ids), 'Saved QC')
-        pd.testing.assert_frame_equal(frame[list(QC_INFO_COLUMNS)], saved[list(QC_INFO_COLUMNS)], check_dtype=False, check_exact=True)
-        parameters = dict(mapping_threshold=mapping_threshold, lambda_max=lambda_max,
-                          puc19_min=puc19_min, cpg_min=cpg_min, gini_max=gini_max)
-        reasons = diagnostics.filter_reasons(frame, **parameters)
-        result = frame.drop(columns=[c for c in reasons if c not in QC_INFO_COLUMNS], errors='ignore').merge(
-            reasons, on=list(QC_INFO_COLUMNS[:3]), how='left', validate='one_to_one')
-        cells = read_active_cells(paths.project_dir, sealed_context=sealed)
-        identity = pd.DataFrame({'Sample_ID': [c['sample_id'] for c in cells],
-                                 'DNA_Barcode': [c['dna_barcode'] for c in cells],
-                                 'Cell_Order': [c['cell_order'] for c in cells]})
-        result = result.drop(columns=['DNA_Barcode', 'Cell_Order'], errors='ignore').merge(identity, on='Sample_ID', validate='one_to_one')
-        result['sample'] = result.Sample_ID
-        result['clone_id'] = result.CloneID
-        result['nCG'] = result.Sample_Unique_CpG_Sites
-        result['met_rate'] = result['Sample_Meth_CpG_Rate%'] / 100
-        result.attrs['qc_filter_parameters'] = parameters
-        _atomic_write_csv(reasons, paths.qc_results_dir / diagnostics.FILTER_INFO, before_commit=completed.assert_current)
-        completed.assert_current()
-        return result
 
 
 if __name__ == "__main__":
