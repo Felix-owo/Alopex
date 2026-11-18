@@ -62,7 +62,7 @@ Notebook 调用独立 Processor 完成计算，再加载 QC 绘图；Processor �
 
 终端运行时自动选择原位动态面板，非交互输出仅保留阶段变化、告警和五分钟心跳。资源缺失显示不可用，RSS合计和采样峰值不代表独占物理内存或精确峰值；界面显示“最终提交”时仍须等待完成，只有子进程（含句柄关闭）成功退出才显示“已完成”。
 
-失败先看面板原因，再打开完整日志定位首条错误。Notebook中断会先等待本次QC清理，再回收其进程组内仍存活的后代；等待中断处理结束后再重跑Processor。详细约束见[统一展示标准](../docs/contracts/environment.md#运行展示标准)。
+失败先看面板原因，再打开完整日志定位首条错误。Notebook中断会先等待本次QC清理，再回收其进程组内仍存活的后代；等待中断处理结束后再重跑Processor。
 
 关闭 Notebook 标签页不会停止 kernel 中的计算。需要停止 QC 时，使用中断操作并等待清理结束；可在 JupyterLab 的 Running 面板确认 kernel 状态，见[官方说明](https://jupyterlab.readthedocs.io/en/stable/user/running.html)。
 日志目录不可用时会提示并显示原生输出；中断仍会等待本次计算清理并回收其进程组。先修复提示中的日志路径，再重跑即可恢复状态卡和完整调用日志。
@@ -115,9 +115,8 @@ PY_KERNEL
 | `RawAdata.h5ad` / `RawAdata.input_schema.json` | 全细胞、全参考 canonical CpG 导入矩阵与复用记录，保留辅助序列供 QC／审计 |
 | `SingleCpG_Adata.h5ad` / `SingleCpG_Adata.input_schema.json` | Notebook 最后一格生成的全细胞、主核染色体 single-CpG 矩阵与完成记录 |
 | `Chromosome_QC_Information.csv` | 全细胞逐染色体整数计数、位点数与甲基化率 |
-| `TSS_Score_Information.csv` | 全细胞分数、覆盖分母和抽样/缺失状态 |
 | `QC_Filter_Reasons.csv` | Notebook筛选后逐条件结果及失败原因 |
-| `TSS_Profile_Information.csv` | 未跳过 TSS 时生成，仅含抽中且有覆盖的 bins |
+| `TSS_Profile_Information.csv` | 原有 TSS profile：抽中细胞有覆盖 offset 的甲基化率与甲基化信号整数计数 |
 | `plots/` | QC、Final QC、孔板、信号组成、TSS、CpG density 与 PCA 等 PDF |
 | `.cache/` | CpG 统计、信号组成、Gini 与 QC 完成身份等内部缓存，不手动改写 |
 | `methyltree/allCpGs.h5ad` / `methyltree/sample_sheet.csv` | 显式运行 MethylTree 衔接入口时生成；独立的所选细胞矩阵及全部细胞注释 |
@@ -126,11 +125,11 @@ PY_KERNEL
 
 ## 连接 MethylTree
 
-1. 使用 Python 3.13 的 MethylTree kernel 打开本机 `test/only_quality_checking.ipynb`；同一环境须具备 Alopex QC 依赖。填写 `DNA_PROJECT_ROOT`，`DNA_PIPELINE_ROOT` 可留空从 sealed 交付定位，然后按原单元顺序运行。两项均为 `None` 时沿用原始输入流程；无需先执行 Alopex 可视化 Notebook。
+1. 使用独立 MethylTree kernel（模板标记为 `MethylTree_3_10_lab`，按本机实际注册项选择）打开 [only_quality_checking_alopex.ipynb](only_quality_checking_alopex.ipynb)。从 Alopex 项目或子目录启动，默认向上发现项目，再从 sealed 交付定位 Pipeline；也可显式填写 `DNA_PROJECT_ROOT` / `DNA_PIPELINE_ROOT`。Alopex 计算通过该 Pipeline 的受管 Python 子进程执行，无需向 MethylTree kernel 安装 Alopex 的整套依赖；无需先执行 Alopex 可视化 Notebook。
 2. Processor 从当前 complete 交付构建或复用标准 QC/Raw；`alopex.downstream.methyltree.prepare_methyltree_inputs` 复用同一 SingleCpG builder，导出至固定 `06_downstream/methyltree/`。
-3. 完成后确认全部细胞在 `sample_sheet.csv`，按导入门槛选中的细胞在 `allCpGs.h5ad`。H5AD 为标准 AnnData，X 保持 backed。Notebook 保留 MethylTree 原有绘图、筛选、注释、可选谱系和诊断流程，需安装 MethylTree；仅直接调用下方 Alopex 导出 API 时不要求该包。
+3. 默认不运行可选谱系推断；该可选分析需在自己的 MethylTree 环境单独验收。完成后确认全部细胞在 `sample_sheet.csv`，按导入门槛选中的细胞在 `allCpGs.h5ad`。H5AD 为标准 AnnData，X 保持 backed。Notebook 保留 MethylTree 原有绘图、筛选、注释、可选谱系和诊断流程，需安装 MethylTree；仅直接调用下方 Alopex 导出 API 时不要求该包。
 
-不修改公开 CpG、文件名、表头、坐标或整数计数，也不修改 MethylTree 包源码。sample/clone/plate/barcode/cell order 来自 sealed manifest；原20列QC保留，别名和单位见[参数说明](../docs/ANALYSIS_PARAMETERS.md#methyltree-衔接)。无观测保持NaN；signal比例是coverage比例，不是FASTQ reads比例。不要把原生mapping跨backend当成同一指标。
+不修改公开 CpG、文件名、表头、坐标或整数计数，也不修改 MethylTree 包源码。sample/clone/plate/barcode/cell order 来自 sealed manifest；原20列QC保留，别名和单位见[指标与分母](#指标与分母)。无观测保持NaN；signal比例是coverage比例，不是FASTQ reads比例。不要把原生mapping跨backend当成同一指标。
 
 矩阵沿用 SingleCpG 的坐标和双链 fraction/mean，原始逐链整数计数仍在 Raw；导出按连续单行读取并直接复制 CSR 的 data/indices，保留显式零和缺失掩码。**稀疏未存储项代表缺失**，不能将 `toarray()` 后的零当成真实零甲基化。
 
@@ -152,7 +151,7 @@ samples, h5ad = methyltree.prepare_methyltree_inputs(
 
 标准分析范围为 hg38 的 chr1–22/X/Y、mm10 的 chr1–19/X/Y；辅助／decoy 参与比对，不进入宿主 nCG、甲基化率、Gini、TSS 和最终 Single-CpG 矩阵。TSS／single-CpG BED 必须携带与当前参考匹配的 `.reference.json`，不得把旧目录套到新交付。
 
-来源与绑定见源码 checkout 的 `docs/ANALYSIS_PARAMETERS.md`「标准 reference 与分析范围」；此策略自 v16.2 发布。
+来源与绑定以当前封存 reference 回执和固定清单为准。
 
 读图时先区分位点均值、coverage 比例和 read-pair 指标。身份列按字符串保留前导零及合法 `NA/nan/None`，数值缺失保持 NaN；观测零值不能当作缺失。完整定义见[QC 字段][qc-fields]和[生物学分母][denominators]。
 
@@ -174,7 +173,9 @@ Notebook 默认同时要求 lambda methylation `<10%`、pUC19 methylation `>90%`
 
 ### 图与展示控制
 
-染色体诊断与 TSS score 绘图支持独立调用：从当前完成 QC 读取数据后，可直接运行 `plotting.plot_chromosome_diagnostics(...)` 或 `plotting.plot_tss_scores(...)` 并导出图片。
+染色体诊断图沿用前面 QC 单元的主题、字号和 CloneID 公共前后缀省略规则；Notebook 传入同一份 `clone_color_map`，使各图的组别颜色一致，完整身份仍保留在表格和矩阵中。热图分别用青绿表示覆盖、玫红表示甲基化；甲基化缺失为灰色，观测零仍显示为色阶起点。下方表格按 CloneID 和染色体展示数值列中位数，逐细胞原表保留在 `df_chromosome` 中。
+
+染色体图支持独立调用：从当前完成 QC 读取数据后，可运行 `plotting.plot_chromosome_diagnostics(..., clone_color_map=clone_color_map)` 并导出图片；不传颜色表时使用现有默认配色规则。
 
 #### 图 / Notebook 控制：解读与输出
 
@@ -290,20 +291,76 @@ Cabernet、TAPS、Droplet 均在 DNA manifest 的可选 `rna_sample` 填 RNA_DAR
 
 `Integrated_QC_Information.csv` 保留 RNA 身份，RNA 13列与 DNA 20列的独立 QC schema 不变；RNA 下游记录实际关联和输入哈希。完整关联边界见[Manifest 契约][manifest-contract]与[Droplet 关联契约][droplet-contract]。
 
-[qc-fields]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/ANALYSIS_PARAMETERS.md#下游-qc-字段
-[denominators]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/ANALYSIS_PARAMETERS.md#生物学分母与零值解释
-[recompute]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/ANALYSIS_PARAMETERS.md#下游重算与-tss-抽检控制
-[single-params]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/ANALYSIS_PARAMETERS.md#notebook-末尾-single-cpg-矩阵
-[single-contract]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/contracts/downstream.md#83-single-cpg-reference
-[qc-contract]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/contracts/downstream.md#9-qc-与-multiqc
-[manifest-contract]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/contracts/inputs.md#manifest-与-rna-关联
-[droplet-contract]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/contracts/droplet.md#droplet-的配套-rna-独立关联
-[benchmarks]: https://github.com/Felix-owo/Alopex_dev/blob/main/docs/BENCHMARKS.md
+[qc-fields]: #指标与分母
+[denominators]: #指标与分母
+[recompute]: #缓存与强制重算
+[single-params]: #保存供下游复用的-single-cpg-矩阵
+[single-contract]: #保存供下游复用的-single-cpg-矩阵
+[qc-contract]: #指标与分母
+[manifest-contract]: #关联-rna_darlin-结果
+[droplet-contract]: #关联-rna_darlin-结果
+[benchmarks]: #指标与分母
 
 ## 诊断与矩阵注释
 
-Notebook增加逐染色体覆盖/甲基化图、TSS score与覆盖比例图，以及逐细胞筛选原因表。TSS score为abs(offset)与甲基化fraction的Pearson相关；结合覆盖比例和status解释，未抽中与无覆盖均不填分数0。默认HQ规则保持不变。
+Notebook提供逐染色体覆盖/甲基化图与逐细胞筛选原因表；TSS QC沿用原有profile及可视化。默认HQ规则保持不变。
 
-末尾Single矩阵保存完整obs注释、HQ/筛选原因、TSS摘要、sealed条码与孔序，后续可直接使用adata.obs。全部细胞仍保留，选择HQ由下游显式执行。标准H5AD/CSR路径不需要SnapATAC2或Polars；大参考矩阵用磁盘CSR逐行处理，避免一次读取全体var标签或obsm。
+末尾Single矩阵保存完整obs注释、HQ/筛选原因、sealed条码与孔序，后续可直接使用adata.obs。全部细胞仍保留，选择HQ由下游显式执行。标准H5AD/CSR路径不需要SnapATAC2或Polars；大参考矩阵用磁盘CSR逐行处理，避免一次读取全体var标签或obsm。
 
-更新后重启kernel，从第一格重跑；旧Raw schema会按身份自动重建。缓存与输入失败时保留原始日志，修复原因后重跑Processor，再运行Notebook后续单元。
+更新后重启kernel，从第一格运行。Processor按各自身份更新失效的下游缓存；本次调整只使TSS缓存失效，Raw、CpG、Gini、Single-CpG与染色体统计的算法身份不变。原TSS profile保留`Sample_ID/position_coarse/meth_frac/count/CloneID`五列。缓存与输入失败时保留原始日志，修复原因后运行Processor，再运行Notebook后续单元。
+
+## 指标与分母
+
+`DNAme_QC_Information.csv`按下表分组顺序写20列；完整pair funnel、policy/unit及更细的诊断保留在sealed final manifest与MultiQC。
+身份列按字符串读写，保留前导零及合法`NA/nan/None`；数值缺失保持NaN，CSV按round-trip精度复用。
+
+| 列（按写出顺序） | 定义与单位 |
+| --- | --- |
+| `Sample_ID`、`CloneID`、`PlateID` | sealed细胞/克隆/孔板身份；不能用行号或静默交集替换 |
+| `Native_Mapping%` | backend原生mapping百分比，保留其原生单位与分母，不当作跨backend同义指标 |
+| `Sample_Unique_CpG_Sites`、`Sample_Meth_CpG_Rate%` | 宿主已覆盖canonical胞嘧啶位点数及逐位点甲基化率均值 |
+| `Lambda_Unique_CpG_Sites`、`Lambda_Meth_CpG_Rate%` | 精确lambda contig的同类位点数及均值，非合并reads比率 |
+| `pUC19_Unique_CpG_Sites`、`pUC19_Meth_CpG_Rate%` | 精确pUC19 contig的同类位点数及均值 |
+| `Non_CpG_Methylation%`、`High_CpH_Flag_Rate%` | 各backend定义的non-CpG统计及flagged/assessed比例；TAPS前者为判链宿主CHG/CHH转换率，后者不适用为NaN |
+| `Signal_Host_Rate%`、`Signal_Lambda_Rate%`、`Signal_pUC19_Rate%`、`Signal_mtDNA_Rate%` | 各类canonical CpG coverage(m+u)/全部contig总coverage×100；其他contig仍进入总分母 |
+| `Gini_Index` | canonical CpG coverage在有覆盖固定宽bin的Gini；限主核染色体，含chrY、排除chrM及辅助序列；主核位点数为0时为NaN，即使线粒体、辅助序列或对照有覆盖；真实零甲基化且有主核coverage仍计算Gini |
+| `Duplicate_Pair_Rate%`、`Trim_Retention%`、`Final_Pair_Yield%` | 分母按本节pair表；Droplet不以分子数反推pair去重率，该列为NaN |
+
+
+| 指标 | 定义 |
+| --- | --- |
+| QC三参考Meth_CpG_Rate% | 分别对宿主/lambda/pUC19已覆盖的canonical胞嘧啶位点取m/(m+u)的算术均值×100，不是将reads计数合并后的比率；零位点为NaN |
+| contig归属 | 位点统计与coverage分类共用原始名称：controls仅精确`lambda`/`pUC19`，mt按既有chrM/MT/chrMT规则，宿主仅主核染色体（标准人chr1–22/X/Y、小鼠chr1–19/X/Y）；其他contig只进total分母。例如`chr_lambda_alt`、`lambda_decoy`均不属宿主或controls；不按子串或大小写别名分类 |
+| SingleCpG X | 同一参考CpG区间内已覆盖C/G位点的fraction均值；例如1/4与9/12得到0.5，不是10/16。缺覆盖为稀疏缺项，有覆盖但全unmethyl为显式0；不把缺项补成观测0 |
+| TSS | 同offset有覆盖gene/bin的fraction均值；count为这些gene/bin甲基化信号之和，不能当总coverage/read pairs或全基因组唯一分子数。共享基因组区间仍保留每个gene关联/权重；无覆盖不出行，有覆盖全unmethyl保fraction=0/count=0 |
+| TAPS native controls | lambda假阳性/pUC19转换取总mod/总(mod+unmod)，与上述QC位点均值不是同一分母；必须同时报告观测数，不混用为化学效率 |
+
+
+统一比率按下表计算，不跨阶段替换分母：
+
+| 指标 | 分子 | 分母 | 解释 |
+| --- | --- | --- | --- |
+| Trim retention | trimmed pairs | Cutadapt input pairs | trimming 后保留比例 |
+| Duplicate pair rate | duplicate pairs | backend accepted pairs | 以pair为去重单位的路线适用，Droplet 为 NaN |
+| PostDedup retention（`PostDedup_Retention_pct`） | postdedup pairs | backend accepted pairs | 分子/分母×100，不使用 trimmed 作为分母 |
+| Final yield | final retained pairs | Cutadapt input pairs | 从 trimming 前到最终调用输入的 pair 产出 |
+| High-CpH rate | flagged pairs | assessed pairs | 保留实际评估集合；TAPS 不适用 |
+
+| 路线 | 接受 / 去重单位 | 不可误读的边界 |
+| --- | --- | --- |
+| Bismark 孔板 | unique concordant pairs；paired-end dedup；policy=`bismark_unique_concordant` | 原生 `ambiguous_pairs` 可观测，`no_primary_pairs` 留空 |
+| BISCUIT / Dupsifter | any-primary QNAME pair funnel，允许 one-mate-primary；policy=`biscuit_any_primary_pair_funnel` | 原生互斥 `No_Mapped`/`No_Primary` 分别记为 `unmapped_pairs`/`no_primary_pairs`，两者之和为 `backend_rejected_pairs`；`ambiguous_pairs` 留空，不自行重判 BAM mapping |
+| Droplet | alignment/filter 以 pairs 记账，甲基化按胞嘧啶/UMI 共识 | 不移除整对，`duplicate_pairs=0`、`postdedup=accepted`；pair 去重率为NaN，不填0%；位点共识计数单列 |
+| TAPS / Rastair | 标记重复，允许进入调用的 pairs | 保留 BAM 含全部记录；final 不等同 BAM 总 pairs；high-CpH 为 NaN |
+
+MultiQC 的 native 模块仅去掉本 Pipeline 的末尾报告后缀，不使用默认中间子串截断或首尾字符裁剪；Cutadapt 固定按 `<Sample_ID>.cutadapt.json`、BISCUIT 按唯一细胞报告文件名取身份，重复清名也只去一次报告后缀；文件格式只判最后扩展名。
+
+保留前导连字符、`NA`、前导零及 ID 内的点号/`.cutadapt`，以及与报告后缀同名的结尾。原始 native JSON/文本不改写。
+
+MultiQC 只对展示抽样，文库概要与科学结果仍覆盖全库；完整名单与诊断保留在对应原始日志和已封存交付中。
+
+Cutadapt adapter QC 分开输出 `R1_Adapter_pct` 与 `R2_Adapter_pct`。
+
+`non_cpg_methylation_pct` 对 BISCUIT 来自 CpH retention table，对 Cabernet Bismark 来自原生 extraction splitting report 的 CHG+CHH 观察，对 Droplet 来自过滤后 CHG/CHH 的胞嘧啶/UMI 共识计数，对 TAPS 采用[判链宿主统计](#指标与分母)。
+
+均记录 `non_cpg_metric_source`，不作为跨 backend 的统一 hard threshold。

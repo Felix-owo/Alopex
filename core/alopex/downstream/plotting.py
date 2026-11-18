@@ -1891,56 +1891,48 @@ def plot_final_qc_dashboard_batch(
         )
 
 
-def plot_chromosome_diagnostics(frame, out_path=None):
+def plot_chromosome_diagnostics(frame, out_path=None, clone_color_map=None):
     """逐CloneID/主染色体显示覆盖及甲基化；缺覆盖保持空白，不以零制造甲基化。"""
-    _load_plot_dependencies()
-    with plt.rc_context({'font.size': 10, 'axes.titlesize': 12, 'axes.labelsize': 10,
-                         'xtick.labelsize': 9, 'ytick.labelsize': 9, 'legend.fontsize': 9,
-                         'legend.title_fontsize': 10}):
-        data = frame.loc[frame['chromosome_class'].eq('host')].copy()
-        if data.empty:
-            if out_path is not None:
-                Path(out_path).unlink(missing_ok=True)
-            return
-        chroms = sorted(data.chrom.unique(), key=lambda name: (int(name[3:]) if name[3:].isdigit() else 100 if name == 'chrX' else 101))
-        groups = list(dict.fromkeys(data.CloneID))
-        grouped = data.groupby(['CloneID', 'chrom'], sort=False)
-        coverage = grouped.observed_sites.median().unstack('chrom').reindex(index=groups, columns=chroms)
-        methylation = grouped.meth_frac.median().unstack('chrom').reindex(index=groups, columns=chroms)
-        valid = grouped.meth_frac.count().unstack('chrom').reindex(index=groups, columns=chroms).fillna(0)
-        fig, axes = plt.subplots(2, 1, figsize=(max(9, len(chroms) * .42), max(5, len(groups) * .55 + 3)))
-        sns.heatmap(np.log10(coverage + 1), cmap='Blues', ax=axes[0], cbar_kws={'label': 'log10(median sites + 1)'})
-        sns.heatmap(methylation, annot=valid.astype(int), fmt='d', cmap='viridis', vmin=0, vmax=1, ax=axes[1], cbar_kws={'label': 'Median site fraction'})
-        axes[0].set_title('Chromosome coverage (zero sites retained)')
-        axes[1].set_title('Chromosome methylation\nNumbers: covered cells; blank: missing')
-        for ax in axes:
-            ax.set_xlabel('Chromosome'); ax.set_ylabel('CloneID'); ax.tick_params(axis='x', rotation=45)
-        fig.tight_layout()
+    setup_nature_style()
+    data = frame.loc[frame['chromosome_class'].eq('host')].copy()
+    if data.empty:
         if out_path is not None:
-            fig.savefig(out_path, bbox_inches='tight')
-        plt.show()
-
-
-def plot_tss_scores(frame, out_path=None):
-    """score与实际gene/bin覆盖并列展示；未定义score不补零，抽样状态仍在表内。"""
-    _load_plot_dependencies()
-    with plt.rc_context({'font.size': 10, 'axes.titlesize': 12, 'axes.labelsize': 10,
-                         'xtick.labelsize': 9, 'ytick.labelsize': 9, 'legend.fontsize': 9,
-                         'legend.title_fontsize': 10}):
-        valid = frame.loc[np.isfinite(frame['TSS_score']) & np.isfinite(frame['TSS_coverage_fraction'])]
-        if valid.empty:
-            if out_path is not None:
-                Path(out_path).unlink(missing_ok=True)
-            print('TSS score 无可定义相关的细胞；请查看覆盖和 TSS_score_status。')
-            return
-        fig, ax = plt.subplots(figsize=(6, 4.5))
-        sns.scatterplot(data=valid, x='TSS_coverage_fraction', y='TSS_score', hue='CloneID', ax=ax)
-        ax.set_xlim(0, 1.02)
-        ax.set_ylim(-1.02, 1.02)
-        ax.set_xlabel('Covered gene/bin members / eligible members')
-        ax.set_ylabel('Pearson r(|TSS offset|, methylation fraction)')
-        ax.set_title(f'Defined TSS scores: {len(valid)} / {len(frame)} cells')
-        fig.tight_layout()
-        if out_path is not None:
-            fig.savefig(out_path, bbox_inches='tight')
-        plt.show()
+            Path(out_path).unlink(missing_ok=True)
+        return
+    data['CloneID'] = data['CloneID'].map(normalize_clone_id_value)
+    chroms = sorted(data.chrom.unique(), key=lambda name: (int(name[3:]) if name[3:].isdigit() else 100 if name == 'chrX' else 101))
+    groups = sorted(data.CloneID.dropna().unique().tolist())
+    label_map, omitted = make_cloneid_diff_labels(groups)
+    if clone_color_map is None:
+        clone_color_map = generate_clone_color_map(groups)
+    grouped = data.groupby(['CloneID', 'chrom'], sort=False)
+    coverage = grouped.observed_sites.median().unstack('chrom').reindex(index=groups, columns=chroms)
+    methylation = grouped.meth_frac.median().unstack('chrom').reindex(index=groups, columns=chroms)
+    valid = grouped.meth_frac.count().unstack('chrom').reindex(index=groups, columns=chroms).fillna(0)
+    fig, axes = plt.subplots(2, 1, figsize=(max(12, len(chroms) * .65), max(9, len(groups) * .7 + 5)), dpi=PlotParams.DPI)
+    coverage_cmap = mcolors.LinearSegmentedColormap.from_list('coverage', ['#EDF5F4', NATURE_BASE_PALETTE[0], '#498A86'])
+    methylation_cmap = mcolors.LinearSegmentedColormap.from_list('methylation', ['#F9EFF2', NATURE_BASE_PALETTE[1], '#C15473'])
+    sns.heatmap(np.log10(coverage + 1), cmap=coverage_cmap, vmin=0, ax=axes[0],
+                linewidths=.5, linecolor='white', cbar_kws={'label': 'log10(Median Sites + 1)'})
+    sns.heatmap(methylation, annot=valid.astype(int), fmt='d', cmap=methylation_cmap,
+                vmin=0, vmax=1, ax=axes[1], linewidths=.5, linecolor='white',
+                annot_kws={'fontsize': FontSizes.LEGEND}, cbar_kws={'label': 'Median Site Fraction'})
+    for i, (ax, title) in enumerate(zip(axes, ['Chromosome Coverage', 'Chromosome Methylation'], strict=True)):
+        format_ax(ax, title=title, xlabel='Chromosome', ylabel='CloneID')
+        ax.set_facecolor('#F2F4F7')
+        ax.set_yticklabels([label_map.get(group, group) for group in groups], rotation=0)
+        ax.set_xticklabels(chroms, rotation=45, ha='right')
+        for tick, group in zip(ax.get_yticklabels(), groups, strict=True):
+            tick.set_color(clone_color_map.get(group, UNKNOWN_COLOR))
+        add_panel_letter(ax, panel_label(i))
+        colorbar = ax.collections[0].colorbar
+        colorbar.ax.tick_params(labelsize=FontSizes.LEGEND, colors=Colors.TICK)
+        colorbar.set_label(colorbar.ax.get_ylabel(), fontsize=FontSizes.LABEL, color=Colors.LABEL)
+    fig.text(.5, .045, 'Medians across cells in each CloneID; numbers: cells with methylation coverage.\n'
+             'Zero sites are retained; grey cells: missing methylation.', ha='center', fontsize=10.2, color=Colors.ANNOT)
+    add_cloneid_omission_note(fig, omitted, y=.015)
+    plt.tight_layout(rect=[0, .075, 1, .98], h_pad=2.8)
+    if out_path is not None:
+        fig.savefig(out_path, bbox_inches='tight')
+    plt.show()
+    plt.close(fig)

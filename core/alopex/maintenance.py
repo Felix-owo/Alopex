@@ -301,7 +301,7 @@ def _check_installed_environment(prefix: Path, role: str, expected_subdir: str, 
     normalize = lambda value: re.sub(r"[-_.]+", "-", value).lower()
     # Python 包可能由 pip 安装或覆盖；有效版本来自 dist-info，不由残留 Conda 记录代替。
     python_distributions = {name: name for name in (
-        "anndata", "ipykernel", "jupyterlab", "numba", "numpy", "packaging", "pandas", "polars",
+        "anndata", "h5py", "ipykernel", "jupyterlab", "numba", "numpy", "packaging", "pandas", "polars",
         "pyyaml", "scikit-learn", "seaborn", "tqdm", "jsonschema", "snakemake",
         "snakemake-executor-plugin-slurm", "pip", "pysam", "cutadapt", "multiqc", "awscli",
         "leidenalg", "cykhash", "umi_tools", "rich", "psutil",

@@ -1076,9 +1076,6 @@ TSS_REQUIRED_COLUMNS = (
     "meth_frac",
     "count",
     "CloneID",
-    "coverage",
-    "covered_bins",
-    "observed_sites",
 )
 
 
@@ -2342,12 +2339,6 @@ def _validated_tss_cache(
             or np.any((counts == 0) != (fractions == 0))
         ):
             return None
-        for name in ("coverage", "covered_bins", "observed_sites"):
-            values = pd.to_numeric(prof[name], errors="raise").to_numpy(dtype=float)
-            if not np.isfinite(values).all() or (values <= 0).any() or not np.equal(values, np.floor(values)).all():
-                return None
-        if (prof["coverage"].to_numpy() < counts).any():
-            return None
         prof["Sample_ID"] = sample_values
         prof["position_coarse"] = positions.astype(np.int64)
         prof["meth_frac"] = fractions
@@ -2524,30 +2515,20 @@ def compute_tss_profile(
     raw_adata, df_qc: pd.DataFrame, tss_bed_path: Path, out_csv: Path, recompute: bool,
     empty_cpg_sample_ids: set[str], *, sample_fraction: float = 1.0, sample_seed: int = 0, before_commit=None,
 ) -> pd.DataFrame:
-    """直接读取抽中CSR行计算TSS，并同步发布全部细胞的覆盖及score解释。"""
+    """直接读取抽中CSR行计算并缓存原有TSS profile。"""
     assert_current = _reference_guard(tss_bed_path, before_commit=before_commit)
     if set(empty_cpg_sample_ids) - set(df_qc.Sample_ID.astype(str)):
         raise ValueError("Empty-CpG Sample_ID set differs from QC table")
     selected, _ = _select_tss_cells(df_qc, sample_fraction, sample_seed)
     selected_ids = set(selected.Sample_ID)
-    scores_path = out_csv.parent / diagnostics.TSS_SCORE_INFO
     if not recompute:
         profile = _validated_tss_cache(out_csv, selected_ids, set(empty_cpg_sample_ids) & selected_ids)
-        if profile is not None and scores_path.is_file():
-            try:
-                scores = pd.read_csv(scores_path, converters={"Sample_ID": str, "CloneID": str}, float_precision="round_trip")
-                scores = diagnostics.validate_tss_scores(scores, df_qc, selected_ids)
-            except (ValueError, pd.errors.ParserError):
-                scores = None
-            clones = df_qc.set_index("Sample_ID").CloneID
-            if scores is not None and (scores.CloneID.eq(scores.Sample_ID.map(clones)).all()
-                    and (profile.empty or profile.CloneID.eq(profile.Sample_ID.map(clones)).all())):
-                assert_current()
-                return profile
-    profile, eligible = diagnostics.tss_profiles(raw_adata, selected, tss_bed_path, _is_primary_chromosome)
-    scores = diagnostics.tss_scores(profile, df_qc, selected_ids, eligible)
+        clones = df_qc.set_index("Sample_ID").CloneID
+        if profile is not None and (profile.empty or profile.CloneID.eq(profile.Sample_ID.map(clones)).all()):
+            assert_current()
+            return profile
+    profile = diagnostics.tss_profiles(raw_adata, selected, tss_bed_path, _is_primary_chromosome)
     _atomic_write_csv(profile, out_csv, before_commit=assert_current)
-    _atomic_write_csv(scores, scores_path, before_commit=assert_current)
     validated = _validated_tss_cache(out_csv, selected_ids, set(empty_cpg_sample_ids) & selected_ids)
     if validated is None:
         raise ValueError("Computed TSS profile violates the output contract")
@@ -2895,7 +2876,7 @@ def _run_pipeline_impl(
     if changed:
         _log("需要更新的下游缓存：" + ", ".join(sorted(changed)))
     # 附表内容也绑定上次完整提交；格式合法的外部改写不能被再次签为本代真值。
-    diagnostic_bindings = [("chromosome", diagnostics.CHROMOSOME_INFO), ("tss", diagnostics.TSS_SCORE_INFO)]
+    diagnostic_bindings = [("chromosome", diagnostics.CHROMOSOME_INFO)]
     if cfg.tss_bed is not None:
         diagnostic_bindings.append(("tss", paths.tss_info.name))
     for stage, name in diagnostic_bindings:
@@ -3037,18 +3018,6 @@ def _run_pipeline_impl(
 
     compute_chromosome_diagnostics(raw_adata, df_qc, paths.qc_results_dir / diagnostics.CHROMOSOME_INFO,
         recompute="chromosome" in changed, before_commit=prepare_cache_commit)
-    if cfg.tss_bed is None:
-        scores = diagnostics.tss_scores(pd.DataFrame(), df_qc, set(), {}, skipped=True)
-        score_path = paths.qc_results_dir / diagnostics.TSS_SCORE_INFO
-        cached_scores = None
-        if score_path.is_file():
-            try:
-                candidate = pd.read_csv(score_path, converters={'Sample_ID': str, 'CloneID': str}, float_precision='round_trip')
-                cached_scores = diagnostics.validate_tss_scores(candidate, df_qc, set())
-            except (ValueError, pd.errors.ParserError):
-                pass
-        if cached_scores is None or not cached_scores.TSS_score_status.eq('skipped').all():
-            _atomic_write_csv(scores, score_path, before_commit=prepare_cache_commit)
     identity["diagnostic_artifacts"] = {name: _content_binding(paths.qc_results_dir / name)
         for _, name in diagnostic_bindings}
 
@@ -3637,10 +3606,6 @@ def load_chromosome_qc_frame(paths):
     return _load_qc_diagnostic(paths, diagnostics.CHROMOSOME_INFO)
 
 
-def load_tss_score_frame(paths):
-    """加载覆盖信息、抽样状态和可解释的TSS score；未抽中/无覆盖不伪造score。"""
-    return _load_qc_diagnostic(paths, diagnostics.TSS_SCORE_INFO)
-
 
 def annotate_notebook_qc(paths, frame, *, mapping_threshold=None, lambda_max=10.0,
                          puc19_min=90.0, cpg_min=500000, gini_max=0.5):
@@ -3659,9 +3624,6 @@ def annotate_notebook_qc(paths, frame, *, mapping_threshold=None, lambda_max=10.
         reasons = diagnostics.filter_reasons(frame, **parameters)
         result = frame.drop(columns=[c for c in reasons if c not in QC_INFO_COLUMNS], errors='ignore').merge(
             reasons, on=list(QC_INFO_COLUMNS[:3]), how='left', validate='one_to_one')
-        scores = load_tss_score_frame(paths)
-        result = result.drop(columns=[c for c in scores if c not in ('Sample_ID', 'CloneID')], errors='ignore').merge(
-            scores, on=['Sample_ID', 'CloneID'], how='left', validate='one_to_one')
         cells = read_active_cells(paths.project_dir, sealed_context=sealed)
         identity = pd.DataFrame({'Sample_ID': [c['sample_id'] for c in cells],
                                  'DNA_Barcode': [c['dna_barcode'] for c in cells],
