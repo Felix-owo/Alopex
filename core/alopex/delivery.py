@@ -18,13 +18,18 @@ import sys
 _LOADED_MODULE_CODE = sys._getframe().f_code
 import tempfile
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from .config import (
+    DD_CONSENSUS,
+    DD_CONSENSUS_QC_SUFFIX,
+    DD_PROTOCOLS,
     CellOutputPaths,
     DROPLET_DESIGN_RESOURCE,
+    DROPLET_DESIGN_SHA256,
     MULTIQC_BISCUIT_SOURCE_SUFFIXES,
     PUBLIC_RESULT_DIR_NAMES,
     ProjectLayout,
@@ -37,14 +42,13 @@ from .config import (
     cpg_representation,
     default_dna_route,
     get_backend,
-    get_protocol,
     load_project_config,
     logger,
     read_environment_identity,
     reference_identity,
     resolve_bismark_alignment,
     resolve_reference,
-    validate_reference_component,
+    active_reference_digest,
 )
 from .inputs import (
     INITIAL_CELL_MANIFEST_FIELDS,
@@ -56,6 +60,9 @@ from .inputs import (
     map_discovered_samples_to_manifest,
     read_cell_identity_manifest,
     read_demux_generation,
+    fastq_inventory_records,
+    reject_duplicate_fastq_chunks,
+    verify_snapshot_fastqs,
 )
 from .io import (
     project_temporary_parent,
@@ -79,16 +86,20 @@ from .runtime import (
     effective_cpu_count,
 )
 from .science import (
-    DROPLET_DEDUP_POLICY,
+    _biscuit_mapq_counts,
+    _bismark_pair_reports,
+    _bismark_trimmed_mates,
     _bismark_version_text,
     _high_cph_multiqc_payload,
-    _parse_bismark_non_cpg_methylation_pct,
+    _native_count,
     _parse_cph_methylation_pct,
     _parse_cutadapt_metrics,
     _read_biscuit_native_mapping,
     _read_dupsifter_metrics,
     _read_high_cph_summary,
     build_metrics,
+    parse_bismark_extraction_report,
+    read_droplet_umi_qc,
 )
 
 
@@ -120,11 +131,11 @@ def _write_pair_level_multiqc(rows: list[dict[str, object]], out_json: Path) -> 
             ),
             "Native_Mapping_pct": float(row["native_mapping_pct"]),
             "Native_Mapping_Unit": row["native_mapping_unit"],
-            "Duplicate_Pair_Rate_pct": (None if row.get("protocol") == "droplet" else
+            "Duplicate_Pair_Rate_pct": (None if row.get("protocol") in DD_PROTOCOLS else
                 100.0 * duplicate_pairs / accepted_pairs if accepted_pairs else 0.0
             ),
             "Dedup_Policy": row["dedup_policy"],
-            **{key: row[key] for key in ("cpg_read_observations", "cpg_umi_observations", "cpg_ambiguous_umi_sites") if key in row},
+            **{key: row[key] for key in ("cpg_read_observations", "cpg_umi_observations", "cpg_ambiguous_umi_sites", "cpg_fragment_tag_observations", "cpg_ambiguous_fragment_tag_sites") if key in row},
             "PostDedup_Retention_pct": (
                 100.0 * postdedup_pairs / accepted_pairs if accepted_pairs else 0.0
             ),
@@ -142,7 +153,8 @@ def _write_pair_level_multiqc(rows: list[dict[str, object]], out_json: Path) -> 
         "section_name": "Alopex pair-level QC",
         "description": (
             "Read-pair retention funnel plus backend-native mapping QC. BISCUIT native "
-            "mapping is primary MAPQ>=40 individual reads; Bismark native mapping is "
+            "mapping counts mapped MAPQ>=40 records among all post-dedup non-secondary "
+            "records, including supplementary alignments. Bismark native mapping is "
             "unique concordant read pairs. These mapping percentages use declared units "
             "and must not be treated as the same numerator definition. TAPS uses proper primary pairs "
             "with at least one MAPQ>=20 non-QC-failed mate; duplicate flags are excluded only during calling. "
@@ -217,6 +229,7 @@ class CellMetricJob:
     public_paths: CellOutputPaths
     options: FinalManifestOptions
     bismark_version: str
+    mates: tuple[str, str]
 
 
 @dataclass(frozen=True)
@@ -270,7 +283,7 @@ def write_final_sample_manifest(
 
 
     expected_runs = _plan_expected_runs(cells, demux_state)
-    _merge_committed_generations(
+    cell_mates = _merge_committed_generations(
         demux_state,
         initial_cell_manifest,
         cells,
@@ -279,6 +292,7 @@ def write_final_sample_manifest(
     _require_declared_routes(cells)
     _apply_cell_metrics(
         cells,
+        cell_mates=cell_mates,
         layout=layout,
         published_layout=published_layout,
         options=opts,
@@ -331,7 +345,7 @@ def _plan_expected_runs(
     expected_runs: dict[str, dict[str, str]] = {}
     for record in cells.values():
         project_id = str(record.get("project_sample_id", "") or "").strip()
-        protocol = str(record.get("protocol", "") or "").strip().lower()
+        protocol = str(record.get("protocol", "") or "").strip()
         dna_raw_sample = str(record.get("dna_raw_sample", "") or "").strip()
         routes = []
         if dna_raw_sample:
@@ -361,7 +375,7 @@ def _plan_expected_runs(
 
 def _require_declared_routes(cells: dict[str, dict[str, object]]) -> None:
     for cell_id, record in cells.items():
-        protocol = str(record.get("protocol", "") or "").strip().lower()
+        protocol = str(record.get("protocol", "") or "").strip()
         if str(record.get("dna_raw_sample", "") or "").strip():
             expected_route = default_dna_route(protocol)
             if record.get("dna_route_id") != expected_route:
@@ -376,7 +390,8 @@ def _merge_committed_generations(
     initial_cell_manifest: str,
     cells: dict[str, dict[str, object]],
     expected_runs: dict[str, dict[str, str]],
-) -> None:
+) -> dict[str, tuple[str, str]]:
+    cell_mates = {}
     for run_id, expected_run in sorted(expected_runs.items()):
         manifest = demux_state / run_id / "manifest.tsv"
         completion = demux_state / run_id / "completion.json"
@@ -385,9 +400,9 @@ def _merge_committed_generations(
             completion,
             expected_manifest_path=manifest,
             expected_cell_manifest_path=(demux_state.parent / "calling" / run_id / "cell_manifest.tsv")
-            if expected_run["protocol"] == "droplet" else initial_cell_manifest,
+            if expected_run["protocol"] in DD_PROTOCOLS else initial_cell_manifest,
         )
-        if expected_run["protocol"] == "droplet":
+        if expected_run["protocol"] in DD_PROTOCOLS:
             local_cells = read_cell_identity_manifest(committed["_cell_manifest_path"])
             expected_cells = {cell_id: {key: str(row[key]) for key in INITIAL_CELL_MANIFEST_FIELDS}
                               for cell_id, row in cells.items()
@@ -427,6 +442,8 @@ def _merge_committed_generations(
             if str(demux.get("downstream_dna", "")).strip().lower() == "true":
                 if record.get("dna_route_id"):
                     raise ValueError(f"Cell {cell_id!r} has more than one downstream-DNA demux route")
+                if demux["dna_status"] == "Pass":
+                    cell_mates[cell_id] = (demux["dna_r1"], demux["dna_r2"])
                 record.update({
                     "dna_route_id": route,
                     "dna_raw_sample": raw,
@@ -437,6 +454,7 @@ def _merge_committed_generations(
                     "dna_unassigned_rate": demux.get("unassigned_rate", ""),
                     "high_cph_role": demux.get("high_cph_role", ""),
                 })
+    return cell_mates
 
 
 def _taps_cell_metrics(
@@ -445,9 +463,17 @@ def _taps_cell_metrics(
     qc = json.loads(paths["rastair_qc"].read_text())
     if qc["sample"] != cell_id or qc["backend"] != "rastair":
         raise ValueError("TAPS QC identity disagrees with the active cell")
-    for key in ("trimmed_pairs", "bam_primary_records", "backend_accepted_pairs", "backend_rejected_pairs",
-                "duplicate_pairs", "postdedup_pairs", "unmapped_pairs", "discordant_pairs", "quality_rejected_pairs"):
-        if type(qc[key]) is not int or qc[key] < 0:
+    bam_counts = ("bam_records", "bam_primary_records", "bam_secondary_records", "bam_supplementary_records",
+                  "bam_duplicate_records", "bam_unmapped_records")
+    controls = {"lambda": "lambda_false_positive_pct", "pUC19": "pUC19_conversion_pct"}
+    control_counts = tuple(f"{name}_cpg_{unit}" for name in controls for unit in ("mod", "observations", "sites"))
+    for key in (*bam_counts, *control_counts, "native_cpg_rows", "canonical_cpg_rows", "zero_observation_rows",
+                "excluded_variant_or_denovo_rows", "trimmed_pairs", "backend_accepted_pairs", "backend_rejected_pairs",
+                "duplicate_pairs", "postdedup_pairs", "unmapped_pairs", "discordant_pairs", "quality_rejected_pairs",
+                "non_cpg_chg_mod", "non_cpg_chg_unmod", "non_cpg_chh_mod", "non_cpg_chh_unmod",
+                "non_cpg_observations", "non_cpg_candidate_pairs", "non_cpg_oriented_pairs",
+                "non_cpg_ambiguous_pairs", "snp_sites"):
+        if type(qc.get(key)) is not int or qc[key] < 0:
             raise ValueError(f"TAPS QC requires a nonnegative integer: {key}")
     if qc["trimmed_pairs"] != cutadapt["trimmed_pairs"] or qc["bam_primary_records"] != 2 * qc["trimmed_pairs"]:
         raise ValueError("TAPS BAM and Cutadapt pair counts disagree")
@@ -457,25 +483,51 @@ def _taps_cell_metrics(
         raise ValueError("TAPS pair funnel does not close")
     if sum(qc[k] for k in ("unmapped_pairs", "discordant_pairs", "quality_rejected_pairs")) != rejected:
         raise ValueError("TAPS rejection categories do not close")
+    # secondary 和 supplementary 可以重叠。保留的 pair 至少有一条非重复比对。
+    nonprimary = qc["bam_records"] - qc["bam_primary_records"]
+    secondary, supplementary = qc["bam_secondary_records"], qc["bam_supplementary_records"]
+    # 接受或 discordant 的 pair 至少一端已比对，quality_rejected 的两端均已比对。
+    both_unmapped = 2 * qc["unmapped_pairs"]
+    max_unmapped = both_unmapped + accepted + qc["discordant_pairs"] + nonprimary
+    if (not max(secondary, supplementary) <= nonprimary <= secondary + supplementary
+            or not duplicates <= qc["bam_duplicate_records"] <= qc["bam_records"] - postdedup
+            or not both_unmapped <= qc["bam_unmapped_records"] <= max_unmapped):
+        raise ValueError("TAPS BAM record counts disagree with alignment flags or pair counts")
+    if (qc["canonical_cpg_rows"] + qc["excluded_variant_or_denovo_rows"] + qc["zero_observation_rows"]
+            != qc["native_cpg_rows"] or sum(qc[f"{name}_cpg_sites"] for name in controls) > qc["canonical_cpg_rows"]
+            or (qc["canonical_cpg_rows"] > 0 and postdedup == 0)):
+        raise ValueError("TAPS native, canonical and control CpG site counts disagree")
+    for name, rate_key in controls.items():
+        modified, observations, sites = (qc[f"{name}_cpg_{unit}"] for unit in ("mod", "observations", "sites"))
+        if modified > observations or sites > observations or bool(sites) != bool(observations):
+            raise ValueError(f"TAPS {name} CpG counts disagree")
+        if rate_key not in qc:
+            raise ValueError(f"TAPS QC is missing {rate_key}")
+        rate = qc[rate_key]
+        if observations:
+            if type(rate) not in (int, float) or rate != 100.0 * modified / observations:
+                raise ValueError(f"TAPS {rate_key} disagrees with CpG counts")
+        elif rate is not None:
+            raise ValueError(f"TAPS {rate_key} must be null without CpG observations")
     non_cpg = {k: v for k, v in qc.items() if k.startswith("non_cpg_")}
     if non_cpg.get("non_cpg_metric_source") != "taps_oriented_host_chg_chh_conversion":
         raise ValueError("TAPS non-CpG QC source is invalid")
-    for key in ("non_cpg_chg_mod", "non_cpg_chg_unmod", "non_cpg_chh_mod", "non_cpg_chh_unmod",
-                "non_cpg_observations", "non_cpg_candidate_pairs", "non_cpg_oriented_pairs",
-                "non_cpg_ambiguous_pairs", "snp_sites"):
-        if type(qc[key]) is not int or qc[key] < 0:
-            raise ValueError(f"TAPS QC requires a nonnegative integer: {key}")
     modified = sum(qc[f"non_cpg_{context}_mod"] for context in ("chg", "chh"))
     total = modified + sum(qc[f"non_cpg_{context}_unmod"] for context in ("chg", "chh"))
     if (total != qc["non_cpg_observations"]
+            or (total > 0 and qc["non_cpg_oriented_pairs"] == 0)
             or qc["non_cpg_oriented_pairs"] + qc["non_cpg_ambiguous_pairs"] != qc["non_cpg_candidate_pairs"]
             or not 0 <= qc["non_cpg_candidate_pairs"] <= postdedup):
         raise ValueError("TAPS non-CpG accounting does not close")
-    expected_pct = 100.0 * modified / total if total else float("nan")
-    if not (math.isnan(expected_pct) and math.isnan(qc["non_cpg_methylation_pct"])) and not math.isclose(expected_pct, qc["non_cpg_methylation_pct"]):
+    rate = qc["non_cpg_methylation_pct"]
+    if total:
+        valid_rate = type(rate) in (int, float) and rate == 100.0 * modified / total
+    else:
+        valid_rate = type(rate) is float and math.isnan(rate)
+    if not valid_rate:
         raise ValueError("TAPS non-CpG percentage disagrees with counts")
     return NativeCellMetrics(accepted, rejected, duplicates, postdedup, {
-        **{k: v for k, v in qc.items() if k.startswith(("bam_", "lambda_", "pUC19_"))},
+        **{k: qc[k] for k in (*bam_counts, *control_counts, *controls.values())},
         "snp_sites": qc["snp_sites"], "methylation_signal": "5mC+5hmC",
         "mapping_policy": "bwa_rastair_eligible_pairs", "native_mapping_policy": "bwa_proper_primary_any_mate_mapq20",
         "native_mapping_unit": "read_pairs", "native_mapping_pct": 100.0 * accepted / qc["trimmed_pairs"] if qc["trimmed_pairs"] else 0.0,
@@ -494,11 +546,24 @@ def _biscuit_cell_metrics(
 ) -> NativeCellMetrics:
     if not paths["dupsifter_multiqc"].is_file():
         raise FileNotFoundError(f"Active cell is missing Dupsifter QC: {paths['dupsifter_multiqc']}")
-    _native, pairs = _read_dupsifter_metrics(paths["dupsifter_multiqc"], cell_id, trimmed_pairs)
+    native, pairs = _read_dupsifter_metrics(paths["dupsifter_multiqc"], cell_id, trimmed_pairs)
+    mapping = _read_biscuit_native_mapping(paths["mapq_table"])
+    both, single = pairs["both_primary_mapped_pairs"], pairs["one_primary_mapped_pairs"]
+    duplicate_single = native["Dup_Forward"] + native["Dup_Reverse"]
+    primary_mapped = 2 * (both - native["Dup_Both"]) + single - duplicate_single
+    extra_mapped = mapping["optimally_aligned_reads"] + mapping["suboptimally_aligned_reads"] - primary_mapped
+    extra_unmapped = mapping["unaligned_native_reads"] - 2 * pairs["unmapped_pairs"]
+    # 去重前的 primary 总数给出实际存在的未比对 mate 数。仅重复的单端模板可能带走其中一条。
+    mates = native["Primary_Reads"] - 2 * (both + pairs["unmapped_pairs"]) - single
+    min_mates = max(0, mates - duplicate_single)
+    max_mates = min(mates, single - duplicate_single)
+    if (extra_mapped < 0 or extra_unmapped < min_mates
+            or extra_mapped + max(0, extra_unmapped - max_mates) > native["Secondary_Supplementary"]):
+        raise ValueError(f"BISCUIT MAPQ counts disagree with Dupsifter for {cell_id!r}: {paths['mapq_table']}")
     counts = [pairs.pop(key) for key in (
         "backend_accepted_pairs", "backend_rejected_pairs", "duplicate_pairs", "postdedup_pairs")]
     return NativeCellMetrics(*counts, {
-        **_read_biscuit_native_mapping(paths["mapq_table"]), **pairs, "ambiguous_pairs": "",
+        **mapping, **pairs, "ambiguous_pairs": "",
         "mapping_policy": "biscuit_any_primary_pair_funnel",
         "dedup_policy": "dupsifter_wgbs_signature_remove_dups",
         "non_cpg_methylation_pct": _parse_cph_methylation_pct(paths["cph_table"]),
@@ -508,10 +573,11 @@ def _biscuit_cell_metrics(
 
 def _bismark_cell_metrics(
     job: CellMetricJob, paths: Mapping[str, Path], trimmed_pairs: int,
-    summary: Mapping[str, object],
+    summary: Mapping[str, object], cutadapt: Mapping[str, object],
 ) -> NativeCellMetrics:
     metrics = build_metrics(
         sample=job.cell_id, version=job.bismark_version,
+        trimmed_mates=_bismark_trimmed_mates(cutadapt, paths["cutadapt_json"]),
         alignment_report=paths["bismark_align_report"], dedup_report=paths["bismark_dedup_report"],
         filter_summary=summary, protocol=job.protocol,
     )
@@ -532,23 +598,28 @@ def _bismark_cell_metrics(
         "both_primary_mapped_pairs": accepted, "one_primary_mapped_pairs": 0,
         "unmapped_pairs": int(metrics["unmapped_pairs"]), "ambiguous_pairs": int(metrics["ambiguous_pairs"]),
         "no_primary_pairs": "", "mapping_policy": "bismark_unique_concordant",
-        "dedup_policy": DROPLET_DEDUP_POLICY if job.protocol == "droplet" else "bismark_paired_endpoint_orientation",
+        "dedup_policy": DD_CONSENSUS[job.protocol].dedup_policy if job.protocol in DD_PROTOCOLS else "bismark_paired_endpoint_orientation",
     }
-    if job.protocol == "droplet":
+    if job.protocol in DD_PROTOCOLS:
+        tag = DD_CONSENSUS[job.protocol]
         contexts = metrics["umi_qc"]["contexts"]
         cph_m = sum(contexts[k]["methyl"] for k in ("CHG", "CHH"))
         cph_total = cph_m + sum(contexts[k]["unmethyl"] for k in ("CHG", "CHH"))
         fields.update({
             "non_cpg_methylation_pct": 100.0 * cph_m / cph_total if cph_total else float("nan"),
-            "non_cpg_metric_source": "droplet_umi_consensus_chg_chh",
-            "molecule_qc_metric_unit": "cytosine_umi_consensus",
+            "non_cpg_metric_source": tag.cph_source,
+            "molecule_qc_metric_unit": tag.unit,
             "cpg_read_observations": contexts["CpG"]["read_observations"],
-            "cpg_umi_observations": contexts["CpG"]["methyl"] + contexts["CpG"]["unmethyl"],
-            "cpg_ambiguous_umi_sites": contexts["CpG"]["ambiguous_umis"],
+            "tag_source": tag.source,
+            tag.count_field: contexts["CpG"]["methyl"] + contexts["CpG"]["unmethyl"],
+            tag.ambiguous_field: contexts["CpG"][f"ambiguous_{tag.tag}s"],
         })
     else:
+        extraction = parse_bismark_extraction_report(paths["bismark_extract_report"], job.cell_id)
+        if extraction.pairs != metrics["final_retained_pairs"]:
+            raise ValueError(f"Bismark extraction input disagrees with the retained pairs for {job.cell_id!r}")
         fields.update({
-            "non_cpg_methylation_pct": _parse_bismark_non_cpg_methylation_pct(paths["bismark_extract_report"]),
+            "non_cpg_methylation_pct": extraction.non_cpg_pct,
             "non_cpg_metric_source": "bismark_extraction_chg_chh",
         })
     return NativeCellMetrics(accepted, rejected, int(metrics["duplicate_pairs"]),
@@ -556,17 +627,15 @@ def _bismark_cell_metrics(
 
 
 def _filtered_cell_metrics(
-    job: CellMetricJob, paths: Mapping[str, Path], trimmed_pairs: int,
+    job: CellMetricJob, paths: Mapping[str, Path], trimmed_pairs: int, cutadapt: Mapping[str, object],
 ) -> NativeCellMetrics:
     if not paths["high_cph_summary"].is_file():
         raise FileNotFoundError(f"Active cell is missing high-CpH summary: {paths['high_cph_summary']}")
     summary = _read_high_cph_summary(paths["high_cph_summary"], job.cell_id, job.options.backend)
     if summary["protocol"] != job.protocol:
         raise ValueError(f"High-CpH summary protocol disagrees with the cell identity: {paths['high_cph_summary']}")
-    if not summary["filter_applied"]:
-        raise ValueError(f"High-CpH summary must record the fixed filter action: {paths['high_cph_summary']}")
     native = (_biscuit_cell_metrics(job.cell_id, paths, trimmed_pairs) if job.options.backend == "biscuit"
-              else _bismark_cell_metrics(job, paths, trimmed_pairs, summary))
+              else _bismark_cell_metrics(job, paths, trimmed_pairs, summary, cutadapt))
     assessed = int(summary["candidate_read_pairs"])
     removed = int(summary["flagged_read_pairs"])
     if assessed + int(summary["excluded_read_pairs"]) > native.postdedup_pairs:
@@ -583,7 +652,9 @@ def _metrics_for_cell(job: CellMetricJob) -> tuple[str, dict[str, object]]:
     options = job.options
     artifacts = cell_artifacts(job.paths, job.protocol,
         generate_snp=options.generate_snp or options.backend == "rastair", keep_final_bam=options.keep_final_bam)
-    cutadapt = _parse_cutadapt_metrics(artifacts.metrics["cutadapt_json"])
+    cutadapt_path = artifacts.metrics["cutadapt_json"]
+    cutadapt_report = _read_json(cutadapt_path, "Cutadapt report")
+    cutadapt = _parse_cutadapt_metrics(cutadapt_path, job.mates, cutadapt_report)
     try:
         demux_pairs = int(job.dna_reads.strip())
     except ValueError as exc:
@@ -596,7 +667,7 @@ def _metrics_for_cell(job: CellMetricJob) -> tuple[str, dict[str, object]]:
     if options.backend == "rastair":
         native = _taps_cell_metrics(job.cell_id, artifacts.metrics, cutadapt)
     else:
-        native = _filtered_cell_metrics(job, artifacts.metrics, int(cutadapt["trimmed_pairs"]))
+        native = _filtered_cell_metrics(job, artifacts.metrics, int(cutadapt["trimmed_pairs"]), cutadapt_report)
     parsed_inputs = set(artifacts.metrics.values())
     for path in artifacts.final_inputs:
         if path in parsed_inputs:
@@ -621,6 +692,7 @@ def _metrics_for_cell(job: CellMetricJob) -> tuple[str, dict[str, object]]:
 def _apply_cell_metrics(
     cells: dict[str, dict[str, object]],
     *,
+    cell_mates: Mapping[str, tuple[str, str]],
     layout: ProjectLayout,
     published_layout: ProjectLayout,
     options: FinalManifestOptions,
@@ -645,7 +717,7 @@ def _apply_cell_metrics(
             )
             continue
         jobs.append(CellMetricJob(
-            cell_id=cell_id, protocol=str(record["protocol"]).strip().lower(),
+            cell_id=cell_id, protocol=str(record["protocol"]).strip(), mates=cell_mates[cell_id],
             dna_reads=str(record.get("dna_reads", "")), paths=layout.cell(cell_id),
             public_paths=published_layout.cell(cell_id), options=options, bismark_version=bismark_version,
         ))
@@ -873,6 +945,11 @@ def run_multiqc_report(file_list: Path, config_file: Path, output_dir: Path, com
             ),
             interactive=False,
         )
+        # 原生进程在其他模块成功时可返回 0，即使 BISCUIT 模块已抛错。
+        # 只有已送入报告的非空 MAPQ 分布才要求该模块出现。
+        if (result.sys_exit_code == 0 and any(path.endswith("_mapq_table.txt") for path in sources)
+                and "biscuit" not in multiqc.list_modules()):
+            raise RuntimeError("MultiQC did not render the declared BISCUIT MAPQ data")
         return result.sys_exit_code
     finally:
         multiqc.config.find_user_files = find_user_files
@@ -918,13 +995,118 @@ def select_multiqc_samples(samples: Iterable[str]) -> list[str]:
     return sorted(ranked[:MULTIQC_MAX_CELLS])
 
 
+def _check_multiqc_native_reports(paths: Sequence[Path], selected_mates: Mapping[str, tuple[str, str]],
+                                  protocol: str) -> dict[str, dict[str, tuple[int, int] | int]]:
+    """核对选中细胞的报告，返回逐 context 的读段观测数供 M-bias 对账。"""
+    suffixes = ("_PE_report.txt", ".deduplication_report.txt", "_splitting_report.txt")
+    native = {}
+    read_counts = {}
+    for path in paths:
+        if path.name.endswith(DD_CONSENSUS_QC_SUFFIX):
+            sample = path.name.removesuffix(DD_CONSENSUS_QC_SUFFIX)
+            if protocol not in DD_PROTOCOLS or sample not in selected_mates or sample in read_counts:
+                raise ValueError(f"Unexpected Droplet consensus table for {protocol}: {path}")
+            contexts = read_droplet_umi_qc(path, sample, protocol)["contexts"]
+            read_counts[sample] = {key: value["read_observations"] for key, value in contexts.items()}
+        elif path.name.endswith(suffixes):
+            if path.name in native and native[path.name] != path:
+                raise ValueError(f"Duplicate Bismark report for MultiQC: {path}")
+            native[path.name] = path
+    pair_rows = {}
+    if any(name.endswith("_splitting_report.txt") for name in native):
+        pair_tables = [p for p in paths if p.name == "pair_level_qc_mqc.json"]
+        if len(pair_tables) != 1:
+            raise ValueError("Bismark extraction reports need the final pair-level QC table")
+        pair_rows = _read_json(pair_tables[0], "pair-level QC")["data"]
+    for path in paths:
+        if not path.name.endswith(".cutadapt.json"):
+            continue
+        sample = path.name.removesuffix(".cutadapt.json")
+        if sample not in selected_mates:
+            raise ValueError(f"Unexpected Cutadapt report outside the selected cells: {path}")
+        report = _read_json(path, "Cutadapt report")
+        metrics = _parse_cutadapt_metrics(path, selected_mates[sample], report)
+        alignment = native.pop(sample + "_PE_report.txt", None)
+        if alignment is None:
+            continue
+        dedup = native.pop(sample + ".deduplication_report.txt", None)
+        extract = native.pop(sample + "_splitting_report.txt", None)
+        if protocol in DD_PROTOCOLS and (dedup or extract):
+            raise ValueError(f"Unexpected plate Bismark report for {protocol}: {sample}")
+        aligned, _ = _bismark_pair_reports(alignment, dedup, sample, _bismark_trimmed_mates(report, path))
+        if aligned["total"] != metrics["trimmed_pairs"]:
+            raise ValueError(f"Bismark alignment input disagrees with Cutadapt: {alignment}")
+        if extract:
+            extraction = parse_bismark_extraction_report(extract, sample)
+            pct = extraction.non_cpg_pct
+            row = pair_rows.get(sample, {})
+            if (type(row.get("Final_Retained_Pairs")) is not int or row["Final_Retained_Pairs"] != extraction.pairs
+                    or isinstance(row.get("Non_CpG_Methylation_pct"), bool)
+                    or "Non_CpG_Methylation_pct" not in row
+                    or row["Non_CpG_Methylation_pct"] != (pct if math.isfinite(pct) else None)):
+                raise ValueError(f"Bismark extraction disagrees with final pair-level QC: {extract}")
+            read_counts[sample] = extraction.counts
+    if native:
+        raise ValueError(f"Bismark reports lack a matching Cutadapt or alignment report: {list(native)}")
+    return read_counts
+
+
+def _multiqc_mbias_source(path: Path, out_dir: Path, protocol: str,
+                          expected: Mapping[str, tuple[int, int] | int]) -> Path:
+    """验证双端逐周期计数，给 MultiQC 的缺失百分比保留独立的一列。"""
+    text = path.read_text(encoding="utf-8")
+    blocks = text.strip("\n").split("\n\n")
+    droplet = protocol in DD_PROTOCOLS
+    if droplet and not blocks.pop(0).startswith(f"Alopex {protocol} read-level M-bias;"):
+        raise ValueError(f"Wrong Droplet M-bias protocol in {path}")
+    totals = {context: [0, 0] for context in expected}
+    sections = set()
+    mate_lengths = {}
+    for block in blocks:
+        lines = block.splitlines()
+        header = re.fullmatch(r"(CpG|CHG|CHH) context \((R[12])\)", lines[0]) if lines else None
+        if not header or header.groups() in sections or len(lines) < 3 or not lines[2].startswith("position\t"):
+            raise ValueError(f"Invalid or repeated M-bias section in {path}")
+        sections.add(header.groups())
+        total = totals[header[1]]
+        previous = 0
+        for line in lines[3:]:
+            try:
+                pos, methyl, unmethyl, percentage, coverage = line.split("\t")
+                cycle, m, u, n = map(_native_count, (pos, methyl, unmethyl, coverage))
+            except ValueError as exc:
+                raise ValueError(f"Invalid M-bias data in {path}: {line!r}") from exc
+            # Droplet 仅写有观察的周期。Bismark 写完整的 1-based 序列，零覆盖百分比留空。
+            if cycle <= previous or (not droplet and cycle != previous + 1):
+                raise ValueError(f"Invalid M-bias cycle in {path}: {line!r}")
+            display = format(100.0 * m / n, ".8f" if droplet else ".2f") if n else ""
+            if m + u != n or (droplet and not n) or percentage != display:
+                raise ValueError(f"M-bias percentage or coverage disagrees with its counts in {path}: {line!r}")
+            previous = cycle
+            total[0] += m
+            total[1] += u
+        if not droplet and mate_lengths.setdefault(header[2], previous) != previous:
+            raise ValueError(f"M-bias contexts have different cycle ranges for {header[2]} in {path}")
+    observed = {context: sum(values) if droplet else tuple(values) for context, values in totals.items()}
+    if len(sections) != 6 or observed != expected:
+        raise ValueError(f"M-bias read observations disagree with the cell report: {path}")
+    # MultiQC 的空白分词会把末列的 coverage=0 读成甲基化 0%。显式 NaN 在图中写为 null。
+    projection = re.sub(r"\t\t(0+)$", r"\tnan\t\1", text, flags=re.MULTILINE)
+    if projection != text:
+        path = out_dir / "mbias" / path.name
+        atomic_write_bytes(path, projection.encode("utf-8"))
+    return path
+
+
 def prepare_sampled_multiqc_sources(
-    inputs: Iterable[str | Path], selected_samples: Sequence[str], total_cells: int,
-    out_dir: Path,
+    inputs: Iterable[str | Path], selected_mates: Mapping[str, tuple[str, str]], total_cells: int,
+    out_dir: Path, *, protocol: str,
 ) -> tuple[list[str], str]:
     """统一展示子集及 Bismark 报告后缀；原生源须已按集合选定，不修改任何源文件。"""
-    selected = set(selected_samples)
+    selected = selected_mates.keys()
     sampled = total_cells > len(selected)
+    paths = [Path(raw) for raw in inputs]
+    read_counts = _check_multiqc_native_reports(paths, selected_mates, protocol)
     out_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(out_dir / "multiqc_config.json", {
         "fn_clean_trim": [],
@@ -933,6 +1115,9 @@ def prepare_sampled_multiqc_sources(
         # MultiQC 默认的中间子串截断也会破坏合法细胞身份和 custom table 的关联。
         # BISCUIT 会重复清名；每次从原报告名开始，避免再次截断 ID 自身的同名结尾。
         "use_filename_as_sample_name": ["cutadapt", "biscuit"],
+        "section_comments": {"biscuit-mapping-overview":
+            "BISCUIT counts each post-dedup alignment record with SAM flag 0x100 clear. "
+            "This includes supplementary alignments. The denominator includes unmapped records."},
         "fn_clean_exts": [{
             "type": "regex", "module": "bismark",
             "pattern": r"(?:_PE_report|_splitting_report|\.deduplication_report|\.M-bias)\.txt$",
@@ -944,9 +1129,26 @@ def prepare_sampled_multiqc_sources(
         }],
     })
     sources = []
-    for raw in inputs:
-        path = Path(raw)
-        if sampled and path.name.endswith("_mqc.json"):
+    for path in paths:
+        if path.name.endswith(".M-bias.txt"):
+            sample = path.name.removesuffix(".M-bias.txt")
+            if sample not in read_counts:
+                raise ValueError(f"M-bias lacks the selected cell's extraction or consensus report: {path}")
+            path = _multiqc_mbias_source(path, out_dir, protocol, read_counts[sample])
+        elif path.name.endswith("_mapq_table.txt"):
+            table = path.read_text(encoding="utf-8")
+            counts = _biscuit_mapq_counts(path, table)
+            total = sum(counts.values())
+            if total == 0:
+                # 原生 MultiQC 用记录总数计算比率，空细胞仍在 Alopex 的逐细胞表中。
+                continue
+            if total == counts["unmapped"] or "," in table:
+                # 原生绘图会将每个 MAPQ 桶除以 mapped 数，且只接受无千分位的整数。
+                # 临时展示表保留实际桶计数与样本名，科学输入始终是完整原表。
+                path = out_dir / "biscuit" / "qc" / path.parent.name / path.name
+                rows = [f"{key}\t{value}\n" for key, value in counts.items() if value]
+                atomic_write_bytes(path, ("BISCUITqc Mapping Quality Table\nMapQ\tCount\n" + "".join(rows)).encode())
+        elif sampled and path.name.endswith("_mqc.json") and not path.name.endswith(DD_CONSENSUS_QC_SUFFIX):
             payload = json.loads(path.read_text(encoding="utf-8"))
             data = payload["data"]
             if set(data) - selected:
@@ -986,13 +1188,11 @@ def prepare_high_cph_multiqc_sources(
         if not sample or {"bsconv": "biscuit", "nonconversion": "bismark"}.get(kind) != backend:
             raise ValueError(f"Unexpected high-CpH summary for {backend}: {path}")
         summary = _read_high_cph_summary(path, sample, backend)
-        if summary["protocol"] != protocol or not summary["filter_applied"]:
-            raise ValueError(f"High-CpH summary disagrees with the current protocol or filter action: {path}")
+        if summary["protocol"] != protocol:
+            raise ValueError(f"High-CpH summary disagrees with the current protocol: {path}")
         if sample in aggregate["data"]:
             raise ValueError(f"Duplicate high-CpH summary for {sample!r}: {path}")
-        payload = _high_cph_multiqc_payload(
-            sample, summary, protocol, summary["high_cph_role"]
-        )
+        payload = _high_cph_multiqc_payload(sample, summary)
         if not aggregate["data"]:
             aggregate = payload
         else:
@@ -1076,19 +1276,11 @@ def _fastq_inventory(
     map_discovered_samples_to_manifest(discovered, manifest_rows, protocol=protocol)
     if not discovered:
         raise ValueError(f"no paired FASTQ samples found under: {raw_dir}")
-    result: list[Mapping[str, object]] = []
-    for sample, mates in sorted(discovered.items()):
-        r1s, r2s = list(mates["r1"]), list(mates["r2"])
-        if len(r1s) != len(r2s):
-            raise ValueError(f"FASTQ inventory became unpaired for sample {sample!r}")
-        for segment, (r1, r2) in enumerate(zip(r1s, r2s, strict=True), start=1):
-            result.append({
-                "raw_sample": sample,
-                "segment": segment,
-                "r1": stable_file_identity(Path(r1), hash_content=False),
-                "r2": stable_file_identity(Path(r2), hash_content=False),
-            })
-    return result
+    records = fastq_inventory_records(discovered)
+    for mates in discovered.values():
+        reject_duplicate_fastq_chunks(mates["r1"])
+        reject_duplicate_fastq_chunks(mates["r2"])
+    return records
 
 
 def _executable_identity(path: Path) -> Mapping[str, object]:
@@ -1115,11 +1307,11 @@ def _executable_identity(path: Path) -> Mapping[str, object]:
 
 
 def _backend_reference_observation(
-    config: Mapping[str, object], reference: Path
+    config: Mapping[str, object], reference: Path, *, expected_reference: Mapping | None = None,
 ) -> Mapping[str, object]:
     backend = get_backend(dict(config))
     kind = ("bismark-local" if resolve_bismark_alignment(config).local_alignment else "bismark-combined") if backend == "bismark" else backend
-    validate_reference_component(reference, kind)
+    content = active_reference_digest(reference, kind, expected_reference)
 
     if backend == "bismark":
         public = Path(f"{reference}.bismark")
@@ -1141,6 +1333,7 @@ def _backend_reference_observation(
             )
         return {
             "backend": "bismark",
+            "kind": kind, "content_sha256": content,
             "alignment_mode": "local-faithful" if local_alignment else "end-to-end-combined",
             "public_path": str(public.absolute()),
             "resolved_path": str(resolved),
@@ -1157,8 +1350,17 @@ def _backend_reference_observation(
         )
     return {
         "backend": backend,
+        "kind": kind, "content_sha256": content,
         "indexes": [stable_file_identity(path, hash_content=False) for path in indexes],
     }
+
+
+def verify_run_snapshot_inputs(basis: Mapping) -> None:
+    verify_snapshot_fastqs(basis["raw_fastqs"])
+    reference, backend = basis["reference"], basis["backend_reference"]
+    digest = active_reference_digest(Path(reference["resolved_path"]), backend["kind"], reference["content"])
+    if digest != backend["content_sha256"]:
+        raise ValueError("Reference index generation differs from the frozen run snapshot")
 
 
 def _observe_snapshot_input(path: Path) -> tuple[bytes, dict[str, object]]:
@@ -1195,7 +1397,7 @@ def _snapshot_basis(
 
     sample_manifest = project_dir / "00_config" / "sample_manifest.tsv"
     barcode_map = project_dir / "00_config" / "Barcode_Map.csv"
-    for path in (config_path, sample_manifest, *([] if config["analysis"]["protocol"] == "droplet" else [barcode_map])):
+    for path in (config_path, sample_manifest, *([] if config["analysis"]["protocol"] in DD_PROTOCOLS else [barcode_map])):
         if not path.is_file():
             raise FileNotFoundError(f"run-start input is missing: {path}")
 
@@ -1211,12 +1413,18 @@ def _snapshot_basis(
         backend, {"biscuit": biscuit_env, "bismark": bismark_env,
                        "rastair": rastair_env}[backend]
     )
-    protocol = str(config.get("analysis", {}).get("protocol", "")).strip().lower()
+    protocol = str(config.get("analysis", {}).get("protocol", "")).strip()
     manifest_bytes, manifest_identity = _observe_snapshot_input(sample_manifest)
     manifest_rows = _parse_project_sample_manifest(
         io.StringIO(manifest_bytes.decode("utf-8-sig"), newline=""), path=sample_manifest,
         species=species, protocol=protocol,
     )
+    dd_identity = {}
+    if protocol in DD_PROTOCOLS:
+        digest = stable_file_identity(pipeline_root / DROPLET_DESIGN_RESOURCE)["sha256"]
+        if digest != DROPLET_DESIGN_SHA256:
+            raise ValueError("DD DNA barcode design SHA256 mismatch at snapshot creation")
+        dd_identity = {"barcode_design_sha256": digest, "tag_source": DD_CONSENSUS[protocol].source}
     return {
         "pipeline": {
             "root": str(pipeline_root.resolve()),
@@ -1227,12 +1435,13 @@ def _snapshot_basis(
             "protocol": protocol,
             "methylation_backend": backend,
             "cpg_coordinate_base": config["analysis"]["cpg_coordinate_base"],
+            **dd_identity,
         },
         "project": {
             "path": str(project_dir.resolve()),
             "config": config_identity,
             "sample_manifest": manifest_identity,
-            **({} if protocol == "droplet" else {"barcode_map": stable_file_identity(barcode_map, hash_content=True)}),
+            **({} if protocol in DD_PROTOCOLS else {"barcode_map": stable_file_identity(barcode_map, hash_content=True)}),
         },
         "raw_fastqs": _fastq_inventory(
             project_dir / "01_raw",
@@ -1240,7 +1449,7 @@ def _snapshot_basis(
             protocol=protocol,
         ),
         "reference": reference_record,
-        "backend_reference": _backend_reference_observation(config, reference),
+        "backend_reference": _backend_reference_observation(config, reference, expected_reference=reference_record["content"]),
         "environments": {
             "control": control_observation,
             backend: active_backend_observation,
@@ -1340,7 +1549,7 @@ def create_run_snapshot(
                 Path(str(project_basis["sample_manifest"]["path"])),
                 inputs_dir / "sample_manifest.tsv", project_basis["sample_manifest"], input_store, link_parent=final / "inputs",
             ),
-            **({} if basis["analysis"]["protocol"] == "droplet" else {"barcode_map": _copy_observed_file(
+            **({} if basis["analysis"]["protocol"] in DD_PROTOCOLS else {"barcode_map": _copy_observed_file(
                 Path(str(project_basis["barcode_map"]["path"])),
                 inputs_dir / "Barcode_Map.csv", project_basis["barcode_map"], input_store, link_parent=final / "inputs",
             )}),
@@ -1410,7 +1619,7 @@ def load_run_snapshot(path: str | Path) -> Mapping[str, object]:
     copies = payload.get("input_copies")
     if not isinstance(project, Mapping) or not isinstance(copies, Mapping):
         raise ValueError(f"run snapshot input copies are malformed: {manifest}")
-    for key in ("config", "sample_manifest", *([] if payload["basis"]["analysis"]["protocol"] == "droplet" else ["barcode_map"])):
+    for key in ("config", "sample_manifest", *([] if payload["basis"]["analysis"]["protocol"] in DD_PROTOCOLS else ["barcode_map"])):
         _validate_input_copy(manifest.parent, copies.get(key), project.get(key), key)
     return payload
 
@@ -1450,12 +1659,32 @@ def _check_result_directories(root: Path, relative: Path, *, label: str) -> None
 
 
 def _staged_file_state(observed: os.stat_result, *, include_ctime: bool = False) -> dict[str, int]:
-    """ctime 仅用于本次读取/哈希期间的检查；硬链接改变它，不写入恢复身份。"""
+    """ctime 用于暂存复验，不进入公开交付身份。"""
     state = {"device": observed.st_dev, "inode": observed.st_ino,
              "size_bytes": observed.st_size, "mtime_ns": observed.st_mtime_ns}
     if include_ctime:
         state["ctime_ns"] = observed.st_ctime_ns
     return state
+
+
+def output_file_state(observed: os.stat_result) -> tuple[int, ...]:
+    """供交付和下游复验同一个已核验的普通文件。"""
+    return observed.st_dev, observed.st_ino, observed.st_size, observed.st_mtime_ns, observed.st_ctime_ns
+
+
+def _output_state_digest(record: Mapping[str, object], state: tuple[int, ...]) -> str:
+    return sha256_bytes(canonical_json_bytes([record["path"], record["sha256"], state]))
+
+
+@lru_cache(maxsize=8192)
+def _published_content_hash(path: Path, state: tuple[int, ...]) -> str:
+    """跨机器或文件状态变化后读实际字节，同一进程可复用已核验的状态。"""
+    if output_file_state(path.lstat()) != state:
+        raise ValueError(f"published delivery output changed before hashing: {path}")
+    digest = sha256_file(path)
+    if output_file_state(path.lstat()) != state:
+        raise ValueError(f"published delivery output changed while hashing: {path}")
+    return digest
 
 
 def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
@@ -1515,7 +1744,6 @@ def _staged_output_inventory(results: Path) -> list[dict[str, object]]:
         digest = sha256_file(path)
         if _staged_file_state(path.stat(), include_ctime=True) != state:
             raise ValueError(f"staged output changed while hashing: {path}")
-        del state["ctime_ns"]
         records.append(
             {
                 "path": relative.as_posix(),
@@ -1537,11 +1765,14 @@ def _validate_inventory(
     *,
     label: str,
     staged: bool = False,
+    newly_linked: Collection[str] = (),
+    output_state_digests: Mapping[str, str] | None = None,
 ) -> list[dict[str, object]]:
     if not isinstance(records, list) or not records:
         raise ValueError(f"{label} inventory is empty or malformed")
     validated: list[dict[str, object]] = []
     seen: set[str] = set()
+    restored_path = None
     for raw in records:
         if not isinstance(raw, Mapping):
             raise ValueError(f"{label} inventory contains a malformed record")
@@ -1564,15 +1795,71 @@ def _validate_inventory(
         if not stat.S_ISREG(observed.st_mode):
             raise ValueError(f"{label} output must be a regular file: {path}")
         size_changed = observed.st_size != raw["size_bytes"]
+        record = dict(raw)
         if staged:
             state = raw.get("stage_identity")
-            if (size_changed or not isinstance(state, dict) or any(type(value) is not int for value in state.values())
-                    or state != _staged_file_state(observed)):
-                raise _StagedOutputChanged(f"staged output identity changed: {path}; rerun to regenerate delivery-ready")
-        elif size_changed:
-            raise ValueError(f"{label} output size changed: {path}")
-        validated.append(dict(raw))
+            actual = _staged_file_state(observed, include_ctime=True)
+            if not isinstance(state, dict) or any(type(value) is not int for value in state.values()):
+                raise ValueError(f"invalid staged output identity: {path}")
+            if size_changed or ((state != actual or key in newly_linked) and (
+                sha256_file(path) != raw["sha256"]
+                or _staged_file_state(path.lstat(), include_ctime=True) != actual
+            )):
+                # 保留已知的原哈希。仅重建 ready 会把未验证的修改当作原产物。
+                raise ValueError(f"staged output content changed: {path}; restore verified output or rerun its producer")
+            if {key: value for key, value in state.items() if key != "ctime_ns"} != _staged_file_state(observed):
+                # 先核完整清单。其他文件若已损坏，必须保留 ready 中的原哈希。
+                restored_path = path
+            record["stage_identity"] = actual
+        else:
+            if size_changed:
+                raise ValueError(f"{label} output size changed: {path}")
+            state = output_file_state(observed)
+            recorded = output_state_digests.get(key) if output_state_digests is not None else None
+            if (recorded != _output_state_digest(record, state)
+                    and _published_content_hash(path, state) != raw["sha256"]):
+                raise ValueError(f"{label} output checksum changed: {path} (SHA-256)")
+            record["verified_state"] = state
+        validated.append(record)
+    if restored_path is not None:
+        raise _StagedOutputChanged(f"staged output identity changed: {restored_path}; rerun to regenerate delivery-ready")
     return validated
+
+
+def _check_shared_published_outputs(project: Path, ready: Path, outputs: list[dict[str, object]]) -> None:
+    """公开路径仍与暂存共享 inode 时，完整或中断交付的凭证仍能核对原字节。"""
+    try:
+        previous = load_run_manifest(project, validate_outputs=False)
+    except (FileNotFoundError, ValueError):
+        previous = {}
+    if previous.get("status") != "complete":
+        try:
+            previous = load_delivery_ready(ready, validate_staged=False)
+        except (FileNotFoundError, ValueError):
+            return
+    if not isinstance(previous.get("outputs"), list):
+        return
+    hashes = {item["path"]: item.get("sha256") for item in previous["outputs"]
+              if isinstance(item, Mapping) and isinstance(item.get("path"), str)}
+    delivery = previous.get("delivery")
+    digests = delivery.get("output_state_sha256") if isinstance(delivery, Mapping) else None
+    for record in outputs:
+        name = record["path"]
+        if name not in hashes or hashes[name] == record["sha256"]:
+            continue
+        public = project / "03_results" / name
+        try:
+            published = public.lstat()
+        except FileNotFoundError:
+            continue
+        state = record["stage_identity"]
+        if (published.st_dev, published.st_ino) == (state["device"], state["inode"]):
+            # 内容栏损坏时，仍可用原凭证中的独立状态摘要核对这次实际读出的哈希。
+            if (isinstance(digests, Mapping)
+                    and digests.get(name) == _output_state_digest(record, output_file_state(published))):
+                continue
+            raise ValueError(f"staged output shares changed published content: {public}; "
+                             "restore the verified bytes or rerun its producer before publishing")
 
 
 def write_delivery_ready(
@@ -1613,13 +1900,15 @@ def write_delivery_ready(
     if snapshot.get("snapshot_id") != delivery_id:
         raise ValueError("delivery generation must use the run snapshot id")
 
+    outputs = _staged_output_inventory(stage_results)
+    _check_shared_published_outputs(project, output, outputs)
     payload: dict[str, object] = {
         "schema_version": DELIVERY_READY_SCHEMA_VERSION,
         "delivery_id": delivery_id,
         "recorded_at_utc": _utc_now(),
         "project_dir": str(project.resolve()),
         "run_snapshot_path": str(snapshot_path),
-        "outputs": _staged_output_inventory(stage_results),
+        "outputs": outputs,
     }
     atomic_write_json(output, payload)
     return output
@@ -1650,25 +1939,53 @@ def _manifest_path(project: Path) -> Path:
     return project / "03_results" / "run_manifest.json"
 
 
+def run_manifest_state(path: Path) -> tuple[int, ...]:
+    """有效文件链接同时绑定入口和目标，目标须为普通交付文件。"""
+    entry = path.lstat()
+    if stat.S_ISLNK(entry.st_mode):
+        target = path.stat()
+        state = output_file_state(entry) + output_file_state(target)
+    else:
+        target = entry
+        state = output_file_state(entry)
+    if not stat.S_ISREG(target.st_mode):
+        raise ValueError(f"Delivery manifest must be a regular file: {path}")
+    return state
+
+
+def verified_published_output_states(project: Path, manifest: Mapping) -> dict[str, tuple[int, ...]]:
+    """逐项核交付内容，返回实际核过的状态供读取者绑定至提交。"""
+    delivery = manifest.get("delivery")
+    digests = delivery.get("output_state_sha256") if isinstance(delivery, Mapping) else None
+    records = _validate_inventory(project / "03_results", manifest.get("outputs"), label="published delivery",
+                                  output_state_digests=digests if isinstance(digests, Mapping) else None)
+    return {Path(record["path"]).as_posix(): record["verified_state"] for record in records}
+
+
 def load_run_manifest(
     path_or_project: str | Path,
     *,
     validate_outputs: bool = True,
 ) -> dict[str, object]:
-    path = Path(path_or_project).expanduser().resolve()
-    manifest = path if path.name == "run_manifest.json" else _manifest_path(path)
+    path = Path(path_or_project).expanduser().absolute()
+    if path.name == "run_manifest.json":
+        if path.parent.name != "03_results":
+            raise ValueError(f"run manifest project and location disagree: {path}")
+        project = path.parent.parent.resolve()
+    else:
+        project = path.resolve()
+    manifest = _manifest_path(project)
+    state = run_manifest_state(manifest)
     payload = _read_json(manifest, "run manifest")
     if payload.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION:
         raise ValueError(f"unsupported run manifest schema: {manifest}")
-    project = Path(str(payload.get("project_dir", ""))).expanduser().resolve()
-    if manifest != _manifest_path(project).resolve(strict=False):
+    owner = payload.get("project_dir")
+    if not isinstance(owner, str) or not Path(owner).is_absolute() or Path(owner).resolve() != project:
         raise ValueError("run manifest project and location disagree")
     if validate_outputs:
-        _validate_inventory(
-            project / "03_results",
-            payload.get("outputs"),
-            label="published delivery",
-        )
+        verified_published_output_states(project, payload)
+    if run_manifest_state(manifest) != state:
+        raise ValueError(f"Sealed delivery changed while reading the run manifest: {manifest}")
     return payload
 
 
@@ -1683,15 +2000,25 @@ def read_sealed_final_manifest(path: Path, record: Mapping[str, object]) -> csv.
     return csv.DictReader(io.TextIOWrapper(io.BytesIO(content), encoding="utf-8-sig", newline=""), delimiter="\t")
 
 
-def _publish_hardlink(stage: Path, public: Path, relative: Path) -> None:
+def _publish_hardlink(stage: Path, public: Path, relative: Path) -> bool:
+    """安装后返回 True。已是同一文件时保留文件状态，供暂存凭证复验。"""
+    source = stage / relative
     destination = public / relative
+    try:
+        installed = destination.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if os.path.samestat(source.lstat(), installed):
+            return False
     destination.parent.mkdir(parents=True, exist_ok=True)
     tmp = project_temporary_parent(destination) / f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     try:
-        os.link(stage / relative, tmp)
+        os.link(source, tmp)
         os.replace(tmp, destination)
     finally:
         tmp.unlink(missing_ok=True)
+    return True
 
 
 def _prune_stale_public_files(public: Path, allowed: set[str]) -> None:
@@ -1738,6 +2065,8 @@ def _run_manifest_payload(ready: Mapping[str, object], snapshot: Mapping[str, ob
         },
         "run": {
             "protocol": str(analysis_record.get("protocol", "")),
+            **({k: analysis_record[k] for k in ("barcode_design_sha256", "tag_source")}
+               if analysis_record.get("protocol") in DD_PROTOCOLS else {}),
             "species": str(analysis_record.get("species", "")),
             "methylation_backend": str(analysis_record.get("methylation_backend", "")),
             "cpg_representation": cpg_representation(analysis_record["cpg_coordinate_base"]),
@@ -1767,9 +2096,9 @@ def publish_delivery(ready_path: str | Path) -> Path:
     public = project / _PUBLIC_DIRNAME
     stage = project / "02_work" / "results_stage"
 
-    def validate_staged(records):
+    def validate_staged(records, *, newly_linked=()):
         try:
-            return _validate_inventory(stage, records, label="staged delivery", staged=True)
+            return _validate_inventory(stage, records, label="staged delivery", staged=True, newly_linked=newly_linked)
         except _StagedOutputChanged:
             # onsuccess 失败不会将已完成的 ready 规则标为未完成。只撤销已失效的凭证。
             ready_manifest.unlink(missing_ok=True)
@@ -1779,6 +2108,7 @@ def publish_delivery(ready_path: str | Path) -> Path:
     snapshot_path = Path(str(ready["run_snapshot_path"])).resolve()
     snapshot = load_run_snapshot(snapshot_path)
     payload = _run_manifest_payload(ready, snapshot)
+    verify_run_snapshot_inputs(snapshot["basis"])
     config = load_project_config(
         snapshot_path.parent / "inputs" / snapshot["input_copies"]["config"]["snapshot_path"]
     )
@@ -1791,19 +2121,27 @@ def publish_delivery(ready_path: str | Path) -> Path:
     public.mkdir(parents=True, exist_ok=True)
 
     allowed: set[str] = set()
+    newly_linked: set[str] = set()
     for record in outputs:
         relative = _safe_relative(record["path"], label="published output path")
         allowed.add(relative.as_posix())
-        _publish_hardlink(stage, public, relative)
+        if _publish_hardlink(stage, public, relative):
+            newly_linked.add(relative.as_posix())
 
     _prune_stale_public_files(public, allowed)
-    validate_staged(outputs)
-    _validate_inventory(public, outputs, label="published delivery")
+    # 新硬链接本身会改变 ctime，可能遮住同时的写入。用 ready 的内容哈希核验后再签发公开凭证。
+    outputs = validate_staged(outputs, newly_linked=newly_linked)
+    digests = {}
     for record in outputs:
         relative = Path(record["path"])
-        if not os.path.samefile(stage / relative, public / relative):
-            raise ValueError(f"published delivery is not the staged hardlink: {relative}")
+        observed = (public / relative).lstat()
+        if _staged_file_state(observed, include_ctime=True) != record["stage_identity"]:
+            raise ValueError(f"published delivery is not the verified staged hardlink: {relative}")
+        digests[record["path"]] = _output_state_digest(record, output_file_state(observed))
+    payload["delivery"]["output_state_sha256"] = digests
+    _validate_inventory(public, outputs, label="published delivery", output_state_digests=digests)
 
+    verify_run_snapshot_inputs(snapshot["basis"])
     atomic_write_json(marker, payload)
 
     if not config["retention"]["keep_final_bam"]:
@@ -1938,6 +2276,19 @@ def project_status(
                                     "status": "resumable",
                                     "reason": f"unretained BAM/index awaits cleanup under the Snakemake lock: {path}",
                                 }
+                        scratch = project / "02_work" / "demux"
+                        try:
+                            scratch_mode = scratch.lstat().st_mode
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            if stat.S_ISDIR(scratch_mode):
+                                return {
+                                    "status": "resumable",
+                                    "reason": f"demux scratch awaits cleanup under the Snakemake lock: {scratch}",
+                                }
+                            logger.warning("Refusing to resume demux cleanup through a non-directory: %s", scratch)
+                        verify_run_snapshot_inputs(snapshot["basis"])
                         return {
                             "status": "complete_current",
                             "manifest": str(public_manifest),

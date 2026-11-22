@@ -17,6 +17,7 @@ pub(crate) fn run(args: &Args, spool: &Path) -> Result<()> {
         serde_json::from_slice(&std::fs::read(args.evidence_pairs.as_ref().unwrap())?)?;
     anyhow::ensure!(!pairs.is_empty(), "empty evidence request");
     let (manifest, blocks) = blocks(spool)?;
+    anyhow::ensure!(args.mode == DemuxMode::DdMet5 && manifest.mode == args.mode.as_str(), "shared UMI evidence requires DD-MET5 spool");
     let mut children: AHashMap<Vec<u8>, droplet::Molecules> = AHashMap::new();
     for pair in &pairs {
         anyhow::ensure!(
@@ -44,7 +45,7 @@ pub(crate) fn run(args: &Args, spool: &Path) -> Result<()> {
         for block in &blocks {
             for shard in &wanted {
                 let raw = decode(spool, *shard, &block.segments[*shard])?;
-                walk(&raw, |record| {
+                walk(&raw, args.mode, |record| {
                     if selected.contains(record.barcode) {
                         if let Some(key) = record.key {
                             consume(record.barcode, key);

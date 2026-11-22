@@ -1,11 +1,61 @@
 use super::*;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read};
+
+#[derive(Clone, Copy, PartialEq)]
+enum FieldState {
+    Start,
+    Unquoted,
+    Quoted,
+    AfterQuote,
+}
+
+// csv crate 容许引号提前结束或直到 EOF 都未闭合。只校验字段边界，
+// 实际解码和行宽检查仍由 csv 完成；状态跨读取缓冲区保留。
+struct BarcodeCsv<R> {
+    input: R,
+    state: FieldState,
+    line: usize,
+    last_cr: bool,
+}
+
+impl<R: Read> Read for BarcodeCsv<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use FieldState::*;
+        let size = self.input.read(buf)?;
+        if size == 0 && !buf.is_empty() && self.state == Quoted {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("unterminated quoted field at line {}", self.line)));
+        }
+        for &byte in &buf[..size] {
+            self.state = match (self.state, byte) {
+                (Start | AfterQuote, b'"') => Quoted,
+                (Quoted, b'"') => AfterQuote,
+                (Quoted, _) => Quoted,
+                (_, b',' | b'\r' | b'\n') => Start,
+                (AfterQuote, _) => return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("unexpected byte after closing quote at line {}", self.line))),
+                _ => Unquoted,
+            };
+            if byte == b'\r' || (byte == b'\n' && !self.last_cr) {
+                self.line += 1;
+            }
+            self.last_cr = byte == b'\r';
+        }
+        Ok(size)
+    }
+}
 
 pub(super) fn load_barcode_map(path: &Path, mode: DemuxMode) -> Result<Vec<CellRow>> {
+    let mut input = BufReader::new(File::open(path)
+        .with_context(|| format!("Cannot read Barcode_Map.csv: {}", path.display()))?);
+    if input.fill_buf()?.starts_with(b"\xef\xbb\xbf") {
+        input.consume(3);
+    }
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .delimiter(b',')
-        .from_path(path)
-        .with_context(|| format!("Cannot read Barcode_Map.csv: {}", path.display()))?;
+        .from_reader(BarcodeCsv { input, state: FieldState::Start, line: 1, last_cr: false });
 
     let headers = reader
         .headers()
@@ -26,7 +76,7 @@ pub(super) fn load_barcode_map(path: &Path, mode: DemuxMode) -> Result<Vec<CellR
     }
     let idx_dna = header_index(&headers, "DNA_Barcode")?;
     let idx_plate = header_index_optional(&headers, "PlateID");
-    if mode != DemuxMode::DnaOnlyDroplet && idx_plate.is_none() {
+    if !mode.is_droplet() && idx_plate.is_none() {
         anyhow::bail!("Barcode_Map.csv missing required column PlateID");
     }
     let idx_order = header_index(&headers, "Cell_Order")?;
@@ -51,7 +101,7 @@ pub(super) fn load_barcode_map(path: &Path, mode: DemuxMode) -> Result<Vec<CellR
             continue;
         }
         if dna.is_empty()
-            || (mode != DemuxMode::DnaOnlyDroplet && plate.is_empty())
+            || (!mode.is_droplet() && plate.is_empty())
             || order.is_empty()
         {
             anyhow::bail!(
@@ -62,7 +112,7 @@ pub(super) fn load_barcode_map(path: &Path, mode: DemuxMode) -> Result<Vec<CellR
                 order
             );
         }
-        if mode == DemuxMode::DnaOnlyDroplet {
+        if mode.is_droplet() {
             if dna.len() != 17
                 || !dna.bytes().all(|b| matches!(b, b'A' | b'G' | b'T'))
                 || !plate.is_empty()
@@ -177,7 +227,7 @@ pub(super) fn validate_barcode_rows(rows: &[CellRow], mode: DemuxMode) -> Result
             );
         }
     }
-    if mode != DemuxMode::DnaOnlyDroplet {
+    if !mode.is_droplet() {
         audit_correction_neighborhoods(dna_map.keys(), "DNA_Barcode")?;
     }
     Ok(())

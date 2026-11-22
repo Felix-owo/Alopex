@@ -12,15 +12,20 @@ import io
 import json
 import os
 import errno
+import fcntl
 import shutil
 import stat
 import subprocess
+import threading
 import uuid
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 
-def iter_tree_files(root: Path, *, exclude_names: Collection[str] = ()) -> Iterator[Path]:
+def iter_tree_files(
+    root: Path, *, exclude_names: Collection[str] = (), exclude_paths: Collection[Path] = (),
+) -> Iterator[Path]:
     """枚举非目录成员，不沿目录链接递归；扫描失败须阻止清单被当作完整结果。
 
     rglob会吞掉目录扫描错误；身份、输入和完整复制不能把不可读分支当作空目录。
@@ -36,6 +41,13 @@ def iter_tree_files(root: Path, *, exclude_names: Collection[str] = ()) -> Itera
                 if entry.name in excluded:
                     continue
                 path = Path(entry.path)
+                if exclude_paths and (path in exclude_paths or any(
+                    path.parent == excluded.parent
+                    and path.name.casefold() == excluded.name.casefold()
+                    and path.samefile(excluded)
+                    for excluded in exclude_paths
+                )):
+                    continue
                 if entry.is_dir(follow_symlinks=False):
                     pending.append(path)
                 else:
@@ -47,6 +59,38 @@ def sha256_bytes(data: bytes) -> str:
     """返回内存字节串的 SHA-256 摘要。"""
 
     return hashlib.sha256(data).hexdigest()
+
+
+def require_distinct_paths(paths: Iterable[Path], *, label: str) -> None:
+    """已存在的文件按 inode 识别别名，待创建的文件按解析后的路径识别。"""
+    seen = set()
+    for path in paths:
+        try:
+            state = path.stat()
+        except FileNotFoundError:
+            key = path.resolve()
+        else:
+            key = state.st_dev, state.st_ino
+        if key in seen:
+            raise ValueError(f"{label} must be distinct: {path}")
+        seen.add(key)
+
+
+@contextmanager
+def publication_locks(paths: set[Path]):
+    """按 inode 顺序加锁；持久锁文件使共享目的地的写者只在提交期间串行。"""
+    with ExitStack() as stack:
+        descriptors = {}
+        for path in paths:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o666)
+            stack.callback(os.close, fd)
+            state = os.fstat(fd)
+            if not stat.S_ISREG(state.st_mode) or state.st_nlink != 1:
+                raise ValueError(f"invalid publication lock: {path}")
+            descriptors[(state.st_dev, state.st_ino)] = fd
+        for key in sorted(descriptors):
+            fcntl.flock(descriptors[key], fcntl.LOCK_EX)
+        yield
 
 
 def sha256_file(path: str | Path, *, chunk_size: int = 4 * 1024 * 1024) -> str:
@@ -102,6 +146,43 @@ def stat_if_present(path: Path) -> os.stat_result | None:
         else:
             state = candidate.stat()
             return state if candidate == path else None
+
+
+class ExistingFileLocks:
+    """在独立 kernel 内短暂独占生产者已有的锁文件，文件消失时拒绝读写。"""
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._descriptors: set[int] = set()
+        os.register_at_fork(before=self._guard.acquire, after_in_parent=self._guard.release,
+                            after_in_child=self._close_inherited)
+
+    def _close_inherited(self):
+        # 子进程只关闭副本，不能对父进程的 open file description 执行 LOCK_UN。
+        for descriptor in self._descriptors:
+            os.close(descriptor)
+        self._descriptors.clear()
+        self._guard.release()
+
+    @contextmanager
+    def hold(self, path: Path):
+        owner = os.getpid()
+        with self._guard:
+            descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+            self._descriptors.add(descriptor)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError(f"Expected an existing regular lock file: {path}")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(f"Downstream QC is busy: {path.parent}; retry after the current writer finishes") from exc
+            yield
+        finally:
+            if os.getpid() == owner:
+                with self._guard:
+                    self._descriptors.remove(descriptor)
+                    os.close(descriptor)
 
 
 def project_temporary_parent(destination: str | Path, *, project_dir: str | Path | None = None) -> Path:
@@ -325,12 +406,19 @@ def render_tsv(
 ) -> str:
     """按当前 schema 序列化 TSV；固定 Unix 换行与确定性输出。"""
 
-    buffer = io.StringIO(newline="")
+    # CSV writer 依据终止符决定哪些字符要引用。让它保护字段内的 CR/LF，
+    # 再仅把每条完整记录末尾的 CRLF 写为 LF，保留字段内的原始换行。
+    class UnixRecords(io.StringIO):
+        def write(self, record: str) -> int:
+            super().write(record[:-2] + "\n")
+            return len(record)
+
+    buffer = UnixRecords(newline="")
     writer = csv.DictWriter(
         buffer,
         fieldnames=list(fieldnames),
         delimiter="\t",
-        lineterminator="\n",
+        lineterminator="\r\n",
         extrasaction="raise",
     )
     writer.writeheader()

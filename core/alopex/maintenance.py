@@ -14,9 +14,11 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -29,11 +31,11 @@ from .config import (
     SPIKE_CONTIGS,
     _PRIMARY_CONTIGS,
     _PROTOCOL_FIXED_CONFIG,
-    _fai_contigs,
     _read_reference_binding,
     _reference_file_record,
     _reference_file_state,
     apply_config_defaults,
+    checked_fasta_index,
     envs_section,
     envs_section_sha256,
     finalize_project_config,
@@ -41,16 +43,23 @@ from .config import (
     managed_alignment_contigs,
     primary_analysis_contigs,
     read_environment_identity,
+    read_fasta_index,
+    _reference_file_present,
     reference_binding_path,
     reference_component_files,
     reference_sequence_identity,
     validate_downstream_reference,
     validate_tss_reference,
     validate_reference_component,
+    validated_spike_bases,
+    verify_fasta_layout,
 )
 from .io import (
+    _fsync_directory,
     atomic_write_bytes,
     atomic_write_json,
+    publication_locks,
+    require_distinct_paths,
     sha256_file,
 )
 from .paths import PIPELINE_ROOT
@@ -62,6 +71,7 @@ def begin_reference_build(reference: Path, output: Path, annotation: Path | None
     ref = reference.resolve()
     payload = {"reference": reference_sequence_identity(ref), "fasta_state": list(_reference_file_state(ref))}
     if annotation is not None:
+        payload["fai_state"] = list(_reference_file_state(Path(f"{ref}.fai")))
         payload["annotation"] = {"path": str(annotation.resolve()), **_reference_file_record(annotation)}
     atomic_write_json(output, payload)
 
@@ -77,9 +87,10 @@ def seal_reference_component(reference: Path, kind: str, *, build_input: Path | 
         if before["reference"] != identity or before["fasta_state"] != list(_reference_file_state(reference)):
             raise ValueError("reference changed during component build")
     receipt = reference_binding_path(reference, kind, root=root)
-    # fasta重建时旧receipt已由组装事务撤销；只在此边界计算每个新工件的一次完整hash。
-    files = {os.path.relpath(p, receipt.parent): _reference_file_record(p)
-             for p in reference_component_files(reference, kind, root)}
+    with checked_fasta_index(reference) if kind == "fasta" else nullcontext():
+        # fasta重建时旧receipt已由组装事务撤销；只在此边界计算每个新工件的一次完整hash。
+        files = {os.path.relpath(p, receipt.parent): _reference_file_record(p)
+                 for p in reference_component_files(reference, kind, root)}
     if kind.startswith("bismark-"):
         genome = files[os.path.relpath((root or Path(str(reference) + ".bismark")) / "genome.fa", receipt.parent)]
         if genome["sha256"] != identity["fasta"]["sha256"]:
@@ -87,19 +98,28 @@ def seal_reference_component(reference: Path, kind: str, *, build_input: Path | 
     atomic_write_json(receipt, {"schema_version": 1, "kind": kind, "reference": identity, "files": files})
 
 
-def seal_downstream_reference_bindings(reference: Path, annotation: Path, tss: Path, cpg: Path,
-                                       build_input: Path) -> None:
+def _downstream_build_inputs(reference: Path, annotation: Path, build_input: Path) -> tuple[dict, dict]:
     before = json.loads(build_input.read_text())
     identity = reference_sequence_identity(reference)
-    if before["reference"] != identity or before["fasta_state"] != list(_reference_file_state(reference)):
+    if (before["reference"] != identity or before["fasta_state"] != list(_reference_file_state(reference))
+            or before["fai_state"] != list(_reference_file_state(Path(f"{reference.resolve()}.fai")))):
         raise ValueError("reference changed during downstream reference build")
-    annotation_record = _reference_file_record(annotation, before["annotation"])
+    recorded = before["annotation"]
+    if recorded["path"] != str(annotation.resolve()) or recorded["state"] != list(_reference_file_state(annotation)):
+        raise ValueError(f"annotation changed during downstream reference build: {annotation}")
+    return identity, _reference_file_record(annotation, recorded)
+
+
+def seal_downstream_reference_bindings(reference: Path, annotation: Path, tss: Path, cpg: Path,
+                                       build_input: Path) -> None:
+    records = {path: _reference_file_record(path) for path in (tss, cpg)}
+    identity, annotation_record = _downstream_build_inputs(reference, annotation, build_input)
     for role, path in (("tss", tss), ("single-cpg", cpg)):
         receipt = Path(str(path) + ".reference.json")
         atomic_write_json(receipt, {"schema_version": 1, "kind": role, "reference": identity,
                                    "annotation": annotation_record,
                                    **({"bin_unit": "protein_coding_gene"} if role == "tss" else {}),
-                                   "files": {path.name: _reference_file_record(path)}})
+                                   "files": {path.name: records[path]}})
 
 
 def relocate_downstream_bindings(reference: Path, tss: Path, cpg: Path) -> None:
@@ -139,12 +159,15 @@ def import_reference_binding(reference: Path, kind: str, *, root: Path | None = 
         payload = validate_reference_component(reference, kind, root=root)
     else:
         receipt = Path(str(artifact) + ".reference.json")
-        payload = (validate_tss_reference(reference, artifact, annotation) if kind == "tss" else
-                   validate_downstream_reference(reference, artifact, kind, annotation))
-    records = {relative: _reference_file_record(receipt.parent / relative, record)
-               for relative, record in payload["files"].items()}
-    if artifact is not None and annotation is not None and annotation.is_file():
-        payload["annotation"] = _reference_file_record(annotation, payload["annotation"])
+        payload = (validate_tss_reference(reference, artifact) if kind == "tss" else
+                   validate_downstream_reference(reference, artifact, kind))
+    if kind != "fasta" and payload["reference"] != reference_sequence_identity(reference, verify_content=True):
+        raise ValueError(f"reference/component generation mismatch: {receipt}")
+    with checked_fasta_index(reference) if kind == "fasta" else nullcontext():
+        records = {relative: _reference_file_record(receipt.parent / relative, record, verify_content=True)
+                   for relative, record in payload["files"].items()}
+    if artifact is not None and annotation is not None and _reference_file_present(annotation):
+        payload["annotation"] = _reference_file_record(annotation, payload["annotation"], verify_content=True)
     payload["files"] = records
     atomic_write_json(receipt, payload)
 
@@ -267,19 +290,32 @@ def _check_installed_environment(prefix: Path, role: str, expected_subdir: str, 
     """只读核对已安装包；不导入目标环境的科学、绘图或 Notebook 模块。"""
     from conda.models.match_spec import MatchSpec
     from conda.models.version import VersionSpec
-    from importlib.metadata import Distribution
+    from email.parser import BytesHeaderParser
     from packaging.markers import default_environment
     from packaging.requirements import Requirement
+
+    prefix = prefix.resolve(strict=True)
+
+    def managed_path(path: Path) -> Path:
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(prefix):
+            raise ValueError(f"{role}: package metadata escaped the managed prefix: {path}")
+        return resolved
+
+    def read_record(entry: os.DirEntry[str]) -> dict[str, Any]:
+        path = Path(entry.path)
+        if entry.is_symlink():
+            path = managed_path(path)
+        return json.loads(path.read_text(encoding="utf-8"))
 
     records: dict[str, dict[str, Any]] = {}
     native = False
     # 包记录在共享文件系统上逐个同步读取会累积 I/O 等待；有界重叠读取，
     # 按原枚举顺序消费全部记录，保留坏 JSON、重复包和未请求包的平台拒绝。
-    with ThreadPoolExecutor(max_workers=min(4, effective_cpu_count())) as reader:
-        loaded = reader.map(
-            lambda path: json.loads(path.read_text(encoding="utf-8")),
-            (prefix / "conda-meta").glob("*.json"),
-        )
+    with os.scandir(managed_path(prefix / "conda-meta")) as entries, ThreadPoolExecutor(
+        max_workers=min(4, effective_cpu_count())
+    ) as reader:
+        loaded = reader.map(read_record, (entry for entry in entries if entry.name.endswith(".json")))
         for record in loaded:
             name = record["name"]
             if name in records:
@@ -301,33 +337,47 @@ def _check_installed_environment(prefix: Path, role: str, expected_subdir: str, 
     normalize = lambda value: re.sub(r"[-_.]+", "-", value).lower()
     # Python 包可能由 pip 安装或覆盖；有效版本来自 dist-info，不由残留 Conda 记录代替。
     python_distributions = {name: name for name in (
-        "anndata", "h5py", "ipykernel", "jupyterlab", "numba", "numpy", "packaging", "pandas", "polars",
-        "pyyaml", "scikit-learn", "seaborn", "tqdm", "jsonschema", "snakemake",
-        "snakemake-executor-plugin-slurm", "pip", "pysam", "cutadapt", "multiqc", "awscli",
-        "leidenalg", "cykhash", "umi_tools", "rich", "psutil",
+        "anndata", "backports.zstd", "h5py", "ipykernel", "jupyterlab", "numba", "numpy", "packaging", "pandas",
+        "pyyaml", "scikit-learn", "seaborn", "jsonschema", "snakemake",
+        "snakemake-executor-plugin-slurm", "pip", "pysam", "cutadapt", "multiqc",
+        "rich", "psutil", "conda", "conda-libmamba-solver",
     )}
-    python_distributions.update({"matplotlib-base": "matplotlib", "python-igraph": "igraph"})
-    def distribution_for(name):
-        candidates = list(Distribution.discover(name=name, path=[str(site)]))
+    python_distributions["matplotlib-base"] = "matplotlib"
+    metadata_by_name: dict[str, list[Path]] = {}
+    if site.is_dir():
+        for entry in managed_path(site).iterdir():
+            if entry.suffix.lower() in {".dist-info", ".egg-info"}:
+                metadata_by_name.setdefault(normalize(entry.stem.partition("-")[0]), []).append(entry)
+
+    def distribution_version(name: str) -> str:
+        candidates = metadata_by_name.get(normalize(name), [])
         if len(candidates) != 1:
             raise ValueError(f"{role}: missing or ambiguous Python metadata for {name}")
-        distribution = candidates[0]
-        if Path(distribution.locate_file("")).resolve() != site.resolve():
-            raise ValueError(f"{role}: Python metadata escaped the managed prefix for {name}")
-        if normalize(distribution.metadata["Name"] or "") != normalize(name):
+        entry = candidates[0]
+        info = managed_path(entry)
+        if entry.suffix.lower() == ".dist-info":
+            info = managed_path(info / "METADATA")
+        elif info.is_dir():
+            info = managed_path(info / "PKG-INFO")
+        metadata = BytesHeaderParser().parsebytes(info.read_bytes())
+        if normalize(metadata.get("Name", "")) != normalize(name):
             raise ValueError(f"{role}: Python distribution identity mismatch for {name}")
-        return distribution
+        version = metadata.get("Version")
+        if not version:
+            raise ValueError(f"{role}: missing Python distribution version for {name}")
+        return version
     for dependency in section["dependencies"]:
         if isinstance(dependency, str):
             spec = MatchSpec(dependency)
             record = records.get(spec.name)
             distribution_name = python_distributions.get(spec.name)
             if distribution_name is not None:
-                distribution = distribution_for(distribution_name)
+                version = distribution_version(distribution_name)
                 constraint = spec.get_raw_value("version")
-                if constraint and not VersionSpec(constraint).match(distribution.version):
+                if constraint and not VersionSpec(constraint).match(version):
                     raise ValueError(f"{role}: effective Python package does not satisfy {dependency}")
-                if (spec.get_raw_value("build") is not None or spec.get_raw_value("channel") is not None):
+                if (spec.name in {"conda", "conda-libmamba-solver"}
+                        or spec.get_raw_value("build") is not None or spec.get_raw_value("channel") is not None):
                     if record is None or not spec.match(record):
                         raise ValueError(f"{role}: installed artifact does not satisfy {dependency}")
             elif record is None or not spec.match(record):
@@ -337,8 +387,7 @@ def _check_installed_environment(prefix: Path, role: str, expected_subdir: str, 
                 requirement = Requirement(item)
                 if requirement.marker and not requirement.marker.evaluate(marker_environment):
                     continue
-                distribution = distribution_for(requirement.name)
-                if distribution.version not in requirement.specifier:
+                if distribution_version(requirement.name) not in requirement.specifier:
                     raise ValueError(f"{role}: installed pip package does not satisfy {item}")
 
 
@@ -405,20 +454,131 @@ def _atomic_text_path(path: Path) -> Path:
 def _gtf_attributes(raw: str) -> dict[str, str]:
     attributes: dict[str, str] = {}
     for item in raw.split(";"):
-        key, separator, value = item.strip().partition(" ")
-        if separator:
-            if key in {"gene_id", "gene_type"} and key in attributes:
-                raise ValueError(f"duplicate GTF {key}")
-            attributes[key] = value.strip().strip('"')
+        fields = item.split(maxsplit=1)
+        if not fields or fields[0] not in {"gene_id", "gene_type"}:
+            continue
+        key = fields[0]
+        if key in attributes:
+            raise ValueError(f"duplicate GTF {key}")
+        value = re.fullmatch(r'"([^"\s;]+)"', fields[1].strip()) if len(fields) == 2 else None
+        if value is None:
+            raise ValueError(f"invalid quoted GTF {key}")
+        attributes[key] = value[1]
     return attributes
 
 
-def _annotation_release_signature(species: str) -> tuple[str, str]:
-    if species == "hg38":
-        return "GRCh38", "version 48"
-    if species == "mm10":
-        return "GRCm38", "version M25"
-    raise ValueError(f"unsupported standard species: {species}")
+_GENCODE_RELEASES = {"hg38": ("GRCh38.p14", "48"), "mm10": ("GRCm38.p6", "M25")}
+# 官方 CHR / PRI 完整 GTF 解压后的 SHA-256，两个版本的主核基因与 TSS 坐标逐项一致。
+_GENCODE_ANNOTATION_SHA256 = {
+    "94fac30910407d25e0a261b278a2fdce09e79f91d53e72dd3e56b21bc3ead557": "hg38",
+    "0bc33e92c494f98f0ad91b0c4cde56f7caafe8e62d270a9f8554d0991765a155": "hg38",
+    "0b0cb02ee1b25cf635844e9b409193c27b18be3e9a7403ce9869c7d00f30f6bc": "mm10",
+    "009fe0274de483412832839740e92c959877f511833a2c6bcc41043477d1af9e": "mm10",
+}
+
+
+def _gencode_rows(annotation: Path, species: str | None) -> Iterator[tuple[int, str]]:
+    """读取同一发行版与组装的 GTF 记录，保留物理行号。"""
+    if species is not None and species not in _GENCODE_RELEASES:
+        raise ValueError(f"unsupported standard species: {species}")
+    expected = _GENCODE_RELEASES.values() if species is None else [_GENCODE_RELEASES[species]]
+    with annotation.open(encoding="utf-8") as source:
+        fields = {}
+        line_number = 1
+        line = source.readline()
+        while line.startswith("#"):
+            key, sep, value = line.partition(":")
+            if sep and key in {"##description", "##provider"}:
+                if key in fields:
+                    raise ValueError(f"duplicate GTF header {key}: {annotation}")
+                fields[key] = value.strip()
+            line_number += 1
+            line = source.readline()
+        description = fields.get("##description", "")
+        builds = re.findall(r"\bGRC[hm][\w.-]+", description)
+        versions = re.findall(r"\bversion\s+([^\s,;)]+)", description)
+        if fields.get("##provider") != "GENCODE" or not any(
+            versions == [version] and builds in ([build], [build.split(".")[0]])
+            for build, version in expected
+        ):
+            required = " or ".join(f"GENCODE version {v} on {b}" for b, v in expected)
+            raise ValueError(f"GTF must be {required}: {annotation}")
+        if line:
+            yield line_number, line
+        for number, line in enumerate(source, line_number + 1):
+            if line.startswith(("##description:", "##provider:")):
+                raise ValueError(f"{annotation}:{number}: misplaced GTF header after data")
+            if not line.startswith("#"):
+                yield number, line
+
+
+def _host_contig_lengths(records, species: str | None) -> dict[str, int]:
+    primary = set(primary_analysis_contigs(species or "hg38"))
+    return {name: length for name, length, *_ in records if name in primary}
+
+
+def _gencode_tss(annotation: Path, species: str | None,
+                 contig_lengths: Mapping[str, int]) -> Iterator[tuple[str, str, str, int]]:
+    """按原注释顺序给出主核蛋白编码基因及其链定向的 BED 边界。"""
+    seen_genes: set[str] = set()
+    for line_number, raw in _gencode_rows(annotation, species):
+        if "\x00" in raw:
+            raise ValueError(f"{annotation}:{line_number}: GTF record contains a NUL byte")
+        fields = raw.rstrip("\n").split("\t")
+        if len(fields) != 9:
+            raise ValueError(f"invalid GTF field count on line {line_number}: {annotation}")
+        chrom, _, feature, start_s, end_s, _, strand, _, attrs_s = fields
+        if feature != "gene" or chrom not in contig_lengths:
+            continue
+        try:
+            attrs = _gtf_attributes(attrs_s)
+        except ValueError as exc:
+            raise ValueError(f"{annotation}:{line_number}: {exc}") from exc
+        if "gene_type" not in attrs:
+            raise ValueError(f"{annotation}:{line_number}: GTF gene lacks gene_type")
+        if attrs["gene_type"] != "protein_coding":
+            continue
+        if strand not in {"+", "-"}:
+            raise ValueError(f"{annotation}:{line_number}: invalid protein-coding GTF strand {strand!r}")
+        gene_id = attrs.get("gene_id")
+        if not gene_id:
+            raise ValueError(f"protein-coding GTF gene lacks gene_id on line {line_number}: {annotation}")
+        if gene_id in seen_genes:
+            raise ValueError(f"duplicate protein-coding gene_id {gene_id!r}: {annotation}:{line_number}")
+        seen_genes.add(gene_id)
+        if re.fullmatch(r"[0-9]+", start_s) is None or re.fullmatch(r"[0-9]+", end_s) is None:
+            raise ValueError(f"{annotation}:{line_number}: invalid GTF coordinate")
+        start, end = int(start_s) - 1, int(end_s)
+        if not 0 <= start < end <= contig_lengths[chrom]:
+            raise ValueError(f"GTF gene exceeds canonical contig bounds on line {line_number}: {annotation}")
+        yield chrom, strand, gene_id, start if strand == "+" else end
+
+
+def _annotation_species(records, species: str | None) -> str | None:
+    """用完整主染色体长度识别标准组装，区域参考沿用调用者的物种。"""
+    observed = {name: length for name, length, *_ in records}
+    for standard, primary in _PRIMARY_CONTIGS.items():
+        if all(observed.get(name) == length for name, length in primary):
+            if species is not None and species != standard:
+                raise ValueError(f"reference FAI belongs to {standard}, expected {species}")
+            return standard
+    return species
+
+
+def validate_gencode_annotation(annotation: Path | None, species: str | None, reference: Path,
+                                verified_sha256: str | None = None) -> None:
+    """已核验的官方全文摘要确定注释来源。其他可用源与构建共用基因及表头检查。"""
+    records = read_fasta_index(Path(f"{reference.resolve()}.fai"))
+    species = _annotation_species(records, species)
+    assembly = _GENCODE_ANNOTATION_SHA256.get(verified_sha256)
+    if assembly is not None:
+        if species is not None and species != assembly:
+            raise ValueError(f"GENCODE annotation belongs to {assembly}, expected {species}")
+        return
+    if annotation is not None:
+        lengths = _host_contig_lengths(records, species)
+        for _ in _gencode_tss(annotation, species, lengths):
+            pass
 
 
 def build_downstream_references(
@@ -429,10 +589,10 @@ def build_downstream_references(
     tss_bed: str | Path,
     single_cpg_bed: str | Path,
 ) -> Mapping[str, object]:
-    """构建 TSS bins 与 SnapATAC2 兼容的 single-CpG BED。
+    """构建 TSS bins 与 SingleCpG 使用的双链位点 BED。
 
     CpG BED 为 BED3、0-based half-open，每条 interval 覆盖 CpG 二核苷酸 ``[C, G+1)``，
-    因此两条链上报出的 base-resolution 值都会落入同一个 SnapATAC2 peak_file feature。
+    因此两条链上报出的胞嘧啶坐标都落入同一个矩阵特征。
     """
 
     reference = Path(fasta).expanduser().resolve()
@@ -440,6 +600,11 @@ def build_downstream_references(
     annotation = Path(annotation_gtf).expanduser().resolve()
     tss = Path(tss_bed).expanduser().resolve()
     cpg = Path(single_cpg_bed).expanduser().resolve()
+    locks = {path.parent / ".alopex-downstream-build.lock" for path in (tss, cpg)}
+    receipts = [Path(str(path) + ".reference.json") for path in (tss, cpg)]
+    members = [reference, fai, annotation, reference_binding_path(reference, "fasta"), tss, cpg, *receipts, *locks]
+    path_label = "downstream reference inputs, outputs and receipts"
+    require_distinct_paths(members, label=path_label)
     if not reference.is_file() or reference.stat().st_size == 0:
         raise FileNotFoundError(f"reference FASTA is missing or empty: {reference}")
     if not fai.is_file() or fai.stat().st_size == 0:
@@ -449,89 +614,21 @@ def build_downstream_references(
             f"reference annotation GTF is missing or empty: {annotation}"
         )
 
-    contigs = _fai_contigs(fai)
-    host_contigs = [
-        (name, length)
-        for name, length in contigs
-        if name in primary_analysis_contigs(species)
-    ]
-    contig_lengths = dict(host_contigs)
-    expected_build, expected_release = _annotation_release_signature(species)
-    header_lines: list[str] = []
     tss_tmp = _atomic_text_path(tss)
     cpg_tmp = _atomic_text_path(cpg)
     binding_input = _atomic_text_path(tss.with_suffix(".build-input.json"))
-    begin_reference_build(reference, binding_input, annotation)
     tss_count = 0
     protein_coding_gene_count = 0
-    seen_genes: set[str] = set()
 
     try:
-        with annotation.open("rt", encoding="utf-8") as source, tss_tmp.open(
-            "wt", encoding="utf-8", newline=""
-        ) as output:
-            for line_number, raw in enumerate(source, start=1):
-                if raw.startswith("#"):
-                    if len(header_lines) < 100:
-                        header_lines.append(raw.rstrip("\n"))
-                    continue
-                fields = raw.rstrip("\n").split("\t")
-                if len(fields) != 9:
-                    raise ValueError(
-                        f"invalid GTF field count on line {line_number}: {annotation}"
-                    )
-                (
-                    chrom,
-                    _source,
-                    feature,
-                    start_s,
-                    end_s,
-                    _score,
-                    strand,
-                    _frame,
-                    attrs_s,
-                ) = fields
-                if (
-                    feature != "gene"
-                    or chrom not in contig_lengths
-                ):
-                    continue
-                try:
-                    attrs = _gtf_attributes(attrs_s)
-                except ValueError as exc:
-                    raise ValueError(f"{annotation}:{line_number}: {exc}") from exc
-                if not attrs.get("gene_type", "").strip():
-                    raise ValueError(f"{annotation}:{line_number}: GTF gene lacks gene_type")
-                if attrs.get("gene_type") != "protein_coding":
-                    continue
-                # 不能把无法定义TSS的主核蛋白编码gene静默过滤后封存为完整参考。
-                if strand not in {"+", "-"}:
-                    raise ValueError(f"{annotation}:{line_number}: invalid protein-coding GTF strand {strand!r}")
-                gene_id = attrs.get("gene_id", "").strip()
-                if not gene_id:
-                    raise ValueError(
-                        "protein-coding GTF gene lacks gene_id on line "
-                        f"{line_number}: {annotation}"
-                    )
-                if gene_id in seen_genes:
-                    raise ValueError(f"duplicate protein-coding gene_id {gene_id!r}: {annotation}:{line_number}")
-                seen_genes.add(gene_id)
-                if (re.fullmatch(r"[0-9]+", start_s) is None
-                        or re.fullmatch(r"[0-9]+", end_s) is None):
-                    raise ValueError(f"{annotation}:{line_number}: invalid GTF coordinate")
-                gene_start = int(start_s) - 1
-                gene_end = int(end_s)
-                if (
-                    gene_start < 0
-                    or gene_end <= gene_start
-                    or gene_end > contig_lengths[chrom]
-                ):
-                    raise ValueError(
-                        "GTF gene exceeds canonical contig bounds on line "
-                        f"{line_number}: {annotation}"
-                    )
+        begin_reference_build(reference, binding_input, annotation)
+        contigs = read_fasta_index(fai)
+        _annotation_species(contigs, species)
+        verify_fasta_layout(reference, contigs)
+        contig_lengths = _host_contig_lengths(contigs, species)
+        with tss_tmp.open("wt", encoding="utf-8", newline="") as output:
+            for chrom, strand, gene_id, transcription_start in _gencode_tss(annotation, species, contig_lengths):
                 protein_coding_gene_count += 1
-                transcription_start = gene_start if strand == "+" else gene_end
                 for offset in range(-2000, 2000, 20):
                     if strand == "+":
                         bin_start = transcription_start + offset
@@ -549,17 +646,10 @@ def build_downstream_references(
                     )
                     tss_count += 1
 
-        header = "\n".join(header_lines)
-        if expected_build not in header or expected_release not in header:
-            raise ValueError(
-                f"{species} GTF must be GENCODE {expected_release} on "
-                f"{expected_build}: {annotation}"
-            )
         if protein_coding_gene_count == 0 or tss_count == 0:
             raise ValueError(f"GTF produced no protein-coding TSS bins: {annotation}")
 
         cpg_count = 0
-        selected = {name for name, _length in host_contigs}
         current = ""
         current_position = 0
         previous_base = ""
@@ -580,7 +670,7 @@ def build_downstream_references(
                             previous_base = ""
                             continue
                         sequence = "".join(raw.split()).upper()
-                        if not sequence or current not in selected:
+                        if not sequence or current not in contig_lengths:
                             continue
                         combined = previous_base + sequence
                         combined_start = current_position - (1 if previous_base else 0)
@@ -597,12 +687,16 @@ def build_downstream_references(
             raise ValueError(f"reference produced no CpG sites: {reference}")
 
         # 换成员前先验证构建输入仍同代；外层Doctor持有可恢复发布事务。
-        before = json.loads(binding_input.read_text())
-        if before["reference"] != reference_sequence_identity(reference):
-            raise ValueError("reference changed during downstream build")
-        os.replace(tss_tmp, tss)
-        os.replace(cpg_tmp, cpg)
-        seal_downstream_reference_bindings(reference, annotation, tss, cpg, binding_input)
+        with publication_locks(locks):
+            _downstream_build_inputs(reference, annotation, binding_input)
+            require_distinct_paths(members, label=path_label)
+            for receipt in receipts:
+                receipt.unlink(missing_ok=True)
+            os.replace(tss_tmp, tss)
+            os.replace(cpg_tmp, cpg)
+            # 不区分大小写的文件系统上，首次写出后才能按 inode 识别原先均不存在的别名。
+            require_distinct_paths(members, label=path_label)
+            seal_downstream_reference_bindings(reference, annotation, tss, cpg, binding_input)
     finally:
         for temporary in (tss_tmp, cpg_tmp, binding_input):
             try:
@@ -620,25 +714,28 @@ def build_downstream_references(
     }
 
 
+def _source_spike_bases(name: str, fasta: Path) -> bytes:
+    with fasta.open("rb") as handle:
+        if not handle.readline().startswith(b">"):
+            raise ValueError(f"missing {name} FASTA header: {fasta}")
+        bases = bytearray()
+        # 误选整份宿主 FASTA 时也只读取一条对照所需的空间。
+        for line in iter(lambda: handle.readline(SPIKE_CONTIGS[name] + 2), b""):
+            bases.extend(line.rstrip(b"\r\n"))
+            if len(bases) > SPIKE_CONTIGS[name]:
+                raise ValueError(f"source FASTA exceeds the required {name} length: {fasta}")
+        return validated_spike_bases(name, fasta, bytes(bases))
+
+
 def append_spikein_contigs(lambda_fasta: Path, puc19_fasta: Path, target_fasta: Path) -> None:
-    """把 lambda 与 pUC19 spike-in contig 追加到临时 assembled FASTA 末尾。"""
-
-    def spike_sequence(path: Path) -> str:
-        data = "".join(
-            line.strip()
-            for line in path.read_text().splitlines()
-            if line and not line.startswith(">")
-        ).upper()
-        if not data:
-            raise ValueError(f"empty spike FASTA: {path}")
-        return data
-
-    with target_fasta.open("a") as handle:
-        for name, path in (("lambda", lambda_fasta), ("pUC19", puc19_fasta)):
-            sequence = spike_sequence(path)
-            handle.write(f">{name}\n")
+    """两份对照均匹配固定序列后，再写入临时组装。"""
+    controls = [(name, _source_spike_bases(name, path))
+                for name, path in (("lambda", lambda_fasta), ("pUC19", puc19_fasta))]
+    with target_fasta.open("ab") as handle:
+        for name, sequence in controls:
+            handle.write(f">{name}\n".encode("ascii"))
             for offset in range(0, len(sequence), 60):
-                handle.write(sequence[offset : offset + 60] + "\n")
+                handle.write(sequence[offset : offset + 60] + b"\n")
 
 
 # NCBI GRCh38 analysis-set CEN/PAR/WGS 与 GRC exclusions 的保留序列子集。
@@ -771,10 +868,9 @@ def mask_analysis_reference(species: str, fasta: Path) -> None:
     """
     if species not in _ANALYSIS_MASK_INTERVALS:
         raise ValueError(f"unsupported analysis-set assembly: {species}")
-    records = [line.split("\t") for line in Path(str(fasta) + ".fai").read_text().splitlines() if line.strip()]
-    by_name = {r[0]: (r[0], *(int(v) for v in r[1:5])) for r in records}
-    if len(by_name) != len(records):
-        raise ValueError("duplicate contig in candidate FASTA index")
+    records = read_fasta_index(Path(str(fasta) + ".fai"))
+    verify_fasta_layout(fasta, records)
+    by_name = {row[0]: row for row in records}
     # 所有目标区间写前验证；只改碱基、不改布局，原 FAI 仍精确有效。
     blocks = []
     for name, intervals in _ANALYSIS_MASK_INTERVALS[species].items():
@@ -791,72 +887,51 @@ def mask_analysis_reference(species: str, fasta: Path) -> None:
 
 
 def fai_contract_check(mode: str, label: str, fai: Path, fasta: Path) -> bool:
-    """校验 source/assembled FASTA 是否满足标准 contig 长度契约。
-
-    只读取很小的 .fai 并通过 FAI 几何 + FASTA 大小的算术检查排除截断文件，
-    assembled hg38/mm10 额外只读对应 analysis-set 区间以核对 hard-mask，不扫描全基因组。
-    mode=source 允许 UCSC FASTA 中的额外 contig（primary 与
-    spike 必须全部存在且长度精确）；mode=assembled 只允许标准 contig 的精确顺序。
-    """
-
-    records: list[tuple[str, int, int, int, int]] = []
-    seen: set[str] = set()
-    for line in fai.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        fields = line.split("\t")
-        if len(fields) < 5 or not fields[0]:
-            return False
-        name = fields[0]
-        if name in seen:
-            return False
-        seen.add(name)
-        try:
-            length, offset, line_bases, line_width = (int(v) for v in fields[1:5])
-        except ValueError:
-            return False
-        if length <= 0 or offset < 0 or line_bases <= 0 or line_width < line_bases:
-            return False
-        records.append((name, length, offset, line_bases, line_width))
-    if not records:
-        return False
-
-
-    fasta_size = fasta.stat().st_size
-    for _name, length, offset, line_bases, line_width in records:
-        full_rows = (length - 1) // line_bases
-        final_row_start = offset + full_rows * line_width
-        final_row_bases = (length - 1) % line_bases + 1
-        if final_row_start + final_row_bases > fasta_size:
-            return False
-
-    length_records = [(name, length) for name, length, *_ in records]
-    if mode == "source":
-        if label in MANAGED_SPECIES:
-            observed = dict(length_records)
-            return all(
-                observed.get(name) == length
-                for name, length in _PRIMARY_CONTIGS[label]
-            )
-        if label in SPIKE_CONTIGS:
-            return (
-                len(length_records) == 1
-                and length_records[0][1] == SPIKE_CONTIGS[label]
-            )
-        return False
-    if mode == "assembled":
-        if label not in MANAGED_CONTIGS or length_records != managed_alignment_contigs(label):
-            return False
-        if label in _ANALYSIS_MASK_INTERVALS:
-            by_name = {r[0]: r for r in records}
-            try:
-                return all(data.translate(None, b"\r\n") == b"N" * length
-                           for name, intervals in _ANALYSIS_MASK_INTERVALS[label].items()
-                           for _start, data, length in _reference_mask_blocks(label, fasta, by_name[name], intervals))
-            except ValueError:
+    """核对 FAI 布局、宿主范围与组装顺序、analysis-set mask 及两条对照的内容。"""
+    required = managed_alignment_contigs(label) if mode == "assembled" and label in MANAGED_CONTIGS else None
+    try:
+        records = read_fasta_index(fai)
+        length_records = [(name, length) for name, length, *_ in records]
+        if mode == "source":
+            verify_fasta_layout(fasta, records)
+            if label in MANAGED_SPECIES:
+                observed = dict(length_records)
+                return all(observed.get(name) == length for name, length in _PRIMARY_CONTIGS[label])
+            if label not in SPIKE_CONTIGS or len(records) != 1 or records[0][1] != SPIKE_CONTIGS[label]:
                 return False
-        return True
-    return False
+            _source_spike_bases(label, fasta)
+            return True
+        if length_records != required:
+            return False
+        verify_fasta_layout(fasta, records, check_spikes=True)
+        by_name = {r[0]: r for r in records}
+        return all(data.translate(None, b"\r\n") == b"N" * length
+                   for name, intervals in _ANALYSIS_MASK_INTERVALS[label].items()
+                   for _start, data, length in _reference_mask_blocks(label, fasta, by_name[name], intervals))
+    except ValueError:
+        return False
+
+
+def rebuild_source_fai(label: str, fasta: Path, samtools: str) -> int:
+    """仅验证成功且输入未更换时，才将同卷私有候选发布为 source FAI。"""
+    target = Path(str(fasta) + ".fai")
+    state = _reference_file_state(fasta)
+    # 用私有目录，让 samtools 按当前 umask 创建索引，并在同一挂载点原子替换。
+    with tempfile.TemporaryDirectory(dir=target.parent, prefix=".source-fai.") as stage:
+        candidate = Path(stage) / target.name
+        status = subprocess.run([samtools, "faidx", "--fai-idx", candidate,
+                                 "--gzi-idx", Path(stage) / "candidate.gzi", fasta]).returncode
+        if status:
+            return status if status > 0 else 128 - status
+        if not fai_contract_check("source", label, candidate, fasta):
+            raise ValueError(f"source FASTA/FAI failed validation: {fasta}")
+        with candidate.open("rb") as handle:
+            os.fsync(handle.fileno())
+        if _reference_file_state(fasta) != state:
+            raise RuntimeError(f"source FASTA changed while building its index: {fasta}")
+        os.replace(candidate, target)
+        _fsync_directory(target.parent, strict=True)
+    return 0
 
 
 # Doctor 维护：测试路线和 fixture

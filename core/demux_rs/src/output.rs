@@ -127,12 +127,12 @@ fn safe_writer_pair_limit(requested: usize, soft_limit: Option<usize>) -> usize 
 }
 
 fn writer_pair_budget(mode: DemuxMode, buckets: usize, soft_limit: Option<usize>) -> usize {
-    let requested = if mode == DemuxMode::DnaOnlyDroplet && soft_limit.is_some() {
+    let requested = if mode.is_droplet() && soft_limit.is_some() {
         buckets.max(MAX_OPEN_BUCKETS)
     } else {
         MAX_OPEN_BUCKETS
     };
-    let reader_budget = if mode == DemuxMode::DnaOnlyDroplet {
+    let reader_budget = if mode.is_droplet() {
         64
     } else {
         0
@@ -150,7 +150,7 @@ fn writer_pair_budget(mode: DemuxMode, buckets: usize, soft_limit: Option<usize>
 
 #[test]
 fn droplet_writer_budget_retains_all_or_uses_bounded_fallback() {
-    let mode = DemuxMode::DnaOnlyDroplet;
+    let mode = DemuxMode::DdMet5;
     assert_eq!(writer_pair_budget(mode, 6000, Some(12128)), 6000);
     assert_eq!(writer_pair_budget(mode, 6000, Some(12127)), 128);
     assert_eq!(writer_pair_budget(mode, 6000, Some(256)), 64);
@@ -188,7 +188,7 @@ impl WriterCache {
             writeback,
             order: VecDeque::new(),
             max_pairs: effective_max_pairs,
-            all_buckets_fit: mode == DemuxMode::DnaOnlyDroplet && buckets <= effective_max_pairs,
+            all_buckets_fit: mode.is_droplet() && buckets <= effective_max_pairs,
         }
     }
 
@@ -261,7 +261,7 @@ fn writer_loop(
 
     let mut pending = BTreeMap::new();
     let mut next_chunk_id = 0u64;
-    let profile_enabled = paths.mode == DemuxMode::DnaOnlyDroplet;
+    let profile_enabled = paths.mode.is_droplet();
     let mut write_seconds = 0f64;
     let mut output_chunks = 0u64;
     for (chunk_id, buffer) in rx_write {
@@ -508,7 +508,7 @@ fn create_fastq_writers(
         .map(|(_, limit)| *limit);
     let r1 = OutputFile::new(r1, writeback.clone())?;
     let r2 = OutputFile::new(r2, writeback)?;
-    if paths.mode == DemuxMode::DnaOnlyDroplet {
+    if paths.mode.is_droplet() {
         let outputs = (paths.dna_cell_ids.len()).max(1) * 2;
         let capacity = droplet_writer_buffer_capacity(outputs, dirty_threshold);
         Ok((
@@ -574,11 +574,7 @@ fn write_report(
         schema_version: 4,
         build_version: env!("CARGO_PKG_VERSION").to_string(),
         source_revision: BUILD_SOURCE_REVISION.to_string(),
-        mode: match paths.mode {
-            DemuxMode::DnaOnly => "dna-only".to_string(),
-            DemuxMode::DnaOnlyTaps => "dna-only-taps".to_string(),
-            DemuxMode::DnaOnlyDroplet => "dna-only-droplet".to_string(),
-        },
+        mode: paths.mode.as_str().to_owned(),
         retention_policy: "matched_read_pairs".to_string(),
         retention_threshold: paths.min_matched_read_pairs,
         input_fastq_pairs: paths.input_fastq_pairs,
@@ -733,7 +729,7 @@ pub(super) fn prepare_output_roots(config: &Config, spool: Option<&Path>, rows: 
     crate::cli::validate_io_paths(&inputs, &directories,
         &[("--json-report", config.json_report.as_path())])?;
     let names: Vec<_> = rows.iter().map(|row| format!("{}_{}", config.sample_name,
-        if config.mode == DemuxMode::DnaOnlyDroplet { &row.dna_barcode } else { &row.plate_id })).collect();
+        if config.mode.is_droplet() { &row.dna_barcode } else { &row.plate_id })).collect();
     for (_, root) in &directories {
         validate_cell_output_names(root, &names)?;
     }
@@ -775,7 +771,7 @@ fn materialize_output_root(path: &Path, label: &str) -> Result<PathBuf> {
 }
 
 fn writer_shards(mode: DemuxMode) -> usize {
-    if mode == DemuxMode::DnaOnlyDroplet {
+    if mode.is_droplet() {
         4
     } else {
         1

@@ -8,6 +8,8 @@ use std::time::Instant;
 
 #[derive(Parser, Debug)]
 struct StageArgs {
+    #[arg(long, value_enum, default_value_t = DemuxMode::DdMet5)]
+    mode: DemuxMode,
     #[arg(long, required = true)]
     r1: Vec<PathBuf>,
     #[arg(long, required = true)]
@@ -345,7 +347,7 @@ struct Staged {
     block: Block,
     compressed: Vec<Vec<u8>>,
 }
-fn stage_batch(id: u64, input: InputChunk, shards: usize) -> Result<Staged> {
+fn stage_batch(id: u64, input: InputChunk, shards: usize, mode: DemuxMode) -> Result<Staged> {
     let started = Instant::now();
     let mut raw: Vec<Vec<u8>> = (0..shards).map(|_| Vec::new()).collect();
     let mut counts: AHashMap<[u8; 17], droplet::BarcodeCount> = AHashMap::new();
@@ -372,7 +374,7 @@ fn stage_batch(id: u64, input: InputChunk, shards: usize) -> Result<Staged> {
             "invalid quality"
         );
         metrics.input_reads += 1;
-        match droplet::extract(seq) {
+        match droplet::extract(seq, mode) {
             Ok(layout) => {
                 metrics.structured_reads += 1;
                 metrics.barcode_with_c += u64::from(layout.barcode.contains(&b'C'));
@@ -392,7 +394,7 @@ fn stage_batch(id: u64, input: InputChunk, shards: usize) -> Result<Staged> {
                 append_u32(out, i)?;
                 out.extend_from_slice(layout.barcode);
                 out.push(u8::from(r2.len() <= 9));
-                let key = droplet::molecule_key(&layout, seq);
+                let key = if mode == DemuxMode::DdMet5 { droplet::molecule_key(&layout, seq) } else { None };
                 out.push(u8::from(key.is_some()));
                 out.extend_from_slice(&key.unwrap_or(0).to_le_bytes());
                 let length_at = out.len();
@@ -684,6 +686,7 @@ pub(crate) fn run() -> Result<()> {
     let mut argv: Vec<_> = std::env::args_os().collect();
     argv.remove(1);
     let args = StageArgs::parse_from(argv);
+    anyhow::ensure!(args.mode.is_droplet(), "stage requires a DD methylation chemistry");
     anyhow::ensure!(
         args.threads > 0 && args.shards > 0 && args.batch_pairs > 0,
         "invalid stage budgets"
@@ -712,6 +715,7 @@ pub(crate) fn run() -> Result<()> {
         tx_recycle.send(InputChunk::new(args.batch_pairs))?;
     }
     let shards = args.shards;
+    let mode = args.mode;
     let reader_args = StageArgs::parse_from({
         let mut a: Vec<_> = std::env::args_os().collect();
         a.remove(1);
@@ -723,7 +727,7 @@ pub(crate) fn run() -> Result<()> {
             .into_iter()
             .par_bridge()
             .try_for_each_with(tx_done, |tx, (id, input)| {
-                tx.send((id, stage_batch(id, input, shards)?))?;
+                tx.send((id, stage_batch(id, input, shards, mode)?))?;
                 Ok::<(), anyhow::Error>(())
             })?;
         Ok(())
@@ -732,7 +736,7 @@ pub(crate) fn run() -> Result<()> {
     let spool_path = args.spool.clone();
     let spool_recycle = tx_recycle.clone();
     let spool_writer = std::thread::spawn(move || -> Result<u64> {
-        let writeback = writeback::WritebackGuard::start(DemuxMode::DnaOnlyDroplet, shards)?;
+        let writeback = writeback::WritebackGuard::start(mode, shards)?;
         let mut writers: Vec<_> = (0..shards)
             .map(|i| {
                 let file = File::create(spool_path.join(format!("{i:04}.pack")))?;
@@ -850,7 +854,8 @@ pub(crate) fn run() -> Result<()> {
         serde_json::json!({"compute_threads":compute_threads,"inflight_chunks":capacity,"inline_count_bytes":std::mem::size_of::<CompactCount>(),"count_table_shards":64,"batch_pairs":args.batch_pairs,"rank_key_bytes":std::mem::size_of::<([u8;17],u64)>(),"pairs":total,"blocks":next,"wall_seconds":start.elapsed().as_secs_f64(),"worker_parse_seconds_sum":worker_parse,"worker_compress_seconds_sum":worker_compress,"main_count_merge_seconds":merge_seconds,"main_spool_queue_wait_seconds":write_seconds,"main_receive_wait_seconds":receive_seconds,"final_counts_seconds":at.elapsed().as_secs_f64()})
     );
     let manifest = Manifest {
-        version: 1,
+        version: 2,
+        mode: mode.as_str().to_owned(),
         shards,
         blocks: next,
         pairs: total,

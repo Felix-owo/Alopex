@@ -629,12 +629,12 @@ fn run() -> Result<()> {
     let args = Args::parse();
     let droplet_spool = args.droplet_spool.clone();
     anyhow::ensure!(
-        droplet_spool.is_none() || args.mode == DemuxMode::DnaOnlyDroplet,
-        "staged reads require dna-only-droplet"
+        droplet_spool.is_none() || args.mode.is_droplet(),
+        "staged reads require DD-MET3 or DD-MET5 mode"
     );
     anyhow::ensure!(
-        args.mode != DemuxMode::DnaOnlyDroplet || droplet_spool.is_some(),
-        "dna-only-droplet requires --droplet-spool from droplet-stage"
+        !args.mode.is_droplet() || droplet_spool.is_some(),
+        "DD methylation requires --droplet-spool from droplet-stage"
     );
     if args.threads == 0 {
         anyhow::bail!("--threads must be greater than 0");
@@ -683,7 +683,7 @@ fn run() -> Result<()> {
                     .map(|row| row.dna_barcode.clone());
                 let mut index =
                     BarcodeIndex::from_barcodes(dna_barcodes, dna_bc_len);
-                if config.mode == DemuxMode::DnaOnlyDroplet {
+                if config.mode.is_droplet() {
                     droplet::protect_design(&mut index)?;
                 }
                 Ok(index)
@@ -698,7 +698,7 @@ fn run() -> Result<()> {
                 format!(
                     "{}_{}",
                     config.sample_name,
-                    if config.mode == DemuxMode::DnaOnlyDroplet {
+                    if config.mode.is_droplet() {
                         &row.dna_barcode
                     } else {
                         &row.plate_id
@@ -1031,15 +1031,15 @@ mod tests {
                 b"GCGCGCGCGCGCGCGCGCGC",
             ]
             .concat();
-            let found = droplet::extract(&seq).unwrap();
+            let found = droplet::extract(&seq, DemuxMode::DdMet5).unwrap();
             assert_eq!(found.barcode, cb);
             assert_eq!(found.umi, umi);
             assert_eq!(found.trim_start, 87);
             seq.insert(0, b'G');
-            assert_eq!(droplet::extract(&seq).unwrap().trim_start, 88);
+            assert_eq!(droplet::extract(&seq, DemuxMode::DdMet5).unwrap().trim_start, 88);
             seq.remove(0);
             seq.remove(0);
-            assert!(droplet::extract(&seq).is_err());
+            assert!(droplet::extract(&seq, DemuxMode::DdMet5).is_err());
         }
         let original = [
             cb.as_slice(),
@@ -1051,19 +1051,19 @@ mod tests {
         .concat();
         let mut inserted = original.clone();
         inserted.insert(51, b'A');
-        assert_eq!(droplet::extract(&inserted).unwrap().trim_start, 88);
+        assert_eq!(droplet::extract(&inserted, DemuxMode::DdMet5).unwrap().trim_start, 88);
         let mut deleted = original.clone();
         deleted.remove(51);
-        assert_eq!(droplet::extract(&deleted).unwrap().trim_start, 86);
+        assert_eq!(droplet::extract(&deleted, DemuxMode::DdMet5).unwrap().trim_start, 86);
         let mut truncated = original.clone();
         truncated.truncate(70);
-        assert!(droplet::extract(&truncated).is_err());
+        assert!(droplet::extract(&truncated, DemuxMode::DdMet5).is_err());
         let mut invalid = original.clone();
         invalid[0] = b'N';
-        assert!(droplet::extract(&invalid).is_err());
+        assert!(droplet::extract(&invalid, DemuxMode::DdMet5).is_err());
         let mut invalid_umi = original;
         invalid_umi[20] = b'X';
-        assert!(droplet::extract(&invalid_umi).is_err());
+        assert!(droplet::extract(&invalid_umi, DemuxMode::DdMet5).is_err());
     }
 
     #[test]
@@ -1208,6 +1208,8 @@ mod tests {
             "DNA_Barcode,,PlateID,Cell_Order\nACGTACGT,unused,A1,1\n",
             "DNA_Barcode,PlateID,Cell_Order\nACGTACGT,.,1\n",
             "DNA_Barcode,PlateID,Cell_Order\nACGTACGT,..,1\n",
+            "DNA_Barcode,PlateID,Cell_Order\nACGTACGT,A1,\"unfinished\nTTTTCCCC,B1,2\n",
+            "DNA_Barcode,PlateID,Cell_Order\nACGTACGT,A1,\"one\"tail\n",
         ] {
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
@@ -1263,9 +1265,41 @@ mod tests {
 
     #[test]
     fn paired_read_ids_normalize_mate_suffix_and_description() {
-        let normalized = validate_paired_read_ids(b"read-1/1 lane", b"read-1/2 other")
+        validate_paired_read_ids(b"read-1/1 lane", b"read-1/2 other")
             .expect("paired IDs should normalize");
-        assert_eq!(normalized, b"read-1");
+        validate_paired_read_ids(b"read-1", b"read-1").unwrap();
+        validate_paired_read_ids(b"read-1/1", b"read-1").unwrap();
+        validate_paired_read_ids(b"read-1/1\x0blane A", b"read-1/2\x0blane B").unwrap();
+        for (left, right) in [
+            (b"read-1/2".as_slice(), b"read-1/1".as_slice()),
+            (b"read-1/1", b"read-1/1"),
+            (b"read-1/2", b"read-1/2"),
+        ] {
+            assert!(validate_paired_read_ids(left, right).is_err());
+        }
+    }
+
+    #[test]
+    fn illumina_read_fields_identify_the_physical_mate() {
+        for (left, right) in [
+            (&b"cluster 1:N:0:1"[..], &b"cluster 2:Y:0:ACGT+TGCA"[..]),
+            (b"cluster/1\t 1:N:0:", b"cluster 2:N:0:N lane note"),
+            (b"cluster", b"cluster 2:N:0:11"),
+            (b"cluster/1 note 2:N:0:1", b"cluster/2 1:N:note:1"),
+            (b"cluster 2:N:0:free-text", b"cluster/2 other"),
+            (b"cluster/1:AAAGAAGAAGAATAGAG 1:N:0:1", b"cluster/2:AAAGAAGAAGAATAGAG"),
+        ] {
+            validate_paired_read_ids(left, right).unwrap();
+        }
+        for (left, right) in [
+            (&b"cluster 2:N:0:1"[..], &b"cluster 1:N:0:1"[..]),
+            (b"cluster 1:N:0:ACGT", b"cluster 1:Y:0:ACGT"),
+            (b"cluster 2:N:0:ACGT+TGCA", b"cluster"),
+            (b"cluster/1 2:N:0:1", b"cluster/2"),
+            (b"cluster/1:AAAGAAGAAGAATAGAG", b"cluster/2:AAAGAAGAAGAATAGAG 1:N:0:1"),
+        ] {
+            assert!(validate_paired_read_ids(left, right).is_err());
+        }
     }
 
     #[test]
@@ -1274,13 +1308,27 @@ mod tests {
         let mut reader = needletail::parse_fastx_reader(&input[..]).unwrap();
         let mut names = Vec::new();
         while let Some(record) = reader.next() {
-            names.push(normalize_read_id(record.unwrap().id()).unwrap().to_vec());
+            let mut output = Vec::new();
+            write_fastq_record(
+                &mut output,
+                record.unwrap().id(),
+                b"ACGT",
+                b"IIII",
+                0,
+                Some(b"UMI"),
+                false,
+            )
+            .unwrap();
+            names.push(output.split(|byte| *byte == b'\n').next().unwrap().to_vec());
         }
-        assert_eq!(names, [b"read".to_vec(), b"@read".to_vec(), b"read/1".to_vec()]);
+        assert_eq!(
+            names,
+            [b"@read:UMI".to_vec(), b"@@read:UMI".to_vec(), b"@read/1:UMI".to_vec()]
+        );
         assert!(validate_paired_read_ids(b"@read/1", b"read/2").is_err());
         assert!(validate_paired_read_ids(b"read/1", b"@read/2").is_err());
         for id in [b"".as_slice(), b" read", b"\tread", b"/1"] {
-            assert!(normalize_read_id(id).is_err());
+            assert!(validate_paired_read_ids(id, id).is_err());
         }
     }
 
@@ -1289,6 +1337,23 @@ mod tests {
         let error = validate_paired_read_ids(b"read-1/1", b"read-2/2")
             .expect_err("different molecule IDs must fail");
         assert!(error.to_string().contains("read-ID mismatch"));
+    }
+
+    #[test]
+    fn annotated_read_ids_require_matching_stem_barcode_and_mate_direction() {
+        let left = b"molecule/1:AAAGAAGAAGAATAGAG";
+        let right = b"molecule/2:AAAGAAGAAGAATAGAG";
+        validate_paired_read_ids(left, right).unwrap();
+        for other in [
+            &b"other/2:AAAGAAGAAGAATAGAG"[..],
+            b"molecule/2:AAAGAAGAAGAATAGAN",
+            b"molecule/1:AAAGAAGAAGAATAGAG",
+            b"molecule:AAAGAAGAAGAATAGAG",
+            b"molecule/2:AAAGAAGAAGAATAGA",
+        ] {
+            assert!(validate_paired_read_ids(left, other).is_err());
+        }
+        assert!(validate_paired_read_ids(right, left).is_err());
     }
 
     #[test]

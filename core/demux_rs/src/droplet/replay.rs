@@ -83,6 +83,7 @@ fn consumed_spool_cache_ranges_wait_for_complete_batches_and_full_pages() {
 
 fn prepare_replay_block(
     block: &Block,
+    mode: DemuxMode,
     readers: &[std::sync::Mutex<File>],
     indices: &Arc<Vec<BarcodeIndex>>,
     barcode_ids: &AHashMap<&str, usize>,
@@ -123,7 +124,7 @@ fn prepare_replay_block(
             let mut selected = Vec::new();
             let mut fates = FateCounts::default();
             let mut seen = 0u64;
-            walk(&raw, |record| {
+            walk(&raw, mode, |record| {
                 anyhow::ensure!(
                     u64::from(record.ordinal) < block.pairs,
                     "ordinal outside block"
@@ -222,7 +223,7 @@ pub(crate) fn run(
 ) -> Result<()> {
     let (manifest, blocks) = blocks(spool)?;
     anyhow::ensure!(
-        config.mode == DemuxMode::DnaOnlyDroplet
+        config.mode.is_droplet() && manifest.mode == config.mode.as_str()
             && manifest.input_fastq_pairs == paths.input_fastq_pairs,
         "replay input mismatch"
     );
@@ -271,6 +272,7 @@ pub(crate) fn run(
                 .map(|block| {
                     prepare_replay_block(
                         block,
+                        config.mode,
                         &readers,
                         &indices,
                         &barcode_ids,

@@ -51,7 +51,7 @@ Alopex 项目启动器
 
 选项：
   --init-project [PROJECT]  初始化项目骨架（独立维护动作，完成后立即退出）。
-  --refresh-manifest        重扫 01_raw/ 并刷新 sample manifest（独立维护动作）。
+  --refresh-manifest        按配对分块刷新文库清单。
   --dry-run, -n             只读检查：不写任何项目状态。
   -h, --help                显示本帮助。
 
@@ -188,7 +188,7 @@ if (( DNA_PIPELINE_READ_ONLY == 0 && DNA_PIPELINE_REFRESH_MANIFEST == 0 )) && \
         -- bash "$DNA_PIPELINE_LAUNCHER_SOURCE"
 fi
 
-# FASTQ 刷新会原位追加。正式运行从 snapshot 到作业结束持共享输入锁。
+# 正式运行从 snapshot 到作业结束持共享输入锁，刷新清单须等待本轮完成。
 if (( DNA_PIPELINE_READ_ONLY == 0 && DNA_PIPELINE_REFRESH_MANIFEST == 0 )) && \
     [[ "${DNA_PIPELINE_RAW_LOCK_PID:-}" != "$$" ]]; then
     exec env PYTHONPATH="$DNA_PIPELINE_ROOT/core" "$DNA_PIPELINE_PYTHON" -m alopex with-raw-input-lock \
@@ -527,7 +527,13 @@ dna_pipeline_local_mem_budget_mib() {
     elif [[ "${SLURM_MEM_PER_CPU:-}" =~ ^[1-9][0-9]*$ && "${SLURM_CPUS_ON_NODE:-}" =~ ^[1-9][0-9]*$ ]]; then
         budget=$(( SLURM_MEM_PER_CPU * SLURM_CPUS_ON_NODE ))
     elif [[ "$(uname -s)" == Darwin ]]; then
-        budget=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1048576 ))
+        # sysconf 在受限进程中也可获取物理页数及页长。
+        budget="$("$DNA_PIPELINE_PYTHON" -c '
+import os
+pages = os.sysconf("SC_PHYS_PAGES")
+page_size = os.sysconf("SC_PAGE_SIZE")
+print(max(0, pages) * max(0, page_size) // (1024 * 1024))
+' 2>/dev/null)" || budget=""
     else
         budget=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0) / 1024 ))
     fi

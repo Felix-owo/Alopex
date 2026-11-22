@@ -755,8 +755,8 @@ import runpy
 import sys
 
 for module_name in (
-    "anndata", "IPython", "ipykernel", "jupyterlab", "matplotlib", "numba", "numpy", "packaging",
-    "pandas", "h5py", "sklearn", "seaborn", "tqdm", "yaml",
+    "anndata", "backports.zstd", "IPython", "ipykernel", "jupyterlab", "matplotlib", "numba", "numpy", "packaging",
+    "pandas", "h5py", "sklearn", "seaborn", "yaml",
 ):
     importlib.import_module(module_name)
 entry = sys.argv[1]
@@ -1296,16 +1296,16 @@ usage_reference() {
   现成完整 FASTA/index 可直接导入并复用，无需 source 文件。
 
 标准输出：
-  hg38: chr1-22,chrX,chrY,chrM + lambda + pUC19
-  mm10: chr1-19,chrX,chrY,chrM + lambda + pUC19
+  hg38: GIAB v3 的 218 条序列加 lambda 和 pUC19，共 220 条。
+  mm10: GRCm38 的 66 条序列加 lambda 和 pUC19，共 68 条。
   下游: protein-coding TSS ±2000 bp / 20 bp bins + primary-contig single-CpG BED.gz
 
 本脚本不会联网下载 reference。
-其它物种由用户自行准备最终 FASTA，并自行构建 FAI、BISCUIT、Bismark index 与下游 reference。
+其它物种由用户准备最终 FASTA、FAI、所选后端的索引和下游参考。
 
 运行前检查：
-  软件/配置 + 4 个 source FASTA / 2 个 GTF + 已有 reference bundle 是否全部 READY。
-  source FASTA 通过 .fai 检查必需 contig 与预期长度；不会为完整性检查全量哈希序列。
+  只读核对已有 reference bundle。需要重建时，按组件检查对应的源 FASTA 或 GTF。
+  源 FAI 须通过必需 contig、长度及 FASTA 实际布局核对。索引重建通过验证后原子替换。
   preflight 不生成详细 build plan；若 hg38/mm10 已全部 READY，脚本直接成功结束，不申请 SLURM。
 
 Linux/HPC 行为：
@@ -1355,33 +1355,20 @@ check_prerequisites_reference() {
 fai_contract_check() {
     local mode="$1" label="$2" fai="$3" fasta="$4"
     env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex fai-check \
-        --mode "$mode" --label "$label" --fai "$fai" --fasta "$fasta" >/dev/null 2>&1
+        --mode "$mode" --label "$label" --fai "$fai" --fasta "$fasta"
 }
 
 ensure_source_fai() {
-    local label="$1" fasta="$2" fai="${2}.fai" rebuilt=0
-
-    if [[ ! -s "$fai" || "$fasta" -nt "$fai" ]]; then
-        rm -f -- "$fai" || return $?
-        echo "为 source FASTA 建索引以检查完整性： $fasta"
-        "$SAMTOOLS_BIN" faidx "$fasta" || return $?
-        rebuilt=1
+    local label="$1" fasta="$2" fai="${2}.fai" rc
+    if [[ ( -e "$fai" || -L "$fai" ) && ! "$fasta" -nt "$fai" ]]; then
+        if fai_contract_check source "$label" "$fai" "$fasta"; then return 0; else rc=$?; fi
+        # 只有内容不合格（1）才重建，访问或读取故障保留原索引。
+        (( rc == 1 )) || return "$rc"
     fi
 
-    if fai_contract_check source "$label" "$fai" "$fasta"; then
-        return 0
-    fi
-
-    if (( rebuilt == 0 )); then
-        echo "缓存的 source FAI 校验失败，重建一次： $fai"
-        rm -f -- "$fai" || return $?
-        "$SAMTOOLS_BIN" faidx "$fasta" || return $?
-        fai_contract_check source "$label" "$fai" "$fasta" && return 0
-    fi
-
-    echo "ERROR: source FASTA 未通过轻量完整性检查：$fasta" >&2
-    echo "       必需 contig 缺失或长度不符合标准；文件可能下载截断或不是预期 reference。" >&2
-    return 2
+    echo "正在校验并重建 source FASTA 索引： $fasta"
+    env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex rebuild-source-fai \
+        --label "$label" --fasta "$fasta" --samtools "$SAMTOOLS_BIN"
 }
 
 check_sources_for_build_plan() {
@@ -1559,7 +1546,7 @@ assemble_reference() {
     env PYTHONPATH="$PIPELINE_ROOT/core" "$PYTHON_BIN" -m alopex mask-analysis-reference \
         --species "$species" --fasta "$tmp_fasta" || return $?
     fai_contract_check assembled "$species" "$tmp_fasta.fai" "$tmp_fasta" || {
-        echo "ERROR: 临时组装的 $species FASTA 未通过 contig、顺序、长度或 analysis-set hard-mask 校验。" >&2
+        echo "ERROR: 临时组装的 $species FASTA 未通过 contig、顺序、长度、对照序列或 analysis-set hard-mask 校验。" >&2
         return 1
     }
 
@@ -1956,7 +1943,7 @@ downstream_references_ready() {
     [[ ! -e "$(downstream_commit_journal "$species")" ]] || return 1
     downstream_files_ready "$DOWNSTREAM_TSS" "$DOWNSTREAM_SINGLE_CPG" || return $?
     reference_binding check --reference "$fasta" --kind downstream --tss-bed "$DOWNSTREAM_TSS" \
-        --single-cpg-bed "$DOWNSTREAM_SINGLE_CPG" --annotation-gtf "$DOWNSTREAM_GTF"
+        --single-cpg-bed "$DOWNSTREAM_SINGLE_CPG" --annotation-gtf "$DOWNSTREAM_GTF" --species "$species"
 }
 
 downstream_files_ready() {
@@ -2042,7 +2029,7 @@ build_downstream_references() {
        ! mv -f -- "$new/tss.bed.reference.json" "$DOWNSTREAM_TSS.reference.json" ||
        ! mv -f -- "$new/single_cpg.bed.gz.reference.json" "$DOWNSTREAM_SINGLE_CPG.reference.json" ||
        ! reference_binding relocate --reference "$fasta" --kind downstream --tss-bed "$DOWNSTREAM_TSS" --single-cpg-bed "$DOWNSTREAM_SINGLE_CPG" ||
-       ! reference_binding check --reference "$fasta" --kind downstream --tss-bed "$DOWNSTREAM_TSS" --single-cpg-bed "$DOWNSTREAM_SINGLE_CPG" --annotation-gtf "$DOWNSTREAM_GTF"; then
+       ! reference_binding check --reference "$fasta" --kind downstream --tss-bed "$DOWNSTREAM_TSS" --single-cpg-bed "$DOWNSTREAM_SINGLE_CPG" --annotation-gtf "$DOWNSTREAM_GTF" --species "$species"; then
         echo "ERROR: $species downstream 提交失败，正在恢复上一完整代。" >&2
         recover_downstream_commit "$species" || return $?
         return 1
@@ -3082,18 +3069,11 @@ BENCHMARK_JSON="$BENCHMARK_ROOT/benchmark.json"
 
 DOCTOR_TMP_PARENT="$PIPELINE_ROOT/logs"
 
-DOCTOR_SANDBOX_RETENTION_DAYS=14
-
-
 # 清理 Doctor 初始化期间被中断的本轮沙箱。
 doctor_early_cleanup() {
     local status=$?
     trap - EXIT INT TERM HUP
-    if [[ -n "${TMP_ROOT:-}" && "$TMP_ROOT" == "$DOCTOR_TMP_PARENT/doctor."* && -e "$TMP_ROOT" ]]; then
-        find "$TMP_ROOT" -type d -exec chmod u+rwx {} + 2>> "$DETAIL_LOG" || true
-        find "$TMP_ROOT" -type f -exec chmod u+rw {} + 2>> "$DETAIL_LOG" || true
-        rm -rf -- "$TMP_ROOT" >> "$DETAIL_LOG" 2>&1 || true
-    fi
+    remove_doctor_sandbox || true
     exit "$status"
 }
 
@@ -3202,16 +3182,23 @@ EOF
         [[ -z "${job_id:-}" ]] || summary "[Alopex job] $job_id $route"
     fi
 }
+doctor_sandbox_identity() {
+    [[ -d "$1" && ! -L "$1" ]] || return 1
+    stat -c '%d:%i' -- "$1" 2>/dev/null || stat -f '%d:%i' "$1"
+}
 remove_doctor_sandbox() {
-    local expected_prefix="$DOCTOR_TMP_PARENT/doctor."
+    local expected_prefix="$DOCTOR_TMP_PARENT/doctor." current
     [[ -n "${TMP_ROOT:-}" && "$TMP_ROOT" == "$expected_prefix"* && "$TMP_ROOT" != "$DOCTOR_TMP_PARENT" ]] || {
         printf '拒绝清理不安全的 Doctor 沙箱路径： %s\n' "${TMP_ROOT:-<empty>}" >> "$DETAIL_LOG"
         return 2
     }
-    [[ -e "$TMP_ROOT" ]] || return 0
-
+    [[ -e "$TMP_ROOT" || -L "$TMP_ROOT" ]] || return 0
+    current="$(doctor_sandbox_identity "$TMP_ROOT")" && [[ "$current" == "${DOCTOR_SANDBOX_ID:-}" ]] || {
+        printf 'Doctor 沙箱身份改变，保留当前目录： %s\n' "$TMP_ROOT" >> "$DETAIL_LOG"
+        return 2
+    }
+    # 删除目录项只需目录可写。文件可能硬链接到其他结果，不能更改它的权限。
     find "$TMP_ROOT" -type d -exec chmod u+rwx {} + 2>> "$DETAIL_LOG" || true
-    find "$TMP_ROOT" -type f -exec chmod u+rw {} + 2>> "$DETAIL_LOG" || true
     rm -rf -- "$TMP_ROOT" >> "$DETAIL_LOG" 2>&1
     [[ ! -e "$TMP_ROOT" ]]
 }
@@ -3345,10 +3332,8 @@ run_doctor_section() {
     DOCTOR_RUN_ID="$(date '+%Y%m%dT%H%M%S').$$"
     DOCTOR_LOG_ROOT="${DNA_PIPELINE_DOCTOR_LOG_DIR:-$PIPELINE_ROOT/logs/doctor}"
     mkdir -p "$DOCTOR_LOG_ROOT" "$DOCTOR_TMP_PARENT"
-    find "$DOCTOR_TMP_PARENT" -mindepth 1 -maxdepth 1 -type d -name 'doctor.*' \
-        -mtime "+$DOCTOR_SANDBOX_RETENTION_DAYS" \
-        -exec rm -rf -- {} + 2>/dev/null || true
     TMP_ROOT="$(mktemp -d "$DOCTOR_TMP_PARENT/doctor.${DOCTOR_RUN_ID}.XXXXXX")" || exit 1
+    DOCTOR_SANDBOX_ID="$(doctor_sandbox_identity "$TMP_ROOT")" || exit 1
     DETAIL_LOG="$DOCTOR_LOG_ROOT/doctor.${DOCTOR_RUN_ID}.detail.log"
     FINAL_LOG="$DOCTOR_LOG_ROOT/doctor.${DOCTOR_RUN_ID}.summary.log"
     LATEST_DETAIL_LOG="$DOCTOR_LOG_ROOT/latest.detail.log"

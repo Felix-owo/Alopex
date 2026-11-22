@@ -309,7 +309,7 @@ pub(super) struct WritebackGuard {
 
 impl WritebackGuard {
     pub(super) fn start(mode: DemuxMode, max_streams: usize) -> Result<Option<Self>> {
-        if mode != DemuxMode::DnaOnlyDroplet || !cfg!(target_os = "linux") {
+        if !mode.is_droplet() || !cfg!(target_os = "linux") {
             return Ok(None);
         }
         Self::spawn(Arc::new(WritebackState::new(

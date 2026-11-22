@@ -176,10 +176,15 @@ pub(crate) fn validate_io_paths(
     inputs: &[(&str, &Path)], directories: &[(&str, &Path)], files: &[(&str, &Path)],
 ) -> Result<()> {
     let mut protected = Vec::new();
+    let mut fastqs = std::collections::HashSet::new();
     for (label, path) in inputs {
         let resolved = path.canonicalize().with_context(||
             format!("Cannot resolve {label}: {}", path.display()))?;
         let metadata = std::fs::metadata(&resolved)?;
+        if matches!(*label, "--r1" | "--r2") {
+            anyhow::ensure!(fastqs.insert((metadata.dev(), metadata.ino())),
+                "Duplicate FASTQ input for {label}: {}", path.display());
+        }
         let traced = protect_input_entries(path, &std::env::current_dir()?, label, &mut protected)?;
         let traced_metadata = std::fs::metadata(&traced)?;
         anyhow::ensure!((metadata.dev(), metadata.ino()) == (traced_metadata.dev(), traced_metadata.ino()),
@@ -313,6 +318,10 @@ fn io_plan_rejects_aliases_without_creating_or_changing_files() {
     assert!(validate_io_paths(&inputs, &[], &[("report", &linked)]).is_err());
     let hard = root.join("shared-report.json");
     std::fs::hard_link(&input, &hard).unwrap();
+    for label in ["--r1", "--r2"] {
+        let error = validate_io_paths(&[("--r1", &input), (label, &hard)], &[], &[]).unwrap_err();
+        assert!(error.to_string().contains("Duplicate FASTQ input"));
+    }
     assert!(validate_io_paths(&inputs, &[], &[("report", &hard)]).is_err());
     assert!(validate_io_paths(&inputs, &[], &[("report", &missing.join("../shared-report.json"))]).is_err());
     let not_directory = root.join("file");
@@ -405,6 +414,24 @@ pub(crate) enum DemuxMode {
     DnaOnly,
     #[value(name = "dna-only-taps")]
     DnaOnlyTaps,
-    #[value(name = "dna-only-droplet")]
-    DnaOnlyDroplet,
+    #[value(name = "dna-only-dd-met3")]
+    DdMet3,
+    #[value(name = "dna-only-dd-met5")]
+    DdMet5,
+}
+
+
+impl DemuxMode {
+    pub(crate) fn is_droplet(self) -> bool {
+        matches!(self, Self::DdMet3 | Self::DdMet5)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DnaOnly => "dna-only",
+            Self::DnaOnlyTaps => "dna-only-taps",
+            Self::DdMet3 => "dna-only-dd-met3",
+            Self::DdMet5 => "dna-only-dd-met5",
+        }
+    }
 }

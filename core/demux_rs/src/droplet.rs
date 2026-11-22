@@ -59,19 +59,19 @@ fn mismatch(expected: u8, observed: u8, ct: bool) -> usize {
     )
 }
 
-fn distance(observed: &[u8], ct: bool) -> usize {
-    let n = ANCHOR.len();
+fn distance(anchor: &[u8], observed: &[u8], ct: bool) -> usize {
+    let n = anchor.len();
     if observed.len() == n {
-        return ANCHOR
+        return anchor
             .iter()
             .zip(observed)
             .map(|(&a, &b)| mismatch(a, b, ct))
             .sum();
     }
     let (short, long, deletion) = if observed.len() < n {
-        (observed, ANCHOR, true)
+        (observed, anchor, true)
     } else {
-        (ANCHOR, observed, false)
+        (anchor, observed, false)
     };
     let cost = |i: usize, j: usize| {
         if deletion {
@@ -91,20 +91,28 @@ fn distance(observed: &[u8], ct: bool) -> usize {
     best
 }
 
-pub(super) fn extract(seq: &[u8]) -> std::result::Result<Layout<'_>, TerminalFate> {
-    if seq.len() < 28 + ANCHOR.len() - 1 {
+pub(super) fn extract(seq: &[u8], mode: DemuxMode) -> std::result::Result<Layout<'_>, TerminalFate> {
+    // DD-MET3 has a fixed B17 followed by 7F, 17L, ME and the 9-base gap.
+    // Its fragment tag is part of the insert and must stay in the emitted R1.
+    let met3 = mode == DemuxMode::DdMet3;
+    let (anchor, starts) = if met3 {
+        (b"TTGCTGTCGTCCGTCGTTGCTCGTAGATGTGTATAAGAGACAG".as_slice(), 17..=17)
+    } else {
+        (ANCHOR, 28..=30)
+    };
+    if seq.len() < starts.start() + anchor.len() - 1 {
         return Err(TerminalFate::Short);
     }
     let mut best = 3;
     let mut boundary = None;
     let mut ambiguous = false;
-    for start in 28..=30 {
-        for length in 48..=50 {
+    for start in starts {
+        for length in anchor.len()-1..=anchor.len()+1 {
             let end = start + length;
             if end > seq.len() {
                 continue;
             }
-            let score = distance(&seq[start..end], true).min(distance(&seq[start..end], false));
+            let score = distance(anchor, &seq[start..end], true).min(distance(anchor, &seq[start..end], false));
             if score > 2 {
                 continue;
             }
@@ -121,19 +129,24 @@ pub(super) fn extract(seq: &[u8]) -> std::result::Result<Layout<'_>, TerminalFat
         return Err(TerminalFate::Ambiguous);
     }
     let (start, end) = boundary.ok_or(TerminalFate::Unmatched)?;
-    if start < 29 || end + 9 >= seq.len() {
-        return Err(TerminalFate::Short);
-    }
-    let barcode = &seq[start - 29..start - 12];
-    let umi = &seq[start - 12..start];
+    let trim_start = end + 9;
+    let (barcode_start, umi) = if met3 {
+        (0, seq.get(trim_start..trim_start + 12).ok_or(TerminalFate::Short)?)
+    } else {
+        if start < 29 || trim_start >= seq.len() {
+            return Err(TerminalFate::Short);
+        }
+        (start - 29, &seq[start - 12..start])
+    };
+    let barcode = &seq[barcode_start..barcode_start + 17];
     if !barcode.iter().all(|b| b"ACGT".contains(b)) || !umi.iter().all(|b| b"ACGTN".contains(b)) {
         return Err(TerminalFate::Unmatched);
     }
     Ok(Layout {
         barcode,
         umi,
-        barcode_start: start - 29,
-        trim_start: end + 9,
+        barcode_start,
+        trim_start,
     })
 }
 

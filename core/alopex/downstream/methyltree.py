@@ -57,7 +57,7 @@ def _sample_info(frame, cells, nCG_cutoff):
 def _write_csr_subset(source, destination, obs, provenance, before_commit):
     """有界复制CSR及HDF5注释；不将全参考var标签或整个X载入内存。"""
     import h5py
-    from anndata._io.specs import write_elem
+    from anndata.experimental import write_elem
     from . import matrix
 
     reader = matrix.CSRReader(source)
@@ -66,17 +66,17 @@ def _write_csr_subset(source, destination, obs, provenance, before_commit):
         rows = reader.obs_names.get_indexer(obs.index)
         if (rows < 0).any():
             raise ValueError("MethylTree selection contains cells absent from SingleCpG")
-        writer = matrix.CSRWriter(destination, obs, n_vars=reader.n_vars, uns=reader.uns)
+        writer = matrix.CSRWriter(destination, obs, n_vars=reader.n_vars)
         for row in rows:
             writer.append(reader.read_rows(int(row), int(row) + 1))
         writer.close()
         writer = None
         before_commit()
-        with h5py.File(source, "r") as src, h5py.File(destination, "r+") as dst:
+        with h5py.File(destination, "r+") as dst:
             del dst["var"]
-            src.copy("var", dst)
+            reader.handle.copy("var", dst)
             del dst["uns"]
-            src.copy("uns", dst)
+            reader.handle.copy("uns", dst)
             write_elem(dst["uns"], "alopex_methyltree_input", provenance)
         before_commit()
     finally:
@@ -103,18 +103,16 @@ def prepare_methyltree_inputs(
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{name} must be a nonnegative integer")
     assert_loaded_sources_current(_LOADED_SOURCE_CODES)
-    with qc._qc_write_lock(paths.qc_results_dir):
+    run_paths = qc.build_paths(paths.project_dir)
+    if run_paths.qc_results_dir != paths.qc_results_dir:
+        raise ValueError("Notebook QC directory differs from the current delivery")
+    with qc._qc_write_lock(run_paths.qc_results_dir):
         sealed = qc.load_sealed_qc_context(paths.project_dir, expected_pipeline_root=paths.pipeline_root)
         if sealed.delivery_id != paths.delivery_id:
             raise ValueError("Delivery changed; rerun the Notebook from its first cell")
-        run_paths = qc.build_paths(paths.project_dir)
-        if run_paths.qc_results_dir != paths.qc_results_dir:
-            raise ValueError("Notebook QC directory differs from the current delivery")
         completed = qc._require_completed_qc(run_paths, sealed)
         cells = qc.read_active_cells(paths.project_dir, sealed_context=sealed)
-        frame = pd.read_csv(paths.qc_info, converters=dict.fromkeys(qc.QC_INFO_COLUMNS[:3], str),
-                            float_precision="round_trip")
-        frame = qc._require_exact_sample_ids(frame, list(completed.sample_ids), "MethylTree QC")
+        frame = qc._read_qc_table(run_paths.qc_info)
         samples = _sample_info(frame, cells, nCG_cutoff)
         selected = samples.loc[samples["nCG"] >= import_nCG_cutoff].copy()
         if selected.empty:

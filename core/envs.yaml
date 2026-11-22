@@ -24,11 +24,11 @@ biscuit:
   dependencies:
   - python>=3.13,<3.14
   - pyyaml>=6,<7
-  - biscuit>=1.10,<1.11
+  - biscuit>=1.11,<1.12
   - dupsifter>=1.4,<1.5
   - cutadapt>=5.2,<6
-  - samtools>=1.24,<1.25
-  - htslib>=1.24,<1.25
+  - samtools>=1.25,<1.26
+  - htslib>=1.25,<1.26
   - gawk>=5.4,<6
   - coreutils>=9.5,<10
   - multiqc>=1.35,<2
@@ -43,11 +43,11 @@ bismark:
   dependencies:
   - python>=3.13,<3.14
   - pyyaml>=6,<7
-  - pysam>=0.23,<0.24
-  - bismark>=3.1,<4
+  - pysam>=0.24.1,<0.25
+  - bismark==3.4.0
   - pip
   - pip:
-    - rapidgzip==0.16.0
+    - rapidgzip==0.16.2
   - bowtie2>=2.5,<3
   - cutadapt>=5.2,<6
   - samtools>=1.25,<1.26
@@ -66,7 +66,7 @@ rastair:
   dependencies:
   - python>=3.13,<3.14
   - pyyaml>=6,<7
-  - pysam>=0.23,<0.24
+  - pysam>=0.24.1,<0.25
   - bwa>=0.7.19,<0.8
   - rastair=2.2.0
   - cutadapt>=5.2,<6
@@ -86,6 +86,7 @@ notebook:
   - python=3.13
   - pip
   - anndata>=0.10,<0.11
+  - backports.zstd>=1.8,<2
   - ipykernel
   - jupyterlab
   - matplotlib-base>=3.9,<4
@@ -98,5 +99,4 @@ notebook:
   - pyyaml>=6,<7
   - scikit-learn>=1.5,<2
   - seaborn>=0.13,<0.14
-  - tqdm>=4.66,<5
   - zstd>=1.5,<2

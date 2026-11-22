@@ -5,15 +5,18 @@ import argparse
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
 from .config import (
+    DD_PROTOCOLS,
     BISCUIT_INDEX_SUFFIXES,
     BISCUIT_TRANSIENT_SUFFIXES,
     MANAGED_SPECIES,
     SPIKE_CONTIGS,
+    _reference_file_present,
     backend_active_index_paths,
     envs_section_sha256,
     envs_spec_logical_name,
@@ -62,6 +65,7 @@ from .maintenance import (
     import_reference_binding,
     mask_analysis_reference,
     publish_release,
+    rebuild_source_fai,
     record_environment_identity,
     relocate_downstream_bindings,
     seal_downstream_reference_bindings,
@@ -69,6 +73,7 @@ from .maintenance import (
     stage_route_config,
     synthesize_route_config,
     validate_benchmark,
+    validate_gencode_annotation,
     validate_release,
     verify_route_outputs,
     write_envs_section_spec,
@@ -81,8 +86,9 @@ from .science import (
     call_droplet_cpg,
     emit_biscuit_cpg,
     emit_rastair_cpg,
-    read_pileup_variant_count,
+    biscuit_pileup_lines,
     run_bismark_pair_split,
+    _read_biscuit_native_mapping,
     run_bsconv_extraction,
     taps_bwa_insert_model,
     write_dupsifter_mqc,
@@ -152,12 +158,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     atomic.add_argument("--samtools", default="samtools")
 
 
-    pileup_count = commands.add_parser("pileup-variant-count", help="校验当前细胞的 BISCUIT pileup 计数。")
-    pileup_count.add_argument("--stats", required=True)
-    pileup_count.add_argument("--sample", required=True)
-
+    pileup = commands.add_parser("biscuit-vcf", help="校验并输出当前细胞的完整 BISCUIT VCF。")
     biscuit_cpg = commands.add_parser("biscuit-cpg", help="从原生 SP/CV 输出 BISCUIT CpG 整数计数。")
-    biscuit_cpg.add_argument("--vcf", required=True)
+    mapq = commands.add_parser("check-biscuit-mapq", help="在提交 QC 前核验原生 MAPQ 表。")
+    mapq.add_argument("table", type=Path)
+    for command_parser in (pileup, biscuit_cpg):
+        command_parser.add_argument("--vcf", required=True)
+        command_parser.add_argument("--stats", required=True)
+        command_parser.add_argument("--sample", required=True)
 
     taps_insert = commands.add_parser("taps-bwa-insert-model", help="推断 TAPS BWA 插入分布并保留长片段。")
     for field in ("r1", "r2", "bwa", "prefix", "scratch"):
@@ -168,7 +176,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     for field in ("bam", "samtools", "scratch", "sample", "output"):
         taps_qc.add_argument("--" + field, required=True)
     taps_cpg = commands.add_parser("rastair-cpg", help="转换原生 Rastair 计数并记录对照 QC。")
-    for field in ("bed", "reference", "alignment-qc", "output-qc", "bam", "samtools", "scratch", "vcf", "output-snp", "sample"):
+    for field in ("bed", "reference", "alignment-qc", "output-qc", "bam", "samtools", "scratch", "vcf", "output-snp", "sample", "species"):
         taps_cpg.add_argument("--" + field, required=True)
 
     write_initial = commands.add_parser("write-cell-manifest", help="写出初始 cell manifest。")
@@ -181,11 +189,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     umi = commands.add_parser("call-droplet-cpg", help="按胞嘧啶位点与 UMI 调用分子共识。")
     for field in ("bam", "reference", "coverage", "qc", "mbias", "scratch", "samtools", "sample"):
         umi.add_argument("--" + field, required=True)
+    umi.add_argument("--protocol", choices=DD_PROTOCOLS, required=True)
     umi.add_argument("--threads", type=int, default=1)
     calling = commands.add_parser("call-droplet-cells", help="按双峰谷底调用 Droplet 细胞。")
     for field in ("counts", "output", "metrics"):
         calling.add_argument("--" + field, required=True)
     calling.add_argument("--demux-binary", required=True)
+    calling.add_argument("--protocol", choices=DD_PROTOCOLS, required=True)
     calling.add_argument("--threads", type=int, default=1)
     calling.add_argument("--spool", required=True)
     stage_droplet = commands.add_parser("stage-droplet-reads", help="配对解析并提交原始条码暂存与完整计数。")
@@ -193,6 +203,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         stage_droplet.add_argument("--" + mate, action="append", required=True)
     for field in ("spool", "counts", "structure", "binary", "decoder-python"):
         stage_droplet.add_argument("--" + field, required=True)
+    stage_droplet.add_argument("--protocol", choices=DD_PROTOCOLS, required=True)
     stage_droplet.add_argument("--threads", type=int, required=True)
     write_metadata = commands.add_parser("write-demux-metadata", help="demux 事务内写出 MQC 与 manifest。")
     for arg in ("report_path", "mqc_path", "manifest_path", "dna_dir",
@@ -217,6 +228,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     write_dupsifter.add_argument("out_json")
     write_dupsifter.add_argument("--sample", required=True)
     write_dupsifter.add_argument("--metadata", required=True, help="Dupsifter 作业 metadata JSON。")
+    write_dupsifter.add_argument("--cutadapt-report", required=True, type=Path)
     extract = commands.add_parser("extract-bsconv", help="bsconv TSV 高 CpH 分类提取。")
     extract.add_argument("--bsconv-tsv", required=True, type=Path)
     extract.add_argument("--threshold", required=True, type=float)
@@ -253,7 +265,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     summary.add_argument("--samtools", required=True)
     summary.add_argument("--percentage", type=float, required=True)
     summary.add_argument("--minimum-count", type=int, required=True)
-    summary.add_argument("--protocol", choices=("cabernet", "droplet"), required=True)
+    summary.add_argument("--protocol", choices=("cabernet", *DD_PROTOCOLS), required=True)
     summary.add_argument("--high-cph-role", choices=("cdna_contamination",), required=True)
     summary.add_argument("--summary-path", type=Path, required=True)
     summary.add_argument("--multiqc-path", type=Path, required=True)
@@ -297,6 +309,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     fai_check.add_argument("--label", required=True)
     fai_check.add_argument("--fai", type=Path, required=True)
     fai_check.add_argument("--fasta", type=Path, required=True)
+    rebuild_fai = commands.add_parser("rebuild-source-fai", help="在 Doctor 的私有暂存目录建立并校验 source FAI。")
+    rebuild_fai.add_argument("--label", required=True)
+    rebuild_fai.add_argument("--fasta", type=Path, required=True)
+    rebuild_fai.add_argument("--samtools", required=True)
     suffixes = commands.add_parser("index-suffixes", help="列出 BISCUIT index 后缀清单。")
     suffixes.add_argument("--transient", action="store_true")
     indexes = commands.add_parser("index-paths", help="列出选中 backend/模式的完整 index 文件家族。")
@@ -321,6 +337,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     binding.add_argument("--build-input", type=Path)
     binding.add_argument("--root", type=Path)
     binding.add_argument("--annotation-gtf", type=Path)
+    binding.add_argument("--species", choices=sorted(MANAGED_SPECIES))
     binding.add_argument("--tss-bed", type=Path)
     binding.add_argument("--single-cpg-bed", type=Path)
     contigs = commands.add_parser("reference-contigs", help="输出固定assembly的比对contig顺序。")
@@ -419,17 +436,19 @@ def main(argv: list[str] | None = None) -> int:
                 samtools=args.samtools,
             )
 
-        elif command == "pileup-variant-count":
-            print(read_pileup_variant_count(args.stats, args.sample))
+        elif command == "check-biscuit-mapq":
+            _read_biscuit_native_mapping(args.table)
+        elif command == "biscuit-vcf":
+            sys.stdout.buffer.writelines(biscuit_pileup_lines(args.vcf, args.stats, args.sample))
         elif command == "biscuit-cpg":
-            emit_biscuit_cpg(args.vcf, sys.stdout)
+            emit_biscuit_cpg(args.vcf, sys.stdout, stats=args.stats, sample=args.sample)
         elif command == "call-droplet-cpg":
-            call_droplet_cpg(args.bam, args.reference, args.coverage, args.qc, args.mbias, sample=args.sample, scratch=args.scratch, samtools=args.samtools, threads=args.threads)
+            call_droplet_cpg(args.bam, args.reference, args.coverage, args.qc, args.mbias, sample=args.sample, scratch=args.scratch, samtools=args.samtools, threads=args.threads, protocol=args.protocol)
         elif command == "call-droplet-cells":
-            call_droplet_cells(args.counts, args.output, args.metrics, demux_binary=args.demux_binary, threads=args.threads, spool=args.spool)
+            call_droplet_cells(args.counts, args.output, args.metrics, demux_binary=args.demux_binary, threads=args.threads, spool=args.spool, protocol=args.protocol)
         elif command == "stage-droplet-reads":
             stage_droplet_reads(args.r1, args.r2, args.spool, args.counts, args.structure,
-                                binary=args.binary, decoder_python=args.decoder_python, threads=args.threads)
+                                binary=args.binary, decoder_python=args.decoder_python, threads=args.threads, protocol=args.protocol)
         elif command == "write-cell-manifest":
             write_initial_cell_manifest(
                 args.project_manifest, args.barcode_map, args.out_tsv,
@@ -472,11 +491,11 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "rastair-cpg":
             emit_rastair_cpg(args.bed, args.reference, args.alignment_qc, args.output_qc, sys.stdout,
                              bam=args.bam, samtools=args.samtools, scratch=args.scratch,
-                             vcf=args.vcf, output_snp=args.output_snp, sample=args.sample)
+                             vcf=args.vcf, output_snp=args.output_snp, sample=args.sample, species=args.species)
         elif command == "write-dupsifter-qc":
             write_dupsifter_mqc(
                 args.stat_path, args.out_json, args.sample,
-                metadata=json.loads(args.metadata),
+                metadata=json.loads(args.metadata), cutadapt_report=args.cutadapt_report,
             )
         elif command == "extract-bsconv":
             run_bsconv_extraction(args)
@@ -535,6 +554,8 @@ def main(argv: list[str] | None = None) -> int:
             environment_is_reusable(args.prefix, args.role, args.envs)
 
         elif command == "reference-binding":
+            if args.action == "relocate" and args.kind != "downstream":
+                raise ValueError("relocate requires --kind downstream")
             if args.action == "begin":
                 if args.build_input is None:
                     raise ValueError("--build-input is required")
@@ -544,15 +565,24 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("downstream bindings require TSS and single-CpG paths")
                 if args.action == "relocate":
                     relocate_downstream_bindings(args.reference, args.tss_bed, args.single_cpg_bed)
-                elif args.action == "import":
-                    for path, kind in ((args.tss_bed, "tss"), (args.single_cpg_bed, "single-cpg")):
-                        import_reference_binding(args.reference, kind, artifact=path, annotation=args.annotation_gtf)
                 elif args.action == "seal":
+                    if args.annotation_gtf is None or args.build_input is None:
+                        raise ValueError("sealing downstream references requires --annotation-gtf and --build-input")
+                    validate_gencode_annotation(args.annotation_gtf, args.species, args.reference)
                     seal_downstream_reference_bindings(args.reference, args.annotation_gtf,
                         args.tss_bed, args.single_cpg_bed, args.build_input)
                 else:
-                    validate_tss_reference(args.reference, args.tss_bed, args.annotation_gtf)
-                    validate_downstream_reference(args.reference, args.single_cpg_bed, "single-cpg", args.annotation_gtf)
+                    tss = validate_tss_reference(args.reference, args.tss_bed, args.annotation_gtf)
+                    cpg = validate_downstream_reference(args.reference, args.single_cpg_bed, "single-cpg", args.annotation_gtf)
+                    if any(tss["annotation"][field] != cpg["annotation"][field] for field in ("sha256", "size_bytes")):
+                        raise ValueError("TSS and SingleCpG reference bindings identify different GTF annotations")
+                    annotation = args.annotation_gtf
+                    if annotation is not None and not _reference_file_present(annotation):
+                        annotation = None
+                    validate_gencode_annotation(annotation, args.species, args.reference, tss["annotation"]["sha256"])
+                    if args.action == "import":
+                        for path, kind in ((args.tss_bed, "tss"), (args.single_cpg_bed, "single-cpg")):
+                            import_reference_binding(args.reference, kind, artifact=path, annotation=args.annotation_gtf)
             elif args.action == "import":
                 import_reference_binding(args.reference, args.kind, root=args.root)
             elif args.action == "seal":
@@ -563,6 +593,18 @@ def main(argv: list[str] | None = None) -> int:
             print("\n".join(name for name, _length in managed_alignment_contigs(args.species) if name not in SPIKE_CONTIGS))
         elif command == "fai-check":
             return 0 if fai_contract_check(args.mode, args.label, args.fai, args.fasta) else 1
+        elif command == "rebuild-source-fai":
+            # subprocess.run 会回收原生命令，TemporaryDirectory 随信号退出清理当次候选。
+            def interrupted(signum, _frame):
+                raise SystemExit(128 + signum)
+
+            signals = (signal.SIGTERM, signal.SIGHUP)
+            original = {sig: signal.signal(sig, interrupted) for sig in signals}
+            try:
+                return rebuild_source_fai(args.label, args.fasta, args.samtools)
+            finally:
+                for sig, handler in original.items():
+                    signal.signal(sig, handler)
         elif command == "index-suffixes":
             suffixes_list = BISCUIT_TRANSIENT_SUFFIXES if args.transient else BISCUIT_INDEX_SUFFIXES
             print("\n".join(suffixes_list))

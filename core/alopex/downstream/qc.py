@@ -3,15 +3,12 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import gzip
 import hashlib
 import importlib.metadata
 import json
 import os
 import re
-import shutil
 import stat as _qc_lock_stat
-import subprocess
 import sys
 
 _LOADED_MODULE_CODE = sys._getframe().f_code
@@ -19,34 +16,39 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from functools import lru_cache
+from dataclasses import dataclass, field as dataclass_field
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
 from ..config import (
+    DD_CONSENSUS,
+    DD_PROTOCOLS,
+    DROPLET_DESIGN_SHA256,
     CPG_REPRESENTATIONS,
     get_backend,
     load_project_config,
+    primary_analysis_contigs,
+    read_fasta_index,
     reference_sequence_identity,
     validate_downstream_reference,
     validate_tss_reference,
 )
-from ..delivery import load_run_manifest, load_run_snapshot, read_sealed_final_manifest
+from ..delivery import (load_run_manifest, load_run_snapshot, output_file_state,
+                        read_sealed_final_manifest, run_manifest_state, verified_published_output_states)
 from ..identity import PythonSourceGraph, capture_loaded_source_codes, assert_loaded_sources_current
 from ..io import sha256_file, project_temporary_parent, stat_if_present
 from ..paths import CORE_ROOT as _CORE_ROOT, PIPELINE_ROOT as _PIPELINE_ROOT
 from ..runtime import effective_cpu_count
 
 
-_LOADED_SOURCE_CODES = capture_loaded_source_codes()
-
-
 FINAL_MANIFEST = Path("03_results/QC_Results/sample_manifest.tsv")
+MAX_CPG_WORKERS = 8
 
 QC_FILTER_DEFAULTS = {
     "mapping_threshold": None,
@@ -136,51 +138,30 @@ class SealedQCContext:
     methylation_backend: str
     output_inventory: Mapping[str, Mapping[str, object]]
     marker_state: tuple[int, ...]
-    final_manifest_state: tuple[int, ...]
+    output_states: Mapping[str, tuple[int, ...]]
 
     def assert_current(self) -> None:
         """确认公开完成凭证与最终样本清单仍属加载时的同一次交付。"""
-        for path, observed in ((self.run_manifest_path, self.marker_state),
-                               (self.project_dir / FINAL_MANIFEST, self.final_manifest_state)):
-            try:
-                current = _delivery_file_state(path)
-            except OSError as exc:
-                raise ValueError(f"Sealed delivery changed: {path}; rerun downstream from the current delivery") from exc
-            if current != observed:
-                raise ValueError(f"Sealed delivery changed: {path}; rerun downstream from the current delivery")
+        _check_delivery_file(self.run_manifest_path, self.marker_state, manifest=True)
+        self.assert_output_current("QC_Results/sample_manifest.tsv")
+
+    def assert_output_current(self, key: str) -> None:
+        _check_delivery_file(self.project_dir / "03_results" / key, self.output_states[key])
 
 
-def _delivery_file_state(path: Path) -> tuple[int, ...]:
-    stat = path.lstat()
-    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+def _check_delivery_file(path: Path, expected: tuple[int, ...], *, manifest: bool = False) -> None:
+    try:
+        current = run_manifest_state(path) if manifest else output_file_state(path.lstat())
+    except OSError as exc:
+        raise ValueError(f"Sealed delivery changed: {path}; rerun downstream from the current delivery") from exc
+    if current != expected:
+        raise ValueError(f"Sealed delivery changed: {path}; rerun downstream from the current delivery")
 
 
 def _mapping(value: object, label: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"Sealed delivery {label} must be a mapping")
     return value
-
-
-def _safe_inventory(records: object) -> dict[str, Mapping[str, object]]:
-    if not isinstance(records, list):
-        raise ValueError("Sealed delivery output inventory is malformed")
-    result: dict[str, Mapping[str, object]] = {}
-    for raw in records:
-        record = _mapping(raw, "output record")
-        text = str(record.get("path", ""))
-        relative = Path(text)
-        if (
-            not relative.parts
-            or relative.is_absolute()
-            or ".." in relative.parts
-            or relative == Path(".")
-        ):
-            raise ValueError(f"Sealed delivery contains an unsafe output path: {text!r}")
-        key = relative.as_posix()
-        if key in result:
-            raise ValueError(f"Sealed delivery repeats output path: {key}")
-        result[key] = record
-    return result
 
 
 def _snapshot_reference_fai(
@@ -219,11 +200,8 @@ def load_sealed_qc_context(
     """加载完整交付及其不可变的 config/reference 契约。"""
     project = Path(project_dir).expanduser().resolve()
     manifest_path = project / "03_results" / "run_manifest.json"
-    marker_state = _delivery_file_state(manifest_path)
-    manifest = load_run_manifest(
-        manifest_path,
-        validate_outputs=True,
-    )
+    marker_state = run_manifest_state(manifest_path)
+    manifest = load_run_manifest(manifest_path, validate_outputs=False)
     if manifest.get("status") != "complete":
         raise ValueError(f"Published Pipeline delivery is not complete: {manifest_path}")
     delivery_id = _manifest_delivery_id(manifest)
@@ -262,14 +240,18 @@ def load_sealed_qc_context(
 
     analysis = _mapping(config.get("analysis"), "snapshot config analysis")
     run_species = str(run.get("species", "")).strip()
-    run_protocol = str(run.get("protocol", "")).strip().lower()
+    run_protocol = str(run.get("protocol", "")).strip()
     config_species = str(config.get("species", "")).strip()
-    config_protocol = str(analysis.get("protocol", "")).strip().lower()
+    config_protocol = str(analysis.get("protocol", "")).strip()
     config_backend = get_backend(config)
     if not run_species or config_species != run_species:
         raise ValueError("Sealed config species disagrees with the run manifest")
-    if run_protocol not in {"cabernet", "taps", "droplet"} or config_protocol != run_protocol:
+    if run_protocol not in {"cabernet", "taps", *DD_PROTOCOLS} or config_protocol != run_protocol:
         raise ValueError("Sealed config protocol disagrees with the run manifest")
+
+    if run_protocol in DD_PROTOCOLS:
+        if run.get("tag_source") != DD_CONSENSUS[run_protocol].source or run.get("barcode_design_sha256") != DROPLET_DESIGN_SHA256:
+            raise ValueError("Sealed DNA tag source or barcode design disagrees with its protocol")
 
     reference_path = Path(str(run.get("reference_path", ""))).expanduser().resolve()
     if not reference_path.is_file():
@@ -292,7 +274,8 @@ def load_sealed_qc_context(
     if config_backend != methylation_backend:
         raise ValueError("Sealed config backend disagrees with the run manifest")
 
-    output_inventory = _safe_inventory(manifest.get("outputs"))
+    output_states = verified_published_output_states(project, manifest)
+    output_inventory = {Path(item["path"]).as_posix(): item for item in manifest["outputs"]}
     if "QC_Results/sample_manifest.tsv" not in output_inventory:
         raise ValueError("Sealed delivery inventory omits QC_Results/sample_manifest.tsv")
     context = SealedQCContext(
@@ -314,7 +297,7 @@ def load_sealed_qc_context(
         methylation_backend=methylation_backend,
         output_inventory=output_inventory,
         marker_state=marker_state,
-        final_manifest_state=_delivery_file_state(project / FINAL_MANIFEST),
+        output_states=output_states,
     )
     context.assert_current()
     return context
@@ -326,8 +309,8 @@ def _inventory_record_for_project_file(
     relative = Path(str(value))
     if relative.is_absolute() or ".." in relative.parts or relative == Path("."):
         raise ValueError(f"Current Pipeline {label} has an unsafe path: {value!r}")
-    path = (context.project_dir / relative).resolve()
-    public_root = (context.project_dir / "03_results").resolve()
+    path = context.project_dir / relative
+    public_root = context.project_dir / "03_results"
     try:
         inventory_key = path.relative_to(public_root).as_posix()
     except ValueError as exc:
@@ -339,7 +322,8 @@ def _inventory_record_for_project_file(
         raise ValueError(
             f"Current Pipeline {label} is not bound by the delivery inventory: {inventory_key}"
         )
-    if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
+    context.assert_output_current(inventory_key)
+    if record["size_bytes"] == 0:
         raise FileNotFoundError(f"Current Pipeline {label} is missing or empty: {path}")
     return path, record
 
@@ -455,12 +439,12 @@ def read_active_cells(
         if cell["mapping_policy"] != expected_policy:
             raise ValueError(f"Cell {sample_id!r} has an invalid mapping_policy")
         expected_native_policy = {
-            "biscuit": "biscuit_primary_mapq_ge_40",
+            "biscuit": "biscuit_nonsecondary_mapq_ge_40",
             "bismark": "bismark_unique_concordant_pairs",
             "rastair": "bwa_proper_primary_any_mate_mapq20",
         }[backend]
         expected_native_unit = {
-            "biscuit": "individual_primary_reads_postdedup",
+            "biscuit": "nonsecondary_alignment_records_postdedup",
             "bismark": "read_pairs",
             "rastair": "read_pairs",
         }[backend]
@@ -474,14 +458,14 @@ def read_active_cells(
         cell["native_mapping_pct"] = native_pct
         expected_dedup_policy = {
             "biscuit": "dupsifter_wgbs_signature_remove_dups",
-            "bismark": "per_cytosine_umi_consensus_hamming1" if row["protocol"] == "droplet" else "bismark_paired_endpoint_orientation",
+            "bismark": DD_CONSENSUS[row["protocol"]].dedup_policy if row["protocol"] in DD_PROTOCOLS else "bismark_paired_endpoint_orientation",
             "rastair": "samtools_markdup_flag_exclude_in_rastair",
         }[backend]
         if cell["dedup_policy"] != expected_dedup_policy:
             raise ValueError(f"Cell {sample_id!r} has an invalid dedup_policy")
         expected_non_cpg_source = {
             "biscuit": "biscuit_cph_retention_by_read_position",
-            "bismark": "droplet_umi_consensus_chg_chh" if row["protocol"] == "droplet" else "bismark_extraction_chg_chh",
+            "bismark": DD_CONSENSUS[row["protocol"]].cph_source if row["protocol"] in DD_PROTOCOLS else "bismark_extraction_chg_chh",
             "rastair": "taps_oriented_host_chg_chh_conversion",
         }[backend]
         if cell["non_cpg_metric_source"] != expected_non_cpg_source:
@@ -528,12 +512,14 @@ def read_active_cells(
             rejection_total = cell["unmapped_pairs"] + cell["no_primary_pairs"]
         if rejection_total != cell["backend_rejected_pairs"]:
             raise ValueError(f"Cell {sample_id!r} rejection categories do not close")
-        if row["protocol"] == "droplet":
-            if cell["duplicate_pairs"] != 0 or row.get("molecule_qc_metric_unit") != "cytosine_umi_consensus":
+        if row["protocol"] in DD_PROTOCOLS:
+            tag = DD_CONSENSUS[row["protocol"]]
+            if (cell["duplicate_pairs"] != 0 or row.get("molecule_qc_metric_unit") != tag.unit
+                    or row.get("tag_source") != tag.source):
                 raise ValueError(f"Cell {sample_id!r} mixes Droplet pair and molecule counts")
             read_count, umi_count, ambiguous_count = (
                 _required_nonnegative_int(row, key, sample_id) for key in
-                ("cpg_read_observations", "cpg_umi_observations", "cpg_ambiguous_umi_sites")
+                ("cpg_read_observations", tag.count_field, tag.ambiguous_field)
             )
             if umi_count + ambiguous_count > read_count:
                 raise ValueError(f"Cell {sample_id!r} has inconsistent Droplet molecule counts")
@@ -602,14 +588,14 @@ def build_qc_records(
 def _output_identity_for_path(
     context: SealedQCContext, path: Path
 ) -> Mapping[str, object]:
-    public = context.project_dir / "03_results"
     try:
-        key = path.resolve().relative_to(public.resolve()).as_posix()
+        key = path.relative_to(context.project_dir / "03_results").as_posix()
     except ValueError as exc:
         raise ValueError(f"Downstream input escapes sealed outputs: {path}") from exc
     record = context.output_inventory.get(key)
     if record is None:
         raise ValueError(f"Downstream input is absent from delivery inventory: {key}")
+    context.assert_output_current(key)
     return record
 
 
@@ -632,7 +618,7 @@ def source_identity(
         "QC_Results/sample_manifest.tsv": sealed.output_inventory["QC_Results/sample_manifest.tsv"]
     }
     for record in records:
-        path = Path(record["cpg_file"]).resolve()
+        path = Path(record["cpg_file"])
         identity = _output_identity_for_path(sealed, path)
         output_records[str(identity["path"])] = identity
 
@@ -681,7 +667,7 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=0,
-        help="Parallel workers; 0 chooses a conservative default.",
+        help=f"CPU budget for CpG processing. 0 uses the available CPUs, with at most {MAX_CPG_WORKERS} cell workers.",
     )
     parser.add_argument(
         "--recompute-cpg-stats",
@@ -744,13 +730,11 @@ import pandas as pd
 
 try:
     import anndata as ad
+    from backports import zstd
     from . import matrix as matrices, diagnostics
     from numba import njit
-    from tqdm import tqdm
-except ImportError as _qc_import_error:
+except ImportError:
     ad = matrices = diagnostics = None
-    tqdm = None
-    _HEAVY_IMPORT_ERROR = _qc_import_error
 
     def njit(*args, **kwargs):
         def _identity(fn):
@@ -786,21 +770,7 @@ class RunConfig:
     gini_bin_size: int = 500000
     tss_sample_fraction: float = 0.1
     tss_sample_seed: int = 0
-    qc_filter_parameters: Mapping[str, float | None] = field(default_factory=QC_FILTER_DEFAULTS.copy)
-
-
-class Timer:
-    def __init__(self) -> None:
-        self._start: dict[str, float] = {}
-
-    def start(self, name: str) -> None:
-        self._start[name] = time.perf_counter()
-
-    def stop(self, name: str) -> float | None:
-        t0 = self._start.pop(name, None)
-        if t0 is None:
-            return None
-        return time.perf_counter() - t0
+    qc_filter_parameters: Mapping[str, float | None] = dataclass_field(default_factory=QC_FILTER_DEFAULTS.copy)
 
 
 def _log(message: str, level: str = "INFO") -> None:
@@ -830,12 +800,18 @@ def _project_directory(
     current = project_dir
     for part in relative.parts:
         current = current / part
-        if current.is_symlink():
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            if create:
+                current.mkdir(exist_ok=True)
+                mode = current.lstat().st_mode
+            else:
+                continue
+        if _qc_lock_stat.S_ISLNK(mode):
             raise ValueError(f"Project directory path must not contain symlinks: {current}")
-        if current.exists() and not current.is_dir():
+        if not _qc_lock_stat.S_ISDIR(mode):
             raise ValueError(f"Project directory path is not a directory: {current}")
-        if create and not current.exists():
-            current.mkdir()
     return current
 
 
@@ -957,30 +933,6 @@ def build_paths(
     )
 
 
-def _select_cpg_cache_state(
-    cached_mapping: pd.DataFrame | None,
-    cached_composition: pd.DataFrame | None,
-) -> pd.DataFrame | None:
-
-    if cached_mapping is None or cached_composition is None:
-        return None
-    merged = cached_mapping.merge(
-        cached_composition,
-        on="Sample_ID",
-        how="left",
-        validate="one_to_one",
-    )
-    for prefix, rate in (("Sample", "Host"), ("Lambda", "Lambda"), ("pUC19", "pUC19")):
-        sites = merged[f"{prefix}_Unique_CpG_Sites"]
-        if ((sites == 0) != (merged[f"Signal_{rate}_Rate%"] == 0)).any():
-            return None
-    sites = merged["Sample_Unique_CpG_Sites"]
-    signals = merged["Sample_CpG_Signals"]
-    if ((signals < sites) | (signals > 65535 * sites)).any():
-        return None
-    return merged.drop(columns=["Signal_Composition_Rule", "Sample_CpG_Signals"])
-
-
 def build_config(
     sealed: SealedQCContext,
     *,
@@ -1045,11 +997,11 @@ COMPOSITION_COV_COLS = (
 )
 
 
-COMPOSITION_FRACTION_COLS = {
-    "lambda_cov": "_f_lambda",
-    "puc19_cov": "_f_puc",
-    "mt_cov": "_f_mt",
-    "host_cov": "_f_host",
+COMPOSITION_RATES = {
+    "host_cov": "Signal_Host_Rate%",
+    "lambda_cov": "Signal_Lambda_Rate%",
+    "puc19_cov": "Signal_pUC19_Rate%",
+    "mt_cov": "Signal_mtDNA_Rate%",
 }
 
 
@@ -1084,9 +1036,6 @@ TSS_REQUIRED_COLUMNS = (
 )
 
 
-GINI_CACHE_COLUMNS = ("Sample_ID", "Gini_Index")
-
-
 QC_INFO_COLUMNS = (
     "Sample_ID",
     "CloneID",
@@ -1110,8 +1059,29 @@ QC_INFO_COLUMNS = (
     "Final_Pair_Yield%",
 )
 
+_QC_SITE_COUNTS = (
+    "Sample_Unique_CpG_Sites",
+    "Lambda_Unique_CpG_Sites",
+    "pUC19_Unique_CpG_Sites",
+)
 
-MAX_CPG_WORKERS = 32
+
+def _read_qc_table(path: Path) -> pd.DataFrame:
+    """按 CSV 原文读取位点计数与身份，比例保留既有的缺失值和精度。"""
+    frame = pd.read_csv(
+        path, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
+        dtype=dict.fromkeys(_QC_SITE_COUNTS, str), float_precision="round_trip",
+    )
+    for column in _QC_SITE_COUNTS:
+        frame[column] = _nonnegative_counts(frame[column])
+    return frame
+
+
+def _nonnegative_counts(values: pd.Series) -> pd.Series:
+    counts = matrices.exact_integers(values, np.int64)
+    if (counts < 0).any():
+        raise ValueError(f"Negative counts in {values.name}")
+    return counts
 
 
 _THREAD_LIMIT_ENV_VARS = (
@@ -1119,24 +1089,17 @@ _THREAD_LIMIT_ENV_VARS = (
     "OPENBLAS_NUM_THREADS",
     "MKL_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
-    "RAYON_NUM_THREADS",
-    "POLARS_MAX_THREADS",
 )
 
 
-def _is_primary_chromosome(seq: str) -> bool:
-    """固定hg38/mm10主核染色体名称；辅助/decoy不因chr前缀进入分析分母。"""
-    return re.fullmatch(r"chr(?:[1-9]|1[0-9]|2[0-2]|X|Y)", str(seq)) is not None
-
-
-@lru_cache(maxsize=4096)
-def _classify_seq_name(seq: str) -> tuple[bool, bool, bool, bool]:
-    seq = str(seq)
-    is_lambda = seq == "lambda"
-    is_puc = seq == "pUC19"
-    is_mt = bool(re.fullmatch(r"(?i)(chrM|MT|chrMT)", seq))
-    is_host = _is_primary_chromosome(seq)
-    return is_lambda, is_puc, is_mt, is_host
+def _chromosome_class(name: str, host_contigs: set[str]) -> str:
+    if name in host_contigs:
+        return "host"
+    if name in {"lambda", "pUC19"}:
+        return name
+    if name.casefold() in {"chrm", "mt", "chrmt"}:
+        return "mtDNA"
+    return "auxiliary"
 
 
 def _bounded_cpg_workers(requested: int, task_count: int) -> int:
@@ -1144,60 +1107,6 @@ def _bounded_cpg_workers(requested: int, task_count: int) -> int:
     if task_count <= 0:
         return 0
     return min(effective_cpu_count(requested), MAX_CPG_WORKERS, task_count)
-
-
-def _thread_map_ordered(function, tasks: list[tuple], worker_count: int) -> list:
-    """编译循环释放 GIL 后共享线程；解码器单线程，完成或失败后恢复父环境。"""
-
-    if not tasks:
-        return []
-    if worker_count <= 0:
-        raise ValueError("worker_count must be positive when tasks are present")
-
-    previous_worker_env = {
-        variable: os.environ.get(variable)
-        for variable in _THREAD_LIMIT_ENV_VARS
-    }
-
-
-    for variable in _THREAD_LIMIT_ENV_VARS:
-        os.environ[variable] = "1"
-
-    executor = None
-    futures = {}
-    try:
-        executor = ThreadPoolExecutor(
-            max_workers=worker_count,
-        )
-        futures = {
-            executor.submit(function, *arguments): index
-            for index, arguments in enumerate(tasks)
-        }
-        rows = [None] * len(tasks)
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                rows[index] = future.result()
-            except BaseException:
-                for pending in futures:
-                    if pending is not future:
-                        pending.cancel()
-                raise
-        return rows
-    except BaseException:
-        for pending in futures:
-            pending.cancel()
-        raise
-    finally:
-
-
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
-        for variable, value in previous_worker_env.items():
-            if value is None:
-                os.environ.pop(variable, None)
-            else:
-                os.environ[variable] = value
 
 
 def _atomic_write_csv(df: pd.DataFrame, path: Path, *, before_commit=None) -> None:
@@ -1262,7 +1171,12 @@ def _atomic_write_json(payload: dict, path: Path, *, before_commit=None) -> None
             before_commit()
         os.replace(temporary, path)
         temporary = None
-        _fsync_directory(path.parent)
+        try:
+            _fsync_directory(path.parent)
+        except OSError:
+            # 完成凭证的目录提交失败，不能由下一次读取批准本次结果。
+            path.unlink(missing_ok=True)
+            raise
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -1335,9 +1249,14 @@ def _invalidate_completion(path: Path) -> None:
     _fsync_directory(path.parent)
 
 
+def _remove_tss_plot(paths: RunPaths) -> None:
+    plots = _project_directory(paths.project_dir, Path("06_downstream/plots"), create=False)
+    (plots / "TSS_Profile.pdf").unlink(missing_ok=True)
+
+
 def _remove_skipped_tss(paths: RunPaths) -> None:
+    _remove_tss_plot(paths)
     paths.tss_info.unlink(missing_ok=True)
-    (paths.qc_results_dir / "plots/TSS_Profile.pdf").unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -1360,16 +1279,21 @@ def _require_completed_qc(
     assert_loaded_sources_current(_LOADED_SOURCE_CODES)
     try:
         qc_guard = _reference_guard(paths.input_identity, paths.qc_info)
+        identity = json.loads(paths.input_identity.read_text())
+        cells = read_active_cells(paths.project_dir, sealed_context=sealed)
+        sample_ids = tuple(cell["sample_id"] for cell in cells)
+        cpg_paths = tuple(cell["cpg_output_identity"]["path"] for cell in cells)
+
         def assert_current():
             assert_loaded_sources_current(_LOADED_SOURCE_CODES)
             sealed.assert_current()
+            for key in cpg_paths:
+                sealed.assert_output_current(key)
             try:
                 qc_guard()
             except ValueError as exc:
                 raise ValueError("QC completion changed; rerun the QC Processor") from exc
 
-        identity = json.loads(paths.input_identity.read_text())
-        sample_ids = tuple(cell["sample_id"] for cell in read_active_cells(paths.project_dir, sealed_context=sealed))
         algorithms = _algorithm_fingerprints() if algorithms is None else algorithms
         generation = identity["cpg_generation"]
         expected_artifacts = {paths.composition_cache.name, diagnostics.CHROMOSOME_INFO, diagnostics.FILTER_INFO}
@@ -1392,9 +1316,10 @@ def _require_completed_qc(
             if verify_diagnostics is None or artifact.name in verify_diagnostics:
                 if _content_binding(artifact) != identity["diagnostic_artifacts"][artifact.name]:
                     raise ValueError(f"stale QC artifact: {artifact.name}")
-        if sealed.config["analysis"]["protocol"] == "droplet":
+        if sealed.config["analysis"]["protocol"] in DD_PROTOCOLS:
             assert_current = _reference_guard(paths.doublet_counts, before_commit=assert_current)
-            if identity["doublet_counts"] != _published_file_binding(paths.doublet_counts):
+            if (identity["doublet_counts"] != _published_file_binding(paths.doublet_counts)
+                    or identity["doublet_counts_ctime_ns"] != paths.doublet_counts.lstat().st_ctime_ns):
                 raise ValueError("stale 1 Mb integer counts")
         assert_current()
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
@@ -1411,36 +1336,14 @@ def _require_current_single(paths, identity):
             or source["cpg_coordinate_base"] != _source_cpg_coordinate_base(identity["cpg_representation"])
             or source["bed_sha256"] != identity["context"]["bed"]
             or source["qc_filter_parameters"] != identity["qc_filter_parameters"]
-            or schema["h5ad"] != _published_file_binding(paths.single_cpg)):
+            or schema["h5ad"] != _published_file_binding(paths.single_cpg)
+            or identity["single_cpg_ctime_ns"] != paths.single_cpg.lstat().st_ctime_ns):
         raise ValueError("SingleCpG is stale; rerun the QC Processor")
     return schema
 
 
 def _read_chrom_sizes(fai_path: Path) -> dict[str, int]:
-
-    chrom_sizes: dict[str, int] = {}
-    with Path(fai_path).open(encoding="utf-8") as handle:
-        for line_no, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) < 2:
-                raise ValueError(f"{fai_path}:{line_no}: malformed FAI row")
-            chrom = fields[0].strip()
-            try:
-                length = int(fields[1])
-            except ValueError as exc:
-                raise ValueError(
-                    f"{fai_path}:{line_no}: non-integer chromosome length"
-                ) from exc
-            if not chrom or length <= 0:
-                raise ValueError(f"{fai_path}:{line_no}: invalid chromosome entry")
-            if chrom in chrom_sizes:
-                raise ValueError(f"{fai_path}:{line_no}: duplicate chromosome {chrom}")
-            chrom_sizes[chrom] = length
-    if not chrom_sizes:
-        raise ValueError(f"Reference FAI contains no usable chromosomes: {fai_path}")
-    return chrom_sizes
+    return {name: length for name, length, *_ in read_fasta_index(fai_path)}
 
 
 def _require_exact_sample_ids(
@@ -1461,21 +1364,6 @@ def _require_exact_sample_ids(
     return out.set_index("Sample_ID").loc[wanted].reset_index()
 
 
-def _mapped_numeric(sid: pd.Series, values: pd.Series) -> np.ndarray:
-    return (
-        pd.to_numeric(sid.map(values), errors="coerce")
-        .fillna(0.0)
-        .to_numpy(dtype=float)
-    )
-
-
-def _clean_cpg_table_name(filename: str) -> str:
-    for suffix in (".tsv.zst", ".tsv"):
-        if filename.endswith(suffix):
-            return filename[: -len(suffix)]
-    return filename
-
-
 def _source_cpg_coordinate_base(representation: str) -> int:
     for base, name in CPG_REPRESENTATIONS.items():
         if representation == name:
@@ -1484,18 +1372,15 @@ def _source_cpg_coordinate_base(representation: str) -> int:
 
 
 @contextmanager
-def _managed_cpg_text(path):
-    """统一 CpG 解码器的退出、诊断和句柄关闭边界。"""
-    process, handle, diagnostics = _open_cpg_text(path)
-    error = None
+def _managed_cpg_text(path: Path):
+    """每个细胞独占一个流式解码器，完整读取所有帧及校验和。"""
+    if path.suffix != ".zst":
+        raise ValueError(f"CpG input must use the current .cpg.tsv.zst contract: {path}")
     try:
-        yield handle
-    except BaseException as exc:
-        error = exc
-        raise
-    finally:
-        handle.close()
-        _finish_cpg_process(process, path, error, diagnostics)
+        with zstd.open(path, "rt", encoding="utf-8") as handle:
+            yield handle
+    except (zstd.ZstdError, EOFError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Cannot decode CpG input {path}: {exc}") from exc
 
 
 def _algorithm_fingerprints() -> dict[str, str]:
@@ -1511,455 +1396,18 @@ def _algorithm_fingerprints() -> dict[str, str]:
     fingerprints = {}
     for stage, names in roots.items():
         selected_roots = tuple("alopex.downstream.qc." + name for name in names)
+        libraries = versions
         if stage == "products":
             selected_roots += ("alopex.downstream.diagnostics.filter_reasons",)
+            libraries = {**versions, "backports.zstd": importlib.metadata.version("backports.zstd"),
+                         "libzstd": zstd.zstd_version}
         selected = sources.dependencies(
             selected_roots,
             exclude=("alopex.downstream.qc._algorithm_fingerprints",),
         )
-        payload = json.dumps({"code": selected, "libraries": versions}, sort_keys=True)
+        payload = json.dumps({"code": selected, "libraries": libraries}, sort_keys=True)
         fingerprints[stage] = hashlib.sha256(payload.encode()).hexdigest()
     return fingerprints
-
-
-def _open_cpg_text(path: Path):
-    """打开流式 CpG 解码器；调用方负责关闭文本流并完成子进程回收。"""
-    if path.name.endswith(".zst"):
-        executable = shutil.which("zstdcat")
-        if executable is None:
-            raise FileNotFoundError("zstdcat is required to read CpG .zst files")
-        # 科学文本保持流式读取；诊断不能占满无人读取的第二条管道。
-        diagnostics = tempfile.TemporaryFile(mode="w+t", errors="replace", dir=project_temporary_parent(path))
-        try:
-            process = subprocess.Popen(
-                [executable, str(path)],
-                stdout=subprocess.PIPE,
-                stderr=diagnostics,
-                text=True,
-            )
-        except BaseException:
-            diagnostics.close()
-            raise
-        assert process.stdout is not None
-        return process, process.stdout, diagnostics
-    raise ValueError(
-        f"CpG input must use the current .cpg.tsv.zst contract: {path}"
-    )
-
-
-def _finish_cpg_process(
-    process: subprocess.Popen | None, path: Path, stream_error: BaseException | None,
-    diagnostics, *, early_stop: bool = False,
-) -> None:
-    try:
-        if process is None or early_stop or stream_error is not None:
-            return
-        return_code = process.wait()
-        if return_code:
-            diagnostics.seek(0)
-            raise RuntimeError(
-                f"zstdcat failed for {path} (exit {return_code}): {diagnostics.read().strip()}"
-            )
-    finally:
-        try:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-        finally:
-            if diagnostics is not None:
-                diagnostics.close()
-
-
-def _iter_cpg_rows(handle, path: Path, chrom_sizes: Mapping[str, int] | None, coordinate_base: int):
-    if handle.readline().rstrip("\n") != "chrom\tpos\tmethyl\tunmethyl":
-        raise ValueError(f"CpG input has an invalid header: {path}")
-    last_positions: dict[str, int] = {}
-    for line_no, line in enumerate(handle, 2):
-        fields = line.rstrip("\n").split("\t")
-        if len(fields) != 4:
-            raise ValueError(f"{path}:{line_no}: invalid CpG fields")
-        chrom, *numbers = fields
-        if not chrom or any(not (value.isascii() and value.isdecimal()) for value in numbers):
-            raise ValueError(f"{path}:{line_no}: invalid CpG fields")
-        pos, methyl, unmethyl = map(int, numbers)
-        length = chrom_sizes.get(chrom) if chrom_sizes is not None else None
-        if (pos < coordinate_base or not 0 < methyl + unmethyl <= 65535
-                or (chrom_sizes is not None and (length is None or pos >= length + coordinate_base))):
-            raise ValueError(f"{path}:{line_no}: invalid CpG coordinate/counts")
-        if chrom in last_positions and pos <= last_positions[chrom]:
-            raise ValueError(f"{path}:{line_no}: duplicate or out-of-order CpG position: {chrom}:{pos}")
-        last_positions[chrom] = pos
-        yield chrom, pos, methyl, unmethyl
-
-
-def _kahan_add(total: float, correction: float, value: float) -> tuple[float, float]:
-    adjusted = value - correction
-    updated = total + adjusted
-    return updated, (updated - total) - adjusted
-
-
-@njit(cache=True, nogil=True)
-def _scan_cpg_summary_block(data, names, offsets, lengths, categories, positions,
-                            coordinate_base, sums, corrections, previous_chrom):
-    # 每块计数在 Python 中累加，避免完整文库的整数累计受 int64 限制。
-    counts = np.zeros(3, dtype=np.int64)
-    coverage = np.zeros(5, dtype=np.int64)
-    cursor = 0
-    line_index = 0
-    while cursor < len(data):
-        start = cursor
-        while cursor < len(data) and data[cursor] != 9 and data[cursor] != 10:
-            cursor += 1
-        if cursor == start or cursor == len(data) or data[cursor] != 9:
-            return counts, coverage, previous_chrom, line_index, 1
-        chrom_end = cursor
-        chrom = previous_chrom
-        if chrom >= 0:
-            if offsets[chrom + 1] - offsets[chrom] != chrom_end - start:
-                chrom = -1
-            else:
-                for j in range(chrom_end - start):
-                    if data[start + j] != names[offsets[chrom] + j]:
-                        chrom = -1
-                        break
-        if chrom < 0:
-            for ref in range(len(lengths)):
-                if offsets[ref + 1] - offsets[ref] != chrom_end - start:
-                    continue
-                same = True
-                for j in range(chrom_end - start):
-                    if data[start + j] != names[offsets[ref] + j]:
-                        same = False
-                        break
-                if same:
-                    chrom = ref
-                    break
-        if chrom < 0:
-            return counts, coverage, previous_chrom, line_index, 2
-        numbers = np.zeros(3, dtype=np.int64)
-        for column in range(3):
-            cursor += 1
-            digit_start = cursor
-            limit = lengths[chrom] - 1 + coordinate_base if column == 0 else 65535
-            value = 0
-            while cursor < len(data) and data[cursor] != 9 and data[cursor] != 10:
-                digit = int(data[cursor]) - 48
-                if digit < 0 or digit > 9:
-                    return counts, coverage, previous_chrom, line_index, 1
-                # 先检查再乘加，长整数/前导零不能绕过范围检查或溢出。
-                if value > (limit - digit) // 10:
-                    return counts, coverage, previous_chrom, line_index, 2
-                value = value * 10 + digit
-                cursor += 1
-            if cursor == digit_start:
-                return counts, coverage, previous_chrom, line_index, 1
-            expected = 9 if column < 2 else 10
-            if cursor >= len(data) or data[cursor] != expected:
-                return counts, coverage, previous_chrom, line_index, 1
-            numbers[column] = value
-        position, methylated, unmethylated = numbers
-        total = methylated + unmethylated
-        if position < coordinate_base or total <= 0 or total > 65535:
-            return counts, coverage, previous_chrom, line_index, 2
-        if position <= positions[chrom]:
-            return counts, coverage, previous_chrom, line_index, 3
-        positions[chrom] = position
-        previous_chrom = chrom
-        category = categories[chrom]
-        coverage[4] += total
-        if category >= 0:
-            coverage[category] += total
-        if category == 0 or category == 1 or category == 3:
-            index = 0 if category == 3 else category + 1
-            counts[index] += 1
-            fraction = 0.0 if methylated == 0 else float(methylated) / float(total)
-            # 不启用 fastmath，不做分块重排/归约；与原逐行 Kahan 运算顺序一致。
-            adjusted = fraction - corrections[index]
-            updated = sums[index] + adjusted
-            corrections[index] = (updated - sums[index]) - adjusted
-            sums[index] = updated
-        cursor += 1
-        line_index += 1
-    return counts, coverage, previous_chrom, line_index, 0
-
-
-def _compiled_cpg_summary(handle, path, chrom_sizes, coordinate_base):
-    """有界文本块中校验并汇总原始 CpG；跨块保持逐染色体顺序及补偿求和状态。"""
-    if handle.readline().rstrip("\n") != "chrom\tpos\tmethyl\tunmethyl":
-        raise ValueError(f"CpG input has an invalid header: {path}")
-    encoded = [chrom.encode("utf-8") for chrom in chrom_sizes]
-    names = np.frombuffer(b"".join(encoded), dtype=np.uint8)
-    offsets = np.array([0, *np.cumsum([len(value) for value in encoded])], dtype=np.int64)
-    lengths = np.array(list(chrom_sizes.values()), dtype=np.int64)
-    categories = []
-    for chrom in chrom_sizes:
-        is_lambda, is_puc, is_mt, is_host = _classify_seq_name(chrom)
-        categories.append(0 if is_lambda else 1 if is_puc else 2 if is_mt else 3 if is_host else -1)
-    categories = np.array(categories, dtype=np.int64)
-    positions = np.full(len(lengths), -1, dtype=np.int64)
-    sums = np.zeros(3, dtype=np.float64)
-    corrections = np.zeros(3, dtype=np.float64)
-    counts = [0, 0, 0]
-    coverage = [0, 0, 0, 0, 0]
-    pending = ""
-    previous_chrom = -1
-    line_no = 2
-    while True:
-        text = handle.read(4 * 1024 * 1024)
-        if text:
-            pending += text
-            end = pending.rfind("\n")
-            if end < 0:
-                continue
-            block, pending = pending[:end + 1], pending[end + 1:]
-        elif pending:
-            block, pending = pending + "\n", ""
-        else:
-            break
-        data = np.frombuffer(block.encode("utf-8"), dtype=np.uint8)
-        batch_counts, batch_coverage, previous_chrom, lines, error = _scan_cpg_summary_block(
-            data, names, offsets, lengths, categories, positions, coordinate_base,
-            sums, corrections, previous_chrom,
-        )
-        if error:
-            detail = "duplicate or out-of-order CpG position" if error == 3 else "invalid CpG fields or coordinate/counts"
-            raise ValueError(f"{path}:{line_no + lines}: {detail}")
-        counts = [a + int(b) for a, b in zip(counts, batch_counts)]
-        coverage = [a + int(b) for a, b in zip(coverage, batch_coverage)]
-        line_no += lines
-    return dict(zip(("host", "lambda", "pUC19"), counts)), dict(zip(("host", "lambda", "pUC19"), sums)), dict(zip(
-        ("lambda_cov", "puc19_cov", "mt_cov", "host_cov", "total_cov"), coverage,
-    ))
-
-
-def _stream_one_cpg_summary(
-    path: Path,
-    sample_id: str,
-    chrom_sizes: Mapping[str, int],
-    coordinate_base: int,
-    allow_empty: bool = False,
-) -> dict:
-
-    if not path.is_file():
-        raise FileNotFoundError(f"CpG input does not exist: {path}")
-    counts = {"host": 0, "lambda": 0, "pUC19": 0}
-    fraction_sums = {"host": 0.0, "lambda": 0.0, "pUC19": 0.0}
-    fraction_corrections = {"host": 0.0, "lambda": 0.0, "pUC19": 0.0}
-    coverage = {
-        "lambda_cov": 0,
-        "puc19_cov": 0,
-        "mt_cov": 0,
-        "host_cov": 0,
-        "total_cov": 0,
-    }
-    process, handle, diagnostics = _open_cpg_text(path)
-    stream_error: BaseException | None = None
-    try:
-        if chrom_sizes is not None:
-            counts, fraction_sums, coverage = _compiled_cpg_summary(handle, path, chrom_sizes, coordinate_base)
-        else:
-            for chrom, position, methylated, unmethylated in _iter_cpg_rows(
-                handle, path, chrom_sizes, coordinate_base
-            ):
-                total = methylated + unmethylated
-                is_lambda_comp, is_puc_comp, is_mt_comp, is_host_comp = (
-                    _classify_seq_name(chrom)
-                )
-                coverage["total_cov"] += total
-                if is_lambda_comp:
-                    coverage["lambda_cov"] += total
-                elif is_puc_comp:
-                    coverage["puc19_cov"] += total
-                elif is_mt_comp:
-                    coverage["mt_cov"] += total
-                elif is_host_comp:
-                    coverage["host_cov"] += total
-
-                category = (
-                    "lambda" if is_lambda_comp else "pUC19" if is_puc_comp else "host" if is_host_comp else None
-                )
-                if category is None:
-                    continue
-                counts[category] += 1
-                fraction = (
-                    0.0 if methylated == 0 else float(methylated) / float(total)
-                )
-                fraction_sums[category], fraction_corrections[category] = _kahan_add(
-                    fraction_sums[category],
-                    fraction_corrections[category],
-                    fraction,
-                )
-    except BaseException as exc:
-        stream_error = exc
-        raise
-    finally:
-        handle.close()
-        _finish_cpg_process(process, path, stream_error, diagnostics)
-
-    def mean_percent(category: str) -> float:
-        count = counts[category]
-        return fraction_sums[category] / count * 100.0 if count else float("nan")
-
-    if coverage["total_cov"] <= 0 and not allow_empty:
-        raise ValueError(f"CpG input contains no data rows: {path}")
-
-    return {
-        "Sample_ID": str(sample_id),
-        "Sample_Unique_CpG_Sites": counts["host"],
-        "Sample_Meth_CpG_Rate%": mean_percent("host"),
-        "Lambda_Unique_CpG_Sites": counts["lambda"],
-        "Lambda_Meth_CpG_Rate%": mean_percent("lambda"),
-        "pUC19_Unique_CpG_Sites": counts["pUC19"],
-        "pUC19_Meth_CpG_Rate%": mean_percent("pUC19"),
-        **coverage,
-        "Sample_CpG_Signals": coverage["host_cov"],
-    }
-
-
-def compute_methylation_statistics(
-    cpg_files: list[Path],
-    sample_ids: list[str],
-    *,
-    chrom_sizes: Mapping[str, int],
-    coordinate_base: int,
-    workers: int,
-    empty_cpg_sample_ids: set[str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if len(cpg_files) != len(sample_ids):
-        raise ValueError("CpG file count and Sample_ID count differ")
-    if not cpg_files:
-        raise ValueError("No CpG files were supplied")
-    empty_cpg = {str(value) for value in (empty_cpg_sample_ids or set())}
-    if empty_cpg - set(map(str, sample_ids)):
-        raise ValueError("Empty-CpG Sample_ID set differs from CpG inputs")
-    worker_count = _bounded_cpg_workers(workers, len(cpg_files))
-    _log(
-        f"正在从 CpG 表流式提取统计信息 (workers: {worker_count})...",
-        level="DEBUG",
-    )
-    rows = _thread_map_ordered(
-        _stream_one_cpg_summary,
-        [
-            (path, sample_id, chrom_sizes, coordinate_base, str(sample_id) in empty_cpg)
-            for path, sample_id in zip(cpg_files, sample_ids, strict=True)
-        ],
-        worker_count,
-    )
-    combined = pd.DataFrame.from_records(rows)
-    mapping = combined[list(MAPPING_STAT_COLUMNS)].copy()
-    composition = combined[["Sample_ID", *COMPOSITION_COV_COLS]].copy()
-    return mapping, composition
-
-
-def _load_methyl_stats_cache(
-    cache_path: Path,
-    sample_ids: list[str],
-    empty_cpg_sample_ids: set[str],
-) -> pd.DataFrame | None:
-    if not cache_path.exists():
-        return None
-    try:
-        df = pd.read_csv(cache_path, converters={"Sample_ID": str}, float_precision="round_trip")
-    except Exception:
-        return None
-    if df.empty or tuple(df.columns) != MAPPING_STAT_COLUMNS:
-        return None
-    wanted = [str(x) for x in sample_ids]
-    try:
-        df = _require_exact_sample_ids(df, wanted, "Mapping_Stats cache")
-        count_cols = [
-            "Sample_Unique_CpG_Sites",
-            "Lambda_Unique_CpG_Sites",
-            "pUC19_Unique_CpG_Sites",
-        ]
-        for column in count_cols:
-            values = pd.to_numeric(df[column], errors="raise").to_numpy(dtype=float)
-            if (
-                not np.isfinite(values).all()
-                or (values < 0).any()
-                or not np.equal(values, np.floor(values)).all()
-            ):
-                return None
-        for prefix in ("Sample", "Lambda", "pUC19"):
-            counts = pd.to_numeric(
-                df[f"{prefix}_Unique_CpG_Sites"], errors="raise"
-            ).to_numpy(dtype=float)
-            rates = pd.to_numeric(
-                df[f"{prefix}_Meth_CpG_Rate%"], errors="raise"
-            ).to_numpy(dtype=float)
-            if np.any((counts > 0) & (~np.isfinite(rates))):
-                return None
-            if np.any((counts == 0) & (~np.isnan(rates))):
-                return None
-            finite = rates[np.isfinite(rates)]
-            if (finite < 0).any() or (finite > 100).any():
-                return None
-        empty_mask = df["Sample_ID"].astype(str).isin(empty_cpg_sample_ids)
-        if not (df.loc[empty_mask, count_cols] == 0).all(axis=None):
-            return None
-    except Exception:
-        return None
-    return df
-
-
-def _validated_composition_cache(
-    cache_path: Path,
-    sample_ids: list[str],
-    empty_cpg_sample_ids: set[str],
-) -> pd.DataFrame | None:
-    if not cache_path.is_file():
-        return None
-    try:
-        cached = pd.read_csv(cache_path, converters={"Sample_ID": str}, float_precision="round_trip")
-        if tuple(cached.columns) != COMPOSITION_CACHE_COLUMNS:
-            return None
-        cached = _require_exact_sample_ids(
-            cached, sample_ids, "CpG_Signal_Composition cache"
-        )
-        if not cached["Signal_Composition_Rule"].astype(str).eq(
-            "primary_nuclear_chromosomes"
-        ).all():
-            return None
-        required_finite = [
-            "Signal_Host_Rate%",
-            "Signal_Lambda_Rate%",
-            "Signal_pUC19_Rate%",
-            "Signal_mtDNA_Rate%",
-            "Sample_CpG_Signals",
-        ]
-        for column in required_finite:
-            values = pd.to_numeric(cached[column], errors="raise").to_numpy(dtype=float)
-            if not np.isfinite(values).all() or (values < 0).any():
-                return None
-            if column.endswith("Rate%") and (values > 100).any():
-                return None
-            if column == "Sample_CpG_Signals" and not np.equal(
-                values, np.floor(values)
-            ).all():
-                return None
-            cached[column] = values
-        rate_sum = cached[
-            [
-                "Signal_Host_Rate%",
-                "Signal_Lambda_Rate%",
-                "Signal_pUC19_Rate%",
-                "Signal_mtDNA_Rate%",
-            ]
-        ].sum(axis=1)
-        if (rate_sum > 100.0 + 1e-9).any():
-            return None
-        empty_mask = cached["Sample_ID"].astype(str).isin(empty_cpg_sample_ids)
-        if not (
-            cached.loc[empty_mask, required_finite].to_numpy(dtype=float) == 0
-        ).all():
-            return None
-        return cached
-    except Exception:
-        return None
 
 
 def compute_cpg_signal_composition(
@@ -1987,43 +1435,26 @@ def compute_cpg_signal_composition(
             + ", ".join(sorted(missing_cov))
         )
     for column in COMPOSITION_COV_COLS:
-        values = pd.to_numeric(comp[column], errors="raise").to_numpy(dtype=float)
-        if not np.isfinite(values).all() or (values < 0).any():
-            raise ValueError(f"Invalid CpG composition values in {column}")
-        comp[column] = values
-    empty_mask = comp["Sample_ID"].astype(str).isin(empty_cpg_sample_ids)
-    if (comp.loc[~empty_mask, "total_cov"] <= 0).any():
+        comp[column] = matrices.exact_integers(comp[column], np.int64)
+        if (comp[column] < 0).any():
+            raise ValueError(f"Negative CpG coverage in {column}")
+    empty_mask = comp["Sample_ID"].isin(empty_cpg_sample_ids)
+    if (comp.loc[~empty_mask, "total_cov"] == 0).any():
         raise ValueError("Non-empty CpG composition has no coverage")
-    if not (comp.loc[empty_mask, COMPOSITION_COV_COLS] == 0).all(axis=None):
+    if (comp.loc[empty_mask, "total_cov"] != 0).any():
         raise ValueError("Empty CpG composition contains coverage")
-    classified = comp[["lambda_cov", "puc19_cov", "mt_cov", "host_cov"]].sum(axis=1)
-    if (classified > comp["total_cov"]).any():
-        raise ValueError("Classified CpG coverage exceeds total coverage")
-    if not np.allclose(comp["Sample_CpG_Signals"], comp["host_cov"], rtol=0, atol=0):
+    if not comp["Sample_CpG_Signals"].equals(comp["host_cov"]):
         raise ValueError("Sample_CpG_Signals differs from host CpG coverage")
 
-    total_cov = comp["total_cov"].astype(float).replace(0.0, np.nan)
-    for source_col, frac_col in COMPOSITION_FRACTION_COLS.items():
-        comp[frac_col] = pd.to_numeric(
-            comp.get(source_col, 0.0) / total_cov, errors="coerce"
-        ).fillna(0.0)
-    comp = comp.set_index("Sample_ID", drop=False)
-
-    base = df_qc[["Sample_ID"]].copy()
-    base["Sample_ID"] = base["Sample_ID"].astype(str)
-    sid = base["Sample_ID"]
-    base["Sample_CpG_Signals"] = pd.to_numeric(
-        sid.map(comp["Sample_CpG_Signals"]), errors="coerce"
-    ).fillna(0.0)
-    f_lambda = _mapped_numeric(sid, comp["_f_lambda"])
-    f_puc = _mapped_numeric(sid, comp["_f_puc"])
-    f_mt = _mapped_numeric(sid, comp["_f_mt"])
-    f_host = _mapped_numeric(sid, comp["_f_host"])
-
-    base["Signal_Lambda_Rate%"] = 100.0 * f_lambda
-    base["Signal_pUC19_Rate%"] = 100.0 * f_puc
-    base["Signal_mtDNA_Rate%"] = 100.0 * f_mt
-    base["Signal_Host_Rate%"] = 100.0 * f_host
+    # 逐类扣减，避免有符号整型加总回绕；只在计算比例时使用浮点数。
+    remaining = comp["total_cov"]
+    denominator = remaining.replace(0, np.nan)
+    base = comp[["Sample_ID", "Sample_CpG_Signals"]].copy()
+    for column, rate in COMPOSITION_RATES.items():
+        if (comp[column] > remaining).any():
+            raise ValueError("Classified CpG coverage exceeds total coverage")
+        remaining = remaining - comp[column]
+        base[rate] = (comp[column] / denominator).fillna(0.0) * 100.0
     base["Signal_Composition_Rule"] = "primary_nuclear_chromosomes"
     comp_out = base[list(COMPOSITION_CACHE_COLUMNS)].copy()
     _atomic_write_csv(comp_out, cache_path, before_commit=before_commit)
@@ -2036,57 +1467,18 @@ def compute_cpg_signal_composition(
     )
 
 
-@njit
 def _gini_from_sorted_positive(x_sorted: np.ndarray) -> float:
     n = x_sorted.size
     if n == 0:
         return float("nan")
-    cumx = np.cumsum(x_sorted)
-    return float((n + 1 - 2 * np.sum(cumx) / cumx[-1]) / n)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def _validated_gini_cache(
-    cache_path: Path,
-    sample_ids: list[str],
-    empty_cpg_sample_ids: set[str],
-) -> pd.DataFrame | None:
-    if not cache_path.is_file():
-        return None
-    try:
-        cached = pd.read_csv(cache_path, converters={"Sample_ID": str}, float_precision="round_trip")
-        if tuple(cached.columns) != GINI_CACHE_COLUMNS:
-            return None
-        cached = _require_exact_sample_ids(cached, sample_ids, "Gini cache")
-        values = pd.to_numeric(cached["Gini_Index"], errors="raise").to_numpy(
-            dtype=float
-        )
-        if (
-            np.isinf(values).any()
-            or (values[np.isfinite(values)] < 0).any()
-            or (values[np.isfinite(values)] > 1).any()
-        ):
-            return None
-        empty_mask = cached["Sample_ID"].astype(str).isin(empty_cpg_sample_ids)
-        if not np.isnan(values[empty_mask]).all() or not np.isfinite(
-            values[~empty_mask]
-        ).all():
-            return None
-        cached["Gini_Index"] = values
-        return cached
-    except Exception:
-        return None
+    # 有序整数窗的成对差之和。单细胞总覆盖已核验，分子与分母仅在最后相除时舍入。
+    denominator = n * int(x_sorted.sum())
+    weights = np.arange(1 - n, n, 2, dtype=np.int64)
+    if denominator <= np.iinfo(np.int64).max:
+        numerator = int(weights @ x_sorted)
+    else:
+        numerator = sum(int(weight) * int(depth) for weight, depth in zip(weights, x_sorted, strict=True))
+    return numerator / denominator
 
 
 def _validated_tss_cache(
@@ -2144,42 +1536,33 @@ def _validated_tss_cache(
         return None
 
 
-@njit
-def _coverage_bins_from_csr(indptr, indices, data, chrom_offsets, bin_offsets, bin_size, base, primary=None):
-    """按原生 reference 顺序分箱，保持原生逐观测 float32 coverage 累加。"""
-    # 只存观测分箱；小 bin 也不能按整个基因组长度分配稠密数组。
-    capacity = min(len(data), (len(indptr) - 1) * bin_offsets[-1])
-    values = np.empty(capacity, dtype=np.float32)
-    bins = np.empty(capacity, dtype=np.int64)
-    rows = np.zeros(len(indptr), dtype=np.int64)
+@njit(cache=True, nogil=True)
+def _coverage_bins(indices, coverage, chrom_offsets, bin_offsets, bin_size, base, primary):
+    """按主核染色体分箱，以整数累加有观测位点的覆盖深度。"""
+    values = np.empty(min(len(indices), bin_offsets[-1]), dtype=np.int64)
+    chrom = 0
+    previous = -1
     used = 0
-    for row in range(len(indptr) - 1):
-        chrom = 0
-        previous = -1
-        for k in range(indptr[row], indptr[row + 1]):
-            index = indices[k]
-            while chrom + 1 < len(chrom_offsets) and index >= chrom_offsets[chrom + 1]:
-                chrom += 1
-            if chrom + 1 >= len(chrom_offsets):
-                raise ValueError("Raw CpG index is outside the reference")
-            pos = index - chrom_offsets[chrom] - base
-            if pos < 0:
-                raise ValueError("Raw CpG index is outside the configured coordinate base")
-            if primary is not None and not primary[chrom]:
-                continue
-            target = bin_offsets[chrom] + pos // bin_size
-            coverage = np.float32(data[k] & 0xffff)
-            if target != previous:
-                if target < previous:
-                    raise ValueError("Raw CpG bins are not ordered")
-                bins[used] = target
-                values[used] = coverage
-                used += 1
-                previous = target
-            else:
-                values[used - 1] = np.float32(values[used - 1] + coverage)
-        rows[row + 1] = used
-    return rows, bins[:used], values[:used]
+    for k, index in enumerate(indices):
+        while chrom + 1 < len(chrom_offsets) and index >= chrom_offsets[chrom + 1]:
+            chrom += 1
+        if chrom + 1 >= len(chrom_offsets):
+            raise ValueError("CpG index is outside the reference")
+        pos = index - chrom_offsets[chrom] - base
+        if pos < 0:
+            raise ValueError("CpG index is outside the configured coordinate base")
+        if not primary[chrom]:
+            continue
+        target = bin_offsets[chrom] + pos // bin_size
+        if target != previous:
+            if target < previous:
+                raise ValueError("CpG bins are not ordered")
+            values[used] = coverage[k]
+            used += 1
+            previous = target
+        else:
+            values[used - 1] += coverage[k]
+    return values[:used]
 
 
 def _validate_tss_sampling(fraction: float, seed: int) -> None:
@@ -2315,7 +1698,7 @@ def _merge_pipeline_qc(
     source_qc["Duplicate_Pair_Rate%"] = percentage(
         "duplicate_pairs", "backend_accepted_pairs"
     )
-    source_qc.loc[source_qc["dedup_policy"] == "per_cytosine_umi_consensus_hamming1", "Duplicate_Pair_Rate%"] = float("nan")
+    source_qc.loc[source_qc["dedup_policy"].isin([tag.dedup_policy for tag in DD_CONSENSUS.values()]), "Duplicate_Pair_Rate%"] = float("nan")
     source_qc["Final_Pair_Yield%"] = percentage(
         "final_retained_pairs", "cutadapt_input_pairs"
     )
@@ -2391,7 +1774,7 @@ def _export_qc(
             primary_empty_mask = df_qc["Sample_Unique_CpG_Sites"].eq(0)
             umi_consensus_sample_ids = set(
                 pipeline_qc.loc[
-                    pipeline_qc["dedup_policy"] == "per_cytosine_umi_consensus_hamming1",
+                    pipeline_qc["dedup_policy"].isin([tag.dedup_policy for tag in DD_CONSENSUS.values()]),
                     "sample_id",
                 ].astype(str)
             )
@@ -2434,7 +1817,7 @@ def _export_qc(
 
 
 @njit(cache=True, nogil=True)
-def _summarize_cpg_row(indices, packed, offsets, categories, window_offsets, base):
+def _summarize_cpg_row(indices, methyl_counts, depths, offsets, categories, window_offsets, base):
     observed = np.zeros(5, np.int64)
     coverage = np.zeros(5, np.int64)
     fractions = np.zeros(5, np.float64)
@@ -2442,12 +1825,12 @@ def _summarize_cpg_row(indices, packed, offsets, categories, window_offsets, bas
     mc = np.zeros(window_offsets[-1], np.int64)
     cov = np.zeros_like(mc)
     chrom = 0
-    for i in range(len(packed)):
+    for i in range(len(indices)):
         pos = indices[i]
         while pos >= offsets[chrom+1]:
             chrom += 1
-        depth = packed[i] & 65535
-        methyl = packed[i] >> 16
+        depth = depths[i]
+        methyl = methyl_counts[i]
         group = categories[chrom]
         observed[group] += 1
         coverage[group] += depth
@@ -2463,7 +1846,7 @@ def _summarize_cpg_row(indices, packed, offsets, categories, window_offsets, bas
 
 
 class _SinglePassCells:
-    """有界解码窗口。每个细胞的同一 CSR 行供全部下游统计使用。"""
+    """按 sealed 细胞身份有界并行。每个 worker 只解码一次并独立算完该行。"""
 
     def __init__(self, sources, sizes, base, representation, workers):
         self.obs_names = pd.Index(sorted(sources))
@@ -2471,28 +1854,31 @@ class _SinglePassCells:
         self.reference = matrices.cpg_reference(sizes, base)
         self.uns = {"cpg_coordinate_base": base, "source_cpg_representation": representation}
         self.sources = sources
-        self.workers = min(4, _bounded_cpg_workers(workers, self.n_obs))
-        self.rows = self._decode()
-        self.position = 0
-        self.consume = None
+        self.workers = _bounded_cpg_workers(workers, self.n_obs)
 
-    def _decode(self):
-        def read(path):
+    def map_cells(self, executor, calculate):
+        def process(sid):
+            path = self.sources[sid]
             with _managed_cpg_text(path) as handle:
-                return matrices.read_cpg_counts(handle, path, self.reference, self.uns["cpg_coordinate_base"])
+                row = matrices.read_cpg_counts(handle, path, self.reference, self.uns["cpg_coordinate_base"])
+            return calculate(sid, row)
 
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            for start in range(0, self.n_obs, self.workers):
-                paths = [self.sources[sid] for sid in self.obs_names[start:start+self.workers]]
-                yield from executor.map(read, paths)
-
-    def read_rows(self, start, stop):
-        if start != self.position or stop != start + 1:
-            raise ValueError("CpG rows must be consumed once in cell order")
-        row = next(self.rows)
-        self.position = stop
-        self.consume(start, row)
-        return row
+        if self.workers == 1:
+            yield from map(process, self.obs_names)
+            return
+        ids = iter(self.obs_names)
+        # 较慢的前序细胞等待写入时，worker 可提前处理下一行，只保留有界的待提交结果。
+        pending = deque(executor.submit(process, sid) for sid in islice(ids, 2 * self.workers))
+        try:
+            while pending:
+                result = pending.popleft().result()
+                sid = next(ids, None)
+                if sid is not None:
+                    pending.append(executor.submit(process, sid))
+                yield result
+        finally:
+            for future in pending:
+                future.cancel()
 
 
 def _calculate_cpg_products(reader, cfg, selected, zero_mapped, bed, single_tmp, counts_tmp):
@@ -2501,46 +1887,63 @@ def _calculate_cpg_products(reader, cfg, selected, zero_mapped, bed, single_tmp,
     names = reference.reference_seq_name.tolist()
     lengths = reference.reference_bp_length.to_numpy(dtype=np.int64)
     offsets = np.r_[0, np.cumsum(lengths+base)]
-    primary = np.asarray([_is_primary_chromosome(name) for name in names])
-    categories = np.asarray([1 if l else 2 if p else 3 if m else 0 if h else 4
-                             for l,p,m,h in map(_classify_seq_name, names)])
-    is_auto = [counts_tmp is not None and bool(re.fullmatch(r"chr(?:[1-9]|1[0-9]|2[0-2])", name))
+    host_contigs = set(primary_analysis_contigs(cfg.genome))
+    host_lengths = {name: length for name, length in zip(names, lengths, strict=True) if name in host_contigs}
+    classes = [_chromosome_class(name, host_contigs) for name in names]
+    category_order = ("host", "lambda", "pUC19", "mtDNA", "auxiliary")
+    categories = np.asarray([category_order.index(group) for group in classes], dtype=np.int64)
+    primary = categories == 0
+    autosomes = host_contigs - {"chrX", "chrY"}
+    is_auto = [counts_tmp is not None and name in autosomes
                for name in names]
     windows = np.r_[0, np.cumsum(np.where(is_auto, (lengths+999999)//1000000, 0))]
     bins = np.r_[0, np.cumsum((lengths + cfg.gini_bin_size - 1)//cfg.gini_bin_size)]
-    tss_index = diagnostics.tss_intervals(cfg.tss_bed, reference, _is_primary_chromosome) if cfg.tss_bed else None
     tss_clones = dict(selected[["Sample_ID", "CloneID"]].itertuples(index=False, name=None))
     profiles, chromosome, statistics, gini = [], [], [], []
     mc = np.zeros((reader.n_obs, windows[-1]), dtype=np.int64)
     cov = np.zeros_like(mc)
     empty = set()
 
-    def consume(start, row):
-        sid = reader.obs_names[start]
-        if not row.nnz:
-            empty.add(sid)
-        elif sid in zero_mapped:
+    def calculate(sid, row):
+        is_empty = not len(row.indices)
+        if not is_empty and sid in zero_mapped:
             raise ValueError(f"Zero-mapped cells must have an empty current CpG result: {sid}")
-        sites, depth, fractions, mc[start], cov[start] = _summarize_cpg_row(
-            row.indices, row.data, offsets, categories, windows, base)
+        sites, depth, fractions, cell_mc, cell_cov = _summarize_cpg_row(
+            row.indices, row.methyl, row.coverage, offsets, categories, windows, base)
         means = [fractions[i]/sites[i]*100 if sites[i] else np.nan for i in range(3)]
-        statistics.append((sid, sites[0], means[0], sites[1], means[1], sites[2], means[2],
-                           depth[1], depth[2], depth[3], depth[0], depth.sum(), depth[0]))
-        _, _, counts = _coverage_bins_from_csr(row.indptr, row.indices, row.data,
-                                               offsets, bins, cfg.gini_bin_size, base, primary)
-        gini.append(_gini_from_sorted_positive(np.sort(counts.astype(np.float64))))
-        chromosome.extend(diagnostics.chromosome_row(
-            reference, offsets, row, sid, _is_primary_chromosome, _classify_seq_name))
+        stats = (sid, sites[0], means[0], sites[1], means[1], sites[2], means[2],
+                 depth[1], depth[2], depth[3], depth[0], depth.sum(), depth[0])
+        counts = _coverage_bins(row.indices, row.coverage, offsets, bins, cfg.gini_bin_size, base, primary)
+        counts.sort()
+        chrom = list(diagnostics.chromosome_row(reference, offsets, row, sid, classes))
+        profile = None
         if tss_index is not None and sid in tss_clones:
             profile = diagnostics.tss_profile_row(reader, row, sid, tss_clones[sid], tss_index)
-            if profile is not None:
-                profiles.append(profile)
+        single = matrices.single_cpg_row(reader, row, single_index, n_vars)
+        return single, stats, _gini_from_sorted_positive(counts), chrom, profile, cell_mc, cell_cov, is_empty
 
-    reader.consume = consume
-    try:
-        matrices.write_single_cpg(reader, bed, single_tmp, pd.DataFrame(index=reader.obs_names))
-    finally:
-        reader.rows.close()
+    with ThreadPoolExecutor(max_workers=reader.workers) as executor:
+        tss_index = tss_future = None
+        if cfg.tss_bed:
+            if reader.workers > 1:
+                tss_future = executor.submit(diagnostics.tss_intervals, cfg.tss_bed, reference, host_contigs)
+            else:
+                tss_index = diagnostics.tss_intervals(cfg.tss_bed, reference, host_contigs)
+        with matrices.single_cpg_writer(reader, bed, single_tmp, host_lengths) as (writer, single_index):
+            if tss_future is not None:
+                tss_index = tss_future.result()
+            n_vars = writer.n_vars
+            with contextlib.closing(reader.map_cells(executor, calculate)) as cells:
+                for start, (single, stats, score, chrom, profile, cell_mc, cell_cov, is_empty) in enumerate(cells):
+                    writer.append(single)
+                    statistics.append(stats)
+                    gini.append(score)
+                    chromosome.extend(chrom)
+                    if profile is not None:
+                        profiles.append(profile)
+                    mc[start], cov[start] = cell_mc, cell_cov
+                    if is_empty:
+                        empty.add(reader.obs_names[start])
     if len(statistics) != reader.n_obs:
         raise RuntimeError("Incomplete single-pass CpG products")
     if counts_tmp is not None:
@@ -2596,8 +1999,10 @@ def _run_pipeline_impl(paths, cfg, workers, recompute, *, sealed_context=None):
     stage(1, "核对当前完整交付和 QC 输入")
     assert_loaded_sources_current(_LOADED_SOURCE_CODES)
     sealed = sealed_context or load_sealed_qc_context(paths.project_dir, expected_pipeline_root=_pipeline_dir())
+    if cfg.genome != sealed.config["species"] or cfg.ref_fai != sealed.reference_fai:
+        raise ValueError("QC species and reference FAI must match the sealed delivery")
     bed = _single_bed(sealed)
-    assert_current = _reference_guard(sealed.reference_path, cfg.ref_fai, bed, cfg.tss_bed,
+    check_references = _reference_guard(sealed.reference_path, cfg.ref_fai, bed, cfg.tss_bed,
         Path(str(bed)+".reference.json"), Path(str(cfg.tss_bed)+".reference.json") if cfg.tss_bed else None,
         before_commit=sealed.assert_current)
     single_reference = validate_downstream_reference(sealed.reference_path, bed, "single-cpg")
@@ -2608,11 +2013,10 @@ def _run_pipeline_impl(paths, cfg, workers, recompute, *, sealed_context=None):
     pipeline_qc = pd.DataFrame.from_records(records)
     _log(f"QC 输入：{len(records)} 个细胞；物种：{cfg.genome}；CPU预算：{workers}")
     sources = {record["sample_id"]: record["cpg_file"] for record in records}
-    for record in records:
-        path = record["cpg_file"]
-        if path.stat().st_size != record["cpg_output_identity"]["size_bytes"]:
-            raise ValueError(f"Sealed CpG result has the wrong size: {path}")
-    assert_current = _reference_guard(*sources.values(), before_commit=assert_current)
+    def assert_current():
+        check_references()
+        for record in records:
+            sealed.assert_output_current(record["cpg_output_identity"]["path"])
     if len(sources)!=len(records):
         raise ValueError("Sealed CpG samples must be unique")
     ids = sorted(sources)
@@ -2633,6 +2037,7 @@ def _run_pipeline_impl(paths, cfg, workers, recompute, *, sealed_context=None):
     identity["algorithms"] = algorithms
     identity["tss_sampling"] = sampling if cfg.tss_bed else None
     identity["qc_filter_parameters"] = filter_parameters
+    droplet = sealed.config["analysis"]["protocol"] in DD_PROTOCOLS
     if not recompute:
         try:
             completed = _require_completed_qc(paths, sealed, algorithms=algorithms, verify_diagnostics=None)
@@ -2640,13 +2045,14 @@ def _run_pipeline_impl(paths, cfg, workers, recompute, *, sealed_context=None):
             pass
         else:
             if completed.identity["identity_sha256"] == identity["identity_sha256"]:
+                completed.assert_current()
+                assert_current()
+                if not droplet:
+                    _invalidate_completion(paths.doublet_counts)
                 if cfg.tss_bed is None:
-                    completed.assert_current()
-                    assert_current()
                     _remove_skipped_tss(paths)
                 if completed.identity["qc_filter_parameters"] != filter_parameters:
-                    frame = pd.read_csv(paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
-                                        float_precision="round_trip")
+                    frame = _read_qc_table(paths.qc_info)
                     frame = _require_exact_sample_ids(frame, ids, "Filter QC")
                     reasons = diagnostics.filter_reasons(frame, **filter_parameters)
                     obs = _single_cpg_obs(frame, pipeline_qc, reasons)
@@ -2661,6 +2067,7 @@ def _run_pipeline_impl(paths, cfg, workers, recompute, *, sealed_context=None):
                     _atomic_write_csv(reasons, filter_output, before_commit=assert_current)
                     current["diagnostic_artifacts"][filter_output.name] = _content_binding(filter_output)
                     schema["h5ad"] = _published_file_binding(paths.single_cpg)
+                    current["single_cpg_ctime_ns"] = paths.single_cpg.lstat().st_ctime_ns
                     schema["input"]["qc_filter_parameters"] = filter_parameters
                     _atomic_write_json(schema, paths.single_schema, before_commit=assert_current)
                     _atomic_write_json(current, paths.input_identity, before_commit=assert_current)
@@ -2677,7 +2084,6 @@ def _run_pipeline_impl(paths, cfg, workers, recompute, *, sealed_context=None):
     base = _source_cpg_coordinate_base(sealed.cpg_representation)
     sizes = _read_chrom_sizes(cfg.ref_fai)
     reader = _SinglePassCells(sources, sizes, base, sealed.cpg_representation, workers)
-    droplet = sealed.config["analysis"]["protocol"] == "droplet"
     zero_mapped = {r["sample_id"] for r in records if r["backend_accepted_pairs"] == 0}
     temp_dir = project_temporary_parent(paths.single_cpg)
     with tempfile.TemporaryDirectory(prefix="cpg-products.", dir=temp_dir) as folder:
@@ -2716,17 +2122,21 @@ def _run_pipeline_impl(paths, cfg, workers, recompute, *, sealed_context=None):
         _fsync_directory(paths.single_cpg.parent)
         generation = uuid.uuid4().hex
         identity["cpg_generation"] = generation
+        identity["single_cpg_ctime_ns"] = paths.single_cpg.lstat().st_ctime_ns
         identity["empty_cpg_sample_ids"] = sorted(empty)
         if counts_tmp is not None:
             _fsync_file(counts_tmp)
             os.replace(counts_tmp, paths.doublet_counts)
             _fsync_directory(paths.doublet_counts.parent)
             identity["doublet_counts"] = _published_file_binding(paths.doublet_counts)
+            identity["doublet_counts_ctime_ns"] = paths.doublet_counts.lstat().st_ctime_ns
+        else:
+            _invalidate_completion(paths.doublet_counts)
         destinations = [paths.composition_cache, chrom_output, filter_output]
         if cfg.tss_bed is not None:
             destinations.append(paths.tss_info)
             if tss.empty:
-                (paths.qc_results_dir / "plots/TSS_Profile.pdf").unlink(missing_ok=True)
+                _remove_tss_plot(paths)
         else:
             _remove_skipped_tss(paths)
         for destination in destinations:
@@ -2803,10 +2213,7 @@ def load_cpg_density_frame(
     assert_qc_current = _require_completed_qc(
         run_paths, sealed, verify_diagnostics=(run_paths.composition_cache.name,),
     ).assert_current
-    qc = pd.read_csv(
-        run_paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
-        float_precision="round_trip",
-    )
+    qc = _read_qc_table(run_paths.qc_info)
     required = ("Sample_ID", "CloneID", "Sample_Unique_CpG_Sites")
     missing = [column for column in required if column not in qc.columns]
     if missing:
@@ -2829,15 +2236,14 @@ def load_cpg_density_frame(
     )
 
     composition_cache_path = run_paths.composition_cache
-    if not composition_cache_path.is_file():
-        raise FileNotFoundError(
-            f"CpG composition cache is absent: {composition_cache_path}"
-        )
-    composition = pd.read_csv(composition_cache_path, converters={"Sample_ID": str}, float_precision="round_trip")
+    composition = pd.read_csv(
+        composition_cache_path, converters={"Sample_ID": str}, dtype={"Sample_CpG_Signals": str},
+    )
     for column in ("Sample_ID", "Sample_CpG_Signals"):
         if column not in composition.columns:
             raise ValueError(f"CpG composition cache is missing column: {column}")
     composition["Sample_ID"] = composition["Sample_ID"].astype(str).str.strip()
+    composition["Sample_CpG_Signals"] = _nonnegative_counts(composition["Sample_CpG_Signals"])
 
     qc_ids = qc["Sample_ID"].tolist()
     for source, label in (
@@ -2857,13 +2263,6 @@ def load_cpg_density_frame(
             validate="one_to_one",
         )
     )
-    for column in (
-        "Sample_Unique_CpG_Sites",
-        "Input_Read_Pairs",
-        "Final_Retained_Pairs",
-        "Sample_CpG_Signals",
-    ):
-        frame[column] = pd.to_numeric(frame[column], errors="raise")
     assert_qc_current()
     return frame
 
@@ -2956,7 +2355,7 @@ def resolve_notebook_paths(
         pipeline_root=pipeline_root,
         delivery_id=delivery_id,
         qc_results_dir=qc_results_dir,
-        plots_dir=qc_results_dir / "plots",
+        plots_dir=_project_directory(project_dir, Path("06_downstream/plots"), create=False),
         qc_info=qc_results_dir / "DNAme_QC_Information.csv",
         tss_info=qc_results_dir / "TSS_Profile_Information.csv",
         composition_cache=qc_results_dir / ".cache" / "CpG_Signal_Composition.csv",
@@ -3050,15 +2449,11 @@ def load_notebook_qc_frame(
     assert_qc_current = _require_completed_qc(
         run_paths, sealed, verify_diagnostics=(diagnostics.FILTER_INFO,),
     ).assert_current
-    paths.qc_results_dir.mkdir(parents=True, exist_ok=True)
-    paths.plots_dir.mkdir(parents=True, exist_ok=True)
+    _project_directory(paths.project_dir, Path("06_downstream/plots"), create=True)
     from .plotting import setup_nature_style, normalize_clone_id_value, generate_clone_color_map
 
     setup_nature_style()
-    df_qc = pd.read_csv(
-        paths.qc_info, converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str),
-        float_precision="round_trip",
-    )
+    df_qc = _read_qc_table(run_paths.qc_info)
     reasons = pd.read_csv(run_paths.qc_results_dir / diagnostics.FILTER_INFO,
                           converters=dict.fromkeys(QC_INFO_COLUMNS[:3], str))
     df_qc = df_qc.merge(reasons, on=list(QC_INFO_COLUMNS[:3]), how="left", validate="one_to_one")

@@ -21,10 +21,8 @@ import tempfile
 import time
 import uuid
 import warnings
-import zlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -32,11 +30,14 @@ from types import MappingProxyType
 from typing import Any, TextIO, TypedDict, cast
 
 from .config import (
+    DD_CONSENSUS,
+    DD_PROTOCOLS,
     BarcodeRow,
     CONFIG_TEMPLATE_YAML,
     CellIdentityRow,
     DROPLET_DESIGN_RESOURCE,
     DROPLET_DESIGN_SHA256,
+    DemuxCompletion,
     DemuxIndex,
     DemuxRow,
     DiscoveredSamples,
@@ -60,7 +61,6 @@ from .io import (
     project_temporary_parent,
     atomic_write_bytes,
     _read_json,
-    _fsync_directory,
     atomic_write_json,
     iter_tree_files,
     render_tsv,
@@ -117,17 +117,17 @@ def _is_merged_fastq(path: Path) -> bool:
 
 
 def _iter_fastq_inventory(
-    dir_raw: Path, archived_paths: frozenset[Path] = frozenset(),
+    dir_raw: Path,
     selected_samples: set[str] | None = None,
 ) -> Iterable[tuple[Path, str, str, str]]:
     unsupported: list[Path] = []
     raw_names: dict[str, str] = {}
+    physical_inputs: dict[tuple[int, int], str] = {}
     ignored_count = 0
     ignored_preview: list[str] = []
-    for path in sorted(iter_tree_files(dir_raw)):
-        if path in archived_paths or not path.name.lower().endswith(FASTQ_SUFFIXES):
-            continue
-        if not stat.S_ISREG(path.stat().st_mode):
+    export_root = _previous_fastq_output(dir_raw)
+    for path in sorted(iter_tree_files(dir_raw, exclude_paths=() if export_root is None else (export_root,))):
+        if not path.name.lower().endswith(FASTQ_SUFFIXES):
             continue
         parsed = _parse_fastq_inventory_name(path)
         if selected_samples is not None and (
@@ -137,9 +137,15 @@ def _iter_fastq_inventory(
             if len(ignored_preview) < 5:
                 ignored_preview.append(path.name)
             continue
+        if export_root is not None and any(
+            parent.name.casefold() == export_root.name.casefold() and parent.samefile(export_root)
+            for parent in path.resolve().parents
+        ):
+            raise ValueError(f"Raw input links to a generated FASTQ export: {path}")
         if parsed is None:
             unsupported.append(path)
             continue
+        _fastq_record(str(path), seen=physical_inputs)
         original_sample, mate, segment = parsed
         if segment.startswith("L000_"):
             raise ValueError(f"FASTQ lane must be within 1-999: {path}")
@@ -173,23 +179,25 @@ def _iter_fastq_inventory(
 
 
 def discover_samples(
-    dir_raw: Path, *, archived_paths: frozenset[Path] = frozenset(),
+    dir_raw: Path, *,
     selected_samples: set[str] | None = None,
 ) -> dict[str, dict[str, list[str]]]:
     """按确定性的 lane/chunk 顺序发现配对 FASTQ。
 
     支持 R1/R2 或末尾 1/2、1-999 的 lane；仅去掉样本名前缀“样本_”，不改文件名或批次信息。
-    lane 按数值配对排序；归一化身份冲突、重复 mate 与缺配对均拒绝；维护预览可排除将归档的源文件。
+    lane 按数值配对排序；归一化身份冲突、重复 mate 与缺配对均拒绝；普通配对按父目录分块。
     指定样本集合时仅校验该集合的输入，其余 FASTQ 提示后跳过；未指定时完整扫描供 refresh 使用。
     """
     _require_no_raw_append(dir_raw.parent)
     logger.info("Starting sample discovery in: %s", dir_raw)
     if not dir_raw.is_dir():
         raise FileNotFoundError(f"Raw data directory not found: {dir_raw}")
-    inventory: dict[str, dict[str, dict[str, Path]]] = {}
+    inventory: dict[str, dict[tuple[str, Path], dict[str, Path]]] = {}
     duplicates: list[str] = []
-    for path, sample, mate, segment in _iter_fastq_inventory(dir_raw, archived_paths, selected_samples):
-        segment_map = inventory.setdefault(sample, {}).setdefault(segment, {})
+    for path, sample, mate, segment in _iter_fastq_inventory(dir_raw, selected_samples):
+        # 普通命名只在同一个目录内配对，按目录路径稳定排序。
+        key = (segment, path.parent if segment == "single" else Path())
+        segment_map = inventory.setdefault(sample, {}).setdefault(key, {})
         if mate in segment_map and segment_map[mate] != path:
             duplicates.append(
                 f"duplicate {mate} for raw sample {sample!r}, segment {segment!r}: "
@@ -206,17 +214,17 @@ def discover_samples(
     for sample, segments in sorted(inventory.items()):
         families = {
             "lane" if key.startswith("L") else "part" if key.startswith("part_") else "single"
-            for key in segments
+            for key, _ in segments
         }
         if len(families) > 1:
             raise ValueError(
                 f"Raw sample {sample!r} mixes incompatible FASTQ naming layouts: {sorted(segments)}"
             )
-        if "single" in families and len(segments) != 1:
-            raise ValueError(f"Raw sample {sample!r} has more than one single-file FASTQ segment")
+        if len(segments) > 1 and any(_is_merged_fastq(path) for mates in segments.values() for path in mates.values()):
+            raise ValueError(f"Raw sample {sample!r} contains merged FASTQs alongside other segments")
         r1_files: list[str] = []
         r2_files: list[str] = []
-        for segment, mates in sorted(segments.items()):
+        for (segment, _parent), mates in sorted(segments.items()):
             missing = [mate for mate in ("R1", "R2") if mate not in mates]
             if missing:
                 incomplete.append(
@@ -250,37 +258,8 @@ def discover_samples(
     return samples
 
 
-def _scan_fastq_layout(
-    dir_raw: Path,
-) -> tuple[dict[str, set[str]], dict[str, dict[Path, dict[str, list[tuple[str, Path]]]]]]:
-    families: dict[str, set[str]] = {}
-    layouts: dict[str, dict[Path, dict[str, list[tuple[str, Path]]]]] = {}
-    for path, sample, mate, segment in _iter_fastq_inventory(dir_raw):
-        family = (
-            "lane"
-            if segment.startswith("L")
-            else "part"
-            if segment.startswith("part_")
-            else "single"
-        )
-        families.setdefault(sample, set()).add(family)
-        layouts.setdefault(sample, {}).setdefault(path.parent, {}).setdefault(
-            mate, []
-        ).append((family, path))
-    return families, layouts
-
-
-@dataclass(frozen=True)
-class FastqAppend:
-    target: Path
-    source: Path
-    archive: Path
-    output: Path
-
-
 _RAW_APPEND_JOURNAL = "05_tmp/.raw-fastq-append.json"
 _RAW_INPUT_LOCK = "05_tmp/.raw-fastq.lock"
-_FASTQ_NEWLINE_MEMBER = gzip.compress(b"\n", mtime=0)
 
 
 def _require_no_raw_append(project: Path) -> None:
@@ -289,12 +268,12 @@ def _require_no_raw_append(project: Path) -> None:
         journal.lstat()
     except FileNotFoundError:
         return
-    raise RuntimeError(f"FASTQ merge recovery is pending at {journal}. Run ./run_pipeline.sh --refresh-manifest.")
+    raise RuntimeError(f"FASTQ merge recovery is pending at {journal}. Finish recovery with the Alopex version that started it.")
 
 
 @contextmanager
 def raw_input_lock(project: Path, *, exclusive: bool) -> Iterator[int]:
-    """互斥保护原位追加与上游运行；锁文件保留，避免并发者切换 inode。"""
+    """协调刷新和正式输入读取；锁文件保留，避免并发者切换 inode。"""
     path = project / _RAW_INPUT_LOCK
     project_temporary_parent(path, project_dir=project)
     access = os.O_RDWR if exclusive else os.O_RDONLY
@@ -314,333 +293,59 @@ def raw_input_lock(project: Path, *, exclusive: bool) -> Iterator[int]:
         os.close(fd)
 
 
-def _merge_file_state(path: Path) -> os.stat_result:
-    state = path.lstat()
-    if not stat.S_ISREG(state.st_mode) or state.st_nlink != 1:
-        raise ValueError(f"FASTQ in-place merge requires a regular file without aliases: {path}")
-    return state
+def reject_duplicate_fastq_chunks(paths: Sequence[str]) -> None:
+    """相同尺寸的 FASTQ 分块在实际消费前比较压缩字节。"""
+    by_size: dict[int, list[Path]] = {}
+    for value in paths:
+        path = Path(value)
+        by_size.setdefault(path.stat().st_size, []).append(path)
+    for equal_size in by_size.values():
+        if len(equal_size) > 1 and len({sha256_file(path) for path in equal_size}) != len(equal_size):
+            raise ValueError(f"Byte-identical FASTQ duplicate copies: {equal_size}")
 
 
-def _require_unused_fastq_archive(path: Path) -> None:
+def _previous_fastq_output(raw: Path) -> Path | None:
+    """排除旧版本的派生文件，避免与原始分块重复计数。"""
+    root = raw / "merged"
     try:
-        path.lstat()
-    except FileNotFoundError:
-        return
-    raise FileExistsError(f"FASTQ merge archive already exists: {path}")
+        state = (root / ".alopex-merged-fastq").lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if not stat.S_ISREG(state.st_mode) or not stat.S_ISDIR(root.lstat().st_mode):
+        raise ValueError(f"Unsafe FASTQ export directory: {root}")
+    return root
 
 
-def _plan_fastq_appends(dir_raw: Path) -> list[FastqAppend]:
-    sample_families, sample_layouts = _scan_fastq_layout(dir_raw)
-    plan: list[FastqAppend] = []
-    for sample, layout in sorted(sample_layouts.items()):
-        plain = {
-            parent: {mate: [path for family, path in records if family == "single"]
-                     for mate, records in mates.items()}
-            for parent, mates in sorted(layout.items())
-        }
-        if all(sum(bool(mates.get(mate)) for mates in plain.values()) < 2 for mate in ("R1", "R2")):
-            continue
-        if sample_families[sample] != {"single"}:
-            raise ValueError(f"Sample {sample!r} has FASTQs outside the plain single-pair naming")
-        if dir_raw.is_symlink():
-            raise ValueError(f"FASTQ in-place merge requires a real raw directory: {dir_raw}")
-        batches: list[list[Path]] = []
-        for parent, mates in plain.items():
-            if any(len(mates.get(mate, [])) != 1 for mate in ("R1", "R2")):
-                raise ValueError(f"{parent} must contain exactly one R1/R2 pair for {sample!r}")
-            batches.append([mates[mate][0] for mate in ("R1", "R2")])
-
-        existing = [pair for pair in batches if any(map(_is_merged_fastq, pair))]
-        if existing:
-            if len(existing) != 1 or not all(map(_is_merged_fastq, existing[0])):
-                raise ValueError(f"Expected one complete merged FASTQ pair for {sample!r}")
-            # 已合并的文件继续作为追加目标，即使新批次的目录名排在前面。
-            batches.remove(existing[0])
-            batches.insert(0, existing[0])
-
-        for target, *sources in zip(*batches, strict=True):
-            output = target
-            if not _is_merged_fastq(target):
-                stem, extension, gzip_extension = target.name.rsplit(".", 2)
-                output = target.with_name(f"{stem}.merged.{extension}.{gzip_extension}")
-                if stat_if_present(output) is not None:
-                    raise FileExistsError(f"Merged FASTQ output already exists: {output}")
-            by_size: dict[int, list[Path]] = {}
-            for path in (target, *sources):
-                by_size.setdefault(_merge_file_state(path).st_size, []).append(path)
-            for equal_size in by_size.values():
-                if len(equal_size) < 2:
-                    continue
-                digests = {sha256_file(path) for path in equal_size}
-                if len(digests) != len(equal_size):
-                    raise ValueError(f"Byte-identical FASTQ duplicate copies for {sample!r}: {equal_size}")
-            for source in sources:
-                archive = source.with_name(source.name + ".archived")
-                _require_unused_fastq_archive(archive)
-                plan.append(FastqAppend(target, source, archive, output))
-    return plan
+def _fastq_record(path: str, *, seen: dict[tuple[int, int], str] | None = None) -> dict:
+    state = Path(path).stat()
+    if not stat.S_ISREG(state.st_mode):
+        raise ValueError(f"FASTQ chunk is not a regular file: {path}")
+    if seen is not None:
+        key = (state.st_dev, state.st_ino)
+        if key in seen:
+            raise ValueError(f"Duplicate FASTQ file alias: {seen[key]} and {path}")
+        seen[key] = path
+    return {"path": path, "device": state.st_dev, "inode": state.st_ino, "size_bytes": state.st_size,
+            "mtime_ns": state.st_mtime_ns, "ctime_ns": state.st_ctime_ns}
 
 
-def _reject_repeated_gzip_batch(target: Path, candidates: Sequence[Path]) -> None:
-    """同一首条 header 只提示可能重复。逐个真实 gzip 成员起点比对完整压缩批次。"""
-    with target.open("rb") as stream, target.open("rb") as compare:
-        block = b""
-        while True:
-            if not block:
-                block = stream.read(64 * 1024)
-                if not block:
-                    return
-            block = block.lstrip(b"\0")  # gzip 成员间允许零填充。
-            if not block:
-                continue
-            offset = stream.tell() - len(block)
-            for path in candidates:
-                compare.seek(offset)
-                with path.open("rb") as batch:
-                    while chunk := batch.read(64 * 1024):
-                        if compare.read(len(chunk)) != chunk:
-                            break
-                    else:
-                        raise ValueError(f"Byte-identical FASTQ batch already in {target}: {path}")
-            member = zlib.decompressobj(16 + zlib.MAX_WBITS)
-            while not member.eof:
-                if not block:
-                    block = stream.read(64 * 1024)
-                    if not block:
-                        raise EOFError(f"Truncated gzip member in {target}")
-                member.decompress(block, 1024 * 1024)
-                block = member.unused_data if member.eof else member.unconsumed_tail
+def fastq_inventory_records(discovered: DiscoveredSamples) -> list[dict]:
+    """按原始文库和配对顺序记录文件状态，避免对 TB 级 FASTQ 再读一遍。"""
+    seen = {}
+    return [
+        {"raw_sample": sample, "segment": segment, "r1": _fastq_record(r1, seen=seen), "r2": _fastq_record(r2, seen=seen)}
+        for sample, mates in sorted(discovered.items())
+        for segment, (r1, r2) in enumerate(zip(mates["r1"], mates["r2"], strict=True), 1)
+    ]
 
 
-def _check_merge_pair(
-    r1: Path, r2: Path, incoming_headers: Mapping[Path, dict[bytes, list[Path]]],
-) -> tuple[bool, bool]:
-    """核对每批边界，返回每个 mate 的末条质量行是否已有换行。"""
-    possible_repeats: dict[Path, list[Path]] = {}
-
-    def read_record(handle, path, headers):
-        header = handle.readline()
-        if not header:
-            return None
-        if headers and header in headers:
-            possible_repeats.setdefault(path, []).extend(headers.pop(header))
-        sequence, plus, quality = (handle.readline() for _ in range(3))
-        if (
-            not header.startswith(b"@") or not plus.startswith(b"+")
-            or not quality
-            or len(sequence.removesuffix(b"\n").removesuffix(b"\r"))
-            != len(quality.removesuffix(b"\n").removesuffix(b"\r"))
-        ):
-            raise ValueError(f"Malformed FASTQ: {path}")
-        token = re.match(rb"[^\t\n\r\v\f ]+", header[1:])
-        if token is None:
-            raise ValueError(f"Missing FASTQ read ID: {path}")
-        name = token.group()
-        if name.endswith((b"/1", b"/2")):
-            name = name[:-2]
-        return name, quality.endswith(b"\n")
-
-    with gzip.open(r1, "rb") as left, gzip.open(r2, "rb") as right:
-        left_headers, right_headers = incoming_headers.get(r1), incoming_headers.get(r2)
-        terminal_newlines = None
-        while True:
-            left_record = read_record(left, r1, left_headers)
-            right_record = read_record(right, r2, right_headers)
-            if left_record is None and right_record is None:
-                if terminal_newlines is None:
-                    raise ValueError(f"Empty FASTQ batch: {r1} and {r2}")
-                break
-            if left_record is None or right_record is None or not left_record[0] or left_record[0] != right_record[0]:
-                raise ValueError(f"FASTQ mate IDs or record counts differ: {r1} and {r2}")
-            terminal_newlines = (left_record[1], right_record[1])
-    for target, candidates in possible_repeats.items():
-        _reject_repeated_gzip_batch(target, candidates)
-    return terminal_newlines
-
-
-def _state_for_append(path: Path) -> dict[str, Any]:
-    st = _merge_file_state(path)
-    return dict(path=str(path.resolve()), dev=st.st_dev, ino=st.st_ino, size=st.st_size, mtime=st.st_mtime_ns)
-
-
-def _append_identity(state: Mapping[str, Any]) -> tuple[int, int]:
-    return state["dev"], state["ino"]
-
-
-@contextmanager
-def _open_merge_file(state: Mapping[str, Any], *, append: bool = False):
-    path = Path(state["path"])
-    flags = os.O_RDWR | os.O_APPEND if append else os.O_RDONLY
-    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, "ab" if append else "rb", buffering=0) as handle:
-        current = os.fstat(handle.fileno())
-        if (
-            not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
-            or (current.st_dev, current.st_ino) != _append_identity(state)
-        ):
-            raise ValueError(f"FASTQ changed identity during merge: {path}")
-        yield handle
-
-
-def _append_fastq(source: Mapping[str, Any], target: Mapping[str, Any], expected_size: int, separator: bytes) -> None:
-    with _open_merge_file(source) as incoming, _open_merge_file(target, append=True) as output:
-        initial = os.fstat(incoming.fileno())
-        if (initial.st_size, initial.st_mtime_ns) != (source["size"], source["mtime"]):
-            raise ValueError(f"FASTQ changed before append: {source['path']}")
-        existing = os.fstat(output.fileno())
-        if existing.st_size != expected_size or (
-            expected_size == target["size"] and existing.st_mtime_ns != target["mtime"]
-        ):
-            raise ValueError(f"FASTQ target changed before append: {target['path']}")
-        data = separator or incoming.read(4 * 1024 * 1024)
-        while data:
-            pending = memoryview(data)
-            while pending:
-                written = output.write(pending)
-                if not written:
-                    raise OSError(f"Short FASTQ append: {target['path']}")
-                pending = pending[written:]
-            data = incoming.read(4 * 1024 * 1024)
-        final = os.fstat(incoming.fileno())
-        if (final.st_size, final.st_mtime_ns) != (initial.st_size, initial.st_mtime_ns):
-            raise ValueError(f"FASTQ changed during append: {source['path']}")
-        if os.fstat(output.fileno()).st_size != expected_size + source["size"] + len(separator):
-            raise OSError(f"Incomplete FASTQ append: {target['path']}")
-        os.fsync(output.fileno())
-
-
-def _recover_fastq_append(project: Path, journal: Path) -> None:
-    record = _read_json(journal, "FASTQ merge journal")
-    raw = (project / "01_raw").resolve()
-    operations = record["appends"]
-    for op in operations:
-        for key in ("source", "target", "archive", "output"):
-            path = Path(op[key]["path"] if key in ("source", "target") else op[key])
-            if not path.is_relative_to(raw) or path.resolve() != path:
-                raise ValueError(f"Unsafe path in FASTQ merge journal: {path}")
-
-    targets: dict[str, tuple[Mapping[str, Any], int, Path]] = {}
-    sources: list[tuple[Path, Path | None]] = []
-    for op in operations:
-        target = op["target"]
-        output = Path(op["output"])
-        _, total, _ = targets.get(target["path"], (target, target["size"], output))
-        targets[target["path"]] = (target, total + op["source"]["size"] + op["separator_bytes"], output)
-        source, archive = Path(op["source"]["path"]), Path(op["archive"])
-        active = stat_if_present(source) is not None
-        if active == (stat_if_present(archive) is not None):
-            raise ValueError(f"Expected exactly one FASTQ source or archive: {source}, {archive}")
-        current = _merge_file_state(source if active else archive)
-        if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
-            op["source"]["dev"], op["source"]["ino"], op["source"]["size"], op["source"]["mtime"]
-        ):
-            raise ValueError(f"FASTQ source changed before recovery: {source}")
-        sources.append((source, None if active else archive))
-
-    for target, maximum, output in targets.values():
-        original = Path(target["path"])
-        current_path = original
-        if output != original and stat_if_present(original) is None:
-            current_path = output
-        state = {**target, "path": str(current_path)}
-        with _open_merge_file(state) as handle:
-            current = os.fstat(handle.fileno())
-            if not target["size"] <= current.st_size <= maximum:
-                raise ValueError(f"Unexpected FASTQ size during recovery: {current_path}")
-        if current.st_size != target["size"]:
-            with _open_merge_file(state, append=True) as handle:
-                handle.truncate(target["size"])
-                os.fsync(handle.fileno())
-        if current_path != original:
-            current_path.rename(original)
-        _fsync_directory(original.parent, strict=True)
-    # 归档已核验。恢复改名失败必须保留日志，不能将归档当成缺席而跳过。
-    for source, archive in reversed(sources):
-        if archive is not None:
-            archive.rename(source)
-        _fsync_directory(source.parent, strict=True)
-    if record["manifest_changed"]:
-        manifest = project / "00_config/sample_manifest.tsv"
-        original = record["manifest_text"]
-        if original is None:
-            manifest.unlink(missing_ok=True)
-        elif stat_if_present(manifest) is None or manifest.read_bytes() != original.encode("utf-8"):
-            atomic_write_bytes(manifest, original.encode("utf-8"), mode=record["manifest_mode"])
-        _fsync_directory(manifest.parent, strict=True)
-    journal.unlink()
-    _fsync_directory(journal.parent, strict=True)
-
-
-@contextmanager
-def _fastq_append_transaction(
-    project: Path, plan: Sequence[FastqAppend], *, manifest_changed: bool,
-    manifest_text: bytes | None, manifest_mode: int | None,
-) -> Iterator[None]:
-    if not plan:
-        yield
-        return
-    # 每个批次独立验证一次。只追加其 gzip 原始字节，不改写第一批前缀。
-    states = {p: _state_for_append(p) for op in plan for p in (op.target, op.source)}
-    paths_by_pair: dict[tuple[Path, str], dict[str, Path]] = {}
-    for path in states:
-        sample, mate, _ = _parse_fastq_inventory_name(path)
-        paths_by_pair.setdefault((path.parent, sample), {})[mate] = path
-    terminal_newlines: dict[Path, bool] = {}
-    incoming_headers: dict[Path, dict[bytes, list[Path]]] = {}
-    for op in plan:
-        if _is_merged_fastq(op.target):
-            with gzip.open(op.source, "rb") as batch:
-                incoming_headers.setdefault(op.target, {}).setdefault(batch.readline(), []).append(op.source)
-    for pair in paths_by_pair.values():
-        left, right = pair["R1"], pair["R2"]
-        terminal_newlines[left], terminal_newlines[right] = _check_merge_pair(left, right, incoming_headers)
-    if any(_state_for_append(path) != state for path, state in states.items()):
-        raise ValueError("FASTQ inputs changed during merge validation")
-    previous_batch: dict[Path, Path] = {}
-    operations = []
-    for op in plan:
-        previous = previous_batch.get(op.target, op.target)
-        operations.append(dict(
-            source=states[op.source], target=states[op.target], archive=str(op.archive.resolve()),
-            output=str(op.output.resolve()),
-            separator_bytes=0 if terminal_newlines[previous] else len(_FASTQ_NEWLINE_MEMBER),
-        ))
-        previous_batch[op.target] = op.source
-    journal = project / _RAW_APPEND_JOURNAL
-    atomic_write_json(journal, dict(
-        appends=operations, manifest_changed=manifest_changed,
-        manifest_text=None if manifest_text is None else manifest_text.decode("utf-8"),
-        manifest_mode=manifest_mode,
-    ), mode=0o600)
-    _fsync_directory(journal.parent, strict=True)
-
-    try:
-        sizes: dict[str, int] = {}
-        for op in operations:
-            target, source = op["target"], op["source"]
-            size = sizes.get(target["path"], target["size"])
-            separator = _FASTQ_NEWLINE_MEMBER if op["separator_bytes"] else b""
-            _append_fastq(source, target, size, separator)
-            sizes[target["path"]] = size + source["size"] + len(separator)
-        for op in plan:
-            _require_unused_fastq_archive(op.archive)
-            if _state_for_append(op.source) != states[op.source]:
-                raise ValueError(f"FASTQ changed before archive: {op.source}")
-            op.source.rename(op.archive)
-            _fsync_directory(op.source.parent, strict=True)
-        for target, output in dict.fromkeys((op.target, op.output) for op in plan):
-            if target != output:
-                if stat_if_present(output) is not None:
-                    raise FileExistsError(f"Merged FASTQ output already exists: {output}")
-                target.rename(output)
-                _fsync_directory(output.parent, strict=True)
-        yield
-        _fsync_directory(project / "00_config", strict=True)
-    except BaseException:
-        _recover_fastq_append(project, journal)
-        raise
-    journal.unlink()
-    _fsync_directory(journal.parent, strict=True)
+def verify_snapshot_fastqs(records: Sequence[Mapping]) -> None:
+    """执行与发布只核对本次封存的分块，不重新选取文库或遍历原始目录。"""
+    for pair in records:
+        for side in ("r1", "r2"):
+            expected = pair[side]
+            if _fastq_record(expected["path"]) != expected:
+                raise ValueError(f"FASTQ input changed since run snapshot: {expected['path']}")
 
 
 _BARCODE_RE = re.compile(r"^[ACGT]+$")
@@ -723,7 +428,7 @@ def validate_barcode_map_for_protocol(
         records = _iter_delimited_rows(handle, path, delimiter=",")
         _, fields = next(records, (0, []))
         headers = _header_map(fields)
-        required = ["dna_barcode", "cell_order"] + ([] if policy.name == "droplet" else ["plateid"])
+        required = ["dna_barcode", "cell_order"] + ([] if policy.name in DD_PROTOCOLS else ["plateid"])
         missing = [name for name in required if name not in headers]
         if missing:
             raise ValueError(
@@ -750,17 +455,17 @@ def validate_barcode_map_for_protocol(
             if not any((dna, plate, order)):
                 continue
             usable_rows += 1
-            if not dna or (not plate and policy.name != "droplet") or not order:
+            if not dna or (not plate and policy.name not in DD_PROTOCOLS) or not order:
                 raise ValueError(
                     f"Barcode_Map.csv row {row_index} has empty required field(s) for "
                     f"protocol={policy.name}: DNA_Barcode={dna!r}, "
                     f"PlateID={plate!r}, Cell_Order={order!r}"
                 )
 
-            if policy.name == "droplet":
-                cell_identity("sample", "droplet", plate, dna)
+            if policy.name in DD_PROTOCOLS:
+                cell_identity("sample", policy.name, plate, dna)
                 if dna not in droplet_design_barcodes():
-                    raise ValueError("Droplet called barcode is outside the fixed DD-MET5 design")
+                    raise ValueError("Droplet called barcode is outside the shared DNA barcode design")
             else:
                 _validate_barcode(dna, column="DNA_Barcode", row_number=row_index)
             if plate and SAMPLE_ID_RE.fullmatch(plate) is None:
@@ -786,9 +491,9 @@ def validate_barcode_map_for_protocol(
 
         if usable_rows == 0:
             raise ValueError(f"Barcode map contains no usable rows: {path}")
-        if not dna_lengths.issubset({17} if policy.name == "droplet" else _SUPPORTED_BARCODE_LENGTHS):
+        if not dna_lengths.issubset({17} if policy.name in DD_PROTOCOLS else _SUPPORTED_BARCODE_LENGTHS):
             raise ValueError(f"Unsupported DNA barcode lengths: {sorted(dna_lengths)}")
-        if policy.name != "droplet":
+        if policy.name not in DD_PROTOCOLS:
             _audit_one_substitution_neighborhoods(sorted(seen_dna), "DNA_Barcode")
         return barcode_rows
 
@@ -884,7 +589,7 @@ def _parse_project_sample_manifest(
                 f"sample_manifest.tsv line {line_no} species={row['species']!r} "
                 f"does not match config species={species!r}"
             )
-        row_protocol = row["protocol"].lower()
+        row_protocol = row["protocol"] if row["protocol"] in DD_PROTOCOLS else row["protocol"].lower()
         if not row_protocol:
             raise ValueError(f"sample_manifest.tsv line {line_no} has empty protocol")
         if row_protocol != protocol:
@@ -949,10 +654,9 @@ def build_refreshed_rows(
     protocol: str,
 ) -> list[dict[str, str]]:
     """由 FASTQ inventory 构建确定性的项目 manifest 行，并提示移除失去本地输入的样本及关联。"""
-    protocol = str(protocol).strip().lower()
-    if protocol not in _PROTOCOLS:
-        raise ValueError(f"Unsupported protocol for manifest refresh: {protocol!r}")
-    input_columns = get_protocol(protocol).raw_input_columns
+    policy = get_protocol(protocol)
+    protocol = policy.name
+    input_columns = policy.raw_input_columns
     discovered = sorted({str(sample).strip() for sample in discovered_samples if str(sample).strip()})
     discovered_set = set(discovered)
     rows_by_id: dict[str, dict[str, str]] = {}
@@ -1047,7 +751,8 @@ def _canonical_project_manifest_rows(
             field: str(raw.get(field, "") or "").strip()
             for field in PROJECT_SAMPLE_MANIFEST_FIELDS
         }
-        row["protocol"] = row["protocol"].lower()
+        if row["protocol"] not in DD_PROTOCOLS:
+            row["protocol"] = row["protocol"].lower()
         normalized.append(row)
     return sorted(normalized, key=lambda row: row["sample_id"])
 
@@ -1093,7 +798,7 @@ def refresh_manifest(
     config_path: Path,
     dry_run: bool = False,
 ) -> dict[str, object]:
-    """在管线读取锁之外合并原始 FASTQ，失败时按日志恢复整组输入。"""
+    """根据 FASTQ 路径与元数据更新文库清单。"""
     project_dir = project_dir.absolute()
     if not project_dir.is_dir():
         raise FileNotFoundError(f"Project directory does not exist: {project_dir}")
@@ -1104,15 +809,7 @@ def refresh_manifest(
         raw_dir = project_dir / "01_raw"
         manifest_path = project_dir / "00_config" / "sample_manifest.tsv"
 
-
-        journal = project_dir / _RAW_APPEND_JOURNAL
-        if journal.is_symlink():
-            raise ValueError(f"Unsafe FASTQ merge journal: {journal}")
-        if stat_if_present(journal) is not None and not dry_run:
-            _recover_fastq_append(project_dir, journal)
-        _require_no_raw_append(project_dir)
-        fastq_appends = _plan_fastq_appends(raw_dir)
-        discovered = discover_samples(raw_dir, archived_paths=frozenset(op.source for op in fastq_appends))
+        discovered = discover_samples(raw_dir)
         if not discovered:
             raise ValueError(f"No paired FASTQ samples found under: {raw_dir}")
         existing_rows = _read_existing_manifest_loose(manifest_path)
@@ -1122,7 +819,6 @@ def refresh_manifest(
         if not rows:
             raise ValueError("Manifest refresh produced no rows")
 
-
         new_text = render_tsv(rows, PROJECT_SAMPLE_MANIFEST_FIELDS)
         validated = _parse_project_sample_manifest(
             io.StringIO(new_text), path=manifest_path, species=species, protocol=protocol
@@ -1131,38 +827,22 @@ def refresh_manifest(
         changed = _canonical_project_manifest_rows(existing_rows) != rows
         backup_path: Path | None = None
 
-        if not dry_run:
+        if changed and not dry_run:
             original_manifest = original_mode = None
-            if changed:
-                try:
-                    manifest_path.lstat()
-                except FileNotFoundError:
-                    pass
-                else:
-                    original_manifest = manifest_path.read_bytes()
-                    original_mode = stat.S_IMODE(manifest_path.stat().st_mode)
-            with _fastq_append_transaction(
-                project_dir, fastq_appends, manifest_changed=changed,
-                manifest_text=original_manifest, manifest_mode=original_mode,
-            ):
-                try:
-                    if changed:
-                        if original_manifest is not None and existing_rows:
-                            backup_path = manifest_path.with_name(f"{manifest_path.name}.bak")
-                            # 不原地截断旧备份，也不沿既有链接写入其他文件。
-                            atomic_write_bytes(
-                                backup_path, original_manifest,
-                                mode=original_mode,
-                            )
-                        write_tsv_atomic(manifest_path, rows, PROJECT_SAMPLE_MANIFEST_FIELDS, mode=original_mode)
-                except BaseException:
-                    # 合并事务由恢复日志还原清单及 FASTQ，普通刷新仅还原清单。
-                    if changed and not fastq_appends:
-                        if original_manifest is None:
-                            manifest_path.unlink(missing_ok=True)
-                        elif not manifest_path.exists() or manifest_path.read_bytes() != original_manifest:
-                            atomic_write_bytes(manifest_path, original_manifest, mode=original_mode)
-                    raise
+            if stat_if_present(manifest_path) is not None:
+                original_manifest = manifest_path.read_bytes()
+                original_mode = stat.S_IMODE(manifest_path.stat().st_mode)
+            try:
+                if original_manifest is not None and existing_rows:
+                    backup_path = manifest_path.with_name(f"{manifest_path.name}.bak")
+                    atomic_write_bytes(backup_path, original_manifest, mode=original_mode)
+                write_tsv_atomic(manifest_path, rows, PROJECT_SAMPLE_MANIFEST_FIELDS, mode=original_mode)
+            except BaseException:
+                if original_manifest is None:
+                    manifest_path.unlink(missing_ok=True)
+                elif stat_if_present(manifest_path) is None or manifest_path.read_bytes() != original_manifest:
+                    atomic_write_bytes(manifest_path, original_manifest, mode=original_mode)
+                raise
 
         return {
             "project_dir": project_dir,
@@ -1175,7 +855,7 @@ def refresh_manifest(
             "row_count": len(rows),
             "changed": changed,
             "backup_path": backup_path,
-            "fastq_appends": fastq_appends,
+            "chunk_count": sum(len(mates["r1"]) for mates in discovered.values()),
             "rows": rows,
             "text": new_text,
         }
@@ -1209,7 +889,7 @@ def init_project_directory(project_dir: str | Path, pipeline_root: str | Path) -
     manifest = project / "00_config" / "sample_manifest.tsv"
     create_input(manifest, b"sample_id\tdna_raw_sample\trna_sample\tspecies\tprotocol\tnotes\n")
     barcode = project / "00_config" / "Barcode_Map.csv"
-    if load_project_config(config)["analysis"]["protocol"] != "droplet":
+    if load_project_config(config)["analysis"]["protocol"] not in DD_PROTOCOLS:
         try:
             barcode_state = barcode.stat()
         except FileNotFoundError:
@@ -1227,7 +907,7 @@ def init_project_directory(project_dir: str | Path, pipeline_root: str | Path) -
 
 
 def print_refresh_result(args, result) -> int:
-    """refresh-manifest 的用户可见输出（预览/更新/未变化 + 追加计划）。"""
+    """refresh-manifest 的用户可见输出（预览/更新/未变化及配对分块数）。"""
     action = "Previewed" if args.dry_run else ("Updated" if result["changed"] else "Unchanged")
     print(f"{action} sample manifest")
     print(f"  Project:  {result['project_dir']}")
@@ -1238,13 +918,7 @@ def print_refresh_result(args, result) -> int:
     print(f"  Species:  {result['species']}")
     print(f"  FASTQ samples: {result['discovered_count']}")
     print(f"  Manifest rows: {result['row_count']}")
-    if result["fastq_appends"]:
-        state = "Planned FASTQ appends" if args.dry_run else "Appended FASTQ files"
-        print(f"  {state}: {len(result['fastq_appends'])}")
-        for op in result["fastq_appends"]:
-            root = result["raw_dir"]
-            print(f"    {op.source.relative_to(root)} -> {op.output.relative_to(root)}")
-            print(f"      Archive: {op.archive.relative_to(root)}")
+    print(f"  Paired FASTQ chunks: {result['chunk_count']}")
     if result["backup_path"]:
         print(f"  Backup:   {result['backup_path']}")
     if args.dry_run:
@@ -1385,7 +1059,8 @@ def _parse_demux_report(raw: object, source: Path) -> DemuxReport:
     for field in ("build_version", "source_revision", "mode", "retention_policy"):
         _text(report[field], field, source)
     mode = cast(str, report["mode"])
-    if mode not in {"dna-only", "dna-only-taps", "dna-only-droplet"}:
+    dd_modes = {get_protocol(name).demux_mode: name for name in DD_PROTOCOLS}
+    if mode not in {"dna-only", "dna-only-taps", *dd_modes}:
         raise ValueError(f"Demux report mode is unsupported: {mode!r}: {source}")
     if report["retention_policy"] != "matched_read_pairs":
         raise ValueError(f"Demux report retention_policy is unsupported: {source}")
@@ -1421,13 +1096,13 @@ def _parse_demux_report(raw: object, source: Path) -> DemuxReport:
             "sample_name", "cell_sample_id", "plate_id", "cell_order", "dna_barcode",
             "dna_status",
         ):
-            _text(sample[field], f"{label}.{field}", source, empty=(field == "plate_id" and mode == "dna-only-droplet"))
+            _text(sample[field], f"{label}.{field}", source, empty=(field == "plate_id" and mode in dd_modes))
         sample_name, cell_id, plate = (
             cast(str, sample[key]) for key in ("sample_name", "cell_sample_id", "plate_id")
         )
         if SAMPLE_ID_RE.fullmatch(sample_name) is None or SAMPLE_ID_RE.fullmatch(cell_id) is None:
             raise ValueError(f"{label} has an invalid sample identity: {source}")
-        if cell_id != cell_identity(sample_name, "droplet" if mode == "dna-only-droplet" else "cabernet", plate, sample["dna_barcode"]):
+        if cell_id != cell_identity(sample_name, dd_modes.get(mode, "cabernet"), plate, sample["dna_barcode"]):
             raise ValueError(f"{label}.cell_sample_id does not match sample_name/plate_id: {source}")
         if cell_id in cell_ids:
             raise ValueError(f"Demux report repeats cell_sample_id={cell_id!r}: {source}")
@@ -1583,7 +1258,7 @@ def _validate_droplet_stage_paths(inputs: Sequence[str | Path], spool: Path,
 
 def stage_droplet_reads(r1: Sequence[str | Path], r2: Sequence[str | Path], spool: str | Path,
                         counts: str | Path, structure: str | Path, *, binary: str | Path,
-                        decoder_python: str | Path, threads: int) -> None:
+                        decoder_python: str | Path, threads: int, protocol: str = "DD-MET5") -> None:
     """配对扫描一次并提交原始条码暂存及完整计数，任一解码或写出失败不提交暂存边界。"""
     if not r1 or len(r1) != len(r2) or threads < 1:
         raise ValueError("Droplet stage requires ordered paired FASTQs and positive threads")
@@ -1600,7 +1275,7 @@ def stage_droplet_reads(r1: Sequence[str | Path], r2: Sequence[str | Path], spoo
             if destination.parent.stat().st_dev != root.stat().st_dev:
                 raise OSError("Droplet stage outputs and temporary directory must share a filesystem")
         staged = root / "spool"
-        command = [str(binary), "droplet-stage", "--spool", str(staged), "--counts-output", str(root / "counts.tsv"),
+        command = [str(binary), "droplet-stage", "--mode", get_protocol(protocol).demux_mode, "--spool", str(staged), "--counts-output", str(root / "counts.tsv"),
                    "--count-metrics", str(root / "structure.json"), "--decoder-python", str(decoder_python), "--threads", str(threads)]
         for flag, paths in (("--r1", r1), ("--r2", r2)):
             for path in paths:
@@ -1611,8 +1286,13 @@ def stage_droplet_reads(r1: Sequence[str | Path], r2: Sequence[str | Path], spoo
             raise RuntimeError(f"Droplet stage temporary directory changed: {root}")
         plan = json.loads((staged / "manifest.json").read_text())
         metrics = json.loads((root / "structure.json").read_text())
-        if plan["version"] != 1 or plan["input_fastq_pairs"] != len(r1) or plan["pairs"] != metrics["input_reads"]:
+        if plan["version"] != 2 or plan.get("mode") != get_protocol(protocol).demux_mode or plan["input_fastq_pairs"] != len(r1) or plan["pairs"] != metrics["input_reads"]:
             raise ValueError("Droplet staged pair accounting differs from structure counts")
+        metrics["protocol"] = protocol
+        metrics["tag_source"] = DD_CONSENSUS[protocol].source
+        if protocol == "DD-MET3":
+            metrics["fragment_tag_with_n"] = metrics.pop("umi_with_n")
+        (root / "structure.json").write_text(json.dumps(metrics, indent=2) + "\n")
         _validate_droplet_stage_paths([*r1, *r2, binary, decoder_python], spool, counts, structure)
         backup = root / "previous"
         backup.mkdir()
@@ -1753,18 +1433,18 @@ def copy_demux_fastq(source: str | Path, destination: str | Path, workers: int =
 
 @lru_cache(maxsize=1)
 def droplet_design_barcodes() -> frozenset[str]:
-    """读取固定内容身份的 DD-MET5 设计条码，供 calling 约束身份，不依赖 RNA 名单。"""
+    """读取固定内容身份的 DD DNA 设计条码，供 calling 约束身份，不依赖 RNA 名单。"""
     path = PIPELINE_ROOT / DROPLET_DESIGN_RESOURCE
     data = path.read_bytes()
     if sha256_bytes(data) != DROPLET_DESIGN_SHA256:
-        raise ValueError("DD-MET5 design barcode resource SHA256 mismatch")
+        raise ValueError("DD DNA design barcode resource SHA256 mismatch")
     return frozenset(gzip.decompress(data).decode("ascii").splitlines())
 
 
 def call_droplet_cells(
     counts_path: str | Path, output: str | Path, metrics_path: str | Path,
     *, demux_binary: str | Path | None = None, threads: int = 1,
-    spool: str | Path | None = None,
+    spool: str | Path | None = None, protocol: str = "DD-MET5",
 ) -> None:
     """按固定谷底及质量/共享分子筛查调用，再限定为设计条码并记录被排除的原始身份。"""
     rows = []
@@ -1788,7 +1468,13 @@ def call_droplet_cells(
                 rows.append((barcode, count))
                 qualities[barcode] = (low, high)
     rows.sort(key=lambda row: (-row[1], row[0]))
-    metrics = {"method": "log10_count_plus_one_valley_200bins_23smooth_20distance", "eligible_barcodes": len(rows), "called_cells": 0}
+    if protocol not in DD_PROTOCOLS:
+        raise ValueError(f"Unsupported calling protocol: {protocol}")
+    if spool is not None:
+        plan = json.loads((Path(spool) / "manifest.json").read_text())
+        if plan.get("version") != 2 or plan.get("mode") != get_protocol(protocol).demux_mode:
+            raise ValueError("Droplet spool chemistry disagrees with calling protocol")
+    metrics = {"protocol": protocol, "method": "log10_count_plus_one_valley_200bins_23smooth_20distance", "eligible_barcodes": len(rows), "called_cells": 0}
     failure = "Droplet calling requires two separated peaks among AGT barcodes with count >100"
     if rows and rows[0][1] != rows[-1][1]:
         values = [math.log10(count + 1) for _, count in rows]
@@ -1847,6 +1533,9 @@ def call_droplet_cells(
               "minimum_shared_umis": 3, "minimum_shared_inserts": 3,
               "signature": "exact_umi12_insert32", "child_signature_cap": 4096, "parent_scan": "complete",
               "evaluated": [], "removed_barcodes": 0, "removed_exact_read_pairs": 0}
+    if protocol == "DD-MET3":
+        screen = {k: v for k, v in screen.items() if k not in ("minimum_shared_umis", "minimum_shared_inserts", "child_signature_cap", "parent_scan", "signature")}
+        screen["method"] = "barcode_quality_diagnostics_only"
     metrics["barcode_error_screen"] = screen
     counts = dict(called)
     candidates = []
@@ -1872,6 +1561,8 @@ def call_droplet_cells(
             decision["reason"] = "independent_q30_support"
         elif low[pos] < 0.2 * count or low[pos] * counts[parent] < 5 * parent_low * count:
             decision["reason"] = "insufficient_quality_evidence"
+        elif protocol == "DD-MET3":
+            decision["reason"] = "quality_suspect_without_experimental_umi"
         else:
             decision["reason"] = "pending_molecule_evidence"
             candidates.append(decision)
@@ -1884,7 +1575,7 @@ def call_droplet_cells(
             with tempfile.TemporaryDirectory(prefix=".droplet_evidence.", dir=project_temporary_parent(metrics_path)) as tmp:
                 pair_file, evidence_file = Path(tmp) / "pairs.json", Path(tmp) / "molecules.json"
                 pair_file.write_text(json.dumps(selected))
-                command = [str(demux_binary), "--mode", "dna-only-droplet", "--threads", str(threads),
+                command = [str(demux_binary), "--mode", get_protocol(protocol).demux_mode, "--threads", str(threads),
                            "--evidence-pairs", str(pair_file), "--evidence-output", str(evidence_file)]
                 command.extend(["--droplet-spool", str(spool)])
                 subprocess.run(command, check=True)
@@ -1926,9 +1617,10 @@ def call_droplet_cells(
                         removed.add(decision["barcode"])
             screen.update(removed_barcodes=len(removed), removed_exact_read_pairs=sum(counts[bc] for bc in removed))
             called = [(bc, n) for bc, n in called if bc not in removed]
-        screen.update(molecule_checked=len(candidates),
-                      insufficient_molecule_evidence=sum(r["reason"] == "insufficient_shared_molecules" for r in candidates),
-                      child_signatures_capped=sum(r["child_saturated"] for r in candidates))
+        if protocol == "DD-MET5":
+            screen.update(molecule_checked=len(candidates),
+                          insufficient_molecule_evidence=sum(r["reason"] == "insufficient_shared_molecules" for r in candidates),
+                          child_signatures_capped=sum(r["child_saturated"] for r in candidates))
         design_called = {bc for bc, _ in called if bc in design}
         excluded = []
         for barcode, count in called:
@@ -1948,7 +1640,7 @@ def call_droplet_cells(
         }
         called = [(bc, n) for bc, n in called if bc in design_called]
         if not called:
-            raise ValueError("Droplet calling retained no cells within the fixed DD-MET5 design")
+            raise ValueError("Droplet calling retained no cells within the fixed methylation barcode design")
         metrics.update(status="complete", called_cells=len(called), called_read_pairs=sum(n for _, n in called))
     except Exception as exc:
         metrics.update(status="failed", failure=f"Droplet calling failed: {exc}")
@@ -1978,7 +1670,7 @@ def _cell_order_key(value: str) -> tuple[int, int | str]:
 
 def cell_identity(project: str, protocol: str, plate: str, barcode: str) -> str:
     """按孔板或液滴协议构造唯一 cell ID。"""
-    if protocol == "droplet":
+    if protocol in DD_PROTOCOLS:
         if plate or not re.fullmatch(r"[AGT]{17}", barcode):
             raise ValueError("Droplet requires a 17 bp AGT barcode and empty plate_id")
         return f"{project}_{barcode}"
@@ -2002,11 +1694,11 @@ def write_initial_cell_manifest(
         Path(project_manifest), species=species, protocol=protocol
     )
     if project_sample_id is not None:
-        if protocol != "droplet" or project_sample_id not in {r["sample_id"] for r in project_rows}:
+        if protocol not in DD_PROTOCOLS or project_sample_id not in {r["sample_id"] for r in project_rows}:
             raise ValueError("Per-library cell manifest requires a registered Droplet sample")
         project_rows = [row for row in project_rows if row["sample_id"] == project_sample_id]
     called = dict(called_cells)
-    if protocol == "droplet":
+    if protocol in DD_PROTOCOLS:
         if len(called) != len(called_cells) or set(called) != {r["sample_id"] for r in project_rows}:
             raise ValueError("Called-cell libraries must exactly match project manifest")
     elif called:
@@ -2015,7 +1707,7 @@ def write_initial_cell_manifest(
     seen: set[str] = set()
     for project in project_rows:
         project_id = project["sample_id"]
-        barcode_rows = validate_barcode_map_for_protocol(Path(called[project_id] if protocol == "droplet" else barcode_map), get_protocol(protocol))
+        barcode_rows = validate_barcode_map_for_protocol(Path(called[project_id] if protocol in DD_PROTOCOLS else barcode_map), get_protocol(protocol))
         for barcode in barcode_rows:
             cell_id = cell_identity(project_id, protocol, barcode["plate_id"], barcode["dna_barcode"])
             if SAMPLE_ID_RE.fullmatch(cell_id) is None:
@@ -2056,16 +1748,19 @@ def read_cell_identity_manifest(path: str | Path) -> dict[str, CellIdentityRow]:
     """读取 demux 前的 cell identity 快照并按 cell ID 索引。"""
     source = Path(path)
     with source.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        fields = list(reader.fieldnames or [])
+        records = _iter_delimited_rows(handle, source, delimiter="\t")
+        _, fields = next(records, (0, []))
         _require_header(fields, INITIAL_CELL_MANIFEST_FIELDS, source=source, label="initial cell manifest")
         rows: dict[str, CellIdentityRow] = {}
-        for line_no, raw in enumerate(reader, start=2):
-            if None in raw:
+        for line_no, values in records:
+            if not values:
+                continue
+            if len(values) != len(fields):
                 raise ValueError(
-                    f"Initial cell manifest line {line_no} has more fields than its header: {source}"
+                    f"Initial cell manifest line {line_no} has {len(values)} fields; "
+                    f"expected {len(fields)}: {source}"
                 )
-            row = {key: str(raw.get(key, "") or "").strip() for key in INITIAL_CELL_MANIFEST_FIELDS}
+            row = {key: value.strip() for key, value in zip(fields, values, strict=True)}
             cell_id = row.get("sample_id", "")
             if not cell_id:
                 if any(row.values()):
@@ -2176,34 +1871,21 @@ def map_discovered_samples_to_manifest(
     protocol: str,
 ) -> MappedDemuxRuns:
     """仅将 manifest 登记的 raw FASTQ 映射到 canonical 样本与 route；登记输入缺失时拒绝。"""
-    protocol = str(protocol).strip().lower()
-    input_columns = get_protocol(protocol).raw_input_columns
-    expected_raw: dict[str, dict[str, str]] = {}
-    for row in manifest_rows:
-        sid = row["sample_id"]
-        dna_raw = row.get("dna_raw_sample", "")
-        if dna_raw:
-            route_id = default_dna_route(protocol)
-            expected_raw[dna_raw] = {
-                "sample_id": sid,
-                "route_id": route_id,
-                "source_column": "dna_raw_sample",
-            }
-    discovered_set = set(discovered)
-    expected_set = set(expected_raw)
-    missing_fastq = sorted(expected_set - discovered_set)
+    route_id = default_dna_route(protocol)
+    expected_raw = {
+        row["dna_raw_sample"]: row["sample_id"]
+        for row in manifest_rows if row.get("dna_raw_sample")
+    }
+    missing_fastq = sorted(expected_raw.keys() - discovered.keys())
     if missing_fastq:
         raise ValueError("Raw FASTQ / sample_manifest mismatch: manifest raw sample(s) without paired FASTQ: " + ", ".join(missing_fastq))
 
     mapped: MappedDemuxRuns = {}
     for raw_sample in sorted(expected_raw):
-        identity = expected_raw[raw_sample]
-        sid = identity["sample_id"]
-        route_id = identity["route_id"]
-        run_id = sid
-        if run_id in mapped:
-            raise ValueError(f"Canonical demux run ID collision: {run_id!r}")
-        mapped[run_id] = {
+        sid = expected_raw[raw_sample]
+        if sid in mapped:
+            raise ValueError(f"Canonical demux run ID collision: {sid!r}")
+        mapped[sid] = {
             "r1": discovered[raw_sample]["r1"],
             "r2": discovered[raw_sample]["r2"],
             "raw_sample": raw_sample,
@@ -2370,36 +2052,29 @@ def read_demux_manifest(manifest_path: str) -> list[DemuxRow]:
     path = Path(manifest_path)
     if not path.is_file():
         raise FileNotFoundError(f"Demux manifest is missing: {path}")
-    text = path.read_text(encoding="utf-8")
-    if not text:
-        raise ValueError(f"Demux manifest is empty: {path}")
-    if not text.endswith("\n"):
-        raise ValueError(f"Demux manifest has no terminal newline and may be truncated: {path}")
-    lines = text.splitlines()
-    if not lines:
-        raise ValueError(f"Demux manifest is empty: {path}")
-    header = lines[0].split("\t")
-    if header != list(DEMUX_MANIFEST_FIELDS):
-        raise ValueError(
-            f"Demux manifest header/order does not match the Alopex contract: {path}; "
-            f"expected={list(DEMUX_MANIFEST_FIELDS)!r}, observed={header!r}. "
-            "Remove the stale/corrupt manifest and rerun demux."
-        )
-
     rows: list[DemuxRow] = []
     row_lines: list[int] = []
-    for line_number, line in enumerate(lines[1:], start=2):
-        if not line.strip():
-            raise ValueError(f"Demux manifest contains a blank row at line {line_number}: {path}")
-        values = line.split("\t")
-        if len(values) != len(header):
-            raise ValueError(
-                f"Demux manifest row {line_number} in {path} has {len(values)} fields; "
-                f"expected {len(header)}. Remove the corrupt manifest and rerun demux."
-            )
-        row = dict(zip(header, values, strict=True))
-        rows.append(row)
-        row_lines.append(line_number)
+    with path.open("rb") as raw:
+        if raw.seek(0, os.SEEK_END) == 0:
+            raise ValueError(f"Demux manifest is empty: {path}")
+        raw.seek(-1, os.SEEK_END)
+        if raw.read(1) not in (b"\r", b"\n"):
+            raise ValueError(f"Demux manifest has no terminal newline and may be truncated: {path}")
+        raw.seek(0)
+        with io.TextIOWrapper(raw, encoding="utf-8", newline="") as handle:
+            records = _iter_delimited_rows(handle, path, delimiter="\t")
+            _, header = next(records, (0, []))
+            _require_header(header, DEMUX_MANIFEST_FIELDS, source=path, label="Demux manifest")
+            for line_number, values in records:
+                if not any(value.strip() for value in values):
+                    raise ValueError(f"Demux manifest contains a blank row at line {line_number}: {path}")
+                if len(values) != len(header):
+                    raise ValueError(
+                        f"Demux manifest row {line_number} in {path} has {len(values)} fields; "
+                        f"expected {len(header)}. Remove the corrupt manifest and rerun demux."
+                    )
+                rows.append(dict(zip(header, values, strict=True)))
+                row_lines.append(line_number)
 
     summaries = [idx for idx, row in enumerate(rows) if row["demux_sample"] == "__SUMMARY__"]
     if len(summaries) != 1 or summaries[0] != len(rows) - 1:
@@ -2531,7 +2206,7 @@ def read_demux_manifest(manifest_path: str) -> list[DemuxRow]:
                 f"Demux manifest line {line_no} has invalid project_sample_id={project_id!r}: {path}"
             )
         project_ids.add(project_id)
-        if (not cell["plate_id"] and route.protocol != "droplet") or not cell["dna_barcode"] or not cell["dna_r1"] or not cell["dna_r2"]:
+        if (not cell["plate_id"] and route.protocol not in DD_PROTOCOLS) or not cell["dna_barcode"] or not cell["dna_r1"] or not cell["dna_r2"]:
             raise ValueError(f"Demux manifest line {line_no} has incomplete cell identity/paths: {path}")
         if not cell["cell_order"].strip():
             raise ValueError(f"Demux manifest line {line_no} has empty cell_order: {path}")
@@ -2646,25 +2321,25 @@ def _validate_committed_fastqs(
         raise FileNotFoundError(
             f"Committed demux output directory is missing: DNA={dna_root}"
         )
+    seen_files: set[tuple[int, int]] = set()
     for row in rows:
-        if row["demux_sample"] == "__SUMMARY__":
+        if row["dna_status"] != "Pass":
             continue
-        for modality, root in (("dna", dna_root),):
-            if row[f"{modality}_status"] != "Pass":
-                continue
-            for mate in (1, 2):
-                fastq = Path(row[f"{modality}_r{mate}"]).resolve()
-                try:
-                    fastq.relative_to(root)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"Committed {modality.upper()} FASTQ escapes its run directory: {fastq}"
-                    ) from exc
-                if not fastq.is_file():
-                    raise FileNotFoundError(
-                        f"Demux manifest marks {row['demux_sample']!r} {modality.upper()} as Pass "
-                        f"but FASTQ is missing: {fastq}"
-                    )
+        cell = row["demux_sample"]
+        for mate in (1, 2):
+            fastq = Path(row[f"dna_r{mate}"]).resolve()
+            if fastq != dna_root / cell / f"{cell}_R{mate}.fastq.gz":
+                raise ValueError(f"Committed DNA FASTQ does not match {cell} R{mate}: {fastq}")
+            try:
+                info = fastq.stat()
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(f"Committed DNA FASTQ is missing for {cell} R{mate}: {fastq}") from exc
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"Committed DNA FASTQ is not a regular file: {fastq}")
+            identity = (info.st_dev, info.st_ino)
+            if identity in seen_files:
+                raise ValueError(f"Committed DNA FASTQ is reused across cells or mates: {fastq}")
+            seen_files.add(identity)
 
 
 def _load_committed_completion(
@@ -2679,13 +2354,15 @@ def _load_committed_completion(
         raise ValueError(f"Invalid demux completion manifest {completion_file}: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"Demux completion manifest root must be an object: {completion_file}")
-    if value.get("schema_version") != DEMUX_COMPLETION_SCHEMA or value.get("status") != "committed":
+    if (_integer(value.get("schema_version"), "schema_version", completion_file) != DEMUX_COMPLETION_SCHEMA
+            or value.get("status") != "committed"):
         raise ValueError(f"Demux generation is not a committed schema-1 generation: {completion_file}")
-    generation = str(value.get("generation_id", ""))
+    _integer(value.get("cell_count"), "cell_count", completion_file)
+    generation = _text(value.get("generation_id"), "generation_id", completion_file)
     if re.fullmatch(r"[0-9a-f]{32}", generation) is None:
         raise ValueError(f"Demux completion generation_id is invalid: {completion_file}")
-    run_id = str(value.get("run_id", ""))
-    project_sample_id = str(value.get("project_sample_id", ""))
+    run_id = _text(value.get("run_id"), "run_id", completion_file)
+    project_sample_id = _text(value.get("project_sample_id"), "project_sample_id", completion_file)
     if SAMPLE_ID_RE.fullmatch(run_id) is None or SAMPLE_ID_RE.fullmatch(project_sample_id) is None:
         raise ValueError(f"Demux completion has an invalid run/project identity: {completion_file}")
 
@@ -2694,14 +2371,22 @@ def _load_committed_completion(
         recorded = value.get(key)
         if not isinstance(recorded, dict):
             raise ValueError(f"Demux completion is missing file identity {key!r}: {completion_file}")
-        path = Path(str(recorded.get("path", ""))).resolve()
+        _integer(recorded.get("size_bytes"), f"{key}.size_bytes", completion_file)
+        digest = _text(recorded.get("sha256"), f"{key}.sha256", completion_file)
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError(f"Demux completion has an invalid {key} sha256: {completion_file}")
+        path = Path(_text(recorded.get("path"), f"{key}.path", completion_file))
+        if not path.is_absolute():
+            raise ValueError(f"Demux completion requires an absolute {key} path: {completion_file}")
+        path = path.resolve()
         if not path.is_file():
             raise FileNotFoundError(f"Committed demux file is missing: {path}")
         identities[key] = path
-    for key in ("dna_dir",):
-        directory = Path(str(value.get(key, ""))).resolve()
-        if not directory.is_dir():
-            raise FileNotFoundError(f"Committed demux output directory is missing: {directory}")
+    directory = Path(_text(value.get("dna_dir"), "dna_dir", completion_file))
+    if not directory.is_absolute():
+        raise ValueError(f"Demux completion requires an absolute dna_dir: {completion_file}")
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Committed demux output directory is missing: {directory}")
     return value, identities, run_id, project_sample_id
 
 
@@ -2772,10 +2457,7 @@ def validate_demux_completion(
     cell_ids = [row["demux_sample"] for row in rows if row["demux_sample"] != "__SUMMARY__"]
     if value.get("cell_count") != len(cell_ids) or value.get("cell_ids_sha256") != _cell_set_digest(cell_ids):
         raise ValueError(f"Demux completion cell set does not match its manifest: {completion_file}")
-    _validate_committed_fastqs(
-        rows,
-        Path(str(value.get("dna_dir", ""))).resolve(),
-    )
+    _validate_committed_fastqs(rows, Path(value["dna_dir"]))
     value["_manifest_path"] = str(identities["manifest"])
     value["_cell_manifest_path"] = str(identities["initial_cell_manifest"])
     value["_rows"] = rows
@@ -2946,20 +2628,31 @@ def write_demux_mqc(
         "Ambiguous_Read_Pairs": fate["ambiguous"],
         "Unmatched_Read_Pairs": fate["unmatched"],
     }
-    if pipeline_mode == "droplet":
+    if pipeline_mode in DD_PROTOCOLS:
         calling = _read_json(Path(calling_metrics), "Droplet calling")
         structure = _read_json(Path(structure_metrics), "Droplet structure")
-        if calling.get("status") != "complete" or calling["called_cells"] != len(rep["samples"]):
-            raise ValueError("Droplet calling/report cell count mismatch")
+        policy_tag = DD_CONSENSUS[pipeline_mode]
+        if (calling.get("protocol") != pipeline_mode or structure.get("protocol") != pipeline_mode
+                or structure.get("tag_source") != policy_tag.source
+                or calling.get("barcode_design_filter", {}).get("sha256") != DROPLET_DESIGN_SHA256):
+            raise ValueError("Droplet calling/structure protocol, tag source or design identity mismatch")
+        if (calling.get("status") != "complete" or calling["called_cells"] != len(rep["samples"])
+                or structure["input_reads"] != rep["input_read_pairs"]):
+            raise ValueError("Droplet calling/structure/report count mismatch")
         screen = calling["barcode_error_screen"]
         summary.update({"Called_Cells": calling["called_cells"], "Calling_Threshold": calling["threshold"],
+                        "Tag_Source": structure["tag_source"], "DNA_Barcode_Design_SHA256": DROPLET_DESIGN_SHA256,
                         "Design_Excluded_Candidates": calling["barcode_design_filter"]["excluded_candidates"],
                         "Design_Excluded_Exact_Read_Pairs": calling["barcode_design_filter"]["excluded_exact_read_pairs"],
                         "Barcode_Error_Candidates_Removed": screen["removed_barcodes"],
-                        "Barcode_Molecule_Candidates_Checked": screen["molecule_checked"],
-                        "Barcode_Insufficient_Molecule_Evidence": screen["insufficient_molecule_evidence"],
-                        "Barcode_Child_Signatures_Capped": screen["child_signatures_capped"],
-                        "Structured_Reads": structure["structured_reads"], "Structured_UMI_With_N": structure["umi_with_n"]})
+                        "Structured_Reads": structure["structured_reads"],
+                        ("Structured_UMI_With_N" if pipeline_mode == "DD-MET5" else "Structured_Fragment_Tag_With_N"): structure[f"{DD_CONSENSUS[pipeline_mode].tag}_with_n"]})
+        if pipeline_mode == "DD-MET5":
+            summary.update({
+                "Barcode_Molecule_Candidates_Checked": screen["molecule_checked"],
+                "Barcode_Insufficient_Molecule_Evidence": screen["insufficient_molecule_evidence"],
+                "Barcode_Child_Signatures_Capped": screen["child_signatures_capped"],
+            })
     route_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", route.route_id)
     obj = {
         "id": f"demux_rs_{route_key}",

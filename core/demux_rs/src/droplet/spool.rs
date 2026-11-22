@@ -21,6 +21,7 @@ pub(super) struct Block {
 #[derive(Serialize, serde::Deserialize)]
 pub(super) struct Manifest {
     pub(super) version: u32,
+    pub(super) mode: String,
     pub(super) shards: usize,
     pub(super) blocks: u64,
     pub(super) pairs: u64,
@@ -56,7 +57,7 @@ pub(super) fn spool_fastq(data: &[u8]) -> Result<(&[u8], &[u8])> {
     anyhow::ensure!(
         id.starts_with(b"@")
             && id.len() > 1
-            && !id.iter().any(u8::is_ascii_whitespace)
+            && !id.iter().any(is_read_id_whitespace)
             && plus == b"+"
             && !seq.is_empty()
             && lines.next() == Some(b"".as_slice())
@@ -69,6 +70,7 @@ pub(super) fn spool_fastq(data: &[u8]) -> Result<(&[u8], &[u8])> {
 
 pub(super) fn walk(
     data: &[u8],
+    mode: DemuxMode,
     mut consume: impl FnMut(RawRecord<'_>) -> Result<()>,
 ) -> Result<()> {
     let mut at = 0usize;
@@ -113,9 +115,12 @@ pub(super) fn walk(
             umi_start > 0 && umi.len() == 12 && umi.iter().all(|b| b"ACGTN".contains(b)),
             "invalid spool UMI"
         );
-        let expected = seq1
-            .get(..32)
-            .and_then(|insert| droplet::encode_molecule(umi, insert));
+        let expected = if mode == DemuxMode::DdMet3 {
+            anyhow::ensure!(seq1.get(..12) == Some(umi), "spool fragment tag disagrees with R1");
+            None
+        } else {
+            seq1.get(..32).and_then(|insert| droplet::encode_molecule(umi, insert))
+        };
         anyhow::ensure!(key == expected, "spool molecule key disagrees with FASTQ");
         consume(RawRecord {
             ordinal,
@@ -132,7 +137,7 @@ pub(super) fn walk(
 pub(super) fn blocks(spool: &Path) -> Result<(Manifest, Vec<Block>)> {
     let manifest: Manifest = serde_json::from_slice(&std::fs::read(spool.join("manifest.json"))?)?;
     anyhow::ensure!(
-        manifest.version == 1 && manifest.shards > 0,
+        manifest.version == 2 && manifest.shards > 0,
         "unsupported spool"
     );
     let mut out = Vec::new();

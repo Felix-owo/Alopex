@@ -340,28 +340,32 @@ dna_pipeline_run_bsconv_classification() {
     fi
 }
 
-# 把后端计数流按配置偏移写成四列 CpG；压缩固定单线程，避免嵌套并行。
+# coverage 用 1-based 闭区间，BED 用 0-based 半开区间。先确认单个位点，再转换公开坐标。
 dna_pipeline_emit_canonical_cpg() {
-    local zstd="${1:?}" pos_expr="${2:?}" out_tmp="${3:?}" source="${4:-stdin}"
+    local zstd="${1:?}" base="${2:?}" format="${3:?}" out_tmp="${4:?}" source="${5:?}"
     {
         printf 'chrom\tpos\tmethyl\tunmethyl\n'
-        LC_ALL=C awk -F '\t' -v OFF="$pos_expr" -v SOURCE="$source" '
+        LC_ALL=C awk -F '\t' -v BASE="$base" -v FMT="$format" -v SOURCE="$source" '
         function invalid(reason) {
             printf "ERROR: invalid CpG record at %s:%d: %s\n", SOURCE, NR, reason > "/dev/stderr";
             exit 1;
         }
-        BEGIN{OFS="\t"; OFMT="%.0f"}
+        BEGIN {
+            OFS="\t"; OFMT="%.0f";
+            if ((FMT != "bed" && FMT != "coverage") || BASE !~ /^[01]$/) invalid("unknown coordinate convention");
+            native_base = (FMT == "coverage");
+        }
         {
-            if (NF < 6 || $1 == "" || $2 == "" || $3 == "" || $5 == "" || $6 == "") invalid("expected nonempty chromosome, coordinates and counts in six tab-separated columns");
+            if (NF != 6 || $1 == "" || $2 == "" || $3 == "" || $5 == "" || $6 == "") invalid("expected nonempty chromosome, coordinates and counts in six tab-separated columns");
+            if ($1 ~ /[[:space:]]/) invalid("whitespace in reference contig name");
             if (($2 $3 $5 $6) ~ /[^0-9]/) invalid("coordinates and counts must be nonnegative integers");
-            start=$2+0; end=$3+0; m=$5+0; u=$6+0; pos=start+OFF;
+            start=$2+0; end=$3+0; m=$5+0; u=$6+0;
             if (start > 9007199254740991 || end > 9007199254740991 || m > 9007199254740991 || u > 9007199254740991) invalid("integer exceeds exact range");
-            if (pos < 0 || pos > 9007199254740991 || end < start) invalid("invalid coordinate interval");
-            if (m+u>0) {
-                if (($1 in last_pos) && pos <= last_pos[$1]) invalid("duplicate or out-of-order CpG position");
-                last_pos[$1]=pos;
-                print $1, pos, m, u;
-            }
+            if (start < native_base || end-start != 1-native_base) invalid("expected a single cytosine in " FMT " coordinates");
+            pos=start-native_base+BASE;
+            if (($1 in last_pos) && pos <= last_pos[$1]) invalid("duplicate or out-of-order CpG position");
+            last_pos[$1]=pos;
+            if (m+u>0) print $1, pos, m, u;
         }'
     } | "$zstd" -q -T1 -c > "$out_tmp"
 }

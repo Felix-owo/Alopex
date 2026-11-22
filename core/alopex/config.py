@@ -6,12 +6,15 @@ import sys
 _LOADED_MODULE_CODE = sys._getframe().f_code
 
 import copy
+import gzip
 import json
 import logging
 import math
 import os
 import re
-from collections.abc import Iterable, Mapping, Sequence
+import stat
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -23,6 +26,7 @@ from .io import (
     sha256_bytes,
     sha256_file,
     stable_file_identity,
+    stat_if_present,
 )
 from .paths import CORE_ROOT
 
@@ -31,6 +35,29 @@ logger = logging.getLogger("dna_pipeline")
 
 
 # 配置与契约
+
+@dataclass(frozen=True)
+class TagConsensus:
+    tag: str
+    source: str
+    unit: str
+    dedup_policy: str
+    cph_source: str
+    count_field: str
+    ambiguous_field: str
+
+
+DD_CONSENSUS = {
+    "DD-MET3": TagConsensus("fragment_tag", "trimmed_r1_insert_prefix12", "cytosine_fragment_tag_consensus",
+                            "per_cytosine_fragment_tag_consensus_hamming1", "fragment_tag_consensus_chg_chh",
+                            "cpg_fragment_tag_observations", "cpg_ambiguous_fragment_tag_sites"),
+    "DD-MET5": TagConsensus("umi", "library_umi12", "cytosine_umi_consensus",
+                            "per_cytosine_umi_consensus_hamming1", "droplet_umi_consensus_chg_chh",
+                            "cpg_umi_observations", "cpg_ambiguous_umi_sites"),
+}
+DD_PROTOCOLS = tuple(DD_CONSENSUS)
+DD_CONSENSUS_QC_SUFFIX = ".umi_consensus_mqc.json"
+
 
 DROPLET_DESIGN_RESOURCE = "resources/droplet_ME5_U3CB_methylation.txt.gz"
 
@@ -86,7 +113,8 @@ required:
 - common
 - cabernet
 - taps
-- droplet
+- DD-MET3
+- DD-MET5
 properties:
   schema_version:
     description: 配置 schema 版本号，当前固定为 3。
@@ -115,12 +143,13 @@ properties:
     - cpg_coordinate_base
     properties:
       protocol:
-        description: 建库协议（cabernet / taps / droplet）；manifest 的 rna_sample 为可选外部 RNA raw 关联。
+        description: 建库协议（cabernet / taps / DD-MET3 / DD-MET5）；manifest 的 rna_sample 为可选外部 RNA raw 关联。
         type: string
         enum:
         - cabernet
         - taps
-        - droplet
+        - DD-MET3
+        - DD-MET5
       cpg_coordinate_base:
         description: 四列 CpG 和下游 SingleCpG 位点的坐标起点；默认 1，设为 0 输出 0-based；不改变 BED、VCF 或 BAM 的原生坐标。
         type: integer
@@ -201,7 +230,9 @@ properties:
     properties:
       demux:
         $ref: '#/$defs/demux'
-  droplet:
+  DD-MET3:
+    $ref: '#/properties/DD-MET5'
+  DD-MET5:
     type: object
     additionalProperties: false
     properties:
@@ -315,7 +346,7 @@ $defs:
         - directional
         - non_directional
       high_cph_retention_threshold:
-        description: read pair CpH retention 严格大于该值时判为 high-CpH；越低越严格。
+        description: 任一可评估比对行的 CpH 保留比例严格大于该值时，按 QNAME 剔除整对。
         type: number
         minimum: 0
         maximum: 1
@@ -359,7 +390,7 @@ references:
   mm10: resources/mm10_reference/mm10.primary.lambda.puc19.fa  # primary genome + lambda + pUC19；也接受绝对路径
 
 analysis:
-  protocol: cabernet              # cabernet / taps / droplet；manifest 的 rna_sample 为可选外部 RNA raw 关联
+  protocol: cabernet              # cabernet / taps / DD-MET3 / DD-MET5；manifest 的 rna_sample 为可选外部 RNA raw 关联
   cpg_coordinate_base: 1         # CpG pos 与 SingleCpG 位点默认 1-based；设为 0 输出 0-based，原生 BED/VCF/BAM 不变
 
 runtime:
@@ -389,7 +420,7 @@ common:
     non_conversion_minimum_count: 5         # 至少这么多个 informative non-CG C 才启用百分比判断，防短 CpH 误杀
   biscuit:
     library_type: non_directional   # directional / non_directional
-    high_cph_retention_threshold: 0.7   # read pair CpH retention 严格大于该值判为 high-CpH；越低越严格
+    high_cph_retention_threshold: 0.7   # 任一可评估比对行的 CpH 保留比例严格超过阈值即剔除整对
     generate_snp: false             # BISCUIT-only SNP 输出开关；true 时发布 snps.bed.gz；TAPS 默认发布 VCF，不使用此开关
 
 cabernet:
@@ -397,7 +428,8 @@ cabernet:
 
 taps: {}
 
-droplet: {}
+DD-MET3: {}
+DD-MET5: {}
 """
 
 
@@ -449,17 +481,19 @@ CONFIG_SECTION_DEFAULTS: dict[str, dict[str, object]] = {
         "methylation_backend": "bismark",
     },
     "taps": {},
-    "droplet": {},
+    "DD-MET3": {},
+    "DD-MET5": {},
 }
 
 
+_DD_FIXED_CONFIG = {
+    "methylation_backend": "bismark",
+    "demux": {"dna_w_spacer_len": 0},
+    "bismark": {"library_type": "non_directional"},
+}
 _PROTOCOL_FIXED_CONFIG = {
     "taps": {"methylation_backend": "rastair"},
-    "droplet": {
-        "methylation_backend": "bismark",
-        "demux": {"dna_w_spacer_len": 0},
-        "bismark": {"library_type": "non_directional"},
-    },
+    **dict.fromkeys(DD_PROTOCOLS, _DD_FIXED_CONFIG),
 }
 
 
@@ -480,7 +514,7 @@ def apply_config_defaults(config: dict[str, object]) -> dict[str, object]:
     # 模板用 null 保留协议默认选择；密封/执行配置仍只消费已求解的布尔值。
     if config["retention"]["keep_final_bam"] is None:
         config["retention"]["keep_final_bam"] = config["analysis"].get("protocol") == "taps"
-    for protocol in ("cabernet", "taps", "droplet"):
+    for protocol in ("cabernet", "taps", *DD_PROTOCOLS):
         for key, value in config[protocol].items():
             if key in ("demux", "high_cph", "bismark", "biscuit") and not isinstance(value, dict):
                 raise ValueError(f"config section {protocol}.{key!s} must be a mapping")
@@ -493,7 +527,7 @@ def get_protocol_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(analysis, Mapping):
         raise ValueError("analysis must be a mapping")
     protocol = analysis.get("protocol")
-    if protocol not in ("cabernet", "taps", "droplet"):
+    if protocol not in ("cabernet", "taps", *DD_PROTOCOLS):
         raise ValueError(f"Unsupported protocol: {protocol!r}")
     module = config.get(protocol)
     if not isinstance(module, dict) or not isinstance(config.get("common"), dict):
@@ -516,6 +550,8 @@ def finalize_project_config(config: Mapping[str, object]) -> dict[str, object]:
     import yaml
     from jsonschema import validate as validate_jsonschema
 
+    if "droplet" in config or (isinstance(config.get("analysis"), Mapping) and config["analysis"].get("protocol") == "droplet"):
+        raise ValueError("Update analysis.protocol and the droplet section in config.yaml to DD-MET5 or DD-MET3; update sample_manifest.tsv protocol to match")
     merged = apply_config_defaults(copy.deepcopy(dict(config)))
     schema = yaml.safe_load(CONFIG_SCHEMA_YAML)
     validate_jsonschema(instance=merged, schema=schema)
@@ -626,20 +662,20 @@ def resolve_bismark_alignment(config: Mapping[str, object]) -> BismarkAlignment:
 
 def cutadapt_adapter_specs(protocol: str) -> tuple[str, str]:
     """按协议返回含最短 overlap 的双端接头，不查询运行状态。"""
-    if get_protocol(protocol).name == "droplet":
+    if get_protocol(protocol).name in DD_PROTOCOLS:
         return "N{9}CTGTCTCTTATACACATCT;min_overlap=12", "N{9}CTRTCTCTTATACACATCT;min_overlap=12"
     return "CTGTCTCTTATACACATCT;min_overlap=3", "N{9}CTGTCTCTTATACACATCT;min_overlap=12"
 
 
-def biscuit_library_mode(config: Mapping[str, object]) -> int:
-    """把命名的 paired-end BISCUIT library type 翻译为 ``align -b`` 的取值。"""
+def biscuit_alignment_args(config: Mapping[str, object]) -> tuple[str, ...]:
+    """保留分段比对的完整读段，以供原生胞嘧啶计数，并指定文库方向。"""
     biscuit = get_protocol_config(config).get("biscuit")
     if not isinstance(biscuit, Mapping):
         raise ValueError("biscuit must be a mapping")
     value = str(biscuit.get("library_type", "")).strip().lower()
     if value not in SUPPORTED_BISCUIT_LIBRARY_TYPES:
         raise ValueError("biscuit.library_type must be directional or non_directional")
-    return {"non_directional": 0, "directional": 1}[value]
+    return ("-Y", "-b", "1" if value == "directional" else "0")
 
 
 def validate_config_semantics(config: Mapping[str, object]) -> None:
@@ -654,7 +690,7 @@ def validate_config_semantics(config: Mapping[str, object]) -> None:
     for species, path in config["references"].items():
         if "\x00" in path:
             raise ValueError(f"references.{species} must not contain NUL")
-    for section in ("common", "cabernet", "droplet"):
+    for section in ("common", "cabernet", *DD_PROTOCOLS):
         for name in config[section].get("high_cph", {}).get("excluded_contigs", ()):
             if re.fullmatch(r"[^,\s]+", name) is None or "\x00" in name:
                 raise ValueError(f"{section}.high_cph.excluded_contigs must contain literal names without whitespace, comma or NUL: {name!r}")
@@ -675,7 +711,7 @@ def validate_config_semantics(config: Mapping[str, object]) -> None:
                 or not math.isfinite(float(value)) or not 0 <= value <= 1):
             raise ValueError(f"{section}.biscuit.high_cph_retention_threshold must be a finite number within [0, 1]")
     if backend == "biscuit":
-        biscuit_library_mode(config)
+        biscuit_alignment_args(config)
     elif backend == "bismark":
         resolve_bismark_alignment(config)
 
@@ -703,10 +739,8 @@ class RawRoutePolicy:
 
 
 _PROTOCOLS = {
-    "droplet": ProtocolPolicy(
-        name="droplet", demux_mode="dna-only-droplet",
-        high_cph_role="cdna_contamination",
-    ),
+    **{name: ProtocolPolicy(name=name, demux_mode="dna-only-" + name.lower(), high_cph_role="cdna_contamination")
+       for name in DD_PROTOCOLS},
     "taps": ProtocolPolicy(
         name="taps", demux_mode="dna-only-taps",
         high_cph_role="not_applicable",
@@ -734,14 +768,16 @@ def _raw_route(
 
 
 _RAW_ROUTES = {
-    "droplet_dna": _raw_route("droplet_dna", "droplet", True),
+    **{name.lower() + "_dna": _raw_route(name.lower() + "_dna", name, True) for name in DD_PROTOCOLS},
     "taps_dna_nucleus": _raw_route("taps_dna_nucleus", "taps", True),
     "cabernet_dna_nucleus": _raw_route("cabernet_dna_nucleus", "cabernet", True),
 }
 
 
 def _canonical_protocol_name(name: str) -> str:
-    protocol = str(name or "").strip().lower()
+    protocol = str(name or "").strip()
+    if protocol not in DD_PROTOCOLS:
+        protocol = protocol.lower()
     if protocol not in _PROTOCOLS:
         raise ValueError(
             f"Unsupported pipeline protocol={protocol!r}; expected one of: "
@@ -969,7 +1005,7 @@ class CellOutputPaths:
 
     @property
     def droplet_umi_qc(self) -> Path:
-        return self.bismark_dir / f"{self.sample_id}.umi_consensus_mqc.json"
+        return self.bismark_dir / (self.sample_id + DD_CONSENSUS_QC_SUFFIX)
 
     @property
     def droplet_umi_cov(self) -> Path:
@@ -1084,12 +1120,12 @@ def cell_artifacts(
                             *paths.biscuit_qc_sources(MULTIQC_BISCUIT_SOURCE_SUFFIXES)))
         else:
             metrics.update(bismark_align_report=paths.bismark_align_report,
-                           bismark_extract_report=paths.droplet_umi_qc if policy.name == "droplet" else paths.bismark_extract_report,
-                           bismark_dedup_report=paths.droplet_umi_qc if policy.name == "droplet" else paths.bismark_dedup_report)
+                           bismark_extract_report=paths.droplet_umi_qc if policy.name in DD_PROTOCOLS else paths.bismark_extract_report,
+                           bismark_dedup_report=paths.droplet_umi_qc if policy.name in DD_PROTOCOLS else paths.bismark_dedup_report)
             reports = [metrics["bismark_align_report"], metrics["bismark_extract_report"], paths.bismark_mbias]
             final_qc.extend(reports)
             multiqc.extend((*reports, high_cph_source))
-            if policy.name != "droplet":
+            if policy.name not in DD_PROTOCOLS:
                 final_qc.append(metrics["bismark_dedup_report"])
                 multiqc.append(metrics["bismark_dedup_report"])
     return CellArtifacts(MappingProxyType(metrics), tuple(deliverables), tuple(final_qc),
@@ -1267,6 +1303,20 @@ _PRIMARY_CONTIGS: Mapping[str, tuple[tuple[str, int], ...]] = {
 
 SPIKE_CONTIGS: Mapping[str, int] = {"lambda": 48502, "pUC19": 2686}
 
+# INSDC J02459.1 与 L09137.2 大写碱基的 SHA-256。
+_SPIKE_SEQUENCE_SHA256 = {
+    "lambda": "36432a40f602258d19ae7c8152ddbc30390b559f2859c01d7047c77b048c71b3",
+    "pUC19": "8a205af08518dae1b0045c7b098986dca18824ef654e75233603602ab89cad04",
+}
+
+
+def validated_spike_bases(name: str, fasta: Path, sequence: bytes) -> bytes:
+    """按固定 accession 核对碱基，返回可写入标准参考的大写序列。"""
+    bases = sequence.translate(None, b"\r\n").upper()
+    if sha256_bytes(bases) != _SPIKE_SEQUENCE_SHA256[name]:
+        raise ValueError(f"{name} FASTA sequence differs from the required accession: {fasta}")
+    return bases
+
 
 MANAGED_CONTIGS = {
     species: [*(primaries), *SPIKE_CONTIGS.items()]
@@ -1282,41 +1332,125 @@ def managed_alignment_contigs(species: str) -> list[tuple[str, int]]:
 
 
 def primary_analysis_contigs(species: str, *, include_mitochondrial: bool = False) -> tuple[str, ...]:
-    return tuple(name for name, _length in _PRIMARY_CONTIGS[species]
+    """标准组装按物种取主染色体；自管物种沿用 chr1–22/X/Y 的 QC 命名范围。"""
+    contigs = _PRIMARY_CONTIGS.get(species, _PRIMARY_CONTIGS["hg38"])
+    return tuple(name for name, _length in contigs
                  if include_mitochondrial or name != "chrM")
 
 
-def _fai_contigs(path: Path) -> list[tuple[str, int]]:
-
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except UnicodeError as exc:
-        raise ValueError(f"reference FAI is not valid text: {path}") from exc
-
-    records: list[tuple[str, int]] = []
+def read_fasta_index(path: Path) -> list[tuple[str, int, int, int, int]]:
+    """读取 faidx 的五列 FASTA 索引，保留字面 contig 和实际文件几何。"""
+    records = []
     seen: set[str] = set()
-    for line_number, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        fields = line.split("\t")
-        if len(fields) < 5 or not fields[0]:
-            raise ValueError(f"invalid reference FAI line {line_number}: {path}")
-        name = fields[0]
-        if name in seen:
-            raise ValueError(f"duplicate reference FAI contig {name!r}: {path}")
-        try:
-            length, offset, line_bases, line_width = map(int, fields[1:5])
-        except ValueError as exc:
-            raise ValueError(
-                f"invalid numeric reference FAI line {line_number}: {path}"
-            ) from exc
-        if length <= 0 or offset < 0 or line_bases <= 0 or line_width < line_bases:
-            raise ValueError(f"invalid reference FAI geometry on line {line_number}: {path}")
-        seen.add(name)
-        records.append((name, length))
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            fields = line.rstrip("\n").split("\t")
+            name = fields[0]
+            if (len(fields) != 5 or not name or re.search(r"[\x00\s]", name, re.ASCII)
+                    or any(not field.isascii() or not field.isdecimal() for field in fields[1:])):
+                raise ValueError(f"invalid reference FAI line {line_number}: {path}")
+            if name in seen:
+                raise ValueError(f"duplicate reference FAI contig {name!r}: {path}")
+            length, offset, line_bases, line_width = map(int, fields[1:])
+            if (not 0 < line_bases <= length < 2**63 or offset >= 2**63
+                    or not line_bases <= line_width < 2**32):
+                raise ValueError(f"invalid reference FAI geometry on line {line_number}: {path}")
+            seen.add(name)
+            records.append((name, length, offset, line_bases, line_width))
     if not records:
         raise ValueError(f"reference FAI contains no contigs: {path}")
     return records
+
+
+def verify_fasta_layout(fasta: Path, records: Sequence[tuple[str, int, int, int, int]],
+                        *, allow_compressed: bool = False, check_spikes: bool = False) -> None:
+    """按 FAI 核实每条序列的标题、首行和末端；复用同一文件状态的成功检查。"""
+    state = _reference_file_state(fasta)
+    try:
+        _verify_fasta_layout(fasta, tuple(records), state, allow_compressed, check_spikes)
+    except EOFError as exc:
+        raise ValueError(f"truncated compressed reference FASTA: {fasta}") from exc
+    if _reference_file_state(fasta) != state:
+        raise RuntimeError(f"reference changed while checking its index: {fasta}")
+
+
+@lru_cache(maxsize=32)
+def _verify_fasta_layout(fasta: Path, records: tuple, state: tuple, allow_compressed: bool, check_spikes: bool) -> None:
+    with fasta.open("rb") as raw, ExitStack() as stack:
+        compressed = allow_compressed and raw.peek(2)[:2] == b"\x1f\x8b"
+        # BGZF 的 FAI 使用解压字节偏移。按物理顺序只向前读，不依赖待校验索引寻址。
+        handle = stack.enter_context(gzip.GzipFile(fileobj=raw)) if compressed else raw
+
+        def next_record():
+            byte = handle.read(1)
+            while byte in (b"\r", b"\n"):
+                byte = handle.read(1)
+            return byte
+
+        for name, length, offset, bases, width in sorted(records, key=lambda row: row[2]):
+            if next_record() != b">":
+                raise ValueError(f"invalid FASTA/FAI record boundary for {name!r}: {fasta}")
+            header = handle.readline().split(None, 1)
+            if not header or header[0] != name.encode() or handle.tell() != offset:
+                raise ValueError(f"invalid FASTA/FAI header or offset for {name!r}: {fasta}")
+            last = offset + (length - 1) // bases * width + (length - 1) % bases
+            if not compressed and last >= state[2]:
+                raise ValueError(f"invalid FASTA/FAI length for {name!r}: {fasta}")
+            if check_spikes and name in SPIKE_CONTIGS:
+                if length != SPIKE_CONTIGS[name]:
+                    raise ValueError(f"invalid {name} reference length: {fasta}")
+                # 对照很短，逐行核对 FAI，在同次顺序读取中核摘要，兼容 BGZF 偏移。
+                sequence = bytearray()
+                remaining = length
+                while remaining:
+                    count = min(remaining, bases)
+                    line = handle.readline(count + 2)
+                    content = line.rstrip(b"\r\n")
+                    ending = line[len(content):]
+                    remaining -= count
+                    if len(content) != count or ending not in (b"", b"\n", b"\r\n"):
+                        raise ValueError(f"invalid FASTA/FAI line width for {name!r}: {fasta}")
+                    if not ending:
+                        if remaining or handle.peek(1) or (length == bases and width not in (bases, bases + 1)):
+                            raise ValueError(f"invalid FASTA/FAI sequence end for {name!r}: {fasta}")
+                    elif (remaining or length == bases) and width != bases + len(ending):
+                        raise ValueError(f"invalid FASTA/FAI line width for {name!r}: {fasta}")
+                    sequence.extend(content)
+                validated_spike_bases(name, fasta, bytes(sequence))
+                continue
+            remaining = bases
+            while remaining:
+                part = handle.readline(min(remaining, 65536))
+                if not part or b"\n" in part or b"\r" in part:
+                    raise ValueError(f"invalid FASTA/FAI line width for {name!r}: {fasta}")
+                remaining -= len(part)
+            newline = handle.read(1)
+            if newline == b"\r":
+                newline += handle.read(1)
+            # HTSlib 可以将文件末尾省略的换行计入最后一个单行记录的行宽。
+            if not newline and length == bases and width in (bases, bases + 1):
+                continue
+            if newline not in (b"\n", b"\r\n") or width != bases + len(newline):
+                raise ValueError(f"invalid FASTA/FAI line width for {name!r}: {fasta}")
+            if length == bases:
+                continue
+            handle.seek(last)
+            if handle.read(1) in (b"", b"\r", b"\n", b">") or handle.peek(1)[:1] not in (b"", b"\r", b"\n"):
+                raise ValueError(f"invalid FASTA/FAI sequence end for {name!r}: {fasta}")
+        if next_record():
+            raise ValueError(f"unindexed FASTA sequence or trailing data: {fasta}")
+
+
+@contextmanager
+def checked_fasta_index(reference: Path, *, check_spikes: bool = False) -> Iterator[list[tuple[str, int, int, int, int]]]:
+    """在布局检查与身份读取之间固定同一 FASTA/FAI，换代时不提交凭证。"""
+    fai = Path(str(reference) + ".fai")
+    before = (_reference_file_state(reference), _reference_file_state(fai))
+    records = read_fasta_index(fai)
+    verify_fasta_layout(reference, records, allow_compressed=True, check_spikes=check_spikes)
+    yield records
+    if before != (_reference_file_state(reference), _reference_file_state(fai)):
+        raise RuntimeError(f"reference FASTA/FAI changed while recording identity: {reference}")
 
 
 def resolve_fai_contigs(
@@ -1333,18 +1467,7 @@ def resolve_fai_contigs(
     path = Path(fai_path)
     if not path.is_file():
         raise FileNotFoundError(f"Reference FASTA index is missing: {path}")
-    contigs: list[str] = []
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        name = line.split("\t", 1)[0].strip()
-        if not name:
-            raise ValueError(f"Reference FAI line {line_no} has an empty contig name: {path}")
-        contigs.append(name)
-    if not contigs:
-        raise ValueError(f"Reference FAI contains no contigs: {path}")
-    if len(set(contigs)) != len(contigs):
-        raise ValueError(f"Reference FAI repeats a contig name: {path}")
+    contigs = [row[0] for row in read_fasta_index(path)]
 
     exact = set(contigs)
     folded: dict[str, list[str]] = {}
@@ -1376,6 +1499,16 @@ def resolve_fai_contigs(
     return tuple(resolved)
 
 
+def _reference_file_present(path: Path) -> bool:
+    """只有路径真正缺席时才允许跳过可选参考或尝试另一根目录。"""
+    state = stat_if_present(path)
+    if state is None:
+        return False
+    if not stat.S_ISREG(state.st_mode):
+        raise ValueError(f"Expected a regular reference file: {path}")
+    return True
+
+
 def resolve_reference(
     config: Mapping[str, object],
     species: str,
@@ -1397,24 +1530,14 @@ def resolve_reference(
         raise ValueError(f"Reference path for species {species!r} is empty")
 
     configured = Path(ref_path).expanduser()
-    pipeline_root = Path(pipeline_root).expanduser().resolve()
-    candidates = (
-        [configured.resolve()]
-        if configured.is_absolute()
-        else [(pipeline_root / configured).resolve(), (project_dir / configured).resolve()]
-    )
-    seen = set()
-    unique = []
+    pipeline_root = Path(pipeline_root).expanduser().absolute()
+    candidates = (configured,) if configured.is_absolute() else (pipeline_root / configured, project_dir / configured)
+    candidates = tuple(dict.fromkeys(candidates))
     for candidate in candidates:
-        key = str(candidate)
-        if key not in seen:
-            unique.append(candidate)
-            seen.add(key)
-    for candidate in unique:
-        if candidate.is_file():
-            return str(candidate)
+        if _reference_file_present(candidate):
+            return str(candidate.resolve(strict=True))
 
-    checked = "\n".join(f"  - {candidate}" for candidate in unique)
+    checked = "\n".join(f"  - {candidate}" for candidate in candidates)
     setup_script = pipeline_root / "core" / "doctor.sh"
     if species in {"hg38", "mm10"}:
         hint = (
@@ -1452,16 +1575,28 @@ def _reference_content_hash(path: str, state: tuple[int, ...]) -> str:
     return value
 
 
-def _reference_file_record(path: Path, recorded: Mapping | None = None) -> dict:
+_NEW_REFERENCE_RECORD = object()
+
+
+def _require_reference_record(record: object, path: Path) -> None:
+    if (not isinstance(record, Mapping) or type(record.get("size_bytes")) is not int or record["size_bytes"] <= 0
+            or not isinstance(record.get("sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None):
+        raise ValueError(f"invalid reference content binding: {path}")
+
+
+def _reference_file_record(path: Path, recorded=_NEW_REFERENCE_RECORD, *, verify_content: bool = False) -> dict:
+    # 省略记录仅用于新建身份；已封存的 null、空对象或不完整字段不能退化为首次签名。
+    if recorded is not _NEW_REFERENCE_RECORD:
+        _require_reference_record(recorded, path)
     state = _reference_file_state(path)
     if not path.is_file() or state[2] <= 0:
         raise ValueError(f"missing/empty reference artifact: {path}")
-    value = (recorded["sha256"] if recorded and list(state) == recorded.get("state")
-             else _reference_content_hash(str(path.resolve()), state))
-    if recorded and (value != recorded.get("sha256") or state[2] != recorded.get("size_bytes")):
+    if not verify_content and recorded is not _NEW_REFERENCE_RECORD and list(state) == recorded.get("state"):
+        value = recorded["sha256"]
+    else:
+        value = _reference_content_hash(str(path.resolve()), state)
+    if recorded is not _NEW_REFERENCE_RECORD and (value != recorded["sha256"] or state[2] != recorded["size_bytes"]):
         raise ValueError(f"reference generation content mismatch: {path}")
-    if re.fullmatch(r"[0-9a-f]{64}", str(value)) is None:
-        raise ValueError(f"invalid reference digest: {path}")
     return {"sha256": value, "size_bytes": state[2], "state": list(state)}
 
 
@@ -1493,19 +1628,20 @@ def _check_bound_artifacts(receipt: Path, payload: Mapping) -> None:
         _reference_file_record(receipt.parent / relative, record)
 
 
-def reference_sequence_identity(reference: str | Path) -> dict:
+def reference_sequence_identity(reference: str | Path, *, verify_content: bool = False) -> dict:
     """内容身份与文件布局分离：同内容touch不强制科学重算，内容变化拒用旧派生。"""
     ref = Path(reference).resolve()
     receipt = reference_binding_path(ref, "fasta")
-    recorded = {}
-    if receipt.is_file():
+    paths = (("fasta", ref), ("fai", Path(str(ref) + ".fai")))
+    if _reference_file_present(receipt):
         payload = _read_reference_binding(receipt, "fasta")
         recorded = payload["files"]
-        if set(recorded) != {ref.name, ref.name + ".fai"}:
+        if not isinstance(recorded, Mapping) or set(recorded) != {ref.name, ref.name + ".fai"}:
             raise ValueError(f"incomplete FASTA binding: {receipt}")
-    records = {}
-    for role, path in (("fasta", ref), ("fai", Path(str(ref) + ".fai"))):
-        records[role] = _reference_file_record(path, recorded.get(os.path.relpath(path, receipt.parent)))
+        records = {role: _reference_file_record(path, recorded[path.name], verify_content=verify_content)
+                   for role, path in paths}
+    else:
+        records = {role: _reference_file_record(path) for role, path in paths}
     return {role: {k: v for k, v in rec.items() if k != "state"} for role, rec in records.items()}
 
 
@@ -1537,6 +1673,31 @@ def validate_reference_component(reference: Path, kind: str, *, root: Path | Non
     return payload
 
 
+def active_alt_index(reference: Path, backend: str) -> Path | None:
+    if backend not in {"biscuit", "rastair"}:
+        return None
+    prefix = reference if backend == "biscuit" else Path(f"{reference}.bwa") / "genome"
+    path = Path(f"{prefix}.alt")
+    state = stat_if_present(path)
+    if state is None:
+        return None
+    if not stat.S_ISREG(state.st_mode):
+        raise ValueError(f"ALT index must be a regular file: {path}")
+    return path
+
+
+def active_reference_digest(reference: Path, kind: str, expected_reference: Mapping | None = None) -> str:
+    """用已验证的序列和当前比对器实际读取的索引内容标识一次分析。"""
+    component = validate_reference_component(reference, kind)
+    if expected_reference is not None and component["reference"] != expected_reference:
+        raise ValueError("Reference generation differs from the frozen run snapshot")
+    files = {name: record["sha256"] for name, record in component["files"].items()}
+    alt = active_alt_index(reference, kind)
+    if alt is not None:
+        files[alt.name] = _reference_content_hash(str(alt.resolve()), _reference_file_state(alt))
+    return sha256_bytes(canonical_json_bytes({"kind": kind, "reference": component["reference"], "files": files}))
+
+
 def validate_downstream_reference(reference: Path, artifact: Path, kind: str,
                                   annotation: Path | None = None) -> dict:
     receipt = Path(str(artifact) + ".reference.json")
@@ -1544,9 +1705,9 @@ def validate_downstream_reference(reference: Path, artifact: Path, kind: str,
     if set(payload["files"]) != {artifact.name} or payload["reference"] != reference_sequence_identity(reference):
         raise ValueError(f"downstream/reference generation mismatch: {artifact}")
     _check_bound_artifacts(receipt, payload)
-    if annotation is not None and annotation.is_file():
-        if _reference_file_record(annotation, payload["annotation"])["sha256"] != payload["annotation"]["sha256"]:
-            raise ValueError(f"annotation changed; rebuild downstream references: {artifact}")
+    _require_reference_record(payload.get("annotation"), receipt)
+    if annotation is not None and _reference_file_present(annotation):
+        _reference_file_record(annotation, payload["annotation"])
     return payload
 
 
@@ -1575,23 +1736,21 @@ def reference_identity(
     fai = Path(f"{resolved_ref}.fai")
     if not fai.is_file() or fai.stat().st_size == 0:
         raise FileNotFoundError(f"reference FAI is missing or empty: {fai}")
-    observed = _fai_contigs(fai)
-    if expected_species in MANAGED_SPECIES and any(
-        dict(observed).get(name) != length for name, length in MANAGED_CONTIGS[expected_species]
-    ):
-        raise ValueError(
-            f"{expected_species} reference contig/order/length contract mismatch: {resolved_ref}"
-        )
-    content = reference_sequence_identity(resolved_ref)
-    ref_stat = resolved_ref.stat()
-    return {
-        "content": content,
-        "public_path": str(public_ref),
-        "resolved_path": str(resolved_ref),
-        "size_bytes": ref_stat.st_size,
-        "mtime_ns": ref_stat.st_mtime_ns,
-        "fai": stable_file_identity(fai, hash_content=False),
-    }
+    with checked_fasta_index(resolved_ref, check_spikes=expected_species in MANAGED_SPECIES) as records:
+        observed = {name: length for name, length, *_ in records}
+        if expected_species in MANAGED_SPECIES and any(
+            observed.get(name) != length for name, length in MANAGED_CONTIGS[expected_species]
+        ):
+            raise ValueError(f"{expected_species} reference contig name/length contract mismatch: {resolved_ref}")
+        ref_stat = resolved_ref.stat()
+        return {
+            "content": reference_sequence_identity(resolved_ref),
+            "public_path": str(public_ref),
+            "resolved_path": str(resolved_ref),
+            "size_bytes": ref_stat.st_size,
+            "mtime_ns": ref_stat.st_mtime_ns,
+            "fai": stable_file_identity(fai, hash_content=False),
+        }
 
 
 BWA_INDEX_SUFFIXES = (".amb", ".ann", ".bwt", ".pac", ".sa")

@@ -1,145 +1,60 @@
-# Alopex v18.9
+# Alopex
 
-## 从这里开始
+English · [简体中文](README.zh-CN.md)
 
-已有环境和项目：在项目目录先运行 `./run_pipeline.sh --dry-run`，确认配置与选样后再运行 `./run_pipeline.sh`。
+Alopex turns paired-end single-cell DNA methylation FASTQs into per-cell CpG counts, conversion and alignment QC, and a sealed result inventory. For a configured project, run `./run_pipeline.sh --dry-run` from the project directory, check the selected libraries and backend, then run `./run_pipeline.sh`.
 
-首次使用按下面三步走；HPC 的执行位置按第 3 节，不在登录节点直接运行完整 Doctor。
+[Choose a protocol](#choose-a-protocol) · [Install and check](#install-and-check) · [Configure a project](#configure-a-project) · [Run and recover](#run-and-recover) · [Read results](#read-results)
 
-1. **准备 Pipeline。** 完成[安装](#1-安装)和[标准 reference](#2-准备标准-reference)。
-2. **验证工具链。** 按[构建与检查](#3-构建与检查)运行 Doctor，看到 `FINAL STATUS: READY` 后继续。
-3. **跑一个项目。** [初始化](#4-初始化与配置) → [导入与选样](#5-导入与选样) → [dry-run 和运行](#6-运行与恢复)；最后核对[结果与完成确认](#7-结果与完成确认)。
+## Choose a protocol
 
-| 当前遇到的情况 | 直接进入 |
-| --- | --- |
-| 已有项目失败、锁残留或发布中断 | [运行与恢复](#6-运行与恢复) |
-| 想看资源、进度或错误日志 | [运行状态与详细输出](#运行状态与详细输出) |
-| 上游已完成，要做 QC 或导出矩阵 | [下游 README](downstream/README.md) |
-| 刚升级 v18.9，要核对修复与恢复步骤 | [v18.9 更新说明](#v189-更新说明) |
+Set `analysis.protocol` once per project and use the same spelling in its manifest. Alopex v19 supports both DD chemistries.
 
-正式源码以 Git tag `v18.9` 为准。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
-
-内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
-
-| 协议 / `analysis.protocol` | 后端 | 主要处理 |
+| Protocol | DNA processing | Matching RNA |
 | --- | --- | --- |
-| Cabernet / `cabernet` | 默认 Bismark，可选 BISCUIT | 孔板解复用、trimming、位置去重、high-CpH/non-conversion 过滤 |
-| Droplet DD-MET5 / `droplet` | 固定 Bismark non-directional | DNA 独立谷底 calling、官方设计白名单、逐胞嘧啶 UMI 共识 |
-| Cabernet–TAPS+ / `taps` | 固定 BWA-MEM + Rastair | 标记重复，调用 CpG/SNP，统计 Non-CpG；不作 high-CpH 筛除 |
+| `DD-MET3` | R1 contains CB17, 7F, 17L, ME, gap9 and the insert. The first 12 bases of the trimmed insert form the fragment tag and remain in the alignment input. | Lemmus DD-MET3, 3′ DDV2. Match the official RNA/DNA barcode pair within the linked library. |
+| `DD-MET5` | R1 contains CB17, the library UMI12, TSO, 17L, ME, gap9 and the insert. Carry the original UMI through alignment and cytosine consensus. | Lemmus DD-MET5, 5′ RNA. Match the same CB17 within the linked library. |
+| `cabernet` | Plate barcode map, Bismark by default or optional BISCUIT, paired-end duplicate handling and high-CpH filtering. | Explicit library and plate identities. |
+| `taps` | Plate barcode map, BWA-MEM and Rastair. Publishes CpG counts, SNP calls and non-CpG QC. | Optional external RNA library link. |
 
-| 查阅内容 | 文档 |
+Both DD protocols independently call DNA cells using raw structured-read counts, a histogram valley and 829,440 DNA design barcodes. DD-MET3 records suspect barcode quality as a diagnostic. DD-MET5 can remove a suspect barcode with independent evidence from library UMIs and insert sequences. Both trim nine bases from R2, use non-directional Bismark and count consensus observations by cell, strand and reference cytosine. Bases with unresolved ties contribute no observation. The BAM retains PCR copies. The DNA design is shared across both chemistries. [Library structures](https://github.com/seekgene/SeekSoulMethyl/tree/v2.2.1#data-structure) · [Official fragment-tag implementation](https://github.com/seekgene/SeekSoulMethyl/blob/v2.2.1/nf/bin/barcode_cs_multi.py#L1219-L1233)
+
+## Install and check
+
+1. Install Conda, Git, curl, gzip and a C compiler. Keep the Pipeline checkout separate from projects. Doctor builds environments, Rust and reference indexes for the target platform. Download `Alopex-v19.1.tar.gz`, `SHA256SUMS` and `SOURCE_SHA256SUMS`, then verify the archive before extracting it. [v19.1 release](https://github.com/Felix-owo/Alopex/releases/tag/v19.1)
+2. Uncompress the six source files into `resources/reference_source/` using the names below. Doctor builds the analysis FASTAs, adds lambda and pUC19, builds indexes and records reference identities. The input sources and masked regions are specified in the [reference guide](README.zh-CN.md#2-准备标准-reference).
+3. Run the checks below from the Pipeline root. On macOS use the local terminal. On HPC verify and transfer the sealed references first, prepare dependencies on the login node, then run the full Doctor in the terminal of the existing Jupyter compute allocation. Transfer the index families and their producer receipts together. The target platform needs its own managed environments and binaries.
+4. Continue after `FINAL STATUS: READY`. Doctor reports its log path under `logs/doctor/`. The standard small scientific runs exercise human Cabernet/Bismark, mouse Cabernet/BISCUIT and TAPS/Rastair.
+
+| Filename | Source |
 | --- | --- |
-| Notebook、矩阵、缓存重算与 RNA 关联 | [下游 README](downstream/README.md) |
-| QC 字段与计数口径 | [指标与分母](downstream/README.md#指标与分母) |
-| 配置与恢复 | [初始化](#4-初始化与配置)、[运行与恢复](#6-运行与恢复) |
-
-
-## 1. 安装
-
-准备可调用的 Conda、git、curl、gzip 和本地 C 编译器（macOS Command Line Tools / Linux `cc`，供 Rust 依赖构建）；Pipeline 与数据项目分开存放。
-
-demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态链接，避免宿主库探测与 Conda 链接器不一致；不要求系统另装 zlib 开发包。
-
-环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。
-
-Bismark 角色要求 SAMtools／HTSlib 1.25 系列，以修复跨参考 pileup 的参考缓存错误；升级源码后须在登录节点执行 `bash core/doctor.sh conda` 更新受管环境，再按标准流程验收。不需要额外 channel、自建 Conda 包或第三方源码补丁。
-
-从 [v18.9 Release](https://github.com/Felix-owo/Alopex/releases/tag/v18.9) 下载 `Alopex-v18.9.tar.gz` 和 `SHA256SUMS`，解压后运行 Doctor。
-
-运行包包含源码、固定资源与下游 Notebook。Conda、生成参考、科学结果和运行日志在安装后生成。
+| `hg38.analysis.fa` | [GIABv3 GRCh38 masked no-ALT assembly with decoys](https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/references/GRCh38/GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta.gz) |
+| `mm10.fa` | [UCSC GRCm38/mm10](https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.fa.gz) |
+| `lambda.fa`, `pUC19.fa` | [Lambda J02459.1](https://www.ncbi.nlm.nih.gov/nuccore/J02459.1) · [pUC19 L09137.2](https://www.ncbi.nlm.nih.gov/nuccore/L09137.2) |
+| `hg38.genes.gtf`, `mm10.genes.gtf` | [GENCODE human v48](https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_48/gencode.v48.annotation.gtf.gz) · [GENCODE mouse M25](https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.annotation.gtf.gz) |
 
 ```bash
-shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v18.9.tar.gz
-cd Alopex-v18.9
-conda --version
+bash core/doctor.sh conda
+bash core/doctor.sh
 ```
 
-跨设备复现应使用同一个正式 tag，并保持原始 FASTQ、manifest、Barcode Map、reference 和配置一致；不要复制另一操作系统的 Conda 目录。
+v19.1 pins Rust Bismark 3.4.0 with SAMtools/HTSlib 1.25. After updating the source, run `bash core/doctor.sh conda` and verify the active binary with `conda/current/bismark/bin/bismark --version`.
 
-运行快照记录实际源码、环境和输入身份。
+To check an installed component, run `bash core/doctor.sh conda --check`, `bash core/doctor.sh demux --check` or `bash core/doctor.sh reference --check`. To rebuild the native demultiplexer, run `bash core/doctor.sh demux`.
 
-| 平台 / 部署方式 | 要求 |
-| --- | --- |
-| macOS | 本机执行 workflow |
-| Linux / HPC | 使用 Slurm，需 `sbatch/squeue/sacct` 与作业提交权限；已有 allocation 承载 controller，规则作业仍经 Slurm 提交 |
-| 源码归档 | 可无 `.git` 部署；环境与 Rust 二进制必须在目标平台构建；已封存 reference 索引可按下述流程跨平台接收并验收 |
+Doctor checks FASTA index geometry and the bases of both control accessions. For TSS, the CHR and PRI comprehensive GTFs in the linked human and mouse releases have identical annotations on the primary nuclear chromosomes. Use a single GTF per species. Doctor validates a private replacement before installing a repaired source index. A failed rebuild preserves the previous index.
 
-## 2. 准备标准 reference
-
-自动构建的标准 reference 为 `hg38` 和 `mm10`。首次运行 Doctor 前，将以下六个文件**下载并解压**到 `resources/reference_source/`；Pipeline 不自动下载原始 reference。
-
-| 固定文件名 | 对应版本 / 来源 | 下载链接 |
-| --- | --- | --- |
-| `hg38.analysis.fa` | GIABv3 / GRCh38 no-ALT analysis set，含 GRC masks 及 MAP2K3/KMT2C/KCNJ18 decoys | [GIABv3 FASTA.gz](https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/references/GRCh38/GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta.gz) |
-| `mm10.fa` | UCSC mm10 / GRCm38 主装配（含未定位／未放置序列） | [mm10.fa.gz](https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.fa.gz) |
-| `lambda.fa` | NCBI J02459.1 | [FASTA](https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=J02459.1&rettype=fasta&retmode=text) |
-| `pUC19.fa` | NCBI L09137.2 | [FASTA](https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=L09137.2&rettype=fasta&retmode=text) |
-| `hg38.genes.gtf` | GENCODE v48 / GRCh38 | [GTF](https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_48/gencode.v48.annotation.gtf.gz) |
-| `mm10.genes.gtf` | GENCODE M25 / GRCm38 | [GTF](https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.annotation.gtf.gz) |
-
-Doctor 保留下载的原始 FASTA，只在临时目录生成分析用 FASTA：hg38 使用 GIABv3 的 no-ALT、CEN/PAR/GRC 屏蔽与定向 decoy；mm10 使用 GRCm38 主装配及其 Y PAR 屏蔽。
-
-分别加入 lambda/pUC19 后为 **220／68 条比对序列**；分析 FASTA 仍使用 `<genome>.primary.lambda.puc19.fa` 路径，其内容范围以固定清单为准。
-
-比对包含真实辅助序列，最终 nCG、甲基化 QC、Gini、TSS 和 Single-CpG 矩阵按明确的主核染色体范围计算。公开四列 CpG 保留全参考观测供 QC／审计，controls 单独统计。参考身份与坐标范围以实际封存回执和 `core/reference/` 固定清单为准。
-
-FASTA/FAI、各 backend 索引、TSS／single-CpG 通过各自的 `.reference.json` 内容回执绑定同一参考。`reference --check` 只读检查；未绑定或失配的旧组件不再报告 READY。修复时 Doctor 通过既有构建事务生成、验证、提交并重建相关派生。请在没有任务使用该受管 reference 时运行修复；旧交付及其矩阵不会被自动重算或转换。
-
-自定义外部参考同样需要在原生索引构建前后绑定。以下示例的 `index_kind` 取实际使用的 `biscuit`、`rastair`、`bismark-local` 或 `bismark-combined`；`seal` 只用于本次新构建，不能给来源未知的旧索引补签：
+For a transferred reference, first verify the FASTA and its index receipts in the candidate directory. An explicit import checks the actual file hashes even when the recorded file metadata match. This example checks the two components used by DD-MET3 and DD-MET5. Verify the remaining installed index families and downstream targets in the same way, then run Doctor and a small alignment before replacing a working installation.
 
 ```bash
-index_kind=bismark-combined
-# 新 FASTA 的 samtools faidx 已完成后封存 FASTA/FAI。
-PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding seal --reference /path/reference.fa --kind fasta
-PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding begin --reference /path/reference.fa --build-input /path/build/input.json
-# 在此使用对应原生工具，从同一 FASTA 构建完整索引家族。
-PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding seal --reference /path/reference.fa --kind "$index_kind" --build-input /path/build/input.json
+ref=/path/to/candidate/hg38.primary.lambda.puc19.fa
+for kind in fasta bismark-combined; do
+  PYTHONPATH=core conda/current/control/bin/python -m alopex reference-binding import \
+    --reference "$ref" --kind "$kind"
+done
 ```
 
-已有新构建参考可整体传输到另一台机器：先放在独立候选目录，连同所有 `.reference.json` 一起复制；用 `reference-binding import` 依次核 FASTA、各索引家族和 downstream。
-
-此动作必须已有有效 producer 回执，逐文件 SHA256 与参考代际完全一致后仅更新目标文件系统的 stat 状态；缺失回执或内容失配会失败，不对未知旧索引补签。随后运行 `reference --check` 和目标平台真实小数据比对／CpG 验收，再切换正式目录。跨平台传输的是索引数据，环境／可执行文件仍使用目标平台版本。
-
-## 3. 构建与检查
-
-在 Pipeline 根目录执行：
-
-| 命令 | 用途 |
-| --- | --- |
-| `bash core/doctor.sh` | 检查或修复 Conda、Rust、reference/indexes，然后运行下表三路线 |
-| `bash core/doctor.sh conda --check` | 只读检查环境 |
-| `bash core/doctor.sh reference --check` | 只读检查 hg38/mm10 reference 及 indexes |
-| `bash core/doctor.sh demux --check` | 只读核对 Rust 源码与二进制身份 |
-| `bash core/doctor.sh download` | 预热 Conda/Rust 下载缓存，不编译、不发布、不提交作业 |
-
-去掉 `--check` 可维护对应段；显式 `demux` 会测试、构建并原子替换生产二进制。完整 Doctor 先检查并复用就绪资源。
-
-HPC 的标准顺序：
-
-更新前核对部署目录、Jupyter 工作目录、`ServerApp.root_dir`、解释器和 kernel 的实际路径；保留运行中的任务。
-
-HPC 更新保留来源仓库的真实 `.git` 与历史，核对正式 tag、commit、工作树和逐文件 SHA256；已有本地修改须先审查保留。归档安装本身仍可不带 Git，不以新建空仓库代替来源历史。
-
-1. 在本机校验正确的 reference、索引及各自 `.reference.json`，再上传到 HPC 的对应位置；按封存清单核对版本和校验值，只补传缺失或不匹配的组件，不在 HPC 临时改用另一套参考。
-2. 在登录节点提前准备 Conda 等依赖下载。需要预热时运行 `bash core/doctor.sh download`；需要安装环境时按 `conda` 段准备。已有正确环境直接复用，不因源码更新重复下载或重建。
-3. 在**现有 JupyterLab 的 Terminal** 中进入 Pipeline 根目录，运行 `bash core/doctor.sh`；确认终端位于 Jupyter 的计算节点和原 allocation。完整 Doctor、科学工具调用不在登录节点运行，也不另起独立 Doctor allocation。
-
-已建环境的 `conda --check` 只读核对身份、已安装版本、平台和必需程序，不重复导入 Notebook 或启动各角色工具；完整工具链检查在创建/修复时执行。计算节点检查失败须回登录节点准备，后续三路线科学验证照常执行。
-
-普通更新以“更新 Pipeline → Jupyter 中跑通标准 Doctor”为验收，不默认追加开发全仓回归、配置穷举或额外 benchmark；这些只在明确要求开发验收时单独执行。部署日志、沙箱和备份放在自己的独立工作目录。
-
-| Doctor 路线 | 内容 |
-| --- | --- |
-| A | hg38 / Cabernet / Bismark：真实 Cabernet 抽样与合成对照 |
-| B | mm10 / Cabernet / BISCUIT：真实 Cabernet DNA 抽样与合成对照 |
-| C | hg38 / TAPS / Rastair：独立合成真值 |
-
-标准 HPC 操作使用现有 Jupyter allocation；macOS 使用本机执行。成功结尾为 `FINAL STATUS: READY`，默认日志在 `logs/doctor/`；成功清理沙箱，失败保留诊断。READY 证明本次工具链与固定小样本通过，不代表真实全库科学等价或性能验证。
-
-## 4. 初始化与配置
-
-在独立数据项目中初始化：
+## Configure a project
 
 ```bash
 mkdir -p /path/to/Patient001
@@ -147,183 +62,60 @@ cd /path/to/Patient001
 /path/to/Alopex/core/run_pipeline.sh --init-project
 ```
 
-也可用 `--init-project /path/to/Patient001`。之后使用项目根目录的 `./run_pipeline.sh`。
-
-初始化保留已有输入；输入链接悬空时会报错，请先修复链接再重试。
-
-sample manifest须保持六列，空字段也保留分隔符；manifest与Barcode Map用于引用字段的引号须正确闭合和转义。格式错误会在处理前报出文件和行号，先修复原表再重试；合法的多行备注和字段内双引号仍支持。
-
-| 项目路径 | 用途 |
-| --- | --- |
-| `00_config/` | `config.yaml`、六列 `sample_manifest.tsv`、孔板协议的 `Barcode_Map.csv` |
-| `01_raw/` | 原始 paired FASTQ |
-| `02_work/` | 可恢复中间结果与稳定结果 stage |
-| `03_results/` | 当前完整交付的科学结果和 QC |
-| `04_logs/` | controller、规则、Slurm 日志与 provenance |
-| `05_tmp/` | 作业临时文件 |
-| `06_downstream/` | 当前下游 QC、矩阵、plots/ 与.cache/ |
-
-在生成的 `00_config/config.yaml` 上修改关键项，例如：
+Edit the generated `00_config/config.yaml`. For a human DD-MET3 library, set `species` to `hg38` and edit these keys in the full schema-3 template.
 
 ```yaml
-schema_version: 3
-species: hg38
-references:
-  hg38: /path/to/Alopex/resources/hg38_reference/hg38.primary.lambda.puc19.fa
 analysis:
-  protocol: cabernet
+  protocol: DD-MET3
   cpg_coordinate_base: 1
-cabernet:
-  methylation_backend: bismark
+DD-MET3: {}
+DD-MET5: {}
 ```
 
-| 配置主题 | 使用规则 |
-| --- | --- |
-| 结构与覆盖 | 只接受 schema 3；内置默认 → `common` → 选定协议覆盖，列表整体替换，固定协议策略最终生效 |
-| reference 路径 | 保留 YAML 引号内的首尾空格；绝对路径直接定位，相对路径依次查 Pipeline 根和项目根，不裁剪为另一文件名 |
-| 共用 / 全局设置 | demux、high-CpH、Bismark、BISCUIT 参数放 `common`；物种/reference、`analysis`、`runtime`、`slurm`、`retention` 为全局设置 |
-| Cabernet | 可选 `methylation_backend: bismark` 或 `biscuit`；Bismark 默认 combined-index end-to-end，`bismark.local_alignment: true` 改为 CT/GA local；Bismark 各协议均固定 `--maxins 1000` |
-| Droplet | backend、spacer=0、non-directional 固定，不声明 `methylation_backend`、`demux.dna_w_spacer_len` 或 `bismark.library_type`；无需 Barcode Map，`rna_sample` 可选填外部 RNA 原始 basename |
-| TAPS | backend 固定 Rastair，不声明 `methylation_backend`；输出 SNP VCF/索引与 Non-CpG QC |
-| 无差异模块 | `taps` / `droplet` 可省略或为 `{}` |
+For DD-MET5 select `DD-MET5`. DD backend, spacer length and library direction are fixed. Keep tunable defaults under `common` or override supported fields in the selected module. For a legacy DD-MET5 configuration, replace `droplet` in `analysis.protocol`, the module name and manifest protocol before running. Existing sealed analyses retain their original software identity. Plate protocols require `00_config/Barcode_Map.csv` with unique `DNA_Barcode,PlateID,Cell_Order` identities. Keep leading zeros in plate and order fields. Use CSV quoting for order labels containing tabs, quotes or line breaks, and double each literal quote within a quoted field.
 
-| 孔板 Barcode Map | 要求 |
-| --- | --- |
-| 必需列 | `DNA_Barcode,PlateID,Cell_Order` |
-| Barcode | 8 或 10 bp A/C/G/T；同长度序列间 Hamming distance 必须大于 2 |
-| 身份 | PlateID、Cell_Order 各自唯一；Cell_Order 保留字符串，不丢前导零 |
-| CSV 格式 | 表头去 BOM、外围空白并忽略大小写后非空且唯一；各行列数一致 |
-| 名称 | PlateID 和样本名仅用 ASCII 字母、数字、点、下划线、连字符，禁止单独的 `.` / `..` |
+1. Place paired `.fastq.gz` or `.fq.gz` files under `01_raw/`. Examples include `Lib_R1.fastq.gz`, `Lib_L001_R1_001.fastq.gz` and `Lib.R1.raw.fastq.gz` with their matching R2 files. Put same-named pairs from separate batches of one library in separate subdirectories. Both mates must have the same lane or chunk identity.
+2. Run `./run_pipeline.sh --refresh-manifest` to register each library once and report the number of paired chunks. The command returns as soon as the manifest is ready. Review `00_config/sample_manifest.tsv` and keep the intended libraries. Its fields are `sample_id,dna_raw_sample,rna_sample,species,protocol,notes`. Supply the exact Lemmus raw basename in `rna_sample` to link an RNA library. An empty field leaves the DNA library unlinked.
+3. Analysis processes all original chunks of each selected library together. At launch, explicit lanes and chunks are ordered by number and same-named batches by directory path. Keep those files stable until delivery. Each physical file can occupy one place in the selected libraries. When a read name ends in `/1` or `/2`, the suffix must match its input side. SeekGene `ID/1:CB17` and `ID/2:CB17` must also agree on the barcode.
 
-## 5. 导入与选样
-
-将 gzip 压缩的 `.fastq.gz` / `.fq.gz` 双端输入放入 `01_raw/`。
-
-| 命名形式 | R1 示例 | R2 示例 |
-| --- | --- | --- |
-| lane / chunk | `SampleA_L001_R1_001.fastq.gz` | `SampleA_L001_R2_001.fastq.gz` |
-| 普通配对 | `SampleA_R1.fastq.gz` | `SampleA_R2.fastq.gz` |
-| raw 后缀 | `SampleA.R1.raw.fastq.gz` | `SampleA.R2.raw.fastq.gz` |
-| 物理前缀 | `样本_SampleA_L1_1.fq.gz` | `样本_SampleA_L1_2.fq.gz` |
-
-mate 支持 `R1/R2` 或 `1/2`，分隔符支持 `_ . -`；lane 为 1–999，chunk 可省略、显式时为三位数字。内部身份仅去掉一次 `样本_`，保留其余基名；缺 mate、重复 segment 或归一化冲突会拒绝。
-
-```bash
-./run_pipeline.sh --refresh-manifest
-```
-
-| 操作 / 清单 | 行为 |
-| --- | --- |
-| 刷新 | 扫描输入并更新 `00_config/sample_manifest.tsv`。同文库的普通 R1/R2 按目录名排序，后续批次的压缩字节追加到第一批两端。已有合并文件时继续追加到该文件。lane 或 chunk 命名的输入按分块读取 |
-| 合并结果 | 合并文件以 `.merged.fastq.gz` 或 `.merged.fq.gz` 结尾，例如 `SampleA.R1.raw.merged.fastq.gz`。Alopex 按原文库名识别这对文件。补测原件以 `.archived` 后缀留在各自目录 |
-| 重复交付 | 已合并文件中若已收录新批次任一端的完整压缩字节，刷新会在写入前报告两个路径。移出重复交付后，再次刷新 |
-| 冲突与恢复 | 相同副本、缺 mate、混合命名、链接输入或归档名冲突会阻止原位合并。保留第一批的独立原件。刷新与正式运行互斥。中断后再次刷新可恢复未提交的合并。若文件访问失败，解决报错中的问题后从同一入口重试 |
-| 清单备份 | 清单内容未变不改写，有效旧清单变更时原子更新滚动 `.bak`。备份写入失败保留上一完整备份。刷新、备份及回滚保留原清单权限 |
-| 清单六列 | `sample_id / dna_raw_sample / rna_sample / species / protocol / notes` |
-| 选样 | 删除不需要的行后直接 dry-run / 运行；未登记 FASTQ 可留在原地，会提示并跳过 |
-| 再次刷新 | **会补登记有效输入，可能重新加入手动删行的样本** |
-
-| 协议 | `rna_sample` 的含义 |
-| --- | --- |
-| Cabernet / TAPS | 可选的外部 RNA_DARLIN **原始 RNA basename**，不是 RNA sample_id 或路径；不产生本地 RNA route，也不会被 refresh 自动当成本地 DNA 登记 |
-| Droplet | 可选外部 RNA 原始 basename，与 Cabernet 一致；配套 RNA 独立 calling，按对应文库与完整 CB17 关联；留空保持未关联 |
-
-DNA/RNA 关联与更新步骤见[下游关联说明](downstream/README.md#关联-rna_darlin-结果)。
-
-## 6. 运行与恢复
-
-科学阶段临时数据固定写入当前项目 `05_tmp/`，每个作业使用独占随机子目录并只清理自身目录。启动前检查预计磁盘需求及10%余量，空间不足直接失败，不自动切换到节点 `/tmp`、`/var/tmp` 或外部 `TMPDIR`。该检查不预留跨作业容量，也不保证共享存储或用户配额永不耗尽。可恢复的跨节点工件保留在 `02_work/`。
-
-升级已有项目时，须在项目外明确删除旧配置中的 `slurm.node_tmpdir`；新版本拒绝该已移除字段，不静默修改用户配置。使用初始化生成的当前配置模板查询调度参数。
+## Run and recover
 
 ```bash
 ./run_pipeline.sh --dry-run
 ./run_pipeline.sh
 ```
 
-项目从当前目录向上定位；初始化、刷新和运行分别执行。launcher 不接受额外 Snakemake flag 或 target。
-遇到悬空配置链接、非普通配置文件或不可访问路径时停止，不改选父项目；先修复当前项目的 `00_config/config.yaml` 再重试。
+The launcher finds the current project, seals its configuration and inputs and selects the executor. macOS runs locally. Linux/HPC submits rules through Slurm. A dry run checks planning. During a real run, inspect `04_logs/controller/`, `04_logs/rules/` and `04_logs/slurm/`. Project-local `05_tmp/` must have room for the requested scratch space and its margin.
 
-正式运行从同一份封存配置选择后端、调度参数和 DAG 输入。快照完成后再编辑项目配置，改动由下一次正式启动读取。`--dry-run` 的规划工作区随调用退出清理，项目内保持原有状态。
+Keep the reference and the selected aligner's indexes stable through publication. A change to a raw FASTQ's ctime, including a permission change, can trigger reprocessing for that library. If the launcher reports changed inputs, verify the original FASTQs and active reference before restarting.
 
-| 情况 | 处理方式 |
+On failure, check the rule and attempt log, keep `02_work/` and `.snakemake/`, fix the cause and rerun. Remove a stale lock only after its controller has stopped. For a failed publication, keep `02_work/results_stage/` and `03_results/` on the same filesystem. Republish from an intact stage. If both paths share a damaged inode, restore verified bytes or regenerate the file with its producing rule. The manifest commits last. A later run retries pending demux cleanup.
+
+If the DNA barcode design fails its hash check, restore `resources/droplet_ME5_U3CB_methylation.txt.gz` from the verified checkout, rebuild with `bash core/doctor.sh demux` and rerun the project. If calling reports no two separated peaks, check the kit and the input read lengths against the read structure before resuming. Read the failed attempt in `04_logs/rules/droplet_calling/<library>.log`.
+
+## Read results
+
+| Path | Contents |
 | --- | --- |
-| 查看进度 / 失败 | 完整日志在 `04_logs/controller/<run_id>.log`，规则与 Slurm 日志在 `04_logs/{rules,slurm}/`；`.attempt1/.attempt2/.attempt3` 保留本轮重试证据 |
-| 规则失败 | 先查对应日志并修正原因，再运行同一 launcher；保留 `02_work/` 和 `.snakemake/`，由 Snakemake 决定重算范围 |
-| 残留锁 | 确认没有运行中的 launcher 后，才手动移除项目 `.snakemake/locks` |
-| 发布中断 | 保留 `02_work/results_stage/` 后重跑。暂存文件身份变化时，重试会重新生成交付凭证。暂存与 `03_results/` 必须同一文件系统，公开 `run_manifest.json` 最后提交 |
-| 最终 DNA BAM | 模板`retention.keep_final_bam: null`按协议默认：TAPS保留、其余回收；显式true/false覆盖。`true` 保留 BAM 及适用索引，缺失时进入 DAG 恢复；`false` 在成功发布后回收当前 backend 活跃细胞的最终 BAM/索引 |
-| 上游重新发布 | 旧下游 context 会拒绝继续读取或提交 QC，需重新启动下游。若公开最终清单与交付哈希不符，从保留的暂存结果重新发布后再运行 QC |
-| reference 构建中断 | 重跑对应 Doctor 段，恢复未完成事务并复验；未完成不报告 READY |
+| `03_results/run_manifest.json` | Complete delivery marker and file inventory. Verify the snapshot identity and output sizes/hashes before consuming results. |
+| `03_results/CpG/<Sample_ID>.cpg.tsv.zst` | Four columns, `chrom, pos, methyl, unmethyl`. The last two are integer counts, and the sealed configuration sets the coordinate base. |
+| `03_results/QC_Results/` | Sealed cell manifest, read and conversion metrics, and `multiqc_report.html`. DD cell IDs are `<sample_id>_<DNA barcode>` with an empty plate ID. |
+| `03_results/SNP/` | TAPS VCF and index, or optional BISCUIT SNP BED and index. |
+| `06_downstream/` | DNA QC, SingleCpG, the DD 1 Mb integer counts for doublet analysis and plots. |
 
-### 运行状态与详细输出
+The sealed `run_manifest.json` records the SHA256 of the DNA design. DD QC records `tag_source` as `trimmed_r1_insert_prefix12` for DD-MET3 or `library_umi12` for DD-MET5. Pair duplicate rate is undefined for both. Methylated and unmethylated counts are observations at a particular cytosine on one strand. Keep observed zeros distinct from missing coverage. [Downstream guide](downstream/README.md)
 
-Doctor、`run_pipeline.sh` 和 Notebook 的 `qc.run_qc_processor()` 自动展示中文状态面板：当前阶段、开始时间与耗时、进程及资源口径；无需新增参数。交互终端原位更新，Notebook详情折叠，重定向仅记录阶段变化/告警及五分钟心跳。
+The DD M-bias plot reports methylation by sequencing cycle for physical FASTQ R1 and R2, before tag consensus. To refresh an existing project after updating Alopex, complete Doctor and run `./run_pipeline.sh` from the project directory.
 
-Doctor summary/detail和controller原生日志完整保留，QC原始输出见项目`04_logs/downstream/qc.<时间>.<PID>.log`；失败从面板日志入口查首条错误。
+To generate DNA QC, SingleCpG and the 1 Mb doublet input from a sealed DD project, use the managed Notebook interpreter. For plots, select the Alopex QC kernel and run the Notebook from its first cell. Restart the kernel after a checkout update. [Kernel registration](downstream/README.md#jupyter--vs-code-kernel) · [DNA QC Notebook](downstream/DNA_QC_Visualization.ipynb)
 
-中断运行后，等待原入口完成清理和自有进程组回收，再重跑对应入口；保留项目中间件供现有恢复流程使用。
+```bash
+PIPELINE=/path/to/Alopex
+PATH="$PIPELINE/conda/current/control/bin:$PATH" PYTHONPATH="$PIPELINE/core" \
+  "$PIPELINE/conda/current/notebook/bin/python" -m alopex.downstream.qc \
+  --project-dir /path/to/Patient001
+```
 
-BISCUIT 的原生读段名称按字面保留，包括双引号。旧实现曾把带引号的名称按CSV解码，可能在high-CpH筛除时删错分子而总数不变；只有实际输入含此类名称才涉及该问题。受影响结果从当前alignment BAM重做bsconv过滤及后续pileup/CpG/QC和交付，缺该BAM时按DAG恢复上游；不能仅重做下游QC或补签旧结果。
+For joint QC, run the matching Lemmus chemistry on its own reads, then integrate its finalized RNA with the sealed DNA delivery and its current QC. DD-MET3 uses 248,832 official barcode pairs, including 82,944 RNA barcodes outside the RNA quantification whitelist. The pairing table is used only for linking cells called on each side. Both native IDs and the single-modality records are retained.
 
-资源申请值、本机采样和远程不可用数据分开显示，任务进度不等于剩余时间。
-
-## 7. 结果与完成确认
-
-| 结果路径 | 内容 |
-| --- | --- |
-| `03_results/CpG/<Sample_ID>.cpg.tsv.zst` | Tab 分隔四列：`chrom, pos, methyl, unmethyl` |
-| `03_results/QC_Results/sample_manifest.tsv` | 最终细胞清单、身份、计数与 QC |
-| `03_results/QC_Results/multiqc_report.html` | 汇总报告 |
-| `03_results/SNP/` | TAPS 默认 VCF/索引；BISCUIT 开启 `generate_snp` 时为 BED/索引 |
-| `03_results/run_manifest.json` | 当前交付的完整标记、配置身份及结果 inventory |
-
-| 科学结果解读 | 边界 |
-| --- | --- |
-| CpG 坐标与计数 | `analysis.cpg_coordinate_base` 仅接受整数 0/1，默认 1；methyl/unmethyl 为非负整数，有效位点 coverage>0，合法空文件保留表头 |
-| 坐标传递 | SingleCpG 沿用 sealed 交付的 base；BED、VCF、BAM 仍按各自格式解释 |
-| Droplet 计数 | BAM 保留 PCR copies，CpG 按胞嘧啶/UMI 共识计独立分子；MAPQ≥10、baseQ≥20，未解决平票不调用；`Duplicate_Pair_Rate%` 为 NaN |
-| TAPS 解读 | Non-CpG 为可判链宿主 CHG/CHH 原始转换率，零观测为缺失，不直接等同真实 mCH 或 cDNA 污染率；未调用 SNP 不等于纯合参考，PASS 仍需结合深度、质量与链支持 |
-| MultiQC | backend 原生 mapping 分母不同；活跃 DNA>1000 时固定展示同一组1000细胞，文库概要仍为全库，全部细胞科学结果与 BAM 策略不变 |
-
-| 完成判据 | 必须满足 |
-| --- | --- |
-| 执行结束 | controller 成功退出；若由 Slurm 作业承载，该作业为 `COMPLETED`、exit `0:0` |
-| 交付完整 | `run_manifest.json` 为 `status: complete`，声明的结果与最终清单齐全 |
-| 再次启动 | 显示 `Alopex delivery is complete and current`，不启动科学作业 |
-
-## 8. 下游
-
-更新 Pipeline 源码后，请先重启 Notebook kernel，再从第一格运行；不要用局部 `reload` 代替重启。这样可避免旧函数生成结果却绑定新源码身份。
-
-| 操作 / 结果 | 使用方式 |
-| --- | --- |
-| 启动 | 用 `conda/current/notebook` 环境打开 `downstream/DNA_QC_Visualization.ipynb`，填写 `DNA_PROJECT_ROOT`、`DNA_PIPELINE_ROOT`；按需设置 `TSS_BED` / `SKIP_TSS` |
-| 下游输出 | 固定写入 `06_downstream/`；完整身份匹配才复用缓存，新结果覆盖对应旧文件，不扫描历史目录，不写回公开结果 |
-| TSS 抽检 | 默认按 CloneID 抽10%，不足10个全检、超过1000个取100；`TSS_SAMPLE_SEED=0` 可复现，`TSS_SAMPLE_FRACTION=1.0` 全检；抽样只影响 TSS，QC、Gini 和 SingleCpG 仍处理全部细胞 |
-| 矩阵与零值 | 位点坐标跟随交付；有覆盖全 unmethyl 保留显式0，缺覆盖不补0；QC 位点均值、SingleCpG 区间均值与合并 reads 的比率不同 |
-| 缓存重建 | 使用 `RECOMPUTE_CPG_STATS` / `--recompute-cpg-stats` 强制单次解码重建 QC、SingleCpG 和适用的 1 Mb 计数。输入或完成身份失配时由 Processor 自动重建 |
-| 绘图 | Final QC 按 CloneID 展示计数直方图，CpG sites 用 log 横轴；CpG density 展示 input pairs / unique CpG sites 散点及拟合，支持 PDF |
-| RNA 关联 | 使用当前完整交付的 sealed manifest 与同代 DNA QC；更新关联后先重发布 DNA 和当前代际 downstream，再整合 RNA |
-
-完整参数、矩阵解释与操作步骤见[下游 README](downstream/README.md)。
-
-## 许可证
-
-Alopex 以 [GPL-3.0](LICENSE) 发布。
-
-### v18.9 更新说明
-
-QC 单次读取封存 CpG，生成 SingleCpG、统计表及 Droplet 的常染色体 1 Mb 整数计数。与 Lemmus 联用时，先用本版完成 Alopex QC，再启动 Lemmus v6.18 的 Droplet Notebook。
-
-多批独立 FASTQ 可按清单刷新规则合并并保留归档。配置快照、发布恢复及最终清单校验沿同一交付身份执行。终端和 Notebook 在启动期间收到中断时会回收本次子进程，Slurm 面板按实际完成事件移除普通及分组作业。
-
-### 源码与临时文件位置
-
-源码按职责定位：`core/alopex/`包含配置、输入、科学处理、交付与维护，其`downstream/`子包负责QC计算与绘图；`core/`下的Shell入口与Snakefile负责运行编排；顶层`downstream/`承载Notebook与操作说明。
-
-项目运行的临时工作与提交文件统一使用本项目 `05_tmp/`，包括预处理、原生工具 spill、诊断、矩阵写出和发布候选；外部 `TMPDIR` / `SLURM_TMPDIR` 不改选节点盘。临时文件关闭并校验后使用同文件系统原子替换；`05_tmp` 不得为符号链接，输出位于另一挂载时明确失败，不回退复制覆盖。
-
-仅清理本次创建的临时项，重试所需的事务备份也保留在 `05_tmp/`，运行或恢复未完成时不要手动清空该目录。
-
-`02_work/` 中有明确下游消费者的阶段产物、`.snakemake/` 恢复状态，以及没有项目上下文的环境/参考安装事务保留各自职责位置。安装事务的临时项必须与安装目标处于同一文件系统，不写入任意分析项目。共享空间和配额仍需足以容纳已有结果、新候选及并发作业；空间检查不等于容量预留。
+Software terms are in [LICENSE](LICENSE).

@@ -13,7 +13,12 @@ pub(super) fn write_fastq_record(
 ) -> Result<()> {
     output.push(b'@');
     if let Some(umi_seq) = umi {
-        output.extend_from_slice(normalize_read_id(id)?);
+        let id = parse_read_id(id)?;
+        output.extend_from_slice(id.name);
+        if let Some(barcode) = id.barcode {
+            output.push(b':');
+            output.extend_from_slice(barcode);
+        }
         output.push(b':');
         output.extend_from_slice(umi_seq);
     } else {
@@ -38,34 +43,78 @@ pub(super) fn write_fastq_record(
     Ok(())
 }
 
-pub(super) fn normalize_read_id(id: &[u8]) -> Result<&[u8]> {
-    // needletail 的 id() 已移除 FASTQ marker；名称中的 @ 不能再删，
-    // 否则不同分子会同名。首字符为空白时没有 ID，不能把备注提升成名称。
-    let end = id
-        .iter()
-        .position(|base| base.is_ascii_whitespace())
-        .unwrap_or(id.len());
-    let mut normalized = &id[..end];
-    if normalized.ends_with(b"/1") || normalized.ends_with(b"/2") {
-        normalized = &normalized[..normalized.len() - 2];
-    }
-    if normalized.is_empty() {
-        anyhow::bail!("FASTQ read identifier is empty after normalization");
-    }
-    Ok(normalized)
+struct ReadId<'a> {
+    name: &'a [u8],
+    mate: Option<u8>,
+    barcode: Option<&'a [u8]>,
 }
 
-pub(super) fn validate_paired_read_ids<'a>(r1_id: &'a [u8], r2_id: &[u8]) -> Result<&'a [u8]> {
-    let r1_normalized = normalize_read_id(r1_id)?;
-    let r2_normalized = normalize_read_id(r2_id)?;
-    if r1_normalized != r2_normalized {
+pub(super) fn is_read_id_whitespace(&byte: &u8) -> bool {
+    matches!(byte, b' ' | b'\t'..=b'\r')
+}
+
+fn illumina_mate(field: &[u8]) -> Option<u8> {
+    let [side @ (b'1' | b'2'), b':', b'Y' | b'N', b':', rest @ ..] = field else {
+        return None;
+    };
+    let colon = rest.iter().position(|&b| b == b':')?;
+    let control = &rest[..colon];
+    let index = &rest[colon + 1..];
+    if control.is_empty() || !control.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    // 末字段可以是样本号、单/双 index，或留空；只取读段端，不将 index 当成配对键。
+    let sample_number = index.iter().all(u8::is_ascii_digit);
+    let is_index = |s: &[u8]| !s.is_empty() && s.iter().all(|b| b"ACGTN".contains(b));
+    (sample_number || index.splitn(2, |&b| b == b'+').all(is_index)).then_some(*side)
+}
+
+fn parse_read_id(id: &[u8]) -> Result<ReadId<'_>> {
+    // needletail 的 id() 已移除 FASTQ marker；名称中的 @ 不能再删，
+    // 否则不同分子会同名。首字符为空白时没有 ID，不能把备注提升成名称。
+    let mut fields = id.split(is_read_id_whitespace);
+    let mut name = fields.next().unwrap_or_default();
+    let mut mate = None;
+    let mut barcode = None;
+    if name.ends_with(b"/1") || name.ends_with(b"/2") {
+        mate = name.last().copied();
+        name = &name[..name.len() - 2];
+    } else if let Some(offset) = name.len().checked_sub(3 + 17) {
+        // SeekGene 的 mate 标记在 CB17 注释之前；注释仍是配对身份的一部分。
+        let (stem, suffix) = name.split_at(offset);
+        if let [b'/', side @ (b'1' | b'2'), b':', cb @ ..] = suffix {
+            if cb.iter().all(|base| b"ACGTN".contains(base)) {
+                name = stem;
+                mate = Some(*side);
+                barcode = Some(cb);
+            }
+        }
+    }
+    if name.is_empty() {
+        anyhow::bail!("FASTQ read identifier is empty after normalization");
+    }
+    if let Some(side) = fields.find(|field| !field.is_empty()).and_then(illumina_mate) {
+        anyhow::ensure!(
+            mate.is_none_or(|suffix| suffix == side),
+            "Conflicting FASTQ mate markers in '{}'", String::from_utf8_lossy(id)
+        );
+        mate = Some(side);
+    }
+    Ok(ReadId { name, mate, barcode })
+}
+
+pub(super) fn validate_paired_read_ids(r1_id: &[u8], r2_id: &[u8]) -> Result<()> {
+    let r1 = parse_read_id(r1_id)?;
+    let r2 = parse_read_id(r2_id)?;
+    if r1.name != r2.name || r1.barcode != r2.barcode
+        || r1.mate == Some(b'2') || r2.mate == Some(b'1') {
         anyhow::bail!(
             "Paired-end read-ID mismatch: R1 '{}' does not match R2 '{}' after normalization",
             String::from_utf8_lossy(r1_id),
             String::from_utf8_lossy(r2_id)
         );
     }
-    Ok(r1_normalized)
+    Ok(())
 }
 
 pub(super) fn validate_fastq_quality(seq: &[u8], qual: &[u8]) -> Result<()> {

@@ -5,16 +5,19 @@ import sys
 _LOADED_MODULE_CODE = sys._getframe().f_code
 
 import csv
-from contextlib import closing, ExitStack
+from contextlib import closing, contextmanager, ExitStack
 from decimal import Decimal, InvalidOperation
+from io import TextIOBase
 from itertools import islice
 from pathlib import Path
+from typing import NamedTuple
 
 import anndata as ad
-from anndata._io.specs import read_elem, write_elem
+from anndata.experimental import read_elem, write_elem
 import h5py
 import numpy as np
 import pandas as pd
+from pandas.io.common import get_handle
 from scipy import sparse
 from numba import njit
 
@@ -22,29 +25,39 @@ from numba import njit
 class CSRReader:
     """直接切片磁盘CSR，不由AnnData将整个obsm或var标签载入内存。"""
 
-    def __init__(self, path, group="X"):
+    def __init__(self, path):
         self.path = Path(path)
         self.handle = h5py.File(path, "r")
         try:
-            self.raw_counts = group == "obsm/__values__"
-            self.group = self.handle[group]
-            if self.group.attrs.get("encoding-type") != "csr_matrix":
-                raise ValueError("Expected a CSR H5AD matrix")
-            self.n_obs, self.n_vars = map(int, self.group.attrs["shape"])
+            self.group = self.handle["X"]
+            if (self.group.attrs.get("encoding-type") != "csr_matrix"
+                    or self.group.attrs.get("encoding-version") != "0.1.0"):
+                raise ValueError("Expected the AnnData CSR matrix encoding version 0.1.0")
+            shape = np.asarray(self.group.attrs["shape"])
+            if (shape.shape != (2,) or shape.dtype.kind not in "iu"
+                    or int(shape.min()) < 0 or int(shape.max()) > np.iinfo(np.int64).max):
+                raise ValueError("Invalid CSR shape")
+            self.n_obs, self.n_vars = map(int, shape)
+            var = self.handle["var"]
+            features = var[var.attrs["_index"]]
+            if not isinstance(features, h5py.Dataset) or features.shape != (self.n_vars,):
+                raise ValueError("CSR feature index length differs from the matrix width")
             self.obs = read_elem(self.handle["obs"])
             self.obs_names = self.obs.index
             if len(self.obs) != self.n_obs or not self.obs.index.is_unique:
                 raise ValueError("CSR row identities are not unique or have a wrong length")
-            self.indptr = self.group["indptr"][:]
-            if (len(self.indptr) != self.n_obs + 1 or self.indptr[0] != 0
-                    or np.any(np.diff(self.indptr) < 0)
-                    or self.indptr[-1] != len(self.group["data"])
-                    or len(self.group["data"]) != len(self.group["indices"])):
+            pointers, indices, data = (self.group[key] for key in ("indptr", "indices", "data"))
+            if (pointers.shape != (self.n_obs + 1,) or pointers.dtype.kind not in "iu"
+                    or indices.ndim != 1 or indices.dtype.kind not in "iu" or data.shape != indices.shape):
+                raise ValueError("Invalid CSR index or data arrays")
+            self.indptr = pointers[:]
+            # 相邻比较避免无符号行指针回绕；先验整数类型，SciPy 才不会截断错误列号。
+            if (self.indptr[0] != 0 or np.any(self.indptr[1:] < self.indptr[:-1])
+                    or int(self.indptr[-1]) != len(data)):
                 raise ValueError("Invalid CSR pointers")
             self.uns = {key: read_elem(self.handle["uns"][key]) for key in
-                        ("cpg_coordinate_base", "source_cpg_representation", "cpg_interval_convention", "reference_sequences", "qc_filter_parameters")
+                        ("cpg_coordinate_base", "source_cpg_representation", "cpg_interval_convention", "qc_filter_parameters")
                         if key in self.handle["uns"]}
-            self.reference = self.uns.get("reference_sequences")
         except BaseException:
             self.close()
             raise
@@ -59,14 +72,7 @@ class CSRReader:
         value = sparse.csr_matrix((values, indices, self.indptr[start:stop + 1] - lo), shape=(stop - start, self.n_vars))
         if not value.has_canonical_format:
             raise ValueError("CSR indices must be sorted and unique")
-        if self.raw_counts:
-            if values.dtype != np.dtype('uint32'):
-                raise ValueError("Raw CSR must store uint32 packed counts")
-            coverage, methyl = values & 65535, values >> 16
-            if (coverage == 0).any() or (methyl > coverage).any():
-                raise ValueError("Raw CSR has invalid methyl/coverage counts")
         return value
-
 
     def iter_rows(self, size=4):
         for start in range(0, self.n_obs, size):
@@ -84,24 +90,28 @@ class CSRReader:
 class CSRWriter:
     """增量写一个由调用方负责事务提交的标准H5AD；显式零不会被消除。"""
 
-    def __init__(self, path, obs, *, group="X", n_vars=0, dtype=np.float32, uns=None):
+    def __init__(self, path, obs, *, n_vars=0, uns=None):
         ad.AnnData(obs=obs, uns=uns or {}).write_h5ad(path)
         self.handle = h5py.File(path, "r+")
-        self.group = self.handle.create_group(group)
-        self.group.attrs.update({"encoding-type": "csr_matrix", "encoding-version": "0.1.0",
-                                 "shape": np.asarray([len(obs), n_vars], dtype=np.int64)})
-        self.rows, self.nnz, self.n_vars = 0, 0, n_vars
-        for name, data_type in (("data", dtype), ("indices", np.int64)):
-            self.group.create_dataset(name, (0,), maxshape=(None,), chunks=(65536,), dtype=data_type,
-                                      compression="gzip", compression_opts=1)
-        self.group.create_dataset("indptr", data=np.zeros(len(obs) + 1, dtype=np.int64))
-        self.var = None
-        if group == "X":
+        try:
+            self.group = self.handle.create_group("X")
+            self.group.attrs.update({"encoding-type": "csr_matrix", "encoding-version": "0.1.0",
+                                     "shape": np.asarray([len(obs), n_vars], dtype=np.int64)})
+            self.rows, self.nnz, self.n_vars = 0, 0, n_vars
+            for name, data_type in (("data", np.float32), ("indices", np.int64)):
+                self.group.create_dataset(name, (0,), maxshape=(None,), chunks=(65536,), dtype=data_type,
+                                          compression="gzip", compression_opts=1, shuffle=True)
+            # 保持 dataset 打开，让 HDF5 缓存跨细胞的压缩块，关闭文件时统一刷盘。
+            self.data, self.indices = self.group["data"], self.group["indices"]
+            self.indptr = self.group.create_dataset("indptr", data=np.zeros(len(obs) + 1, dtype=np.int64))
             var = self.handle["var"]
             key = var.attrs["_index"]
             del var[key]
             self.var = var.create_dataset(key, (0,), maxshape=(None,), chunks=(65536,), dtype=h5py.string_dtype())
             self.var.attrs.update({"encoding-type": "string-array", "encoding-version": "0.2.0"})
+        except BaseException:
+            self.close()
+            raise
 
     def append_features(self, names):
         end = self.n_vars + len(names)
@@ -113,36 +123,42 @@ class CSRWriter:
         self.group.attrs.modify("shape", shape)
 
     def append(self, value):
-        if value.shape[1] != self.n_vars or self.rows + value.shape[0] >= len(self.group["indptr"]):
+        if value.shape[1] != self.n_vars or self.rows + value.shape[0] >= len(self.indptr):
             raise ValueError("CSR block shape differs from the output")
         if not value.has_canonical_format:
             raise ValueError("CSR indices must be sorted and unique")
         stop = self.nnz + value.nnz
-        for name, values in (("data", value.data), ("indices", value.indices)):
-            target = self.group[name]
+        for target, values in ((self.data, value.data), (self.indices, value.indices)):
             target.resize((stop,))
             target[self.nnz:stop] = values
         # SciPy 可用 int32 表示单块，磁盘行指针累计的是所有细胞的观测项。
         pointers = np.add(value.indptr[1:], self.nnz, dtype=np.int64)
-        self.group["indptr"][self.rows + 1:self.rows + value.shape[0] + 1] = pointers
+        self.indptr[self.rows + 1:self.rows + value.shape[0] + 1] = pointers
         self.nnz, self.rows = stop, self.rows + value.shape[0]
 
     def close(self):
         self.handle.close()
 
 
+class CpGCounts(NamedTuple):
+    """一个细胞的有序观测，共用全参考索引，保留原始整数计数。"""
+
+    indices: np.ndarray
+    methyl: np.ndarray
+    coverage: np.ndarray
+
+
 @njit(cache=True, nogil=True)
-def _parse_cpg_block(data, names, name_offsets, lengths, chromosome_offsets, previous_positions, base, previous_chrom):
-    # 与公共四列契约相同的ASCII整数、u16 coverage及逐染色体唯一顺序校验。
-    indices = np.empty(len(data) // 7 + 1, dtype=np.int64)
-    values = np.empty(len(indices), dtype=np.uint32)
+def _parse_cpg_block(data, names, name_offsets, lengths, chromosome_offsets, previous_positions,
+                     base, previous_chrom, remaining, observations):
+    numbers = np.empty(3, dtype=np.int64)
     cursor, used = 0, 0
     while cursor < len(data):
         start = cursor
         while cursor < len(data) and data[cursor] not in (9, 10):
             cursor += 1
         if cursor == start or cursor >= len(data) or data[cursor] != 9:
-            return indices[:used], values[:used], previous_chrom, 1
+            return used, previous_chrom, remaining, 1
         chrom = previous_chrom
         if chrom >= 0:
             if name_offsets[chrom + 1] - name_offsets[chrom] != cursor - start:
@@ -165,35 +181,39 @@ def _parse_cpg_block(data, names, name_offsets, lengths, chromosome_offsets, pre
                     chrom = ref
                     break
         if chrom < 0:
-            return indices[:used], values[:used], previous_chrom, 2
-        numbers = np.zeros(3, dtype=np.int64)
+            return used, previous_chrom, remaining, 2
         for column in range(3):
             cursor += 1
             digit_start, number = cursor, 0
-            limit = lengths[chrom] - 1 + base if column == 0 else 65535
+            limit = lengths[chrom] - 1 + base if column == 0 else (1 << 53) - 1
             while cursor < len(data) and data[cursor] not in (9, 10):
                 digit = int(data[cursor]) - 48
                 if digit < 0 or digit > 9:
-                    return indices[:used], values[:used], previous_chrom, 1
+                    return used, previous_chrom, remaining, 1
                 if number > (limit - digit) // 10:
-                    return indices[:used], values[:used], previous_chrom, 2
+                    return used, previous_chrom, remaining, 2
                 number = number * 10 + digit
                 cursor += 1
             if cursor == digit_start or cursor >= len(data) or data[cursor] != (9 if column < 2 else 10):
-                return indices[:used], values[:used], previous_chrom, 1
+                return used, previous_chrom, remaining, 1
             numbers[column] = number
         position, methyl, unmethyl = numbers
         coverage = methyl + unmethyl
-        if position < base or coverage <= 0 or coverage > 65535:
-            return indices[:used], values[:used], previous_chrom, 2
+        if position < base or coverage <= 0:
+            return used, previous_chrom, remaining, 2
         if position <= previous_positions[chrom]:
-            return indices[:used], values[:used], previous_chrom, 3
+            return used, previous_chrom, remaining, 3
+        # 覆盖均非负。整行可表示时，染色体、QC 分组、Gini 和 1 Mb 窗口的各个子和均可表示。
+        if coverage > remaining:
+            return used, previous_chrom, remaining, 4
+        remaining -= coverage
         previous_positions[chrom], previous_chrom = position, chrom
-        indices[used] = chromosome_offsets[chrom] + position
-        values[used] = (methyl << 16) + coverage
+        observations[0, used] = chromosome_offsets[chrom] + position
+        observations[1, used] = methyl
+        observations[2, used] = coverage
         used += 1
         cursor += 1
-    return indices[:used], values[:used], previous_chrom, 0
+    return used, previous_chrom, remaining, 0
 
 
 def read_cpg_counts(handle, path, reference, base):
@@ -206,7 +226,8 @@ def read_cpg_counts(handle, path, reference, base):
     lengths = reference.reference_bp_length.to_numpy(dtype=np.int64)
     chromosome_offsets = np.r_[0, np.cumsum(lengths + base)].astype(np.int64)
     previous_positions = np.full(len(lengths), -1, dtype=np.int64)
-    parts, values, pending, previous_chrom, line = [], [], "", -1, 2
+    parts, pending, previous_chrom, line = [], "", -1, 2
+    remaining = np.iinfo(np.int64).max
     while True:
         text = handle.read(4 * 1024 * 1024)
         if text:
@@ -219,21 +240,23 @@ def read_cpg_counts(handle, path, reference, base):
             block, pending = pending + "\n", ""
         else:
             break
-        indices, packed, previous_chrom, error = _parse_cpg_block(np.frombuffer(block.encode(), dtype=np.uint8),
-            names, offsets, lengths, chromosome_offsets, previous_positions, base, previous_chrom)
+        observations = np.empty((3, block.count("\n")), dtype=np.int64)
+        used, previous_chrom, remaining, error = _parse_cpg_block(
+            np.frombuffer(block.encode(), dtype=np.uint8), names, offsets, lengths, chromosome_offsets,
+            previous_positions, base, previous_chrom, remaining, observations)
         if error:
-            detail = "duplicate or out-of-order CpG position" if error == 3 else "invalid CpG fields or coordinate/counts"
-            raise ValueError(f"{path}:{line + len(indices)}: {detail}")
-        parts.append(indices)
-        values.append(packed)
-        line += len(indices)
-    indices = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
-    packed = np.concatenate(values) if values else np.empty(0, dtype=np.uint32)
-    if len(indices) and np.any(np.diff(indices) <= 0):
-        order = np.argsort(indices, kind="stable")
-        indices, packed = indices[order], packed[order]
-    return sparse.csr_matrix((packed, indices, np.asarray([0, len(indices)], dtype=np.int64)),
-                             shape=(1, int(chromosome_offsets[-1])))
+            detail = {3: "duplicate or out-of-order CpG position", 4: "cell CpG coverage exceeds int64"}.get(
+                error, "invalid CpG fields or coordinate/counts")
+            raise ValueError(f"{path}:{line + used}: {detail}")
+        parts.append(observations)
+        line += used
+    if not parts:
+        return CpGCounts(*np.empty((3, 0), dtype=np.int64))
+    observations = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=1)
+    indices = observations[0]
+    if np.any(indices[1:] < indices[:-1]):
+        observations = observations[:, np.argsort(indices, kind="stable")]
+    return CpGCounts(*observations)
 
 
 def cpg_reference(chrom_sizes, base):
@@ -244,26 +267,22 @@ def cpg_reference(chrom_sizes, base):
                          "reference_bp_length": lengths})
 
 
-class IntervalIndex:
-    """紧凑的数字区间索引，保留输入列序以及重叠区间的独立观测。"""
-
-    def __init__(self, frame):
-        self.size = len(frame)
-        self.lookup = {}
-        for chrom, positions in frame.groupby("chrom", sort=False).indices.items():
-            order = np.argsort(frame.iloc[positions].start.to_numpy(), kind="stable")
-            columns = np.asarray(positions, dtype=np.int64)[order]
-            starts = frame.start.to_numpy(dtype=np.int64)[columns]
-            ends = frame.end.to_numpy(dtype=np.int64)[columns]
-            self.lookup[str(chrom)] = (starts, ends, np.maximum.accumulate(ends), columns)
+def interval_lookup(starts, ends, columns):
+    """保留参考列身份；仅对尚未按起点排列的区间作稳定排序。"""
+    if np.any(starts[1:] < starts[:-1]):
+        order = np.argsort(starts, kind="stable")
+        starts, ends, columns = starts[order], ends[order], columns[order]
+    max_end = np.maximum.accumulate(ends) if np.any(ends[1:] < ends[:-1]) else ends
+    return starts, ends, max_end, columns
 
 
 @njit(cache=True, nogil=True)
-def _region_observations(positions, packed, starts, ends, max_end, columns):
+def _region_observations(positions, methyl, coverage, starts, ends, max_end, columns):
+    last = np.searchsorted(starts, positions, side="right") - 1
     count = 0
     for i in range(len(positions)):
         pos = positions[i]
-        j = np.searchsorted(starts, pos, side="right") - 1
+        j = last[i]
         while j >= 0 and max_end[j] > pos:
             if ends[j] > pos:
                 count += 1
@@ -271,47 +290,50 @@ def _region_observations(positions, packed, starts, ends, max_end, columns):
     cols = np.empty(count, dtype=np.int64)
     fractions = np.empty(count, dtype=np.float64)
     methyls = np.empty(count, dtype=np.int64)
-    coverages = np.empty(count, dtype=np.int64)
     used = 0
     for i in range(len(positions)):
         pos = positions[i]
-        j = np.searchsorted(starts, pos, side="right") - 1
+        j = last[i]
         while j >= 0 and max_end[j] > pos:
             if ends[j] > pos:
-                coverage = int(packed[i] & 65535)
-                methyl = int(packed[i] >> 16)
-                cols[used], fractions[used] = columns[j], methyl / coverage
-                methyls[used], coverages[used] = methyl, coverage
+                cols[used], fractions[used] = columns[j], methyl[i] / coverage[i]
+                methyls[used] = methyl[i]
                 used += 1
             j -= 1
-    return cols, fractions, methyls, coverages
-
+    return cols, fractions, methyls
 
 
 def aggregate_row(reader, row, index):
-    """返回有观测区间的fraction/mean、methyl/cov整数和及位点数；保留真实零。"""
+    """返回有观测区间的列号、逐胞嘧啶平均 fraction 和 methyl 整数和，保留真实零。"""
     reference = reader.reference
     lengths = reference.reference_seq_length.to_numpy(dtype=np.int64)
     offsets = np.r_[0, np.cumsum(lengths)]
+    boundaries = np.searchsorted(row.indices, offsets)
     base = int(reader.uns["cpg_coordinate_base"])
     parts = []
     for k, chrom in enumerate(reference.reference_seq_name):
-        lookup = index.lookup.get(str(chrom))
+        lookup = index.get(str(chrom))
         if lookup is None:
             continue
-        lo, hi = np.searchsorted(row.indices, offsets[k:k + 2])
+        lo, hi = boundaries[k], boundaries[k + 1]
         if lo < hi:
-            parts.append(_region_observations(row.indices[lo:hi] - offsets[k] - base, row.data[lo:hi], *lookup))
-    if not parts or not any(len(p[0]) for p in parts):
-        return (np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32),
-                np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64))
-    columns, fractions, methyl, coverage = [np.concatenate([p[i] for p in parts]) for i in range(4)]
-    order = np.argsort(columns, kind="stable")
-    columns, fractions, methyl, coverage = [v[order] for v in (columns, fractions, methyl, coverage)]
-    starts = np.r_[0, np.flatnonzero(np.diff(columns)) + 1]
+            matched = _region_observations(row.indices[lo:hi] - offsets[k] - base,
+                                           row.methyl[lo:hi], row.coverage[lo:hi], *lookup)
+            if len(matched[0]):
+                parts.append(matched)
+    if not parts:
+        return (np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.int64))
+    # 大多数 BED 的列按染色体成段。交错或嵌套的列仍按原列号稳定归并。
+    parts.sort(key=lambda part: part[0][0])
+    columns, fractions, methyl = (np.concatenate(items) for items in zip(*parts, strict=True))
+    if np.any(columns[1:] < columns[:-1]):
+        order = np.argsort(columns, kind="stable")
+        columns, fractions, methyl = columns[order], fractions[order], methyl[order]
+    starts = np.r_[0, np.flatnonzero(columns[1:] != columns[:-1]) + 1]
     counts = np.diff(np.r_[starts, len(columns)])
-    return (columns[starts], (np.add.reduceat(fractions, starts) / counts).astype(np.float32),
-            np.add.reduceat(methyl, starts), np.add.reduceat(coverage, starts), counts)
+    return (columns[starts], np.add.reduceat(fractions, starts) / counts,
+            np.add.reduceat(methyl, starts))
 
 
 def exact_integers(values, dtype):
@@ -339,6 +361,20 @@ def exact_integers(values, dtype):
     return values.astype(np.int64, copy=False)
 
 
+class _BedText(TextIOBase):
+    """在 pandas 的 C 解析器截短 NUL 字段前检查解压后的原文。"""
+
+    def __init__(self, source, path):
+        self.source = source
+        self.path = path
+
+    def read(self, size=-1):
+        text = self.source.read(size)
+        if "\x00" in text:
+            raise ValueError(f"BED contains a NUL byte: {self.path}")
+        return text
+
+
 def bed_blocks(path, columns, integer_types):
     """按字面制表符读 BED。只有遇到非整数推断时才重读原文，避免浮点舍入。"""
     options = dict(sep="\t", header=None, names=range(max(columns) + 1), usecols=list(columns),
@@ -346,13 +382,17 @@ def bed_blocks(path, columns, integer_types):
 
     text_types = {i: str for i, name in columns.items() if name not in integer_types}
     with ExitStack() as handles:
-        blocks = handles.enter_context(pd.read_csv(path, dtype=text_types, **options))
+        def open_blocks(dtype):
+            source = handles.enter_context(get_handle(path, "r", encoding="utf-8", compression="infer"))
+            return handles.enter_context(pd.read_csv(_BedText(source.handle, path), dtype=dtype, **options))
+
+        blocks = open_blocks(text_types)
         raw_blocks, previous_raw = None, -1
         for index, block in enumerate(blocks):
             if any(block[i].dtype.kind not in "iu" for i, name in columns.items() if name in integer_types):
                 # 第二个 reader 只取有歧义的块。两边使用相同的空行与分块规则。
                 if raw_blocks is None:
-                    raw_blocks = handles.enter_context(pd.read_csv(path, dtype=str, **options))
+                    raw_blocks = open_blocks(str)
                 block = next(islice(raw_blocks, index - previous_raw - 1, None))
                 previous_raw = index
             block = block.rename(columns=columns, copy=False)
@@ -370,12 +410,13 @@ def bed_blocks(path, columns, integer_types):
             yield block
 
 
-def write_single_cpg(reader, bed, output, obs):
-    """逐块写参考标签、逐细胞写fraction CSR；不物化全库X或全参考字符串列表。"""
+@contextmanager
+def single_cpg_writer(reader, bed, output, host_lengths):
+    """按 BED 原列序写出参考标签，提供只读区间索引，由调用线程顺序提交稀疏行。"""
     base = int(reader.uns["cpg_coordinate_base"])
-    writer = CSRWriter(output, obs.loc[list(reader.obs_names)], uns={
+    writer = CSRWriter(output, pd.DataFrame(index=reader.obs_names), uns={
         "cpg_coordinate_base": base, "cpg_interval_convention": "closed" if base else "half-open",
-        "source_cpg_representation": reader.uns.get("source_cpg_representation", "")})
+        "source_cpg_representation": reader.uns["source_cpg_representation"]})
     pieces, offset = {}, 0
     try:
         with closing(bed_blocks(bed, {0: "chrom", 1: "start", 2: "end"},
@@ -387,24 +428,34 @@ def write_single_cpg(reader, bed, output, obs):
                 writer.append_features(labels)
                 block.index = np.arange(offset, offset + len(block))
                 for chrom, rows in block.groupby("chrom", sort=False):
+                    if chrom not in host_lengths or rows.end.max() > host_lengths[chrom]:
+                        raise ValueError(f"Single-CpG BED interval outside the host reference: {chrom} in {bed}")
                     pieces.setdefault(chrom, []).append((rows.start.to_numpy(), rows.end.to_numpy(), rows.index.to_numpy()))
                 offset += len(block)
         if not offset:
             raise ValueError("Single-CpG BED is empty")
-        index = IntervalIndex.__new__(IntervalIndex)
-        index.size, index.lookup = offset, {}
+        index = {}
         for chrom in list(pieces):
             starts, ends, columns = [np.concatenate([p[i] for p in pieces[chrom]]) for i in range(3)]
             del pieces[chrom]
-            order = np.argsort(starts, kind="stable")
-            starts, ends, columns = starts[order], ends[order], columns[order]
-            index.lookup[str(chrom)] = (starts, ends, np.maximum.accumulate(ends), columns)
-        for i in range(reader.n_obs):
-            row = reader.read_rows(i, i + 1)
-            columns, fractions, _, _, _ = aggregate_row(reader, row, index)
-            writer.append(sparse.csr_matrix((fractions, columns, np.asarray([0, len(columns)], dtype=np.int64)), shape=(1, offset)))
+            lookup = interval_lookup(starts, ends, columns)
+            starts, ends = lookup[:2]
+            ties = starts[1:] == starts[:-1]
+            if ties.any():
+                tied = np.r_[False, ties] | np.r_[ties, False]
+                if pd.MultiIndex.from_arrays((starts[tied], ends[tied])).has_duplicates:
+                    raise ValueError(f"Duplicate Single-CpG BED interval on {chrom}: {bed}")
+            index[chrom] = lookup
+        yield writer, index
     finally:
         writer.close()
+
+
+def single_cpg_row(reader, row, index, n_vars):
+    """将单细胞的区间均值编码为可按原序提交的 float32 稀疏行。"""
+    columns, fractions, _ = aggregate_row(reader, row, index)
+    return sparse.csr_matrix((fractions, columns, np.asarray([0, len(columns)], dtype=np.int64)),
+                             shape=(1, n_vars), dtype=np.float32)
 
 
 def update_obs(path, obs, uns=None):
@@ -416,32 +467,3 @@ def update_obs(path, obs, uns=None):
             if key in handle["uns"]:
                 del handle["uns"][key]
             write_elem(handle["uns"], key, value)
-
-
-@njit(cache=True, nogil=True)
-def _mark_coverage(bits, indices):
-    for index in indices:
-        bits[index >> 3] |= np.uint8(1 << (index & 7))
-
-
-@njit(cache=True, nogil=True)
-def covered_intervals(bits, starts, ends):
-    result = np.zeros(len(starts), dtype=np.bool_)
-    for row in range(len(starts)):
-        for position in range(starts[row], ends[row]):
-            if bits[position >> 3] & (1 << (position & 7)):
-                result[row] = True
-                break
-    return result
-
-
-def covered_positions(reader, rows):
-    """抽检覆盖并集：小输入一次排序，大输入使用有界位图；不扫描未选细胞。"""
-    count = sum(int(reader.indptr[row + 1] - reader.indptr[row]) for row in rows)
-    if count <= 2_000_000:
-        parts = [reader.read_rows(int(row), int(row) + 1).indices for row in rows]
-        return np.unique(np.concatenate(parts)) if parts else np.empty(0, dtype=np.int64)
-    bits = np.zeros((reader.n_vars + 7) // 8, dtype=np.uint8)
-    for row in rows:
-        _mark_coverage(bits, reader.read_rows(int(row), int(row) + 1).indices)
-    return bits

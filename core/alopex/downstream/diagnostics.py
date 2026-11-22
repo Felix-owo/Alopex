@@ -13,7 +13,7 @@ CHROMOSOME_INFO = "Chromosome_QC_Information.csv"
 FILTER_INFO = "QC_Filter_Reasons.csv"
 
 
-def tss_intervals(path, reference, is_primary, covered=None, base=0):
+def tss_intervals(path, reference, host_contigs):
     """完整校验原始 gene/bin 成员，再按实际主核参考构建数字索引。"""
     columns = {0: "chrom", 1: "start", 2: "end", 6: "gene", 8: "offset"}
     try:
@@ -34,38 +34,42 @@ def tss_intervals(path, reference, is_primary, covered=None, base=0):
     frame.loc[clipped, "end"] = limits[clipped].to_numpy(dtype=np.int64)
     if frame.duplicated(["chrom", "start", "end", "gene"]).any():
         raise ValueError(f"TSS BED contains duplicate gene/bin membership: {path}")
-    frame = frame.loc[frame.chrom.map(is_primary) & (frame.start < limits)].copy()
-    if covered is not None:
-        offset = np.r_[0, np.cumsum(reference.reference_seq_length.to_numpy(dtype=np.int64))]
-        reference_offsets = dict(zip(reference.reference_seq_name, offset[:-1]))
-        starts = frame.chrom.map(reference_offsets).to_numpy(dtype=np.int64) + frame.start.to_numpy(dtype=np.int64) + base
-        ends = frame.chrom.map(reference_offsets).to_numpy(dtype=np.int64) + frame.end.to_numpy(dtype=np.int64) + base
-        if covered.dtype == np.uint8:
-            keep = matrix.covered_intervals(covered, starts, ends)
-        else:
-            locations = np.searchsorted(covered, starts)
-            keep = locations < len(covered)
-            keep[keep] &= covered[locations[keep]] < ends[keep]
-        frame = frame.loc[keep].copy()
-    regions = frame[["chrom", "start", "end"]].drop_duplicates().reset_index(drop=True)
-    regions["bin"] = np.arange(len(regions))
-    members = frame.merge(regions, on=["chrom", "start", "end"], how="left", validate="many_to_one")
-    codes, offsets = pd.factorize(members.offset, sort=True)
-    membership = sparse.csr_matrix((np.ones(len(members), dtype=np.int64), (members.bin, codes)),
+    if frame.duplicated(["gene", "offset"]).any():
+        raise ValueError(f"TSS BED assigns multiple intervals to the same gene/offset: {path}")
+    keys = ["chrom", "start", "end"]
+    frame = frame.loc[frame.chrom.isin(host_contigs) & (frame.start < limits), [*keys, "offset"]]
+    # 首次出现顺序即区间行号；同一区间的每个 gene/bin 成员仍各贡献一次。
+    bins = frame.groupby(keys, sort=False).ngroup().to_numpy(dtype=np.int64)
+    regions = frame.loc[~pd.Index(bins).duplicated(), keys].reset_index(drop=True)
+    codes, offsets = pd.factorize(frame.offset, sort=True)
+    membership = sparse.csr_matrix((np.ones(len(frame), dtype=np.int64), (bins, codes)),
                                    shape=(len(regions), len(offsets)))
-    return matrix.IntervalIndex(regions), membership, np.asarray(offsets, dtype=np.int64)
+    index = {
+        chrom: matrix.interval_lookup(rows.start.to_numpy(), rows.end.to_numpy(), rows.index.to_numpy())
+        for chrom, rows in regions.groupby("chrom", sort=False)
+    }
+    return index, membership, np.asarray(offsets, dtype=np.int64)
 
 
 def tss_profile_row(reader, row, sid, clone, tss_index):
     index, membership, offsets = tss_index
-    cols, frac, methyl, _, _ = matrix.aggregate_row(reader, row, index)
+    cols, frac, methyl = matrix.aggregate_row(reader, row, index)
     if not len(cols):
         return None
     weights = membership[cols]
     count = np.asarray(weights.sum(axis=0)).ravel()
     present = count > 0
-    means = np.asarray(frac.astype(np.float64) @ weights).ravel()[present] / count[present]
-    methyl_sum = np.asarray(methyl @ weights).ravel()[present]
+    means = np.asarray(frac @ weights).ravel()[present] / count[present]
+    # 多个基因可重复使用同一位点。仅当上界可能溢出时才用任意精度核算各 offset。
+    if int(methyl.max()) * int(count.max()) <= np.iinfo(np.int64).max:
+        methyl_sum = np.asarray(methyl @ weights).ravel()[present]
+    else:
+        entries = weights.tocoo()
+        exact = np.zeros(len(offsets), dtype=object)
+        np.add.at(exact, entries.col, methyl[entries.row].astype(object) * entries.data)
+        if max(exact) > np.iinfo(np.int64).max:
+            raise ValueError(f"{sid}: TSS methyl count exceeds int64")
+        methyl_sum = exact[present].astype(np.int64)
     return pd.DataFrame({"Sample_ID": sid, "position_coarse": offsets[present], "meth_frac": means,
                          "count": methyl_sum, "CloneID": clone})
 
@@ -75,23 +79,19 @@ def tss_profile_frame(parts):
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=columns)
 
 
-def chromosome_row(reference, offsets, row, sid, is_primary, classify):
+def chromosome_row(reference, offsets, row, sid, classes):
     """按实际 contig 核计数，未覆盖主染色体及 controls 保留 NaN 率。"""
-    for j, chrom in enumerate(reference.reference_seq_name):
-        lo, hi = np.searchsorted(row.indices, offsets[j:j + 2])
-        covered = row.data[lo:hi]
-        is_lambda, is_puc, is_mt, _ = classify(str(chrom))
-        primary = is_primary(str(chrom))
-        if not len(covered) and not (primary or is_lambda or is_puc or is_mt):
+    boundaries = np.searchsorted(row.indices, offsets)
+    for j, (chrom, group) in enumerate(zip(reference.reference_seq_name, classes, strict=True)):
+        lo, hi = boundaries[j], boundaries[j + 1]
+        if lo == hi and group == "auxiliary":
             continue
-        methyl = (covered >> 16).astype(np.uint64)
-        coverage = (covered & 65535).astype(np.uint64)
+        methyl, coverage = row.methyl[lo:hi], row.coverage[lo:hi]
         methyl_total, depth = int(methyl.sum()), int(coverage.sum())
         yield {"Sample_ID": sid, "chrom": str(chrom),
-               "chromosome_class": ("host" if primary else "lambda" if is_lambda else
-                                    "pUC19" if is_puc else "mtDNA" if is_mt else "auxiliary"),
-               "observed_sites": len(covered), "methyl": methyl_total, "unmethyl": depth - methyl_total,
-               "coverage": depth, "meth_frac": float(np.mean(methyl / coverage)) if len(covered) else np.nan}
+               "chromosome_class": group,
+               "observed_sites": hi - lo, "methyl": methyl_total, "unmethyl": depth - methyl_total,
+               "coverage": depth, "meth_frac": float(np.mean(methyl / coverage)) if lo < hi else np.nan}
 
 
 def filter_reasons(frame, *, mapping_threshold=None, lambda_max=10.0, puc19_min=90.0,

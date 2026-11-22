@@ -380,7 +380,7 @@ def plot_wgbs_qc_panel(
     out_path: Path = None,
     figsize: tuple = (16.5, 15.5),
 ):
-    """绘制 WGBS 对照与样本甲基化核心 QC 面板。"""
+    """绘制各协议的 spike-in 对照与宿主甲基化 QC。"""
     if df.empty:
         return
     _load_plot_dependencies()
@@ -404,7 +404,7 @@ def plot_wgbs_qc_panel(
     plot_df[batch_col] = plot_df[batch_col].astype('category')
     panel_cfg = [
         ('sample_nCG', 'sample_rate', 'Sample Methylation vs CpG Coverage'),
-        ('lambda_rate', 'pUC19_rate', 'Bisulfite Conversion Controls'),
+        ('lambda_rate', 'pUC19_rate', 'Spike-in Methylation Controls'),
         ('lambda_rate', 'sample_rate', 'Sample Methylation vs Lambda Control'),
         ('pUC19_rate', 'sample_rate', 'Sample Methylation vs pUC19 Control'),
         ('lambda_nCG', 'lambda_rate', 'Lambda Coverage vs Methylation'),
@@ -450,9 +450,9 @@ def plot_wgbs_qc_panel(
     def pretty_label(value):
         labels = {
             'sample_nCG': 'Sample nCpG',
-            'sample_rate': 'Sample Rate',
-            'lambda_rate': 'Lambda Rate',
-            'pUC19_rate': 'pUC19 Rate',
+            'sample_rate': 'Host methylation (%)',
+            'lambda_rate': 'Lambda methylation (%)',
+            'pUC19_rate': 'pUC19 methylation (%)',
             'lambda_nCG': 'Lambda nCpG',
             'pUC19_nCG': 'pUC19 nCpG',
         }
@@ -1251,6 +1251,7 @@ def plot_tss_profile(
             data=subset,
             x='position_coarse',
             y='meth_frac',
+            seed=0,
             color=clone_color_map.get(clone, None),
             ax=ax1,
             linewidth=PlotParams.LINE_WIDTH,
@@ -1260,13 +1261,14 @@ def plot_tss_profile(
             ax1,
             title=f'{clone_title} - TSS Methylation Profile',
             xlabel='Distance to TSS (bp)',
-            ylabel='mCpG Fraction',
+            ylabel='Mean mCpG fraction across covered cells',
         )
         if 'count' in subset.columns:
             sns.lineplot(
                 data=subset,
                 x='position_coarse',
                 y='count',
+                seed=0,
                 color=clone_color_map.get(clone, None),
                 ax=ax2,
                 linewidth=PlotParams.LINE_WIDTH,
@@ -1276,7 +1278,7 @@ def plot_tss_profile(
                 ax2,
                 title=f'{clone_title} - TSS mCpG Signal Profile',
                 xlabel='Distance to TSS (bp)',
-                ylabel='mCpG Signal Sum',
+                ylabel='Mean methylated count per covered cell',
             )
         else:
             ax2.axis('off')

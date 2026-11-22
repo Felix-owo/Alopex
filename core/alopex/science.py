@@ -14,20 +14,26 @@ import sys
 _LOADED_MODULE_CODE = sys._getframe().f_code
 import tempfile
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
-from contextlib import ExitStack
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
 from .config import (
+    DD_CONSENSUS,
+    DD_PROTOCOLS,
     FILTER_SUMMARY_FIELDS,
     FILTER_SUMMARY_SCHEMA_VERSION,
     SAMPLE_ID_RE,
     get_protocol,
+    primary_analysis_contigs,
     _integer,
 )
 from .io import (
     project_temporary_parent,
+    publication_locks,
+    require_distinct_paths,
     _close_native_stream,
     _read_json,
     atomic_write_json,
@@ -45,32 +51,18 @@ def _native_count(token: str, *, grouped: bool = False) -> int:
     return int(token)
 
 
-def _bismark_field_values(text: str, field: str) -> list[str]:
-    # Capture every occurrence, including empty or malformed values on that physical line.
-    return [raw.strip() for raw in re.findall(
-        rf"^(?:{field}):([^\r\n]*)", text, re.IGNORECASE | re.MULTILINE
-    )]
+def _bismark_field(text: str, field: str, path: Path) -> str:
+    values = {v.strip(" \t") for v in re.findall(rf"^{re.escape(field)}:([^\r\n]*)", text, re.MULTILINE)}
+    if len(values) != 1 or "" in values:
+        raise ValueError(f"Missing or conflicting Bismark {field} in {path}")
+    return values.pop()
 
 
-def _bismark_report_count(
-    text: str, field: str, path: Path, *, optional: bool = False, annotated: bool = False
-) -> int:
-    values = _bismark_field_values(text, field)
-    if not values:
-        if optional:
-            return 0
-        raise ValueError(f"Bismark report lacks {field} count: {path}")
-    counts = set()
-    for value in values:
-        # Deduplication appends a parenthesized percentage to the integer.
-        token = re.sub(r"[ \t]+\([^()]*\)$", "", value) if annotated else value
-        try:
-            counts.add(_native_count(token, grouped=True))
-        except ValueError as exc:
-            raise ValueError(f"Invalid Bismark count for {field} in {path}: {value!r}") from exc
-    if len(counts) != 1:
-        raise ValueError(f"Bismark report has conflicting {field} counts: {path}")
-    return counts.pop()
+def _bismark_report_count(text: str, field: str, path: Path) -> int:
+    try:
+        return _native_count(_bismark_field(text, field, path))
+    except ValueError as exc:
+        raise ValueError(f"Invalid Bismark count for {field} in {path}") from exc
 
 
 def _count_bam_pairs(bam: Path, samtools: str) -> int:
@@ -84,8 +76,12 @@ def _count_bam_pairs(bam: Path, samtools: str) -> int:
     return records // 2
 
 
-def _parse_cutadapt_metrics(path: Path) -> dict[str, int | float]:
-    payload = _read_json_if_present(path)
+def _parse_cutadapt_metrics(path: Path, mates: tuple[str, str], payload: Mapping[str, Any]) -> dict[str, int | float]:
+    """核对原生报告与本次拆分的双端路径。交付时 FASTQ 可能已回收。"""
+    inputs = payload.get("input")
+    if (not isinstance(inputs, dict) or inputs.get("paired") is not True
+            or (inputs.get("path1"), inputs.get("path2")) != mates):
+        raise ValueError(f"Cutadapt report does not match the committed R1/R2 inputs: {path}")
     counts = payload.get("read_counts")
     if not isinstance(counts, dict):
         raise ValueError(f"Cutadapt JSON lacks read_counts: {path}")
@@ -101,6 +97,20 @@ def _parse_cutadapt_metrics(path: Path) -> dict[str, int | float]:
         raise ValueError(f"Cutadapt adapter count exceeds input read pairs: {path}")
     if values["output"] > values["input"]:
         raise ValueError(f"Cutadapt output exceeds input read pairs: {path}")
+    filtered = counts.get("filtered")
+    if not isinstance(filtered, dict) or "too_short" not in filtered:
+        raise ValueError(f"Cutadapt JSON lacks read_counts.filtered: {path}")
+    too_short = filtered["too_short"]
+    if (type(too_short) is not int or too_short < 0 or too_short + values["output"] != values["input"]
+            or any(value is not None for key, value in filtered.items() if key != "too_short")):
+        raise ValueError(f"Cutadapt filtered and retained pairs disagree with input: {path}")
+    # 各协议每端只传一个接头，且每条 read 至多修剪一次。
+    for mate in (1, 2):
+        adapters = payload.get(f"adapters_read{mate}")
+        if (not isinstance(adapters, list) or len(adapters) != 1 or not isinstance(adapters[0], dict)
+                or type(adapters[0].get("total_matches")) is not int
+                or adapters[0]["total_matches"] != values[f"read{mate}_with_adapter"]):
+            raise ValueError(f"Cutadapt R{mate} adapter matches disagree with its read count: {path}")
     return {
         "cutadapt_input_pairs": values["input"],
         "trimmed_pairs": values["output"],
@@ -109,20 +119,8 @@ def _parse_cutadapt_metrics(path: Path) -> dict[str, int | float]:
     }
 
 
-def _read_json_if_present(path: Path) -> dict[str, object]:
-    if not path.is_file():
-        return {}
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"Invalid JSON file: {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ValueError(f"JSON root must be an object: {path}")
-    return value
-
-
 def _validate_high_cph_route(backend: str, protocol: str, role: str) -> None:
-    protocols = {"biscuit": ("cabernet",), "bismark": ("cabernet", "droplet")}
+    protocols = {"biscuit": ("cabernet",), "bismark": ("cabernet", *DD_PROTOCOLS)}
     if protocol not in protocols.get(backend, ()) or role != get_protocol(protocol).high_cph_role:
         raise ValueError(f"Invalid high-CpH protocol/role identity: {backend=}, {protocol=}, {role=}")
 
@@ -130,7 +128,7 @@ def _validate_high_cph_route(backend: str, protocol: str, role: str) -> None:
 def _read_high_cph_summary(path: Path, sample: str, backend: str) -> dict[str, object]:
     if backend == "bismark":
         return _read_filter_summary(path, sample)
-    payload = _read_json_if_present(path)
+    payload = _read_json(path, "high-CpH summary")
     common = {
         "schema_version",
         "backend",
@@ -156,66 +154,48 @@ def _read_high_cph_summary(path: Path, sample: str, backend: str) -> dict[str, o
             f"expected={sorted(expected)}, observed={sorted(payload)}"
         )
     if (
-        payload["schema_version"] != 2
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != 2
         or payload["backend"] != backend
         or payload["sample"] != sample
         or payload["metric_unit"] != "read_pairs"
     ):
         raise ValueError(f"High-CpH summary identity is invalid: {path}")
     _validate_high_cph_route(backend, payload["protocol"], payload["high_cph_role"])
-    counts: dict[str, int] = {}
-    for field in (
-        "candidate_read_pairs",
-        "flagged_read_pairs",
-        "excluded_read_pairs",
-    ):
-        value = payload[field]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"High-CpH summary has invalid {field}: {path}")
-        counts[field] = value
-    if counts["flagged_read_pairs"] > counts["candidate_read_pairs"]:
+    candidate = _integer(payload["candidate_read_pairs"], "candidate_read_pairs", path)
+    flagged = _integer(payload["flagged_read_pairs"], "flagged_read_pairs", path)
+    excluded = _integer(payload["excluded_read_pairs"], "excluded_read_pairs", path)
+    if flagged > candidate:
         raise ValueError(f"High-CpH flagged pairs exceed candidate pairs: {path}")
-    if not isinstance(payload["filter_applied"], bool):
-        raise ValueError(f"High-CpH summary filter_applied is invalid: {path}")
+    if payload["filter_applied"] is not True:
+        raise ValueError(f"High-CpH summary must record the fixed filter action: {path}")
     fraction = payload["high_cph_fraction"]
     if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
         raise ValueError(f"High-CpH summary fraction is invalid: {path}")
-    expected_fraction = (
-        counts["flagged_read_pairs"] / counts["candidate_read_pairs"]
-        if counts["candidate_read_pairs"]
-        else 0.0
-    )
-    if not math.isclose(float(fraction), expected_fraction, abs_tol=1e-12):
+    expected_fraction = flagged / candidate if candidate else 0.0
+    # 两个后端均以整数计数直接相除并写入 JSON，读回的浮点值可精确复算。
+    if fraction != expected_fraction:
         raise ValueError(f"High-CpH summary fraction is inconsistent: {path}")
     threshold = payload["threshold"]
     if (
         isinstance(threshold, bool)
         or not isinstance(threshold, (int, float))
-        or not 0 <= float(threshold) <= 1
+        or not 0 <= threshold <= 1
     ):
         raise ValueError(f"High-CpH summary threshold is invalid: {path}")
-    row_counts: dict[str, int] = {}
-    for field in (
-        "missing_metric_rows",
-        "observed_metric_rows",
-        "flagged_metric_rows",
-        "observed_rows",
-        "excluded_rows",
-    ):
-        value = payload[field]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"High-CpH summary has invalid {field}: {path}")
-        row_counts[field] = value
+    metric_rows = _integer(payload["observed_metric_rows"], "observed_metric_rows", path)
+    high_rows = _integer(payload["flagged_metric_rows"], "flagged_metric_rows", path)
+    excluded_rows = _integer(payload["excluded_rows"], "excluded_rows", path)
+    missing = _integer(payload["missing_metric_rows"], "missing_metric_rows", path)
+    total = _integer(payload["observed_rows"], "observed_rows", path)
+    # 每个类别的 QNAME 来自该类原始行去重。未标记的模板至少各有一行未超阈值。
+    for pairs, rows in ((candidate, metric_rows), (flagged, high_rows), (excluded, excluded_rows)):
+        if pairs > rows or bool(pairs) != bool(rows):
+            raise ValueError(f"BISCUIT High-CpH row accounting is inconsistent: {path}")
     if (
-        row_counts["missing_metric_rows"]
-        + row_counts["observed_metric_rows"]
-        + row_counts["excluded_rows"]
-        != row_counts["observed_rows"]
-        or row_counts["flagged_metric_rows"]
-        > row_counts["observed_metric_rows"]
-        or counts["candidate_read_pairs"] > row_counts["observed_metric_rows"]
-        or counts["flagged_read_pairs"] > row_counts["flagged_metric_rows"]
-        or counts["excluded_read_pairs"] > row_counts["excluded_rows"]
+        missing + metric_rows + excluded_rows != total
+        or candidate - flagged > metric_rows - high_rows
+        or (threshold == 1 and flagged)
         or payload["metric"] != "CpH_retention"
         or payload["comparison"] != ">"
     ):
@@ -244,74 +224,129 @@ def read_pileup_variant_count(path: str | Path, sample: str) -> int:
     return value["variant_records"]
 
 
-def emit_biscuit_cpg(vcf: str | Path, stream: TextIO) -> None:
+_BISCUIT_CONTEXT_TAGS = re.compile(rb"(?:^|;)(CX|N5)(?:=([^;]*))?(?=;|$)")
+_BISCUIT_FIVE_BASES = re.compile(rb"[ACGTRYSWKMBDHVN]{2}C[ACGTRYSWKMBDHVN]{2}")
+
+
+def _biscuit_is_cpg(ref: bytes, info: bytes, path: Path, line_no: int) -> bool:
+    """按原生 fivenuc_context 核对 CX。负链的 N5 已反向互补，边界 N 对应 CN。"""
+    tags = _BISCUIT_CONTEXT_TAGS.findall(info)
+    if ref not in (b"C", b"G"):
+        if tags:
+            raise ValueError(f"BISCUIT VCF {path} line {line_no}: context on a non-cytosine reference")
+        return False
+    context = dict(tags)
+    window = context.get(b"N5", b"")
+    if len(tags) != 2 or b"CX" not in context or not _BISCUIT_FIVE_BASES.fullmatch(window):
+        raise ValueError(f"BISCUIT VCF {path} line {line_no}: expected one CX and one cytosine-centred N5")
+    if b"N" in window:
+        expected = b"CN"
+    elif window[3:4] == b"G":
+        expected = b"CG"
+    elif window[4:5] == b"G":
+        expected = b"CHG"
+    else:
+        expected = b"CHH"
+    if context[b"CX"] != expected:
+        raise ValueError(f"BISCUIT VCF {path} line {line_no}: CX={context[b'CX']!r} disagrees with N5={window!r}")
+    return expected == b"CG"
+
+
+def _biscuit_pileup_records(
+    vcf: str | Path, stats: str | Path, sample: str,
+) -> Iterator[tuple[bytes, list[bytes] | None]]:
+    """流式核对样本、化学体系、上下文与记录数，附上已拆分的 CpG 行供整数提取。"""
+    expected = read_pileup_variant_count(stats, sample)
+    path = Path(vcf)
+    opener = gzip.open if path.suffix == ".gz" else open
+    # pileup 由输入 BAM 文件名派生样本列，生产 BAM 固定为 <Sample_ID>.dna.bam。
+    header = b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" + f"{sample}.dna".encode()
+    with opener(path, "rb") as handle:
+        chemistry_seen = False
+        for line_no, line in enumerate(handle, 1):
+            if line.startswith(b"##"):
+                if re.match(rb"##chemistry(?:[=\s]|$)", line):
+                    chemistry = line.rstrip(b"\r\n").removeprefix(b"##chemistry=")
+                    if chemistry_seen or chemistry not in (b"bisulfite", b"em-seq"):
+                        raise ValueError(f"BISCUIT VCF {path} line {line_no}: duplicate or incompatible chemistry {chemistry!r}")
+                    chemistry_seen = True
+                yield line, None
+                continue
+            if line.rstrip(b"\r\n") != header:
+                raise ValueError(f"BISCUIT VCF {path} line {line_no}: expected one native sample {sample}.dna")
+            yield line, None
+            break
+        else:
+            raise ValueError(f"BISCUIT VCF {path}: missing native sample header")
+
+        count = 0
+        for count, line in enumerate(handle, 1):
+            fields = line.rstrip(b"\r\n").split(b"\t")
+            if line.startswith(b"#") or len(fields) != 10:
+                raise ValueError(f"BISCUIT VCF {path} line {line_no + count}: malformed single-sample record")
+            if count > expected:
+                raise ValueError(f"BISCUIT VCF {path}: more than {expected} records declared for {sample}")
+            is_cpg = _biscuit_is_cpg(fields[3], fields[7], path, line_no + count)
+            yield line, fields if is_cpg else None
+        if count != expected:
+            raise ValueError(f"BISCUIT VCF {path}: expected {expected} records for {sample}, observed {count}")
+
+
+def biscuit_pileup_lines(vcf: str | Path, stats: str | Path, sample: str) -> Iterator[bytes]:
+    """将已校验的原始记录逐行交给 SNP 和 QC 的原生消费者。"""
+    for line, _ in _biscuit_pileup_records(vcf, stats, sample):
+        yield line
+
+
+def emit_biscuit_cpg(vcf: str | Path, stream: TextIO, *, stats: str | Path, sample: str) -> None:
     """从单样本原生 VCF 的 SP/CV 输出 CpG 原始整数，不从三位小数 BT 反推。
 
     BISCUIT 同一过滤循环中，参考 C 的 BSW 转换计入 SP.Y，参考 G 的
     BSC 转换计入 SP.R；CV 为可调用链的 retention+conversion。相反链的
-    非甲基化信息也可能计入 SP.C/G，因此 retention 必须用 CV-conversion。
+    非信息观测也计入 SP.C/G，因此参考碱基支持仅是 retention 的上界。
     保留原生可调用/SNP/质量/重叠过滤、逐链位置及文件顺序，不合并 CpG dyad。
     """
-    path = Path(vcf)
-    opener = gzip.open if path.suffix == ".gz" else open
-    header_seen = False
-    with opener(path, "rt", encoding="utf-8") as handle:
-        for line_no, line in enumerate(handle, 1):
-            label = f"BISCUIT VCF {path} line {line_no}"
-            if line.startswith("##"):
-                continue
-            fields = line.rstrip("\r\n").split("\t")
-            if line.startswith("#CHROM\t"):
-                if (header_seen or len(fields) != 10 or fields[:9] != [
-                        "#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"]):
-                    raise ValueError(f"{label}: requires one native sample header")
-                header_seen = True
-                continue
-            if not header_seen or len(fields) != 10:
-                raise ValueError(f"{label}: missing header or malformed single-sample row")
-            contexts = [item[3:] for item in fields[7].split(";") if item.startswith("CX=")]
-            if len(contexts) > 1:
-                raise ValueError(f"{label}: duplicate CX context")
-            if contexts != ["CG"]:
-                continue
-            if fields[3] not in {"C", "G"} or re.fullmatch(r"[0-9]+", fields[1]) is None or int(fields[1]) < 1:
-                raise ValueError(f"{label}: invalid CpG reference base or position")
-            names, values = fields[8].split(":"), fields[9].split(":")
-            if len(names) != len(set(names)) or len(names) != len(values):
-                raise ValueError(f"{label}: malformed or duplicate FORMAT fields")
-            sample = dict(zip(names, values))
-            # 原生 SNP 干扰可使此行没有 CV；CV=0 同样表示本样本不可调用。
-            if "CV" not in sample:
-                continue
-            if re.fullmatch(r"[0-9]+", sample["CV"]) is None:
-                raise ValueError(f"{label}: invalid integer CV")
-            coverage = int(sample["CV"])
-            if not coverage:
-                continue
-            support = sample.get("SP", "")
-            tokens = re.findall(r"([ACGTYR])([0-9]+)", support)
-            if (not tokens or "".join(base + count for base, count in tokens) != support
-                    or len({base for base, count in tokens}) != len(tokens)):
-                raise ValueError(f"{label}: malformed or duplicate integer SP support")
-            counts = {base: int(count) for base, count in tokens}
-            conversion = counts.get("Y" if fields[3] == "C" else "R", 0)
-            if conversion > coverage or coverage > sum(counts.values()):
-                raise ValueError(f"{label}: inconsistent SP/CV counts")
-            start = int(fields[1]) - 1
-            stream.write(f"{fields[0]}\t{start}\t{start + 1}\t.\t{coverage - conversion}\t{conversion}\n")
-    if not header_seen:
-        raise ValueError(f"BISCUIT VCF {path}: missing native sample header")
+    for line_no, (_, fields) in enumerate(_biscuit_pileup_records(vcf, stats, sample), 1):
+        if fields is None:
+            continue
+        label = f"BISCUIT VCF {vcf} line {line_no}"
+        if not fields[1].isdigit() or int(fields[1]) < 1:
+            raise ValueError(f"{label}: invalid CpG position")
+        names, values = fields[8].split(b":"), fields[9].split(b":")
+        if len(names) != len(set(names)) or len(names) != len(values):
+            raise ValueError(f"{label}: malformed or duplicate FORMAT fields")
+        calls = dict(zip(names, values))
+        # 原生 SNP 干扰可使此行没有 CV；CV=0 同样表示本样本不可调用。
+        if b"CV" not in calls:
+            continue
+        if not calls[b"CV"].isdigit():
+            raise ValueError(f"{label}: invalid integer CV")
+        coverage = int(calls[b"CV"])
+        if not coverage:
+            continue
+        support = calls.get(b"SP", b"")
+        tokens = re.findall(rb"([ACGTYR])([0-9]+)", support)
+        if (not tokens or b"".join(base + count for base, count in tokens) != support
+                or len({base for base, count in tokens}) != len(tokens)):
+            raise ValueError(f"{label}: malformed or duplicate integer SP support")
+        counts = {base: int(count) for base, count in tokens}
+        conversion = counts.get(b"Y" if fields[3] == b"C" else b"R", 0)
+        retention = coverage - conversion
+        if not 0 <= retention <= counts.get(fields[3], 0):
+            raise ValueError(f"{label}: inconsistent SP/CV counts")
+        start = int(fields[1]) - 1
+        stream.write(f"{fields[0].decode()}\t{start}\t{start + 1}\t.\t{retention}\t{conversion}\n")
 
 
-def open_text(path: Path) -> TextIO:
-    if str(path) == "-":
-        return sys.stdin
-    return path.open("r", encoding="utf-8")
+_SAM_QNAME = re.compile(r"[!-?A-~]{1,254}")
 
 
-def normalize_read_name(value: str) -> str:
-
-    return str(value).strip().split()[0]
+def _require_sam_qname(name: str | None, source: str | Path, line: int | None = None) -> str:
+    """依赖模板身份的步骤须按完整 SAM QNAME 匹配；单独的 * 表示名称缺失。"""
+    if not name or name == "*" or _SAM_QNAME.fullmatch(name) is None:
+        location = f"{source}:{line}" if line is not None else str(source)
+        raise ValueError(f"Invalid or unavailable SAM QNAME in {location}: {name!r}")
+    return name
 
 
 def indexed_excluded_contigs(bam_path: Path, samtools: str, excluded: set[str]) -> list[tuple[str, int]]:
@@ -370,7 +405,7 @@ def excluded_reads_from_bam(bam_path: Path, samtools: str, excluded: set[str]) -
                 if len(fields) < 3:
                     raise ValueError(f"Invalid samtools view record for {bam_path}: {line!r}")
                 if fields[2] in excluded:
-                    names.add(normalize_read_name(fields[0]))
+                    names.add(_require_sam_qname(fields[0], bam_path))
             returncode = proc.wait()
             if returncode != 0:
                 diagnostics.seek(0)
@@ -386,8 +421,6 @@ def excluded_reads_from_bam(bam_path: Path, samtools: str, excluded: set[str]) -
 def _high_cph_multiqc_payload(
     sample_name: str,
     summary: Mapping[str, object],
-    protocol: str,
-    high_cph_role: str,
 ) -> dict[str, object]:
     if summary.get("backend") == "bismark":
         return {
@@ -403,16 +436,11 @@ def _high_cph_multiqc_payload(
         "Excluded_Read_Pairs": int(summary["excluded_read_pairs"]),
         "Threshold": float(summary["threshold"]),
     }
-    interpretation = (
-        "candidate cDNA contamination"
-        if high_cph_role == "cdna_contamination"
-        else "residual high-CpH/non-converted DNA reads"
-    )
     return {
         "id": "bsconv_filter",
         "section_name": "High-CpH Read Assessment",
         "description": (
-            f"Protocol={protocol}; high-CpH reads are interpreted as {interpretation}. "
+            f"Protocol={summary['protocol']}; high-CpH reads are interpreted as candidate cDNA contamination. "
             "They are excluded from DNA methylation pileup."
         ),
         "plot_type": "table",
@@ -423,19 +451,6 @@ def _high_cph_multiqc_payload(
         },
         "data": {sample_name: row},
     }
-
-
-def write_multiqc(
-    path: Path,
-    sample_name: str,
-    summary: Mapping[str, object],
-    protocol: str,
-    high_cph_role: str,
-) -> None:
-    """把 high-CpH 评估汇总写成 MultiQC custom-content table JSON。"""
-    obj = _high_cph_multiqc_payload(sample_name, summary, protocol, high_cph_role)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2) + "\n")
 
 
 def _parse_excluded_contigs_json(value: str) -> set[str]:
@@ -496,6 +511,7 @@ def split_pairs(
                 raise ValueError("Odd number of alignment records in paired Bismark BAM")
             if left.query_name != right.query_name:
                 raise ValueError("paired Bismark BAM is not mate-adjacent")
+            _require_sam_qname(left.query_name, source)
             if not (
                 left.is_paired and right.is_paired
                 and left.is_read1 != left.is_read2
@@ -560,21 +576,20 @@ def run_bsconv_extraction(args) -> None:
             raw_high_path = Path(raw_high_handle.name)
             raw_candidate_path = Path(raw_candidate_handle.name)
             raw_excluded_path = Path(raw_excluded_handle.name)
-            with open_text(args.bsconv_tsv) as handle:
+            with (nullcontext(sys.stdin) if str(args.bsconv_tsv) == "-"
+                  else args.bsconv_tsv.open(encoding="utf-8")) as handle:
                 # 原生 bsconv 不转义 QNAME；合法双引号属于读段身份，不能按 CSV 解码。
                 reader = csv.reader(handle, delimiter="\t", quoting=csv.QUOTE_NONE)
                 for row in reader:
-                    if not row or row[0].startswith("#"):
-                        continue
                     if len(row) != BSCONV_P_COLUMNS or not all(
                         re.fullmatch(r"[0-9]+", value) for value in row[:8]
-                    ) or not row[8].strip():
+                    ):
                         raise ValueError(
                             f"Unexpected biscuit bsconv -p row at {args.bsconv_tsv}:{reader.line_num} "
                             f"(expect 8 nonnegative integer cytosine counts + QNAME): {row!r}"
                         )
 
-                    read_name = normalize_read_name(row[8])
+                    read_name = _require_sam_qname(row[8], args.bsconv_tsv, reader.line_num)
                     if excluded_read_names is None:
                         excluded_read_names = (
                             excluded_reads_from_bam(
@@ -647,13 +662,7 @@ def run_bsconv_extraction(args) -> None:
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)
     args.summary_json.write_text(json.dumps(summary, indent=2) + "\n")
     if args.multiqc_json:
-        write_multiqc(
-            args.multiqc_json,
-            args.sample_name,
-            summary,
-            args.protocol,
-            args.high_cph_role,
-        )
+        atomic_write_json(args.multiqc_json, _high_cph_multiqc_payload(args.sample_name, summary))
 
 
 DUPSIFTER_STAT_FIELDS: tuple[tuple[str, str], ...] = (
@@ -680,6 +689,7 @@ def write_dupsifter_mqc(
     demux_sample: str,
     *,
     metadata: Mapping[str, str],
+    cutadapt_report: Path,
 ) -> None:
     """从 DAG 提交的 manifest 行写 Dupsifter custom content。"""
     row = {str(key): str(value or "") for key, value in metadata.items()}
@@ -709,25 +719,22 @@ def write_dupsifter_mqc(
     metrics = {}
     mapping = dict(DUPSIFTER_STAT_FIELDS)
     stat = Path(stat_path)
-    if stat.exists():
-        for line_no, line in enumerate(stat.read_text().splitlines(), start=1):
-            if "]" in line and ":" in line:
-                content = line.split("]", 1)[1].strip()
-                if ":" in content:
-                    key, value = content.split(":", 1)
-                    key = key.strip()
-                    value = value.strip()
-                    if key in mapping:
-                        try:
-                            count = _native_count(value, grouped=True)
-                        except ValueError as exc:
-                            raise ValueError(
-                                f"Invalid Dupsifter count at {stat}:{line_no}: {key}={value!r}"
-                            ) from exc
-                        if mapping[key] in metrics and metrics[mapping[key]] != count:
-                            raise ValueError(f"Conflicting Dupsifter count at {stat}:{line_no}: {key}={value!r}")
-                        metrics[mapping[key]] = count
-    row_key = demux_sample
+    for line_no, line in enumerate(stat.read_text().splitlines(), start=1):
+        prefix, _, content = line.partition("]")
+        key, _, value = content.strip().partition(":")
+        field = mapping.get(key.strip())
+        if prefix != "[dupsifter" or field is None:
+            continue
+        try:
+            count = _native_count(value.strip(), grouped=True)
+        except ValueError as exc:
+            raise ValueError(f"Invalid Dupsifter count at {stat}:{line_no}: {key}={value!r}") from exc
+        if field in metrics and metrics[field] != count:
+            raise ValueError(f"Conflicting Dupsifter count at {stat}:{line_no}: {key}={value!r}")
+        metrics[field] = count
+    cutadapt = _parse_cutadapt_metrics(cutadapt_report, (row["dna_r1"], row["dna_r2"]),
+                                      _read_json(cutadapt_report, "Cutadapt report"))
+    _dupsifter_pair_counts(metrics, stat, cutadapt["trimmed_pairs"])
     output_row = {
         "Protocol": pipeline_mode,
         "Route": route_id,
@@ -742,7 +749,7 @@ def write_dupsifter_mqc(
         "description": f"Duplicate marking statistics for {demux_sample}; raw source={raw_sample}",
         "plot_type": "table",
         "pconfig": {"id": "dupsifter_table", "title": "Dupsifter Statistics", "col1_header": "Sample Name"},
-        "data": {row_key: output_row},
+        "data": {demux_sample: output_row},
     }
     atomic_write_json(out_json, obj)
 
@@ -785,39 +792,44 @@ def _parse_cph_methylation_pct(path: Path) -> float:
 def _read_dupsifter_metrics(
     path: Path, sample: str, trimmed_pairs: int
 ) -> tuple[dict[str, int], dict[str, int]]:
-    payload = _read_json_if_present(path)
+    payload = _read_json(path, "Dupsifter QC")
     data = payload.get("data")
     if not isinstance(data, dict) or set(data) != {sample}:
         raise ValueError(f"Dupsifter QC must contain exactly sample {sample!r}: {path}")
     row = data[sample]
     if not isinstance(row, dict):
         raise ValueError(f"Dupsifter QC sample row is invalid: {path}")
-    native: dict[str, int] = {}
+    return row, _dupsifter_pair_counts(row, path, trimmed_pairs)
+
+
+def _dupsifter_pair_counts(row: Mapping[str, object], path: Path, trimmed_pairs: int) -> dict[str, int]:
     for field in DUPSIFTER_MQC_FIELDS:
         value = row.get(field)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        if type(value) is not int or value < 0:
             raise ValueError(f"Dupsifter QC has invalid {field}: {path}")
-        native[field.lower()] = value
-
-    both = native["both_mapped"]
-    one = native["one_mapped_forward"] + native["one_mapped_reverse"]
-    unmapped = native["no_mapped"]
-    no_primary = native["no_primary"]
-
-
+    if row["Reads_Processed"] != row["Primary_Reads"] + row["Secondary_Supplementary"]:
+        raise ValueError(f"Dupsifter alignment record counts disagree: {path}")
+    for dup, mapped in (("Dup_Both", "Both_Mapped"), ("Dup_Forward", "One_Mapped_Forward"),
+                        ("Dup_Reverse", "One_Mapped_Reverse")):
+        if row[dup] > row[mapped]:
+            raise ValueError(f"Dupsifter {dup} exceeds {mapped}: {path}")
+    both = row["Both_Mapped"]
+    one = row["One_Mapped_Forward"] + row["One_Mapped_Reverse"]
+    unmapped = row["No_Mapped"]
+    no_primary = row["No_Primary"]
     accepted = both + one
     rejected = unmapped + no_primary
-    duplicate = native["dup_both"] + native["dup_forward"] + native["dup_reverse"]
+    # 两端均已比对或均未比对的模板各占两条 primary。单端比对可另含一条未比对 mate。
+    min_primary = 2 * (both + unmapped) + one
+    if not min_primary <= row["Primary_Reads"] <= min_primary + one or no_primary > row["Secondary_Supplementary"]:
+        raise ValueError(f"Dupsifter pair categories disagree with alignment records: {path}")
+    duplicate = row["Dup_Both"] + row["Dup_Forward"] + row["Dup_Reverse"]
     if accepted + rejected != trimmed_pairs:
         raise ValueError(
             "Dupsifter pair categories disagree with Cutadapt output: "
             f"accepted({accepted}) + rejected({rejected}) != trimmed({trimmed_pairs})"
         )
-    if duplicate > accepted:
-        raise ValueError(
-            f"Dupsifter duplicate pairs exceed accepted mapped pairs: {path}"
-        )
-    return native, {
+    return {
         "both_primary_mapped_pairs": both,
         "one_primary_mapped_pairs": one,
         "backend_accepted_pairs": accepted,
@@ -829,18 +841,13 @@ def _read_dupsifter_metrics(
     }
 
 
-def _read_biscuit_native_mapping(path: Path) -> dict[str, object]:
-    if not path.is_file():
-        raise FileNotFoundError(f"Missing BISCUIT MAPQ table: {path}")
-    lines = path.read_text(encoding="utf-8").splitlines()
-    if len(lines) < 3 or lines[:2] != ["BISCUITqc Mapping Quality Table", "MapQ\tCount"]:
-        raise ValueError(f"Malformed BISCUIT MAPQ table header or missing counts: {path}")
-    rows = [line for line in lines[2:] if line.strip()]
-    if not rows:
-        raise ValueError(f"BISCUIT MAPQ table lacks count rows: {path}")
-    optimal = suboptimal = unaligned = 0
-    seen_mapq: set[str | int] = set()
-    for line in rows:
+def _biscuit_mapq_counts(path: Path, text: str) -> dict[str, int]:
+    """受管版 biscuit qc 为 unmapped 和 MAPQ 0–60 各写一行，包括零计数。"""
+    lines = text.splitlines()
+    if lines[:2] != ["BISCUITqc Mapping Quality Table", "MapQ\tCount"]:
+        raise ValueError(f"Malformed BISCUIT MAPQ table header: {path}")
+    counts: dict[str, int] = {}
+    for line in lines[2:]:
         fields = line.split()
         if len(fields) != 2:
             raise ValueError(f"Malformed BISCUIT MAPQ row in {path}: {line!r}")
@@ -849,91 +856,184 @@ def _read_biscuit_native_mapping(path: Path) -> dict[str, object]:
             count = _native_count(raw_count, grouped=True)
         except ValueError as exc:
             raise ValueError(f"Invalid BISCUIT MAPQ count in {path}: {line!r}") from exc
-        label_key: str | int = label
         if label != "unmapped":
             try:
-                label_key = _native_count(label)
+                label = str(_native_count(label))
             except ValueError as exc:
                 raise ValueError(f"Invalid BISCUIT MAPQ label in {path}: {label!r}") from exc
-            if not 0 <= label_key <= 255:
-                raise ValueError(f"Invalid BISCUIT MAPQ range in {path}: {label!r}")
-        if label_key in seen_mapq:
+        if label in counts:
             raise ValueError(f"Duplicate BISCUIT MAPQ category in {path}: {label!r}")
-        seen_mapq.add(label_key)
-        if label == "unmapped":
-            unaligned += count
-        else:
-            if label_key >= 40:
-                optimal += count
-            else:
-                suboptimal += count
-    total = optimal + suboptimal + unaligned
+        counts[label] = count
+    if counts.keys() != {"unmapped", *map(str, range(61))}:
+        raise ValueError(f"BISCUIT MAPQ table requires unmapped and all bins 0–60: {path}")
+    return counts
+
+
+def _read_biscuit_native_mapping(path: Path) -> dict[str, object]:
+    counts = _biscuit_mapq_counts(path, path.read_text(encoding="utf-8"))
+    total = sum(counts.values())
+    unaligned = counts["unmapped"]
+    optimal = sum(counts[str(q)] for q in range(40, 61))
     return {
         "optimally_aligned_reads": optimal,
-        "suboptimally_aligned_reads": suboptimal,
+        "suboptimally_aligned_reads": total - unaligned - optimal,
         "unaligned_native_reads": unaligned,
-        "native_mapping_policy": "biscuit_primary_mapq_ge_40",
-        "native_mapping_unit": "individual_primary_reads_postdedup",
+        "native_mapping_policy": "biscuit_nonsecondary_mapq_ge_40",
+        "native_mapping_unit": "nonsecondary_alignment_records_postdedup",
         "native_mapping_pct": 100.0 * optimal / total if total else 0.0,
     }
 
 
 # 科学处理：Bismark 与 Droplet UMI
 
-def parse_alignment_report(path: Path) -> dict[str, int | float]:
-    text = path.read_text(encoding="utf-8", errors="strict")
+def _bismark_trimmed_mates(cutadapt: Mapping[str, Any], path: Path) -> tuple[str, str]:
+    """Cutadapt records both output paths verbatim even after job scratch is reclaimed."""
+    argv = cutadapt.get("command_line_arguments")
+    if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+        raise ValueError(f"Missing Cutadapt command line for Bismark: {path}")
+    if argv[-2:] != [cutadapt["input"]["path1"], cutadapt["input"]["path2"]]:
+        raise ValueError(f"Cutadapt command line disagrees with its paired inputs: {path}")
+    mates = []
+    for flag in ("-o", "-p"):
+        if argv.count(flag) != 1:
+            raise ValueError(f"Missing or repeated Cutadapt output option {flag}: {path}")
+        index = argv.index(flag) + 1
+        if index >= len(argv) or not Path(argv[index]).is_absolute():
+            raise ValueError(f"Invalid Cutadapt output path for {flag}: {path}")
+        mates.append(argv[index])
+    if mates[0] == mates[1]:
+        raise ValueError(f"Cutadapt paired outputs coincide: {path}")
+    return mates[0], mates[1]
+
+
+def _bismark_cytosine_counts(text: str, path: Path, *, unmethylated_field: str,
+                            pairs: int) -> dict[str, tuple[int, int]]:
+    """核对报告显示值，保留每种 context 的修饰和未修饰观测数。"""
+    total_calls = _bismark_report_count(text, "Total number of C's analysed", path)
+    lines = set(text.split("\n"))
+    counts = {}
+    for context in ("CpG", "CHG", "CHH"):
+        label = f"{context} context"
+        m = _bismark_report_count(text, f"Total methylated C's in {label}", path)
+        u = _bismark_report_count(text, f"{unmethylated_field} in {label}", path)
+        counts[context] = (m, u)
+        n = m + u
+        field = f"C methylated in {label}"
+        missing = f"Can't determine percentage of methylated Cs in {label} if value was 0" in lines
+        if n:
+            valid = not missing and _bismark_field(text, field, path) == f"{m * 100.0 / n:.1f}%"
+        else:
+            valid = missing and not re.search(rf"^{re.escape(field)}:", text, re.MULTILINE)
+        if not valid:
+            raise ValueError(f"Bismark {context} percentage disagrees with its counts: {path}")
+    if sum(m + u for m, u in counts.values()) != total_calls or (pairs == 0 and total_calls):
+        raise ValueError(f"Bismark cytosine total disagrees with its counts: {path}")
+    return counts
+
+
+def parse_alignment_report(path: Path, trimmed_mates: tuple[str, str]) -> dict[str, int | float]:
+    text = path.read_bytes().decode("utf-8")
+    prefix = f"Bismark report for: {trimmed_mates[0]} and {trimmed_mates[1]} (version: "
+    if not text.startswith(prefix):
+        raise ValueError(f"Bismark alignment report does not match the Cutadapt outputs: {path}")
+    # Paths may themselves contain newlines or option-like text. Only parse the report body.
+    text = text[len(prefix):].partition("\n")[2]
+    if re.search(r"^Bismark report for: ", text, re.MULTILINE):
+        raise ValueError(f"Multiple Bismark alignment reports in {path}")
     total = _bismark_report_count(text, "Sequence pairs analysed in total", path)
     unique = _bismark_report_count(text, "Number of paired-end alignments with a unique best hit", path)
     no_alignment = _bismark_report_count(text, "Sequence pairs with no alignments under any condition", path)
     non_unique = _bismark_report_count(text, "Sequence pairs did not map uniquely", path)
     discarded = _bismark_report_count(
-        text, "Sequence pairs which were discarded because genomic sequence could not be extracted",
-        path, optional=True,
+        text, "Sequence pairs which were discarded because genomic sequence could not be extracted", path,
     )
-    efficiencies = _bismark_field_values(text, "Mapping efficiency")
-    if not efficiencies or any(not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?%", v) for v in efficiencies):
-        raise ValueError(f"Missing or invalid Bismark mapping efficiency in {path}: {efficiencies!r}")
-    mapping_efficiency = float(efficiencies[0][:-1])
-    if any(not math.isclose(mapping_efficiency, float(v[:-1]), abs_tol=1e-9) for v in efficiencies[1:]):
-        raise ValueError(f"Bismark report has conflicting mapping efficiency values: {path}")
-    if unique + no_alignment + non_unique != total:
-        raise ValueError(
-            "Bismark alignment counts are inconsistent: "
-            f"unique({unique}) + unaligned({no_alignment}) + "
-            f"non_unique({non_unique}) != total({total})"
-        )
-    if discarded > unique:
-        raise ValueError(
-            "Bismark discarded-pair count exceeds uniquely aligned pairs: "
-            f"discarded={discarded}, unique={unique}"
-        )
-    expected_efficiency = 0.0 if total == 0 else unique * 100.0 / total
-    if not math.isclose(mapping_efficiency, expected_efficiency, abs_tol=0.11):
-        raise ValueError(
-            "Bismark mapping efficiency disagrees with the exact report counts: "
-            f"reported={mapping_efficiency}, expected={expected_efficiency:.6f}"
-        )
+    if unique + no_alignment + non_unique != total or discarded > unique:
+        raise ValueError(f"Inconsistent Bismark alignment counts in {path}")
+    efficiency = f"{unique * 100.0 / total:.1f}" if total else "0"
+    if _bismark_field(text, "Mapping efficiency", path) != efficiency + "%":
+        raise ValueError(f"Bismark mapping efficiency disagrees with the exact report counts: {path}")
+    _bismark_cytosine_counts(text, path, unmethylated_field="Total unmethylated C's", pairs=unique - discarded)
     return {
-        "total": total,
-        "unique": unique,
-        "no_alignment": no_alignment,
-        "non_unique": non_unique,
-        "discarded": discarded,
-        "mapping_efficiency": mapping_efficiency,
+        "total": total, "unique": unique, "no_alignment": no_alignment, "non_unique": non_unique,
+        "discarded": discarded, "mapping_efficiency": float(efficiency),
     }
 
 
-def parse_dedup_report(path: Path) -> dict[str, int]:
-    text = path.read_text(encoding="utf-8", errors="strict")
-    total = _bismark_report_count(text, r"Total number of alignments analysed in .+", path, annotated=True)
-    removed = _bismark_report_count(text, "Total number duplicated alignments removed", path, annotated=True)
-    leftover = _bismark_report_count(text, "Total count of deduplicated leftover sequences", path, annotated=True)
-    if removed > total or leftover != total - removed:
-        raise ValueError(
-            "Bismark deduplication counts are inconsistent: "
-            f"total={total}, removed={removed}, leftover={leftover}"
-        )
-    return {"total": total, "removed": removed, "leftover": leftover}
+def parse_dedup_report(path: Path, input_bam: Path) -> dict[str, int]:
+    text = path.read_bytes().decode("utf-8")
+    header = f"Total number of alignments analysed in {input_bam}:"
+    text = text.lstrip("\n")
+    if not text.startswith(header):
+        raise ValueError(f"Bismark deduplication report names a different input BAM: {path}")
+    value, _, text = text[len(header):].partition("\n")
+    if re.search(r"^Total number of alignments analysed in ", text, re.MULTILINE):
+        raise ValueError(f"Multiple Bismark deduplication reports in {path}")
+    try:
+        total = _native_count(value.strip(" \t"))
+    except ValueError as exc:
+        raise ValueError(f"Invalid Bismark deduplication total in {path}") from exc
+    counts = {"total": total}
+    for key, field, suffix in (
+        ("removed", "Total number duplicated alignments removed", "%)"),
+        ("leftover", "Total count of deduplicated leftover sequences", "% of total)"),
+    ):
+        value = _bismark_field(text, field, path)
+        token, _, annotation = value.partition(" ")
+        try:
+            count = _native_count(token)
+        except ValueError as exc:
+            raise ValueError(f"Invalid Bismark {field} in {path}") from exc
+        percent = count / total * 100.0 if total else 0.0
+        if annotation != f"({percent:.2f}{suffix}":
+            raise ValueError(f"Bismark deduplication percentage disagrees with {field}: {path}")
+        counts[key] = count
+    if counts["removed"] + counts["leftover"] != total:
+        raise ValueError(f"Inconsistent Bismark deduplication counts in {path}")
+    return counts
+
+
+@dataclass(frozen=True)
+class BismarkExtractionReport:
+    pairs: int
+    counts: dict[str, tuple[int, int]]
+
+    @property
+    def non_cpg_pct(self) -> float:
+        """合并 CHG、CHH 原始观察，以两种 context 的总覆盖为分母。"""
+        chg_m, chg_u = self.counts["CHG"]
+        chh_m, chh_u = self.counts["CHH"]
+        total = chg_m + chh_m + chg_u + chh_u
+        return 100.0 * (chg_m + chh_m) / total if total else math.nan
+
+
+def parse_bismark_extraction_report(path: Path, sample: str) -> BismarkExtractionReport:
+    text = path.read_text(encoding="utf-8")
+    bam, _, text = text.partition("\n")
+    if bam != f"cell_{sample}.processed.bam":
+        raise ValueError(f"Bismark extraction report names a different cell BAM: {path}")
+    if _bismark_field(text, "Bismark result file", path) != "paired-end (SAM format)":
+        raise ValueError(f"Bismark extraction report is not paired-end: {path}")
+    processed = re.findall(r"^Processed ([^\r\n]*) lines in total$", text, re.MULTILINE)
+    if len(processed) != 1 or not processed[0].isascii() or not processed[0].isdecimal():
+        raise ValueError(f"Invalid Bismark processed pair count in {path}")
+    pairs = int(processed[0])
+    if _bismark_report_count(text, "Total number of methylation call strings processed", path) != 2 * pairs:
+        raise ValueError(f"Bismark methylation call strings disagree with the pair count: {path}")
+    counts = _bismark_cytosine_counts(text, path, unmethylated_field="Total C to T conversions", pairs=pairs)
+    return BismarkExtractionReport(pairs, counts)
+
+
+def _bismark_pair_reports(alignment_report: Path, dedup_report: Path | None, sample: str,
+                          trimmed_mates: tuple[str, str]) -> tuple[dict[str, int | float], dict[str, int]]:
+    alignment = parse_alignment_report(alignment_report, trimmed_mates)
+    accepted = int(alignment["unique"]) - int(alignment["discarded"])
+    if dedup_report is None:
+        return alignment, {"total": accepted, "removed": 0, "leftover": accepted}
+    input_bam = Path(trimmed_mates[0]).parent / "bismark" / f"{sample}_pe.bam"
+    dedup = parse_dedup_report(dedup_report, input_bam)
+    if dedup["total"] != accepted:
+        raise ValueError(f"Bismark deduplication input disagrees with usable uniquely aligned pairs: {dedup_report}")
+    return alignment, dedup
 
 
 def _read_filter_summary(path: Path, sample: str) -> dict[str, Any]:
@@ -974,8 +1074,8 @@ def _read_filter_summary(path: Path, sample: str) -> dict[str, Any]:
     high_cph = payload["flagged_read_pairs"]
     excluded = payload["excluded_read_pairs"]
     retained = payload["final_retained_pairs"]
-    fraction = float(payload["high_cph_fraction"])
-    threshold = float(payload["threshold"])
+    fraction = payload["high_cph_fraction"]
+    threshold = payload["threshold"]
     minimum_count = payload["minimum_count"]
     filter_applied = payload["filter_applied"]
     if candidate < 0 or excluded < 0 or not 0 <= high_cph <= candidate:
@@ -987,7 +1087,7 @@ def _read_filter_summary(path: Path, sample: str) -> dict[str, Any]:
             f"(candidate={candidate}, flagged={high_cph}, excluded={excluded})"
         )
     expected_fraction = 0.0 if candidate == 0 else high_cph / candidate
-    if not math.isclose(fraction, expected_fraction, abs_tol=1e-12):
+    if fraction != expected_fraction:
         raise ValueError("Bismark non-conversion summary fraction is inconsistent")
     if not 0 <= threshold <= 1:
         raise ValueError("Bismark non-conversion threshold must be within [0, 1]")
@@ -1001,13 +1101,21 @@ def _read_filter_summary(path: Path, sample: str) -> dict[str, Any]:
     return payload
 
 
-DROPLET_DEDUP_POLICY = "per_cytosine_umi_consensus_hamming1"
 
 
 DROPLET_MIN_MAPQ = 10
 
 
 DROPLET_MIN_BASEQ = 20
+
+# Bismark PE 原生写入 FASTQ R1、R2。键为顺序 FLAG，值为共同 XG 和两端 XR。
+# CTOT/CTOB 的 0x40/0x80 与物理端相反。
+_BISMARK_PE_CONVERSIONS = {
+    (99, 147): ("CT", ("CT", "GA")),  # OT
+    (83, 163): ("GA", ("CT", "GA")),  # OB
+    (147, 99): ("CT", ("GA", "CT")),  # CTOT
+    (163, 83): ("GA", ("GA", "CT")),  # CTOB
+}
 
 
 def droplet_umi_consensus(groups: Mapping[str, Sequence[int]]) -> tuple[int, int, int, int]:
@@ -1023,7 +1131,6 @@ def droplet_umi_consensus(groups: Mapping[str, Sequence[int]]) -> tuple[int, int
             if len(remaining) < 48:
                 neighbors = [key for key in remaining if counts[key] < counts[umi]
                              and sum(a != b for a, b in zip(umi, key)) == 1]
-                neighbors.sort(key=lambda key: next((i, "ACGTN".index(b)) for i, (a, b) in enumerate(zip(umi, key)) if a != b))
             else:
                 neighbors = [umi[:i] + alternate + umi[i + 1:] for i, base in enumerate(umi)
                              for alternate in "ACGTN" if alternate != base]
@@ -1043,14 +1150,33 @@ def droplet_umi_consensus(groups: Mapping[str, Sequence[int]]) -> tuple[int, int
     return methyl, unmethyl, merged, ambiguous
 
 
+def _droplet_consensus_table(sample: str, protocol: str, cpg: Mapping[str, int]) -> dict[str, Any]:
+    """按当前协议和同一份 CpG 整数生成 MultiQC 表。"""
+    policy = DD_CONSENSUS[protocol]
+    return {
+        "id": f"alopex_droplet_{policy.tag}_consensus",
+        "section_name": f"{protocol} {policy.unit}",
+        "description": f"逐胞嘧啶标签共识，标签来源 {policy.source}。M-bias 按共识前的 read-base 统计。",
+        "plot_type": "table",
+        "data": {sample: {
+            "CpG_read_observations": cpg["read_observations"],
+            policy.count_field: cpg["methyl"] + cpg["unmethyl"],
+            policy.ambiguous_field: cpg[f"ambiguous_{policy.tag}s"],
+            "CpG_strand_sites": cpg["strand_sites"],
+        }},
+    }
+
+
 def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Path,
                      qc: str | Path, mbias: str | Path, *, sample: str,
-                     scratch: str | Path, samtools: str, threads: int = 1) -> None:
+                     scratch: str | Path, samtools: str, threads: int = 1, protocol: str = "DD-MET5") -> None:
     """保留过滤 BAM 的全部 pairs，按参考胞嘧啶/UMI 生成分子共识 coverage、QC 及 read-level M-bias。"""
     import pysam
 
     if SAMPLE_ID_RE.fullmatch(sample) is None:
         raise ValueError("Invalid Droplet sample identity")
+    policy = DD_CONSENSUS[protocol]
+    bam_tag = "UR" if protocol == "DD-MET5" else "ZF"
     root = Path(tempfile.mkdtemp(prefix="droplet_consensus_", dir=scratch))
     proc = None
     try:
@@ -1065,27 +1191,25 @@ def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Pat
             iterator = iter(source)
             for first in iterator:
                 second = next(iterator, None)
-                if second is None or first.query_name != second.query_name or first.query_name in seen:
+                name = _require_sam_qname(first.query_name, bam)
+                if second is None or name != second.query_name or name in seen:
                     raise ValueError("Droplet calling requires unique, adjacent complete read pairs")
-                seen.add(first.query_name)
-                if (first.flag, second.flag) not in {(99, 147), (163, 83), (147, 99), (83, 163)}:
+                seen.add(name)
+                conversions = _BISMARK_PE_CONVERSIONS.get((first.flag, second.flag))
+                if conversions is None:
                     raise ValueError("Unexpected Bismark paired flags")
-                if (not first.has_tag("XG") or not second.has_tag("XG")
-                        or first.get_tag("XG") != second.get_tag("XG")):
-                    raise ValueError("Droplet mates disagree on Bismark genome conversion")
-                if (any(not record.has_tag("XR") for record in (first, second))
-                        or {first.get_tag("XR"), second.get_tag("XR")} != {"CT", "GA"}):
-                    raise ValueError("Droplet mates require complementary Bismark read conversions")
+                conversion, read_conversions = conversions
                 if (first.reference_id != second.reference_id
                         or any(record.next_reference_id != mate.reference_id
                                or record.next_reference_start != mate.reference_start
                                for record, mate in ((first, second), (second, first)))):
                     raise ValueError("Droplet mate coordinates disagree with the actual pair")
-                umi = first.query_name.rsplit(":", 1)[-1]
-                if not re.fullmatch(r"[ACGTN]{12}", umi):
-                    raise ValueError("Droplet QNAME must end with a 12 bp UMI")
-                for record in (first, second):
-                    mate = 1 if record.is_read1 else 2
+                read_id, _, umi = name.rpartition(":")
+                if not read_id or not re.fullmatch(r"[ACGTN]{12}", umi):
+                    raise ValueError(
+                        f"{protocol} QNAME requires a read identifier followed by a colon and a 12 bp {policy.tag}"
+                    )
+                for mate, (record, xr) in enumerate(zip((first, second), read_conversions), 1):
                     contig = record.reference_name
                     if contig not in checked_contigs:
                         if contig not in reference_lengths or source.get_reference_length(contig) != reference_lengths[contig]:
@@ -1096,15 +1220,14 @@ def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Pat
                         raise ValueError(f"Droplet alignment exceeds reference bounds: {contig}")
                     if any(not record.has_tag(tag) for tag in ("XM", "XR", "XG")):
                         raise ValueError("Bismark methylation tags missing")
+                    if record.get_tag("XR") != xr or record.get_tag("XG") != conversion:
+                        raise ValueError(f"Bismark XR/XG disagree with paired FLAG orientation: {name}")
                     if (record.query_sequence is None or record.query_qualities is None
                             or len(record.get_tag("XM")) != record.query_length):
                         raise ValueError("Droplet calling requires sequence, base qualities and matching XM length")
-                    if record.has_tag("UR") and record.get_tag("UR") != umi:
-                        raise ValueError("Droplet UR tag disagrees with QNAME")
-                    conversion = record.get_tag("XG")
-                    if conversion not in {"CT", "GA"}:
-                        raise ValueError("Invalid Bismark genome conversion")
-                    record.set_tag("UR", umi, value_type="Z")
+                    if record.has_tag(bam_tag) and record.get_tag(bam_tag) != umi:
+                        raise ValueError(f"{bam_tag} disagrees with the {protocol} QNAME tag")
+                    record.set_tag(bam_tag, umi, value_type="Z")
                     record.set_tag("YI", f"{mate}{'R' if record.is_reverse else 'F'}", value_type="Z")
                     record.is_reverse = conversion == "GA"
                     record.mate_is_reverse = conversion == "GA"
@@ -1116,17 +1239,17 @@ def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Pat
                         "-m", "512M", "-T", str(root / "sort"), "-o", str(ordered), str(converted)], check=True)
         converted.unlink()
         contexts = {key: {"methyl": 0, "unmethyl": 0, "read_observations": 0,
-                          "umi_groups": 0, "merged_umis": 0, "ambiguous_umis": 0,
+                          f"{policy.tag}_groups": 0, f"merged_{policy.tag}s": 0, f"ambiguous_{policy.tag}s": 0,
                           "strand_sites": 0} for key in ("CpG", "CHG", "CHH")}
         cycles: dict[tuple[str, str, int], list[int]] = {}
         command = [samtools, "mpileup", "-Q", str(DROPLET_MIN_BASEQ), "-q", str(DROPLET_MIN_MAPQ),
-                   "-B", "-d", "0", "-f", str(reference), "--output-BP", "--output-extra", "RLEN,UR,YI",
+                   "-B", "-d", "0", "-f", str(reference), "--output-BP", "--output-extra", f"RLEN,{bam_tag},YI",
                    "--no-output-ins-mods", "--no-output-ins", "--no-output-ins",
                    "--no-output-del", "--no-output-del", "--no-output-ends", str(ordered)]
         with pysam.FastaFile(str(reference)) as fa, gzip.open(root / "coverage.gz", "wt") as handle:
             proc = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, bufsize=1024 * 1024)
-            chrom = None
-            sequence = ""
+            reference_bases = _TapsReferenceWindow(fa)
+            complement = str.maketrans("ACGT", "TGCA")
             for line in proc.stdout:
                 fields = line.rstrip("\n").split("\t")
                 if len(fields) != 10:
@@ -1136,13 +1259,16 @@ def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Pat
                 base = fields[2].upper()
                 if base not in {"C", "G"}:
                     continue
-                if chrom != fields[0]:
-                    chrom = fields[0]
-                    sequence = fa.fetch(chrom).upper()
-                pos = int(fields[1]) - 1
-                if not 0 <= pos < len(sequence) or sequence[pos] != base:
+                chrom, pos = fields[0], int(fields[1]) - 1
+                if not 0 <= pos < reference_lengths.get(chrom, 0):
                     raise ValueError("Droplet pileup coordinate disagrees with reference")
-                context_seq = sequence[pos:pos + 3] if base == "C" else sequence[max(0, pos - 2):pos + 1][::-1].translate(str.maketrans("ACGT", "TGCA"))
+                if base == "C":
+                    context_seq = reference_bases.fetch(chrom, pos, min(pos + 3, reference_lengths[chrom])).upper()
+                else:
+                    triplet = reference_bases.fetch(chrom, max(0, pos - 2), pos + 1)
+                    context_seq = triplet.upper()[::-1].translate(complement)
+                if not context_seq.startswith("C"):
+                    raise ValueError("Droplet pileup coordinate disagrees with reference")
                 if context_seq.startswith("CG"):
                     context = "CpG"
                 elif len(context_seq) == 3 and context_seq[1] in "ACT" and context_seq[2] in "ACGT":
@@ -1173,9 +1299,9 @@ def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Pat
                 m, u, merged, ambiguous = droplet_umi_consensus(groups)
                 stats = contexts[context]
                 stats["read_observations"] += sum(v[0] + v[1] for v in groups.values())
-                stats["umi_groups"] += len(groups)
-                stats["merged_umis"] += merged
-                stats["ambiguous_umis"] += ambiguous
+                stats[f"{policy.tag}_groups"] += len(groups)
+                stats[f"merged_{policy.tag}s"] += merged
+                stats[f"ambiguous_{policy.tag}s"] += ambiguous
                 stats["methyl"] += m
                 stats["unmethyl"] += u
                 stats["strand_sites"] += int(m + u > 0)
@@ -1186,7 +1312,7 @@ def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Pat
                 raise RuntimeError("Droplet samtools mpileup failed")
             proc = None
         with (root / "mbias.txt").open("w") as handle:
-            handle.write("Alopex Droplet read-level M-bias; MAPQ>=10, baseQ>=20, before UMI consensus\n\n")
+            handle.write(f"Alopex {protocol} read-level M-bias; MAPQ>=10, baseQ>=20, before {policy.unit}\n\n")
             for context in contexts:
                 for mate in ("1", "2"):
                     handle.write(f"{context} context (R{mate})\n====================\nposition\tcount_methylated\tcount_unmethylated\t% methylation\tcoverage\n")
@@ -1195,18 +1321,13 @@ def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Pat
                             m, u = cycles[(ctx, read, cycle)]
                             handle.write(f"{cycle}\t{m}\t{u}\t{100 * m / (m + u):.8f}\t{m + u}\n")
                     handle.write("\n")
-        cpg = contexts["CpG"]
-        payload = {"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY,
+        payload = {"schema_version": 1, "sample": sample, "dedup_policy": policy.dedup_policy,
                    "min_mapq": DROPLET_MIN_MAPQ, "min_baseq": DROPLET_MIN_BASEQ,
-                   "metric_unit": "cytosine_umi_consensus", "processed_pairs": pairs,
-                   "umi_with_n_pairs": umi_n, "contexts": contexts,
-                   "id": "alopex_droplet_umi_consensus", "section_name": "Droplet UMI consensus",
-                   "description": "逐胞嘧啶 UMI 共识；read-level 观测及分子计数不等同 read-pair 去重率。M-bias 为质量过滤后、UMI 共识前的 read-level 统计。",
-                   "plot_type": "table", "data": {sample: {"CpG_read_observations": cpg["read_observations"],
-                       "CpG_UMI_observations": cpg["methyl"] + cpg["unmethyl"],
-                       "CpG_ambiguous_UMIs": cpg["ambiguous_umis"], "CpG_strand_sites": cpg["strand_sites"]}}}
+                   "metric_unit": policy.unit, "protocol": protocol, "tag_source": policy.source, "processed_pairs": pairs,
+                   f"{policy.tag}_with_n_pairs": umi_n, "contexts": contexts,
+                   **_droplet_consensus_table(sample, protocol, contexts["CpG"])}
         (root / "qc.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-        read_droplet_umi_qc(root / "qc.json", sample)
+        read_droplet_umi_qc(root / "qc.json", sample, protocol)
         for name, target in (("coverage.gz", coverage), ("mbias.txt", mbias), ("qc.json", qc)):
             os.replace(root / name, target)
     finally:
@@ -1215,30 +1336,44 @@ def call_droplet_cpg(bam: str | Path, reference: str | Path, coverage: str | Pat
         shutil.rmtree(root)
 
 
-def read_droplet_umi_qc(path: str | Path, sample: str) -> dict[str, Any]:
+def read_droplet_umi_qc(path: str | Path, sample: str, protocol: str = "DD-MET5") -> dict[str, Any]:
     """校验逐胞嘧啶 UMI 共识计数、单位与实际参数，禁止作为 read-pair 去重率解释。"""
-    data = _read_json(Path(path), "Droplet UMI consensus QC")
-    for key, value in {"schema_version": 1, "sample": sample, "dedup_policy": DROPLET_DEDUP_POLICY,
+    policy = DD_CONSENSUS[protocol]
+    data = _read_json(Path(path), "Droplet tag consensus QC")
+    for key, value in {"schema_version": 1, "sample": sample, "dedup_policy": policy.dedup_policy,
                        "min_mapq": DROPLET_MIN_MAPQ, "min_baseq": DROPLET_MIN_BASEQ,
-                       "metric_unit": "cytosine_umi_consensus"}.items():
+                       "metric_unit": policy.unit, "tag_source": policy.source, "protocol": protocol}.items():
         if type(data.get(key)) is not type(value) or data.get(key) != value:
             raise ValueError(f"Invalid Droplet UMI QC {key}: {path}")
-    for key in ("processed_pairs", "umi_with_n_pairs"):
+    for key in ("processed_pairs", f"{policy.tag}_with_n_pairs"):
         data[key] = _integer(data.get(key), key, Path(path))
-    if not 0 <= data["umi_with_n_pairs"] <= data["processed_pairs"]:
+    if not 0 <= data[f"{policy.tag}_with_n_pairs"] <= data["processed_pairs"]:
         raise ValueError("Invalid Droplet UMI pair counts")
-    for context in ("CpG", "CHG", "CHH"):
-        values = data.get("contexts", {}).get(context, {})
-        for key in ("methyl", "unmethyl", "read_observations", "umi_groups", "merged_umis", "ambiguous_umis", "strand_sites"):
-            values[key] = _integer(values.get(key), key, Path(path))
+    contexts = data.get("contexts")
+    if not isinstance(contexts, dict) or contexts.keys() != {"CpG", "CHG", "CHH"}:
+        raise ValueError(f"Invalid Droplet consensus contexts: {path}")
+    for context, values in contexts.items():
+        if not isinstance(values, dict):
+            raise ValueError(f"Invalid Droplet {context} counts: {path}")
+        for key in ("methyl", "unmethyl", "read_observations", f"{policy.tag}_groups", f"merged_{policy.tag}s", f"ambiguous_{policy.tag}s", "strand_sites"):
+            _integer(values.get(key), key, Path(path))
         called = values["methyl"] + values["unmethyl"]
-        if ((data["processed_pairs"] == 0 and values["read_observations"] != 0)
-                or bool(called) != bool(values["strand_sites"])):
-            raise ValueError("Droplet UMI observations disagree with input pairs or called sites")
-        if not (values["strand_sites"] <= called <= values["umi_groups"] <= values["read_observations"]):
-            raise ValueError("Droplet UMI observation accounting is inconsistent")
-        if values["umi_groups"] != called + values["merged_umis"] + values["ambiguous_umis"]:
-            raise ValueError("Droplet UMI consensus accounting does not close")
+        observations = values["read_observations"]
+        groups = values[f"{policy.tag}_groups"]
+        merged = values[f"merged_{policy.tag}s"]
+        ambiguous = values[f"ambiguous_{policy.tag}s"]
+        if ((not data["processed_pairs"] and observations) or bool(called) != bool(values["strand_sites"])
+                or bool(observations) != bool(groups) or bool(groups) != bool(called + ambiguous)):
+            raise ValueError(f"Droplet {context} observations disagree with input pairs, groups or called sites: {path}")
+        # 未决代表至少有两条原始观测。合并也要求代表的原始丰度严格大于邻居。
+        if (values["strand_sites"] > called or groups + ambiguous > observations
+                or (merged and observations == groups) or groups != called + merged + ambiguous):
+            raise ValueError(f"Droplet {context} consensus accounting does not close: {path}")
+    table = _droplet_consensus_table(sample, protocol, contexts["CpG"])
+    # Python 的 True 和 1.0 均等于 1，但都不是观测计数。
+    if (any(data.get(key) != expected for key, expected in table.items())
+            or any(type(count) is not int for count in data["data"][sample].values())):
+        raise ValueError(f"Droplet MultiQC table disagrees with {sample} {protocol} CpG counts or units: {path}")
     return data
 
 
@@ -1247,6 +1382,7 @@ def build_metrics(
     sample: str,
     version: str,
     alignment_report: Path,
+    trimmed_mates: tuple[str, str],
     dedup_report: Path,
     filter_summary: Mapping[str, Any],
     protocol: str = "cabernet",
@@ -1270,19 +1406,12 @@ def build_metrics(
     )
     if not version_label:
         raise ValueError(f"Expected a Bismark 3.x version string, observed: {version!r}")
-    alignment = parse_alignment_report(alignment_report)
-    unique_pairs = int(alignment["unique"])
+    umi_qc = read_droplet_umi_qc(dedup_report, sample, protocol) if protocol in DD_PROTOCOLS else None
+    alignment, dedup = _bismark_pair_reports(
+        alignment_report, None if umi_qc is not None else dedup_report, sample, trimmed_mates,
+    )
     discarded_pairs = int(alignment["discarded"])
-    accepted_pairs = unique_pairs - discarded_pairs
-
-    umi_qc = read_droplet_umi_qc(dedup_report, sample) if protocol == "droplet" else None
-    dedup = {"total": accepted_pairs, "removed": 0, "leftover": accepted_pairs} if umi_qc is not None else parse_dedup_report(dedup_report)
-    if dedup["total"] != accepted_pairs:
-        raise ValueError(
-            "Bismark deduplication input disagrees with usable uniquely aligned pairs: "
-            f"analysed={dedup['total']}, expected={accepted_pairs} "
-            f"(unique={unique_pairs}, discarded={discarded_pairs})"
-        )
+    accepted_pairs = dedup["total"]
     duplicate_pairs = dedup["removed"]
     postdedup_pairs = dedup["leftover"]
 
@@ -1383,7 +1512,7 @@ def write_filter_summary(
     )
     multiqc.write_text(
         json.dumps(
-            _high_cph_multiqc_payload(sample, payload, protocol, high_cph_role),
+            _high_cph_multiqc_payload(sample, payload),
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -1399,22 +1528,6 @@ def run_bismark_pair_split(args) -> int:
     args.excluded.parent.mkdir(parents=True, exist_ok=True)
     print(*split_pairs(args.input_bam, args.bio, args.excluded, excluded_contigs))
     return 0
-
-
-def _parse_bismark_non_cpg_methylation_pct(path: Path) -> float:
-    text = path.read_text(encoding="utf-8", errors="strict")
-    counts: dict[tuple[str, str], int] = {}
-    for state in ("Methylated", "Unmethylated"):
-        for context in ("CHG", "CHH"):
-            field = rf"(?:Total )?{state} (?:C(?:'|’)?s|cytosines) in {context} context"
-            if state == "Unmethylated":
-                field += rf"|Total C to T conversions in {context} context"
-            counts[(state, context)] = _bismark_report_count(text, field, path)
-    methylated = sum(counts[("Methylated", context)] for context in ("CHG", "CHH"))
-    total = methylated + sum(
-        counts[("Unmethylated", context)] for context in ("CHG", "CHH")
-    )
-    return 100.0 * methylated / total if total else math.nan
 
 
 def _bismark_version_text(bismark: str | None) -> str:
@@ -1491,6 +1604,53 @@ TAPS_INCLUDE_FLAGS = 3
 TAPS_EXCLUDE_FLAGS = 3852
 
 
+@contextmanager
+def _taps_collate(bam, samtools, scratch, *, primary_only=False):
+    """隔离 samtools 的溢写文件；解析失败时先回收子进程，再清理本次目录。"""
+    with tempfile.TemporaryDirectory(prefix=".taps_collate.", dir=scratch) as directory:
+        command = [samtools, "collate"]
+        if primary_only:
+            command.append("-f")
+        command.extend(["-O", "-u", "-T", str(Path(directory) / "reads"), bam])
+        process = subprocess.Popen(command, stdout=subprocess.PIPE)
+        try:
+            yield process.stdout
+            if process.wait() != 0:
+                raise RuntimeError(f"samtools collate failed for TAPS BAM: {bam}")
+        finally:
+            _close_native_stream(process)
+
+
+def _taps_read_groups(groups, sample):
+    by_id = {group.get("ID"): group for group in groups}
+    if (not groups or len(by_id) != len(groups) or not all(by_id)
+            or any(group.get("SM") != sample for group in groups)):
+        raise ValueError(f"TAPS BAM requires unique read groups bound to sample {sample}")
+    return by_id
+
+
+def _taps_primary_pair(records, name, bam, groups):
+    _require_sam_qname(name, bam)
+    primary = []
+    template_group = None
+    for read in records:
+        try:
+            group = read.get_tag("RG")
+        except KeyError:
+            group = None
+        if group not in groups:
+            raise ValueError(f"TAPS record has an unbound read group: {name}")
+        if template_group is not None and group != template_group:
+            raise ValueError(f"TAPS template spans different read groups: {name}")
+        template_group = group
+        if not read.is_secondary and not read.is_supplementary:
+            primary.append(read)
+    if (len(primary) != 2 or primary[0].is_read1 == primary[1].is_read1
+            or any(not r.is_paired or r.is_read1 == r.is_read2 for r in primary)):
+        raise ValueError(f"TAPS primary pair is incomplete or duplicated: {name}")
+    return primary
+
+
 def write_taps_alignment_qc(bam: str, samtools: str, scratch: str, sample: str, output: str) -> None:
     """按 QNAME 核算完整 BAM 与 Rastair 可用 pair；仅任一 mate 达到调用条件的 pair 进入漏斗。"""
     import itertools
@@ -1501,28 +1661,21 @@ def write_taps_alignment_qc(bam: str, samtools: str, scratch: str, sample: str, 
                            "trimmed_pairs", "backend_accepted_pairs", "backend_rejected_pairs",
                            "unmapped_pairs", "discordant_pairs", "quality_rejected_pairs",
                            "duplicate_pairs", "postdedup_pairs"), 0)
+    require_distinct_paths([Path(bam), Path(f"{bam}.bai"), Path(output)], label="TAPS BAM, index and alignment QC")
     with pysam.AlignmentFile(bam, "rb") as source:
         header = source.header.to_dict()
         if header.get("HD", {}).get("SO") != "coordinate" or not source.has_index():
             raise ValueError("TAPS BAM must be coordinate sorted and indexed")
-        groups = header.get("RG", [])
-        group_ids = {rg.get("ID") for rg in groups}
-        if (not groups or None in group_ids or "" in group_ids or len(group_ids) != len(groups)
-                or any(rg.get("SM") != sample for rg in groups)):
-            raise ValueError("TAPS BAM requires unique read groups bound to the active sample")
-    process = subprocess.Popen([samtools, "collate", "-O", "-u", "-T", str(Path(scratch) / "qc_collate"), bam], stdout=subprocess.PIPE)
-    try:
-        with pysam.AlignmentFile(process.stdout, "rb") as source:
+    with _taps_collate(bam, samtools, scratch) as stream:
+        with pysam.AlignmentFile(stream, "rb") as source:
+            collated = source.header.to_dict()
+            groups = _taps_read_groups(collated.get("RG", []), sample)
+            if groups != _taps_read_groups(header.get("RG", []), sample) or collated["SQ"] != header["SQ"]:
+                raise ValueError("TAPS BAM header changed during alignment QC")
             for name, group in itertools.groupby(source, key=lambda r: r.query_name):
                 records = list(group)
-                primary = [r for r in records if not r.is_secondary and not r.is_supplementary]
-                if len(primary) != 2 or {r.is_read1 for r in primary} != {True, False} or any(
-                    not r.is_paired or r.is_read1 == r.is_read2 for r in primary
-                ):
-                    raise ValueError(f"TAPS primary pair is incomplete or duplicated: {name}")
+                primary = _taps_primary_pair(records, name, bam, groups)
                 for r in records:
-                    if not r.has_tag("RG") or r.get_tag("RG") not in group_ids:
-                        raise ValueError(f"TAPS record has an unbound read group: {name}")
                     counts["bam_records"] += 1
                     counts["bam_primary_records"] += int(not r.is_secondary and not r.is_supplementary)
                     for key, flag in (("duplicate", r.is_duplicate), ("unmapped", r.is_unmapped),
@@ -1545,10 +1698,6 @@ def write_taps_alignment_qc(bam: str, samtools: str, scratch: str, sample: str, 
                         counts["discordant_pairs"] += 1
                     else:
                         counts["quality_rejected_pairs"] += 1
-        if process.wait() != 0:
-            raise RuntimeError("samtools collate failed during TAPS pair accounting")
-    finally:
-        _close_native_stream(process)
     atomic_write_json(output, {"sample": sample, "backend": "rastair", "schema_version": 1,
                                "read_groups": header.get("RG", []), "programs": header.get("PG", []),
                                "reference_sequences": header["SQ"], **counts})
@@ -1661,7 +1810,7 @@ class _TapsReferenceWindow:
         return self.blocks[key][start - block:end - block]
 
 
-def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str, *, expected_pairs: int) -> dict[str, object]:
+def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str, *, alignment_qc: Mapping, species: str) -> dict[str, object]:
     """统计可判链分子的宿主 CHG/CHH 转换率；未知或冲突链不随机分配，重叠 mate 每位置只计一次。
 
     这是未经 SNP/测序错误校正的原始修饰信号 QC；只用高质量 CpG 转换证据判链，
@@ -1672,22 +1821,25 @@ def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str, 
 
     counts = dict.fromkeys(("non_cpg_candidate_pairs", "non_cpg_oriented_pairs", "non_cpg_ambiguous_pairs",
                            "non_cpg_chg_mod", "non_cpg_chg_unmod", "non_cpg_chh_mod", "non_cpg_chh_unmod"), 0)
+    expected_pairs = alignment_qc["trimmed_pairs"]
     if type(expected_pairs) is not int or expected_pairs < 0:
         raise ValueError("TAPS non-CpG QC requires a nonnegative complete pair count")
+    host_contigs = set(primary_analysis_contigs(species))
     primary_pairs = 0
-    process = subprocess.Popen([samtools, "collate", "-f", "-O", "-u", "-T", str(Path(scratch) / "non_cpg_collate"), bam], stdout=subprocess.PIPE)
-    try:
-        with pysam.FastaFile(reference) as fasta, pysam.AlignmentFile(process.stdout, "rb") as source:
+    with _taps_collate(bam, samtools, scratch, primary_only=True) as stream:
+        with pysam.FastaFile(reference) as fasta, pysam.AlignmentFile(stream, "rb") as source:
+            header = source.header.to_dict()
+            sample = alignment_qc["sample"]
+            groups = _taps_read_groups(header.get("RG", []), sample)
+            if (groups != _taps_read_groups(alignment_qc["read_groups"], sample)
+                    or header["SQ"] != alignment_qc["reference_sequences"]):
+                raise ValueError(f"TAPS BAM header disagrees with alignment QC for {sample}")
             ref = _TapsReferenceWindow(fasta)
             for name, group in itertools.groupby(source, key=lambda r: r.query_name):
-                primary = [r for r in group if not r.is_secondary and not r.is_supplementary]
-                if len(primary) != 2 or {r.is_read1 for r in primary} != {True, False} or any(
-                    not r.is_paired or r.is_read1 == r.is_read2 for r in primary
-                ):
-                    raise ValueError(f"TAPS non-CpG QC requires a complete pair: {name}")
+                primary = _taps_primary_pair(group, name, bam, groups)
                 primary_pairs += 1
                 chrom, bases, orientation, start, seq = _taps_pair_bases(primary, ref)
-                if re.fullmatch(r"chr(?:[1-9]|1[0-9]|2[0-2]|X|Y)", chrom) is None:
+                if chrom not in host_contigs:
                     continue
                 counts["non_cpg_candidate_pairs"] += 1
                 if not orientation:
@@ -1736,12 +1888,8 @@ def taps_non_cpg_metrics(bam: str, reference: str, samtools: str, scratch: str, 
                 counts["non_cpg_chg_unmod"] += chg_unmod
                 counts["non_cpg_chh_mod"] += chh_mod
                 counts["non_cpg_chh_unmod"] += chh_unmod
-        if process.wait() != 0:
-            raise RuntimeError("samtools collate failed during TAPS non-CpG QC")
-        if primary_pairs != expected_pairs:
-            raise ValueError("TAPS non-CpG primary pair count disagrees with alignment QC")
-    finally:
-        _close_native_stream(process)
+    if primary_pairs != expected_pairs:
+        raise ValueError("TAPS non-CpG primary pair count disagrees with alignment QC")
     modified = counts["non_cpg_chg_mod"] + counts["non_cpg_chh_mod"]
     total = modified + counts["non_cpg_chg_unmod"] + counts["non_cpg_chh_unmod"]
     return {**counts, "non_cpg_observations": total,
@@ -1762,50 +1910,55 @@ def emit_taps_snps(vcf: str, output: str, sample: str, *, reference: str) -> int
         with pysam.VariantFile(selected_vcf) as source, pysam.FastaFile(reference) as ref:
             if list(source.header.samples) != ["sample"]:
                 raise ValueError("TAPS SNP VCF requires the native Rastair placeholder sample")
-            old_sample = next(iter(source.header.samples))
             reference_lengths = dict(zip(ref.references, ref.lengths))
             reference_bases = _TapsReferenceWindow(ref)
             header_text = str(source.header).rsplit("\t", 1)[0] + "\t" + sample + "\n"
-            with pysam.BGZFile(output, "w") as target:
+            raw = str(Path(selected) / "selected.vcf.gz")
+            with pysam.BGZFile(raw, "w") as target:
                 target.write(header_text.encode())
                 for row in source:
                     alleles = row.alleles or ()
-                    genotype = row.samples[old_sample].get("GT") or ()
-                    if (set(row.filter) != {"PASS"} or len(alleles) < 2
-                            or any(len(a) != 1 or a not in "ACGT" for a in alleles)
-                            or not any(a is not None and a > 0 for a in genotype)):
+                    if (len(alleles) < 2 or any(a not in {"A", "C", "G", "T"} for a in alleles)
+                            or "GT" not in row.format):
                         continue
+                    # pysam 的 GT 元组会把越界索引和真正缺失都解码成 None；按 VCF 中的数字校验。
+                    record = str(row)
+                    sample_data = record.rstrip("\n").rsplit("\t", 1)[1]
+                    gt = sample_data.split(":")[row.format.keys().index("GT")]
+                    called = [int(a) for a in re.split(r"[/|]", gt.lstrip("/|")) if a != "."]
+                    if any(a < 0 or a >= len(alleles) for a in called):
+                        raise ValueError(f"TAPS SNP GT refers to an undeclared allele: {row.contig}:{row.pos} {gt}")
+                    if not any(called):
+                        continue
+                    if len(set(alleles)) != len(alleles):
+                        raise ValueError(f"TAPS SNP has repeated REF/ALT alleles: {row.contig}:{row.pos}")
                     if (row.contig not in reference_lengths or row.start < 0
                             or row.stop > reference_lengths[row.contig]):
                         raise ValueError(f"TAPS SNP coordinate is outside reference FASTA: {row.contig}:{row.pos}")
                     if reference_bases.fetch(row.contig, row.start, row.stop).upper() != row.ref:
                         raise ValueError(f"TAPS SNP REF disagrees with reference FASTA: {row.contig}:{row.pos}")
-                    target.write(str(row).encode())
+                    target.write(record.encode())
                     count += 1
-    with tempfile.TemporaryDirectory(prefix=".taps_snp.", dir=project_temporary_parent(output)) as scratch:
-        corrected = str(Path(scratch) / "snps.vcf.gz")
-        pysam.bcftools.reheader("--fai", f"{reference}.fai", "--output", corrected, output, catch_stdout=False)
+        corrected = str(Path(selected) / "snps.vcf.gz")
+        pysam.bcftools.reheader("--fai", f"{reference}.fai", "--output", corrected, raw, catch_stdout=False)
+        pysam.tabix_index(corrected, preset="vcf")
+        index = Path(f"{output}.tbi")
+        index.unlink(missing_ok=True)
         os.replace(corrected, output)
-    pysam.tabix_index(output, preset="vcf", force=True)
+        os.replace(f"{corrected}.tbi", index)
     return count
 
 
-def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str, stream: TextIO,
-                     *, bam: str, samtools: str, scratch: str, vcf: str, output_snp: str, sample: str) -> None:
-    """输出共用 CpG writer 的整数计数输入；CpG 任一端已调用为变异时排除两端，不使用 beta。"""
+def _emit_rastair_bed(bed: str, reference: str, stream: TextIO) -> dict:
+    """写出共用 CpG writer 的整数输入，并统计原生行与两个对照的分母。"""
     import pysam
 
-    qc = json.loads(Path(alignment_qc).read_text())
-    if qc["sample"] != sample:
-        raise ValueError("TAPS caller sample differs from alignment QC")
-    qc.update(taps_non_cpg_metrics(bam, reference, samtools, scratch, expected_pairs=qc["trimmed_pairs"]))
-    qc["snp_sites"] = emit_taps_snps(vcf, output_snp, sample, reference=reference)
     counts = {"native_cpg_rows": 0, "canonical_cpg_rows": 0, "excluded_variant_or_denovo_rows": 0,
               "zero_observation_rows": 0}
     controls = {name: {"mod": 0, "unmod": 0, "sites": 0} for name in ("lambda", "pUC19")}
-    required = {"#chr", "start", "end", "unmod", "mod", "coverage", "genotype", "cpg"}
+    required = {"#chr", "start", "end", "strand", "unmod", "mod", "no_snp", "snp", "coverage", "genotype", "cpg"}
     with pysam.FastaFile(reference) as ref, Path(bed).open() as handle:
-        reader = csv.reader(handle, delimiter="\t")
+        reader = csv.reader(handle, delimiter="\t", quoting=csv.QUOTE_NONE)
         fieldnames = next(reader, [])
         column = {name: i for i, name in enumerate(fieldnames)}
         if not required.issubset(fieldnames) or len(fieldnames) != len(set(fieldnames)):
@@ -1819,11 +1972,11 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
         reference_sequence = ""
 
         def flush_cpg() -> None:
-            if any(gt != base + "/" + base for _, _, _, _, _, gt, base in pending):
+            if any(gt != base + "/" + base for _, _, _, _, gt, base in pending):
                 counts["excluded_variant_or_denovo_rows"] += len(pending)
                 return
-            for chrom, pos, mod, unmod, depth, gt, base in pending:
-                if depth == 0 or mod + unmod == 0:
+            for chrom, pos, mod, unmod, gt, base in pending:
+                if mod + unmod == 0:
                     counts["zero_observation_rows"] += 1
                     continue
                 stream.write(f"{chrom}\t{pos}\t{pos + 1}\t.\t{mod}\t{unmod}\n")
@@ -1841,18 +1994,21 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
             origin = row[column["cpg"]]
             if origin not in {"REF", "NEW"}:
                 raise ValueError(f"{label} has invalid CpG origin: {origin!r} (requires REF or NEW)")
+            strand, genotype = row[column["strand"]], row[column["genotype"]]
+            if strand not in {"+", "-", "."} or re.fullmatch(r"[ACGTN]/[ACGTN]", genotype) is None:
+                raise ValueError(f"{label} has invalid Rastair strand or genotype: {strand!r}, {genotype!r}")
             chrom = row[column["#chr"]]
             if chrom not in contigs:
                 raise ValueError(f"{label} contig {chrom!r} is absent from the reference FASTA")
-            numeric = [row[column[k]] for k in ("start", "end", "mod", "unmod", "coverage")]
+            numeric = [row[column[k]] for k in ("start", "end", "mod", "unmod", "no_snp", "snp", "coverage")]
             if any(re.fullmatch(r"[0-9]+", value) is None for value in numeric):
                 raise ValueError(f"{label} has non-integer coordinates/counts (requires nonnegative ASCII integers)")
-            pos, end, mod, unmod, depth = map(int, numeric)
-            if end != pos + 1 or end > ref.get_reference_length(chrom) or mod + unmod > depth:
+            pos, end, mod, unmod, no_snp, snp, depth = map(int, numeric)
+            if end != pos + 1 or end > ref.get_reference_length(chrom) or mod + unmod + no_snp + snp > depth:
                 raise ValueError(f"{label}: Invalid Rastair coordinate/counts: {chrom}:{pos}")
             key = (contigs[chrom], pos)
             if previous is not None and key <= previous:
-                raise ValueError("Rastair BED is not ordered or contains duplicate positions")
+                raise ValueError(f"{label} is not ordered or contains duplicate positions")
             previous = key
             if origin == "NEW":
                 counts["excluded_variant_or_denovo_rows"] += 1
@@ -1868,24 +2024,59 @@ def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str
             cpg_offset = start - reference_start
             if (base not in {"C", "G"} or start < 0
                     or reference_sequence[cpg_offset:cpg_offset + 2] != "CG"):
-                raise ValueError(f"Rastair reference CpG disagrees with FASTA: {chrom}:{pos}")
+                raise ValueError(f"{label}: Rastair reference CpG disagrees with FASTA: {chrom}:{pos}")
+            if strand != ("+" if base == "C" else "-"):
+                raise ValueError(f"{label}: Rastair strand disagrees with reference {base} at {chrom}:{pos}")
             cpg_key = (chrom, start)
             if cpg_key != pending_key:
                 flush_cpg()
                 pending = []
                 pending_key = cpg_key
-            pending.append((chrom, pos, mod, unmod, depth, row[column["genotype"]], base))
+            pending.append((chrom, pos, mod, unmod, genotype, base))
         flush_cpg()
-    qc.update(counts)
+    for name, value in controls.items():
+        denominator = value["mod"] + value["unmod"]
+        counts[f"{name}_cpg_mod"] = value["mod"]
+        counts[f"{name}_cpg_observations"] = denominator
+        counts[f"{name}_cpg_sites"] = value["sites"]
+        metric = "false_positive_pct" if name == "lambda" else "conversion_pct"
+        counts[f"{name}_{metric}"] = 100.0 * value["mod"] / denominator if denominator else None
+    return counts
+
+
+def emit_rastair_cpg(bed: str, reference: str, alignment_qc: str, output_qc: str, stream: TextIO,
+                     *, bam: str, samtools: str, scratch: str, vcf: str, output_snp: str, sample: str, species: str) -> None:
+    """按当前 BAM 的细胞身份提交候选 SNP、索引和 QC，CpG 整数行交给共用 writer。"""
+    snp_path, qc_path = Path(output_snp), Path(output_qc)
+    index = Path(f"{output_snp}.tbi")
+    locks = {path.parent.resolve() / ".alopex-rastair-call.lock" for path in (snp_path, qc_path)}
+    members = [Path(bed), Path(vcf), Path(bam), Path(f"{bam}.bai"), Path(reference), Path(f"{reference}.fai"),
+               Path(alignment_qc), snp_path, index, qc_path, *locks]
+    path_label = "TAPS caller inputs and outputs"
+    require_distinct_paths(members, label=path_label)
+    qc = json.loads(Path(alignment_qc).read_text())
+    if qc["sample"] != sample:
+        raise ValueError("TAPS caller sample differs from alignment QC")
+    qc.update(taps_non_cpg_metrics(bam, reference, samtools, scratch, alignment_qc=qc, species=species))
     qc.update({"signal": "5mC+5hmC", "high_cph_status": "not_applicable",
                "min_mapq": TAPS_MIN_MAPQ, "min_baseq": TAPS_MIN_BASEQ,
                "include_flags": TAPS_INCLUDE_FLAGS, "exclude_flags": TAPS_EXCLUDE_FLAGS,
                "guess_read_orientation": True, "mate_overlap_counted_once": True})
-    for name, value in controls.items():
-        denominator = value["mod"] + value["unmod"]
-        qc[f"{name}_cpg_mod"] = value["mod"]
-        qc[f"{name}_cpg_observations"] = denominator
-        qc[f"{name}_cpg_sites"] = value["sites"]
-        metric = "false_positive_pct" if name == "lambda" else "conversion_pct"
-        qc[f"{name}_{metric}"] = 100.0 * value["mod"] / denominator if denominator else None
-    atomic_write_json(output_qc, qc)
+    for parent in {snp_path.parent, qc_path.parent}:
+        parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".rastair_call.", dir=project_temporary_parent(snp_path)) as directory:
+        snp = str(Path(directory) / "snps.vcf.gz")
+        qc["snp_sites"] = emit_taps_snps(vcf, snp, sample, reference=reference)
+        qc.update(_emit_rastair_bed(bed, reference, stream))
+        stream.flush()
+        # 原生文件和输出流均通过后才撤旧 QC；规则再将四件产物一起发布。
+        with publication_locks(locks):
+            require_distinct_paths(members, label=path_label)
+            qc_path.unlink(missing_ok=True)
+            os.replace(snp, snp_path)
+            os.replace(f"{snp}.tbi", index)
+            # 在忽略大小写的卷上，新建的成员可能同时占用了刚撤下的 QC 路径。
+            if qc_path.exists():
+                qc_path.unlink()
+                raise ValueError(f"{path_label} must be distinct: {qc_path}")
+            atomic_write_json(qc_path, qc)
