@@ -1334,6 +1334,7 @@ def _require_current_single(paths, identity):
             or source["delivery_id"] != identity["delivery_id"]
             or source["source_cpg_representation"] != identity["cpg_representation"]
             or source["cpg_coordinate_base"] != _source_cpg_coordinate_base(identity["cpg_representation"])
+            or source.get("cpg_interval_convention") != matrices.SINGLE_CPG_INTERVAL_CONVENTION
             or source["bed_sha256"] != identity["context"]["bed"]
             or source["qc_filter_parameters"] != identity["qc_filter_parameters"]
             or schema["h5ad"] != _published_file_binding(paths.single_cpg)
@@ -2145,6 +2146,7 @@ def _run_pipeline_impl(paths, cfg, workers, recompute, *, sealed_context=None):
         identity["diagnostic_artifacts"] = {path.name: _content_binding(path) for path in destinations}
         _atomic_write_json({"input": {"cpg_generation": generation, "delivery_id": sealed.delivery_id,
                                       "cpg_coordinate_base": base,
+                                      "cpg_interval_convention": matrices.SINGLE_CPG_INTERVAL_CONVENTION,
                                       "bed_sha256": identity["context"]["bed"],
                                       "qc_filter_parameters": filter_parameters,
                                       "source_cpg_representation": sealed.cpg_representation},

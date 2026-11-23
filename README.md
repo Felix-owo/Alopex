@@ -21,7 +21,7 @@ Both DD protocols independently call DNA cells using raw structured-read counts,
 
 ## Install and check
 
-1. Install Conda, Git, curl, gzip and a C compiler. Keep the Pipeline checkout separate from projects. Doctor builds environments, Rust and reference indexes for the target platform. Download `Alopex-v19.1.tar.gz`, `SHA256SUMS` and `SOURCE_SHA256SUMS`, then verify the archive before extracting it. [v19.1 release](https://github.com/Felix-owo/Alopex/releases/tag/v19.1)
+1. Install Conda, Git, curl, gzip and a C compiler. Keep the Pipeline checkout separate from projects. Doctor builds environments, Rust and reference indexes for the target platform. Download `Alopex-v19.2.tar.gz`, `SHA256SUMS` and `SOURCE_SHA256SUMS`, then verify the archive before extracting it. [v19.2 release](https://github.com/Felix-owo/Alopex/releases/tag/v19.2)
 2. Uncompress the six source files into `resources/reference_source/` using the names below. Doctor builds the analysis FASTAs, adds lambda and pUC19, builds indexes and records reference identities. The input sources and masked regions are specified in the [reference guide](README.zh-CN.md#2-准备标准-reference).
 3. Run the checks below from the Pipeline root. On macOS use the local terminal. On HPC verify and transfer the sealed references first, prepare dependencies on the login node, then run the full Doctor in the terminal of the existing Jupyter compute allocation. Transfer the index families and their producer receipts together. The target platform needs its own managed environments and binaries.
 4. Continue after `FINAL STATUS: READY`. Doctor reports its log path under `logs/doctor/`. The standard small scientific runs exercise human Cabernet/Bismark, mouse Cabernet/BISCUIT and TAPS/Rastair.
@@ -38,7 +38,7 @@ bash core/doctor.sh conda
 bash core/doctor.sh
 ```
 
-v19.1 pins Rust Bismark 3.4.0 with SAMtools/HTSlib 1.25. After updating the source, run `bash core/doctor.sh conda` and verify the active binary with `conda/current/bismark/bin/bismark --version`.
+The managed environment pins Rust Bismark 3.4.0 with SAMtools/HTSlib 1.25. After updating the source, run `bash core/doctor.sh conda` and verify the active binary with `conda/current/bismark/bin/bismark --version`.
 
 To check an installed component, run `bash core/doctor.sh conda --check`, `bash core/doctor.sh demux --check` or `bash core/doctor.sh reference --check`. To rebuild the native demultiplexer, run `bash core/doctor.sh demux`.
 

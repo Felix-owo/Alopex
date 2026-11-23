@@ -17,9 +17,9 @@
 | 已有项目失败、锁残留或发布中断 | [运行与恢复](#6-运行与恢复) |
 | 想看资源、进度或错误日志 | [运行状态与详细输出](#运行状态与详细输出) |
 | 上游已完成，要做 QC 或导出矩阵 | [下游 README](downstream/README.md) |
-| 查本版输入、QC 与恢复变更 | [v19.1 更新说明](#v191-更新说明) |
+| 查 SingleCpG 坐标与旧矩阵重建 | [v19.2 更新说明](#v192-更新说明) |
 
-Alopex v19.1 支持 DD-MET3 与 DD-MET5。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
+Alopex v19.2 支持 DD-MET3 与 DD-MET5。Alopex 将单细胞 DNA 甲基化 paired FASTQ 转为单细胞 CpG、QC 报告和可追溯的完整交付。
 
 内部 CLI 为 `python -m alopex`；计算源码位于 `core/alopex/`，下游结果固定写入 `06_downstream/`。
 
@@ -38,14 +38,14 @@ demux 构建固定将 Cargo.lock 锁定的 `libz-sys` 所带 zlib 源码静态�
 
 环境规格统一在 `core/envs.yaml`，由 Doctor 从 conda-forge / bioconda 安装；原有固定 pip 项目仍由该规格管理。
 
-v19.1 固定 Rust Bismark 3.4.0。更新源码后，在本机或 HPC 登录节点执行 `bash core/doctor.sh conda`，再用 `conda/current/bismark/bin/bismark --version` 核对生效版本。该角色使用 SAMtools／HTSlib 1.25。
+受管环境固定 Rust Bismark 3.4.0。更新源码后，在本机或 HPC 登录节点执行 `bash core/doctor.sh conda`，再用 `conda/current/bismark/bin/bismark --version` 核对生效版本。该角色使用 SAMtools／HTSlib 1.25。
 
-下载 `Alopex-v19.1.tar.gz`、`SHA256SUMS` 和 `SOURCE_SHA256SUMS`，校验并解压后运行 Doctor。[v19.1 Release](https://github.com/Felix-owo/Alopex/releases/tag/v19.1)
+下载 `Alopex-v19.2.tar.gz`、`SHA256SUMS` 和 `SOURCE_SHA256SUMS`，校验并解压后运行 Doctor。[v19.2 Release](https://github.com/Felix-owo/Alopex/releases/tag/v19.2)
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Alopex-v19.1.tar.gz
-cd Alopex-v19.1
+tar -xzf Alopex-v19.2.tar.gz
+cd Alopex-v19.2
 conda --version
 ```
 
@@ -298,7 +298,7 @@ BISCUIT 的原生读段名称按字面保留，包括双引号。旧实现曾把
 | 科学结果解读 | 边界 |
 | --- | --- |
 | CpG 坐标与计数 | `analysis.cpg_coordinate_base` 仅接受整数 0/1，默认 1；methyl/unmethyl 为非负整数，有效位点 coverage>0，合法空文件保留表头 |
-| 坐标传递 | SingleCpG 沿用 sealed 交付的 base；BED、VCF、BAM 仍按各自格式解释 |
+| 坐标传递 | SingleCpG 沿用 sealed 交付的 base，0-based 和 1-based 标签均为左闭右开。BED、VCF、BAM 仍按各自格式解释。 |
 | Droplet 计数 | BAM 保留 PCR copies，CpG 按胞嘧啶累计建库 UMI 或插入序列标签共识；MAPQ≥10、baseQ≥20，未解决平票不调用；`Duplicate_Pair_Rate%` 为 NaN |
 | TAPS 解读 | Non-CpG 为可判链宿主 CHG/CHH 原始转换率，零观测为缺失，不直接等同真实 mCH 或 cDNA 污染率；未调用 SNP 不等于纯合参考，PASS 仍需结合深度、质量与链支持 |
 | MultiQC | backend 原生 mapping 分母不同；活跃 DNA>1000 时固定展示同一组1000细胞，文库概要仍为全库，全部细胞科学结果与 BAM 策略不变 |
@@ -328,6 +328,10 @@ BISCUIT 的原生读段名称按字面保留，包括双引号。旧实现曾把
 ## 许可证
 
 Alopex 以 [GPL-3.0](LICENSE) 发布。
+
+## v19.2 更新说明
+
+SingleCpG 的 0-based 和 1-based 标签均为左闭右开。同一 CpG 分别写作 `chr1:0-2` 和 `chr1:1-3`，矩阵与完成记录标明 `half-open`。升级后运行 QC Processor 即可从已封存的 CpG 重建旧矩阵。[下游读取说明](downstream/README.md#保存供下游复用的-single-cpg-矩阵)
 
 ## v19.1 更新说明
 

@@ -22,6 +22,9 @@ from scipy import sparse
 from numba import njit
 
 
+SINGLE_CPG_INTERVAL_CONVENTION = "half-open"
+
+
 class CSRReader:
     """直接切片磁盘CSR，不由AnnData将整个obsm或var标签载入内存。"""
 
@@ -415,7 +418,7 @@ def single_cpg_writer(reader, bed, output, host_lengths):
     """按 BED 原列序写出参考标签，提供只读区间索引，由调用线程顺序提交稀疏行。"""
     base = int(reader.uns["cpg_coordinate_base"])
     writer = CSRWriter(output, pd.DataFrame(index=reader.obs_names), uns={
-        "cpg_coordinate_base": base, "cpg_interval_convention": "closed" if base else "half-open",
+        "cpg_coordinate_base": base, "cpg_interval_convention": SINGLE_CPG_INTERVAL_CONVENTION,
         "source_cpg_representation": reader.uns["source_cpg_representation"]})
     pieces, offset = {}, 0
     try:
@@ -424,7 +427,8 @@ def single_cpg_writer(reader, bed, output, host_lengths):
             for block in chunks:
                 if (block.start < 0).any() or (block.end <= block.start).any():
                     raise ValueError("Invalid single-CpG BED interval")
-                labels = np.asarray([f"{c}:{s + base}-{e}" for c, s, e in block.itertuples(index=False, name=None)], dtype=object)
+                labels = np.asarray([f"{c}:{s + base}-{e + base}"
+                                     for c, s, e in block.itertuples(index=False, name=None)], dtype=object)
                 writer.append_features(labels)
                 block.index = np.arange(offset, offset + len(block))
                 for chrom, rows in block.groupby("chrom", sort=False):

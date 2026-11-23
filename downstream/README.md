@@ -225,11 +225,13 @@ adata.file.close()
 | 使用边界 | 要求 |
 | --- | --- |
 | 完成记录 | 矩阵与 `SingleCpG_Adata.input_schema.json` 配套使用；输入身份失配时由 Processor 从当前 sealed CpG 自动重建，见[缓存与强制重算](#缓存与强制重算) |
-| 坐标 | 跟随 sealed `analysis.cpg_coordinate_base`：0-based `chr1:0-2` 为半开区间，1-based `chr1:1-2` 为闭区间，表示同一 CpG；传给 BED/0-based 工具前须按实际 metadata 转换 |
+| 坐标 | 跟随 sealed `analysis.cpg_coordinate_base`。0-based `chr1:0-2` 和 1-based `chr1:1-3` 均为左闭右开，表示同一 CpG。当前格式转为 BED 时，两个端点各减去 `uns['cpg_coordinate_base']`。 |
 | 位点列序 | 按 SingleCpG BED 的原始行序排列。跨矩阵对齐时使用 `var_names` 中的区间和 `uns` 中的坐标基准。 |
 | 后续注释 | 只读对象不能回填标签；使用独立可写副本或合适大小的内存子集。MethylTree 分箱后仍按细胞 ID 对齐 `obs` |
 
 矩阵的 `uns` 记录实际坐标 base、区间约定与来源表示。
+
+升级后重新运行 QC Processor，即可从已封存的四列 CpG 重建旧矩阵，无需重跑上游流程。跨版本对齐时读取各自的 `uns`。旧 1-based 闭区间 `[s, e]` 转为 BED `[s-1, e)`。
 
 ## TSS profile
 
